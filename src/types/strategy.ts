@@ -344,7 +344,9 @@ export interface ContextStrategy {
    * a shard's add), the write stops before the next shard and throws
    * WriteLandedError naming the shards stored, which stay on the branch it
    * started on (WriteOutcomeUnknownError where a shard's append threw after
-   * the move), and in legacy mode the strategy hears none of them.
+   * the move); in legacy mode the strategy hears them once it is
+   * initialized again, where the window of the branch it initialized on
+   * holds them.
    *
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
@@ -353,7 +355,8 @@ export interface ContextStrategy {
    * told once, after every shard is stored, with every shard, as a
    * presentRows gives a body; a strategy with only onNewMessage hears each
    * shard in turn at that point. A sharded write that fails tells the
-   * strategy of none of its shards.
+   * strategy only of the shards it leaves stored (WriteLandedError), once it
+   * has tried to remove them, in one call.
    * Once a host presents rows on the branch, or takes a row out of its
    * window by name (retractRows ends legacy mode too), a stored row isn't
    * heard until it is presented: the call comes from presentRows, once per call, after
@@ -1129,9 +1132,14 @@ export interface TimeRangeSummaryEntry {
   level: number;
   content: string;
   tokens: number;
-  /** `sourceRange.first` message's `timestamp`, in epoch ms. */
+  /**
+   * The `timestamp`, in epoch ms, of the first message the summary covers
+   * in the record (by sequence): `sourceRange.first`'s, until a host
+   * presents rows out of record order, after which a chunk is in the
+   * window's order and its first row needn't be its earliest.
+   */
   startMs: number;
-  /** `sourceRange.last` message's `timestamp`, in epoch ms. */
+  /** Likewise the last message's: `sourceRange.last`'s until then. */
   endMs: number;
   /**
    * Exact identity/order boundaries of the covered span, ALONGSIDE the
@@ -1141,8 +1149,9 @@ export interface TimeRangeSummaryEntry {
    * not `startMs`/`endMs` alone: two distinct messages can share a
    * timestamp (wall-clock ms resolution, rapid-fire appends), but
    * `sequence` (chronicle's per-record sequence number) is strictly
-   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
-   * resolved `StoredMessage.id`/`.sequence`.
+   * monotonic and never ties. The `StoredMessage.id`/`.sequence` of the
+   * messages `startMs` and `endMs` are read from: `sourceRange.first`/
+   * `.last`'s until a host presents rows out of record order.
    */
   firstMessageId: string;
   lastMessageId: string;

@@ -509,6 +509,36 @@ function sameElements(a: readonly StoredMessage[], b: readonly StoredMessage[]):
 }
 
 /**
+ * What present's `cutShort` hears of a write that threw, from the ordinals
+ * the store holds once the index reads again: the rows that entered, and
+ * the rows of `moving` that left. Made apart from present, as
+ * leavingSettlement is apart from writeLeaving, so one that waits for a
+ * later write (settled) holds what the write named and nothing else of the
+ * call: not its reading of the index, nor the write's error, whose stack
+ * holds the caller's frames.
+ */
+function presentSettlement(
+  rows: readonly MessageId[],
+  moving: readonly LeftRow[],
+  cutShort: (entered: MessageId[], left: LeftRow[]) => void,
+): (now: ReadonlyMap<MessageId, number>) => void {
+  const before = new Map(moving.map((row) => [row.id, row.ordinal] as const));
+  return (now) => {
+    const left = moving.filter((row) => now.get(row.id) !== row.ordinal);
+    const entered = rows.filter((id) => now.has(id) && now.get(id) !== before.get(id));
+    if (entered.length > 0 || left.length > 0) cutShort(entered, inWindowOrder(left));
+  };
+}
+
+/** What writeLeaving's `cutShort` hears of a write that threw: the rows of `left` out of the window (see presentSettlement). */
+function leavingSettlement(left: readonly LeftRow[], cutShort: (left: LeftRow[]) => void): (now: ReadonlyMap<MessageId, number>) => void {
+  return (now) => {
+    const out = left.filter((row) => now.get(row.id) !== row.ordinal);
+    if (out.length > 0) cutShort(inWindowOrder(out));
+  };
+}
+
+/**
  * The window index of one manager namespace, read through one store handle
  * on whatever branch that handle is on. It reads the state again whenever
  * the state's revision there has moved since it last read it, so another
@@ -995,12 +1025,7 @@ export class WindowIndex {
       this.write(items);
     } catch (error) {
       if (!cutShort) throw error;
-      const before = new Map(moving.map((row) => [row.id, row.ordinal] as const));
-      throw this.afterThrow('presentRows', error, { entering: rows, leaving: inWindowOrder(moving).map((row) => row.id) }, (now) => {
-        const left = moving.filter((row) => now.get(row.id) !== row.ordinal);
-        const entered = rows.filter((id) => now.has(id) && now.get(id) !== before.get(id));
-        if (entered.length > 0 || left.length > 0) cutShort(entered, inWindowOrder(left));
-      }, branch);
+      throw this.afterThrow('presentRows', error, { entering: rows, leaving: inWindowOrder(moving).map((row) => row.id) }, presentSettlement(rows, moving, cutShort), branch);
     }
     const ordinals = this.current().ordinals;
     return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows, left: inWindowOrder(moving) };
@@ -1125,10 +1150,7 @@ export class WindowIndex {
       this.write(tombstones);
     } catch (error) {
       if (!cutShort) throw error;
-      throw this.afterThrow(operation, error, { entering: [], leaving: inWindowOrder(left).map((row) => row.id) }, (now) => {
-        const out = left.filter((row) => now.get(row.id) !== row.ordinal);
-        if (out.length > 0) cutShort(inWindowOrder(out));
-      }, branch);
+      throw this.afterThrow(operation, error, { entering: [], leaving: inWindowOrder(left).map((row) => row.id) }, leavingSettlement(left, cutShort), branch);
     }
   }
 

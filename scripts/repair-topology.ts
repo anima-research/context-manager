@@ -58,6 +58,10 @@
  * listed as `STILL STRANDED …`.
  * None of the modes makes model calls itself.
  *
+ * Once a host presents rows to the namespace (agent-framework #291), the
+ * plan is made over its window, the rows presented in the order they were,
+ * as the strategy reads them; until then over the record.
+ *
  * After --apply the store is reopened with topologyPolicy 'reject'; the run
  * fails if the audit still finds a crossed summary.
  * Exit 0 = nothing crossed is left, or a dry run's plan leaves nothing
@@ -72,6 +76,8 @@ import { loadedAsWritten, planTopologyRepair, type RepairInputs, type RepairReco
 import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
 import { releasedRecordsLine, summaryIdCounterPast } from '../src/strategies/settle-summaries.js';
 import { flagValue, positionalArg, runsFromArgs, runsLine, RUN_VALUE_FLAGS, RUNS_USAGE } from './run-flags.js';
+import { WindowIndex } from '../src/window-index.js';
+import type { StoredMessage } from '../src/types/index.js';
 
 const args = process.argv.slice(2);
 const positional = positionalArg(args, ['--namespace', '--release-head-limit', '--mode', '--rebuild-since', '--messages-state', ...RUN_VALUE_FLAGS]);
@@ -115,7 +121,11 @@ const summaries = stateArray<RepairSummary>(sumsState);
 const records = stateArray<RepairRecord>(chunksState);
 const storedResolutions = store.getStateJson(resolutionsState);
 const resolutions = (storedResolutions != null && typeof storedResolutions === 'object' && !Array.isArray(storedResolutions) ? storedResolutions : {}) as Record<string, number>;
-const messages = stateArray<{ id: string }>(messagesState);
+// Once a host presents rows (agent-framework #291) the strategy reads, and
+// the verification's audit checks, the namespace's window: the rows
+// presented, in the order they were, which can differ from the record's.
+// The plan is made over it; in legacy mode it is the record.
+const messages = new WindowIndex(store, namespace, console).listing(stateArray<StoredMessage>(messagesState)) as Array<{ id: string }>;
 const mergeQueue = stateArray<{ level: number; sourceIds: string[] }>(`${namespace}/autobio:mergeQueue`);
 const mergeQuarantine = stateArray<NonNullable<RepairInputs['mergeQuarantine']>[number]>(`${namespace}/autobio:merge-quarantine`);
 const quarantine = compressionQuarantineHolds(

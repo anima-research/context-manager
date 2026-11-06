@@ -532,6 +532,125 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 2, finding 35: retractRows' tombstones have
+  // landed by then, so it doesn't throw; the call waits to be made.
+  it("the manager's own work around retractRows' call failing is logged, the rows stay out, and the strategy is told at its next notification", async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    strategy.log.length = 0;
+    const own = cm as unknown as { createStrategyContext?: () => never };
+    own.createStrategyContext = () => {
+      throw new Error('zz the manager failed');
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        cm.retractRows([a]);
+      });
+    } finally {
+      delete own.createStrategyContext;
+    }
+    assert.ok(lines.some((line) => line.includes('zz the manager failed')), lines.join('\n'));
+    assert.equal(strategy.log.length, 0, 'nothing was told');
+    assert.equal(cm.ordinalOf(a), undefined, 'the row is out');
+    cm.retractRows([b]);
+    assert.deepEqual(strategy.log, ['retracted a', 'retracted b'], 'the call that waited is made first');
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 2, finding 37: a branch whose window never
+  // held the row isn't told it left.
+  it('a call waiting on an initialization of a branch made before the row was stored is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    // Presented, and made before a was stored: neither its record nor its window ever held a.
+    const older = store.createBranchAt('zz-older', cm.currentBranch().name, store.currentSequence()).name;
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([a]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(older);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, older);
+    assert.equal(cm.windowMode(), 'presented', 'setup: the branch is presented');
+    assert.deepEqual(strategy.retracted, [], "a never entered this branch's window");
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
+  // store no longer holds is told by its id, removed, as retractRows tells it.
+  it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a, b], { undone: true });
+    writer.removeMessage(b);
+    open();
+    await initialized;
+    assert.deepEqual(strategy.retracted.map((l) => [l.rows, l.info]), [
+      [[a], { undone: true, removed: false, ids: [a] }],
+      [[], { undone: true, removed: true, ids: [b] }],
+    ]);
+    await settle();
+    cm.close();
+    writer.close();
+  });
+
+  it("a waiting call's second call whose own work fails waits alone, and the rows told before it aren't told again", async () => {
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b, c] = ['a', 'b', 'c'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    cm.presentRows([a, b, c]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a, b]);
+    writer.removeMessage(b);
+    // The context for the second call, b's, can't be built: the manager's own work.
+    const own = cm as unknown as { createStrategyContext: () => unknown };
+    const build = own.createStrategyContext;
+    let builds = 0;
+    own.createStrategyContext = function (this: unknown) {
+      if (++builds === 2) throw new Error('zz the manager failed');
+      return build.call(this);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        open();
+        await initialized;
+      });
+    } finally {
+      delete (own as { createStrategyContext?: unknown }).createStrategyContext;
+    }
+    assert.ok(lines.some((line) => line.includes('zz the manager failed')), lines.join('\n'));
+    assert.deepEqual(strategy.retracted.map((l) => l.info.ids), [[a]], 'setup: the first call was made');
+    cm.retractRows([c]);
+    assert.deepEqual(strategy.retracted.map((l) => [l.info.ids, l.info.removed]), [[[a], false], [[b], true], [[c], false]], 'b waited alone, and a is told once');
+    await settle();
+    cm.close();
+    writer.close();
+  });
+
   // CM #350 bot review finding 21: while initialization stays failed the
   // calls wait without bound, so what each keeps is kept small.
   it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {

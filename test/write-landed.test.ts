@@ -342,6 +342,94 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     cm.close();
   });
 
+  // CM #350 bot review, wave 2, finding 28: the range removal's hold
+  // pruning runs before the window's work, which runs all the same.
+  it("a rollback removal whose pruning of holds throws still takes a presented shard out of the window, and the strategy hears it leave", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.presentRows([]);
+    const shown: MessageId[] = [];
+    cm.onMessage((event) => {
+      if (event.type !== 'add') return;
+      shown.push(event.message.id);
+      cm.presentRows([event.message.id]);
+    });
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    // Reading a held row throws while the removal runs: the pruning's read.
+    const messages = internals(cm).messageStore;
+    const get = messages.get.bind(messages);
+    const remove = messages.removeBodyGroup.bind(messages);
+    let removing = false;
+    messages.get = (id) => {
+      if (removing) throw new Error('store unreadable');
+      return get(id);
+    };
+    messages.removeBodyGroup = (id) => {
+      removing = true;
+      try {
+        remove(id);
+      } finally {
+        removing = false;
+      }
+    };
+    const { result: err } = errorsDuring(() =>
+      thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')], undefined, undefined, { holdCompression: true })),
+    );
+    assert.equal(err, failure, 'unwrapped: the store holds none of the message');
+    assert.deepEqual(cm.getAllMessages(), []);
+    assert.equal(shown.length, 1, 'setup: the listener presented the first shard');
+    assert.equal(cm.ordinalOf(shown[0]!), undefined, 'the shard left the window as it was removed');
+    assert.deepEqual(strategy.retracted, [{ ids: shown, rows: shown, removed: true }], 'the strategy heard it leave');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 2, finding 34: the rollback knows the ids it
+  // removes, so a failed read of their rows doesn't keep them in the window.
+  it("a rollback whose read of the rows it removes throws still takes a presented shard out of the window, told by its id", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.presentRows([]);
+    const shown: MessageId[] = [];
+    cm.onMessage((event) => {
+      if (event.type !== 'add') return;
+      shown.push(event.message.id);
+      cm.presentRows([event.message.id]);
+    });
+    // The second shard's append fails after it landed, and from then on
+    // reading a row by its id throws: the rollback's read of what it removes.
+    const own = internals(cm);
+    const handle = own.handleMessageStoreEvent.bind(cm);
+    const messages = own.messageStore;
+    const get = messages.get.bind(messages);
+    let unreadable = false;
+    messages.get = (id) => {
+      if (unreadable) throw new Error('store unreadable');
+      return get(id);
+    };
+    const failure = new Error('propagation failed');
+    let adds = 0;
+    own.handleMessageStoreEvent = (event) => {
+      handle(event);
+      if (event.type === 'add' && ++adds === 2) {
+        unreadable = true;
+        throw failure;
+      }
+    };
+    const { result: err, logged } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    unreadable = false;
+    assert.equal(err, failure, 'unwrapped: the store holds none of the message');
+    assert.deepEqual(cm.getAllMessages(), []);
+    assert.ok(logged.some((l) => l.includes('reading the rows before removing body group three') && l.includes('store unreadable')), logged.join('\n'));
+    assert.equal(shown.length, 1, 'setup: the listener presented the first shard');
+    assert.equal(cm.ordinalOf(shown[0]!), undefined, 'the shard left the window as it was removed');
+    assert.deepEqual(strategy.retracted, [{ ids: [shown[0]!], rows: [], removed: true }], 'the strategy heard it leave, by its id');
+    assert.deepEqual(cm.retractAbsentRows(), [], 'nothing is left for a repair to take out');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
   it("a removal that took the shards out and then failed leaves none, so the write's own error is thrown", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
     cm.addMessage('bob', [text('before')]);
@@ -611,6 +699,82 @@ describe("a sharded addMessage's shards land together, as one body", () => {
       const after = cm.addMessage('bob', [text('after')]);
       assert.equal(cm.getAllMessages().at(-1)!.id, after, `${from}: an add once the call returned is taken`);
       await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
+  });
+
+  // CM #350 bot review, wave 2, finding 27: a legacy window holds the
+  // shards a failed write leaves stored, so the strategy hears them.
+  it('in legacy mode the strategy hears the shards a failed write leaves stored, in one call', async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    failRemoval(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ']);
+    assert.deepEqual(strategy.presented, [[stored[0]!.id], err.landed], 'one call with the shards that stayed, which the window holds');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  it("in legacy mode the shards a write stopped by a branch move leaves stored are heard where the branch the strategy initializes on holds them", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore();
+    const start = cm.currentBranch().name;
+    let switched: Promise<void> | undefined;
+    // The listener moves to a branch made after the first shard landed, so
+    // its record, the window there, holds that shard.
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || switched) return;
+      switched = cm.switchBranch(store.createBranchAt('zz-after-shard', start, store.currentSequence()).name);
+    });
+    const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+    await switched;
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one ']);
+    assert.deepEqual(strategy.presented.at(-1), err.landed, 'the shard that stayed, heard once the strategy initialized there');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 2, finding 2: a removal from a listener would
+  // take a shard the write's failure removes, or move the rows it reads back.
+  it('a removal while a sharded addMessage stores its shards is refused, saying why, and a write that then fails leaves none of the body', async () => {
+    for (const remove of ['removeMessage', 'removeMessages'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+      const before = cm.addMessage('bob', [text('before')]);
+      const refusals: unknown[] = [];
+      let first = true;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || !first) return;
+        first = false;
+        for (const id of [event.message.id, before]) {
+          try {
+            if (remove === 'removeMessage') cm.removeMessage(id);
+            else cm.removeMessages(id, id);
+          } catch (err) {
+            refusals.push(err);
+          }
+        }
+      });
+      const failure = new Error('propagation failed');
+      failOwnListenerAfterAdd(cm, 2, failure);
+      const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+      assert.equal(refusals.length, 2, `${remove}: both refused`);
+      for (const refusal of refusals) {
+        assert.ok(refusal instanceof Error, remove);
+        assert.match(refusal.message, new RegExp(`^ContextManager\\.${remove} refused: a sharded addMessage is storing its shards`), remove);
+      }
+      assert.equal(err, failure, `${remove}: unwrapped, the store holds none of the message`);
+      assert.deepEqual(cm.getAllMessages().map(textOf), ['before'], `${remove}: no shard stays, and the row before is kept`);
+      cm.removeMessage(before);
+      assert.deepEqual(cm.getAllMessages(), [], `${remove}: a removal once the call returned is taken`);
       cm.close();
     }
   });

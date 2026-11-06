@@ -57,7 +57,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
+import { WindowIndex, WindowWriteOutcomeUnknownError, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -427,7 +427,8 @@ export class InitializationSupersededError extends Error {
  * Its add may have gone unheard: a failure in the manager's own listener
  * ends the event before a host's onMessage listener hears it, and before
  * the strategy does in legacy mode, where a sharded write that fails tells
- * the strategy of none of its shards. Once a host presents rows on the
+ * the strategy only of the shards its own listener heard that stay, in one
+ * call before this is thrown. Once a host presents rows on the
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
  * a host that presents each row as it is stored does, or taken one out
@@ -656,11 +657,13 @@ export class ContextManager {
    */
   private retractedUnheard: Array<{ left: RetractedRow[]; info: Retraction }> = [];
   /**
-   * While removeMessage or removeMessages removes rows in presented mode:
-   * the rows, read before they went, for the strategy to be told of them
-   * (handleMessageStoreEvent).
+   * While a removal through this manager runs (removeMessage,
+   * removeMessages, a failed sharded addMessage's removal of its shards):
+   * the rows it takes, read before they went, for the strategy to be told
+   * of them (handleMessageStoreEvent), and their ids, which a removal that
+   * names its rows keeps where that read failed (rowsBeforeRemoval).
    */
-  private removing: StoredMessage[] | null = null;
+  private removing: Removing | null = null;
 
   private constructor(
     store: JsStore,
@@ -974,9 +977,10 @@ export class ContextManager {
    *
    * A sharded body's shards land together, as one body: a chunking whose
    * `bodyGroupId` is empty or not a string is refused before any shard is
-   * stored, and an addMessage made while a sharded addMessage stores its
-   * shards (from a listener of a shard's add, or a strategy hook a
-   * listener runs by presenting a shard) is refused, saying why, since its
+   * stored, and an addMessage on this manager made while a sharded
+   * addMessage of its stores its shards (from a listener of a shard's add,
+   * or a strategy hook a listener runs by presenting a shard) is refused,
+   * saying why, since its
    * row would land between the shards and split the body. In legacy mode
    * the strategy hears the shards once every one is stored, in one call,
    * so no hook of its runs between them. A listener that moves the store's
@@ -1095,8 +1099,10 @@ export class ContextManager {
         // reads a body as consecutive messages of one group id whose shard indices
         // rise, so a body's shards must land together: a message appended between
         // them would split the body. Nothing in context-manager appends a message
-        // anywhere but here and below, and an addMessage made while this loop runs
-        // is refused (writingShards): a host's onMessage listener runs inside each
+        // anywhere but here and below, and an addMessage on this manager made while
+        // this loop runs is refused (writingShards, this manager's own: another
+        // manager on the slot doesn't see it, and onMessage's contract rules out an
+        // add from a listener there too): a host's onMessage listener runs inside each
         // append, and the strategy's hooks run there when that listener presents a
         // shard. In legacy mode the strategy hears the body once the loop ends, in
         // one call, as presentRows gives a body, so no hook of its runs between
@@ -1140,13 +1146,30 @@ export class ContextManager {
           if (onBranch()) this.notifyPresented(heard);
           else this.deferPresented(heard, true);
         } catch (err) {
+          const heard = this.writingShards?.heard ?? [];
           this.writingShards = null;
+          // The shards a failed write leaves stored are in a legacy window,
+          // so the strategy hears those it took in, as it hears a write that
+          // completes: at once on the branch the write started on, and after
+          // a move once the strategy is initialized, where the window of
+          // the branch it initialized on holds them.
+          const hearStayed = (stayed: readonly MessageId[]) => {
+            const ids = new Set(stayed);
+            const rows = heard.filter((m) => ids.has(m.id));
+            try {
+              if (onBranch()) this.notifyPresented(rows);
+              else this.deferPresented(rows, true);
+            } catch (error) {
+              logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
+            }
+          };
           // A write the store's branch moved under stopped there, or failed
           // after it moved: what it stored is on the branch it started on,
           // which the store no longer reads, so nothing is read or removed.
           // The shards it stored stayed; a shard whose append threw may have
           // landed there too.
           if (!onBranch()) {
+            hearStayed(stored);
             throw err === moved ? new WriteLandedError(stored, err) : new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err);
           }
           // A write that fails partway leaves no part of the body in the
@@ -1187,7 +1210,7 @@ export class ContextManager {
           // for the store's event (handleMessageStoreEvent).
           const removingBefore = this.removing;
           try {
-            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, () =>
+            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, wrote, () =>
               wrote.flatMap((id) => {
                 const row = this.messageStore.get(id);
                 return row ? [row] : [];
@@ -1206,6 +1229,7 @@ export class ContextManager {
             const stayed = this.rowsStillStored(wrote);
             if (stayed === null) throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
             if (stayed.length > 0) {
+              hearStayed(stayed);
               throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
             }
           } finally {
@@ -1457,15 +1481,17 @@ export class ContextManager {
    * here: a host takes that row out of this window with retractRemoved,
    * naming it, or retractAbsentRows, which finds every such row, and this
    * manager's strategy is told then, by the row's id, as this one's is told
-   * here.
+   * here. A removal made while a sharded addMessage stores its shards (from
+   * an onMessage listener of a shard's add) is refused (see onMessage).
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
+    this.refuseWhileWritingShards('removeMessage');
     this.write(() => {
       // The row is gone by the time the store's event is heard, so it is
       // read here first, for the strategy (handleMessageStoreEvent), as
       // removeMessages reads its range.
-      this.removing = this.rowsBeforeRemoval(`message ${messageId}`, () => {
+      this.removing = this.rowsBeforeRemoval(`message ${messageId}`, [messageId], () => {
         const row = this.messageStore.get(messageId);
         return row ? [row] : [];
       });
@@ -1484,11 +1510,12 @@ export class ContextManager {
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
+    this.refuseWhileWritingShards('removeMessages');
     this.write(() => {
       // The store's event names the range by its ends, and its rows are gone
       // by the time the event is heard, so they are read here first
       // (handleMessageStoreEvent).
-      this.removing = this.rowsBeforeRemoval(`messages ${fromId} to ${toId}`, () => this.slotRowsBetween(fromId, toId));
+      this.removing = this.rowsBeforeRemoval(`messages ${fromId} to ${toId}`, null, () => this.slotRowsBetween(fromId, toId));
       try {
         this.messageStore.removeRange(fromId, toId);
       } finally {
@@ -1501,25 +1528,43 @@ export class ContextManager {
   /**
    * The rows a removal is about to take, as `read` finds them in this
    * manager's slot, for the store's event to take out of the window
-   * (retractOnRemoval). They are read in either mode, without asking the
-   * window: an index that can't be read doesn't keep the strategy from
-   * being told, and in legacy mode the event writes and tells nothing. The
-   * removal goes ahead whatever happens here, as it does when a tombstone
-   * can't be written: a read that fails is logged, and a removal of a
-   * range, whose event names only its ends, then leaves the window's rows
-   * of it their ordinals, untold.
+   * (retractOnRemoval), with their ids: `ids`, for a removal that names its
+   * rows (removeMessage, a failed sharded addMessage's removal of what it
+   * stored), else the ids of the rows read. They are read in either mode,
+   * without asking the window: an index that can't be read doesn't keep
+   * the strategy from being told, and in legacy mode the event writes and
+   * tells nothing. The removal goes ahead whatever happens here, as it does
+   * when a tombstone can't be written: a read that fails is logged, and the
+   * rows a removal names leave the window by their ids, told by their ids
+   * alone. A removal of a range, whose event names only its ends, then
+   * leaves the window's rows of it their ordinals, untold (null).
    */
-  private rowsBeforeRemoval(what: string, read: () => StoredMessage[]): StoredMessage[] | null {
+  private rowsBeforeRemoval(what: string, ids: readonly MessageId[] | null, read: () => StoredMessage[]): Removing | null {
     try {
-      return read();
+      const rows = read();
+      return { ids: ids ?? rows.map((m) => m.id), rows };
     } catch (err) {
       // A format string, since the error follows it: a '%' in an id is doubled.
       const message =
         `[context-manager] reading the rows before removing ${what} failed; ` +
-        `the removal goes ahead, and the window's rows of it keep their ordinals:`;
+        (ids ? `the removal goes ahead, and the window's rows of it leave by their ids:` : `the removal goes ahead, and the window's rows of it keep their ordinals:`);
       logThrown(message.replaceAll('%', '%%'), err, this.diag);
-      return null;
+      return ids ? { ids, rows: [] } : null;
     }
+  }
+
+  /**
+   * Refuses a removal made while a sharded addMessage stores its shards
+   * (from an onMessage listener of a shard's add, or a strategy hook that
+   * listener runs): a shard it took would split the body, and any row it
+   * took would move the rows that write's failure reads back and removes.
+   */
+  private refuseWhileWritingShards(operation: 'removeMessage' | 'removeMessages'): void {
+    if (!this.writingShards) return;
+    throw new Error(
+      `ContextManager.${operation} refused: a sharded addMessage is storing its shards, and a removal now could split the body ` +
+        'or move the rows that call removes if it fails. Remove it once that call has returned.',
+    );
   }
 
   /** The rows of this manager's slot from `fromId` to `toId`, in slot order; empty when either isn't there. */
@@ -1578,10 +1623,14 @@ export class ContextManager {
    * so it can run while a sharded addMessage is still storing that body's
    * remaining shards. It must not add a message synchronously: one added there
    * would land between a body's shards and split the body (body-runs.ts), so
-   * an addMessage made while a sharded addMessage stores its shards is
-   * refused. Add it after the call returns (a microtask or later) instead.
-   * Nor may it move the store's branch then: the sharded write stops before
-   * its next shard and throws (WriteLandedError). A listener
+   * an addMessage on this manager made while a sharded addMessage of its
+   * stores its shards is refused; one on another manager sharing the slot
+   * isn't, and is the listener's to avoid. Add it after the call returns (a
+   * microtask or later) instead. Nor may it remove a message then
+   * (removeMessage, removeMessages on this manager are refused, as a
+   * removal could split the body or move the rows the sharded
+   * write removes if it fails), or move the store's branch: the sharded
+   * write stops before its next shard and throws (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
    * heard stands: the throw doesn't reach the caller. A listener that calls
    * close() lets the write that ran it finish (see close()). Each call
@@ -1770,17 +1819,21 @@ export class ContextManager {
    * The strategy hears the rows that entered the window
    * (ContextStrategy.onPresented) once they are in it and before this
    * returns, fire and forget: its failure is logged, and the rows stay
-   * presented. The first call, which writes the legacy window down, enters
-   * no row the window didn't already hold, which the strategy reads in its
-   * view, so it hears nothing. A call the store refuses tells it nothing;
-   * a call that throws
+   * presented. So is a failure of the manager's own work around the call
+   * (the context it builds for the strategy), which doesn't throw here, as
+   * the rows are in the window: they wait, and are heard at the strategy's
+   * next notification. The first call, which writes the legacy window down, enters
+   * no new row, so the strategy hears nothing: it heard each row as it was
+   * stored. A call the store refuses tells it nothing; a call that throws
    * after the store kept part of it tells the strategy the rows that left
    * and entered before it, then throws; a call that completes a body tells
    * it only the shards that entered then. Where the write throws and
    * the index can't be read again to tell whether it landed, the call
    * throws WindowWriteOutcomeUnknownError (its `cause` the write's own
    * error), and the strategy hears what the store kept at the next write
-   * to the window on that branch.
+   * to the window on that branch, with the rows as this call found them:
+   * a row removed meanwhile is heard entering as it was stored, and then
+   * leaving, as the removal tells it.
    *
    * Returns each named row's index ordinal (see ordinalOf). A closed
    * manager refuses it.
@@ -1794,35 +1847,83 @@ export class ContextManager {
     const merged = this.mergedMessageView();
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
-    // The later shards of a body whose first shard was out, which leave so
-    // the body can enter whole (WindowIndex.present), and the rows that
-    // entered. The rows are found before either hook runs: positionOf reads
-    // the store's branch, which a hook can move. The second call is made
-    // where the first's hook leaves it, as notifyPresented makes a row's
-    // call after another row's hook (deferPresented).
-    const tellAndHear = (left: readonly LeftRow[], entered: readonly MessageId[]) => {
-      const leftRows = left.map(({ id, ordinal }) => ({ id, row: record[positionOf(id)!]!, ordinal }));
-      const enteredRows = entered.map((id) => record[positionOf(id)!]!);
-      const scope = leftRows.length > 0 ? this.hookScope() : null;
-      this.notifyRetracted(leftRows, { undone: false, removed: false });
-      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
-      else this.deferPresented(enteredRows, false);
-    };
+    // A write that threw tells the strategy its rows as this call's record
+    // holds them, read from it by id, never from the store: one whose
+    // outcome was unknown is told at a later write, when the store may no
+    // longer hold a row of it (a removal meanwhile, whose own onRetracted
+    // follows), or can't be read. What waits for that write keeps only the
+    // rows the write named (keep), not the record.
+    const asFound = rowsAsFound(record);
     return this.write(() => {
-      const { ordinals, entered, left } = this.windowIndex.present(ids, record, positionOf, (enteredBefore, leftBefore) => {
-        // The rows a failed write got in stay in the window, and no later
-        // call presents them again: this is the strategy's one hearing of
-        // them, as of the rows it took out. The write's own error is the
-        // one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tellAndHear(leftBefore, enteredBefore);
-        } catch (error) {
-          logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that left or entered before it failed:', error, this.diag);
-        }
-      });
-      tellAndHear(left, entered);
+      let presented: ReturnType<WindowIndex['present']>;
+      try {
+        presented = this.windowIndex.present(ids, record, positionOf, this.cutShortPresentation(asFound));
+      } catch (error) {
+        if (error instanceof WindowWriteOutcomeUnknownError) asFound.keep([...error.entering, ...error.leaving]);
+        throw error;
+      }
+      const { ordinals, entered, left } = presented;
+      // The rows are in the window: a failure of the manager's own work
+      // around the strategy's call is logged, not thrown, since a retry
+      // would be refused, and what it was for waits (tellPresentation).
+      try {
+        this.tellPresentation(left, entered, (id) => record[positionOf(id)!]!);
+      } catch (error) {
+        logThrown('[context-manager] presentRows presented its rows, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+      }
       return ordinals;
     });
+  }
+
+  /**
+   * Tell the strategy what a presentRows did: the later shards of a body
+   * whose first shard was out, which left so the body could enter whole
+   * (WindowIndex.present), and the rows that entered, each read by
+   * `rowOf`. The rows are found before either hook runs, since a hook can
+   * move the store's branch. The second call is made where the first's
+   * hook leaves it, as notifyPresented makes a row's call after another
+   * row's hook (deferPresented). Where the manager's own work around a
+   * call throws (the rows' reading, the context it builds), no hook of
+   * that call has run: the call's rows wait, as rows a delivery that
+   * failed to read left waiting do, to be heard at the strategy's next
+   * notification, and the error is thrown on.
+   */
+  private tellPresentation(left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage): void {
+    let leftTold = left.length === 0;
+    try {
+      const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
+      const enteredRows = entered.map(rowOf);
+      const scope = leftRows.length > 0 ? this.hookScope() : null;
+      this.notifyRetracted(leftRows, { undone: false, removed: false });
+      leftTold = true;
+      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
+      else this.deferPresented(enteredRows, false);
+    } catch (error) {
+      if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal }) => ({ id, ordinal })), info: { undone: false, removed: false } });
+      for (const id of entered) this.presentedUnheard.set(id, this.presentedUnheard.get(id) === true);
+      throw error;
+    }
+  }
+
+  /**
+   * presentRows' hook for a window write that threw (WindowIndex.present's
+   * `cutShort`): it tells the strategy the rows that left and entered
+   * before the throw, read from `rows`, and logs a failure to. It is made
+   * here, apart from the call, so a hook that waits for a later write
+   * holds `rows` and nothing else of the call.
+   */
+  private cutShortPresentation(rows: RowsAsFound): (entered: MessageId[], left: LeftRow[]) => void {
+    return (entered, left) => {
+      // The rows a failed write got in stay in the window, and no later
+      // call presents them again: this is the strategy's one hearing of
+      // them, as of the rows it took out. The write's own error is the
+      // one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        this.tellPresentation(left, entered, (id) => rows.get(id)!);
+      } catch (error) {
+        logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that left or entered before it failed:', error, this.diag);
+      }
+    };
   }
 
   /**
@@ -1853,6 +1954,8 @@ export class ContextManager {
    * The strategy is told the rows left (ContextStrategy.onRetracted, with
    * `undone` as given) once they are out of the window and before this
    * returns, fire and forget: its failure is logged, and the rows stay out.
+   * A failure of the manager's own work around the call is logged too, and
+   * the call waits, as presentRows' rows do.
    * A call that throws after the store kept its tombstones tells the
    * strategy the rows that left, then throws; where the index can't be read
    * again to tell, it throws WindowWriteOutcomeUnknownError and the
@@ -1875,38 +1978,81 @@ export class ContextManager {
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
     const info: Retraction = { undone: options?.undone === true, removed: false };
-    // A row taken out by its id after the store dropped it has no row to
-    // give: it is told by its id, as removed, in a call of its own. Both
-    // calls' rows are found before either hook runs, and the second call is
-    // made where the first's hook leaves it (deferRetracted), as presentRows
-    // makes its second.
-    const tell = (left: readonly LeftRow[]) => {
+    // As presentRows' rows, a write that threw tells its rows as this
+    // call's record holds them, and what waits keeps only those.
+    const asFound = rowsAsFound(record);
+    this.write(() => {
+      let left: LeftRow[];
+      try {
+        left = this.windowIndex.retract(ids, record, positionOf, info.undone, this.cutShortRetraction(asFound, info));
+      } catch (error) {
+        if (error instanceof WindowWriteOutcomeUnknownError) asFound.keep([...error.entering, ...error.leaving]);
+        throw error;
+      }
+      // The rows are out of the window: as presentRows, a failure of the
+      // manager's own work around the call is logged, and the call waits.
+      try {
+        this.tellRetraction(left, info, (id) => {
+          const at = positionOf(id);
+          return at === undefined ? undefined : record[at];
+        });
+      } catch (error) {
+        logThrown('[context-manager] retractRows took its rows out, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+      }
+    });
+  }
+
+  /**
+   * Tell the strategy the rows a retractRows took out, each with the row
+   * `rowOf` gives. A row taken out by its id after the store dropped it
+   * has none to give: it is told by its id, as removed, in a call of its
+   * own. Both calls' rows are found before either hook runs, and the
+   * second call is made where the first's hook leaves it (deferRetracted),
+   * as presentRows makes its second. Where the manager's own work around a
+   * call throws, what it was for waits, as tellPresentation's rows do (a
+   * waiting call tells a row the store no longer holds by its id, in a
+   * call of its own), and the error is thrown on.
+   */
+  private tellRetraction(left: readonly LeftRow[], info: Retraction, rowOf: (id: MessageId) => StoredMessage | undefined): void {
+    const removed: Retraction = { undone: info.undone, removed: true };
+    let waiting: { left: RetractedRow[]; info: Retraction } = { left: left.map(({ id, ordinal }) => ({ id, ordinal })), info };
+    try {
       const held: RetractedRow[] = [];
       const gone: RetractedRow[] = [];
       for (const { id, ordinal } of left) {
-        const at = positionOf(id);
-        if (at === undefined) gone.push({ id, ordinal });
-        else held.push({ id, row: record[at]!, ordinal });
+        const row = rowOf(id);
+        if (row === undefined) gone.push({ id, ordinal });
+        else held.push({ id, row, ordinal });
       }
       const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
-      const removed: Retraction = { undone: info.undone, removed: true };
       this.notifyRetracted(held, info);
+      waiting = { left: gone, info: removed };
       if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
       else this.deferRetracted(gone, removed);
+    } catch (error) {
+      if (waiting.left.length > 0) this.retractedUnheard.push(waiting);
+      throw error;
+    }
+  }
+
+  /**
+   * retractRows' hook for a window write that threw (WindowIndex.retract's
+   * `cutShort`), as cutShortPresentation is presentRows': a row the store
+   * holds when it is told is given as the call's record held it, and one
+   * it no longer holds is told by its id.
+   */
+  private cutShortRetraction(rows: RowsAsFound, info: Retraction): (left: LeftRow[]) => void {
+    return (left) => {
+      // The rows a failed write took out stay out, and no later call
+      // takes them out again: this is the strategy's one hearing of them.
+      // The write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        const merged = this.mergedMessageView();
+        this.tellRetraction(left, info, (id) => (holdsRow(merged, id) ? rows.get(id) : undefined));
+      } catch (error) {
+        logThrown('[context-manager] retractRows was cut short, and telling the strategy of the rows that left before it failed:', error, this.diag);
+      }
     };
-    this.write(() => {
-      const left = this.windowIndex.retract(ids, record, positionOf, info.undone, (cutShort) => {
-        // The rows a failed write took out stay out, and no later call
-        // takes them out again: this is the strategy's one hearing of them.
-        // The write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tell(cutShort);
-        } catch (error) {
-          logThrown('[context-manager] retractRows was cut short, and telling the strategy of the rows that left before it failed:', error, this.diag);
-        }
-      });
-      tell(left);
-    });
   }
 
   /**
@@ -1993,22 +2139,34 @@ export class ContextManager {
    * error is thrown on. Returns the ids taken out, in window order.
    */
   private retractGone(operation: string, take: (cutShort: (left: LeftRow[]) => void) => LeftRow[]): MessageId[] {
-    const info: Retraction = { undone: false, removed: true };
-    const tell = (left: readonly LeftRow[]) => this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, ordinal })), info);
     return this.write(() => {
-      const left = take((cutShort) => {
-        // The rows a failed write took out stay out, and a later call passes
-        // over them: this is the strategy's one hearing of them here. The
-        // write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tell(cutShort);
-        } catch (error) {
-          logThrown(`[context-manager] ${operation} was cut short, and telling the strategy of the rows that left before it failed:`, error, this.diag);
-        }
-      });
-      tell(left);
+      const left = take(this.cutShortGone(operation));
+      this.tellGone(left);
       return left.map((row) => row.id);
     });
+  }
+
+  /** Tell the strategy rows retractGone took out, by their ids, with `removed`. */
+  private tellGone(left: readonly LeftRow[]): void {
+    this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, ordinal })), { undone: false, removed: true });
+  }
+
+  /**
+   * retractGone's hook for a write that threw, made apart from the call, as
+   * cutShortPresentation is, so one that waits for a later write holds
+   * nothing of the call (retractAbsentRows' record).
+   */
+  private cutShortGone(operation: string): (left: LeftRow[]) => void {
+    return (left) => {
+      // The rows a failed write took out stay out, and a later call passes
+      // over them: this is the strategy's one hearing of them here. The
+      // write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        this.tellGone(left);
+      } catch (error) {
+        logThrown(`[context-manager] ${operation} was cut short, and telling the strategy of the rows that left before it failed:`, error, this.diag);
+      }
+    };
   }
 
   /**
@@ -3684,7 +3842,8 @@ export class ContextManager {
    * rejects, naming the stored message, without resetting the head window.
    * So does a presentation of it that fails, or whose strategy hook closes
    * the manager, sets a strategy, moves the store's branch or takes the
-   * transition out of the window again. An add of the
+   * transition out of the window again, and a read of the window, before
+   * the presentation or after it, that fails. An add of the
    * transition that fails after storing it rejects with addMessage's
    * WriteLandedError, naming it, without resetting the head window, and one
    * where the store can't be read to tell whether it was stored rejects with
@@ -3727,8 +3886,17 @@ export class ContextManager {
 
     // Once rows are presented, the head window can start only at a row the
     // window holds: the transition enters it first, as a host's own row does,
-    // unless a host's listener of the add presented it already.
-    if (this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined) {
+    // unless a host's listener of the add presented it already. Where the
+    // window can't be read to tell, the call refuses as a presentation that
+    // fails does, naming the stored transition, which a listener may have
+    // presented.
+    let presenting: boolean;
+    try {
+      presenting = this.windowIndex.mode() === 'presented' && this.windowIndex.ordinalOf(msgId) === undefined;
+    } catch (error) {
+      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, 'stored, and may be presented');
+    }
+    if (presenting) {
       try {
         this.presentRows([msgId]);
       } catch (error) {
@@ -3750,7 +3918,13 @@ export class ContextManager {
       }
       // It may also have taken the transition out again, moving nothing
       // else: the head window can't start at a row the window lacks.
-      if (this.windowIndex.ordinalOf(msgId) === undefined) {
+      let out: boolean;
+      try {
+        out = this.windowIndex.ordinalOf(msgId) === undefined;
+      } catch (error) {
+        throw refuse(`ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`, 'stored, and may be presented');
+      }
+      if (out) {
         throw refuse("ContextManager.resetHeadWindow: the strategy's hook for its transition's presentation took the transition out of the window", 'stored and out of the window');
       }
     }
@@ -3968,13 +4142,13 @@ export class ContextManager {
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          this.retractOnRemoval([event.messageId], this.removing ?? []);
+          this.retractOnRemoval([event.messageId], this.removing?.rows ?? []);
         }
         break;
       case 'removeRange':
         // Ids of the removed span aren't in the event; prune holds whose
         // message no longer exists.
-        {
+        try {
           const before = this.compressionHolds.size;
           for (const id of [...this.compressionHolds]) {
             if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
@@ -3983,20 +4157,23 @@ export class ContextManager {
             if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
           }
           if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+        } finally {
+          // For range removes, we need to check all affected messages
+          // This is a simplification - in practice we'd need to track the IDs
+          //
+          // The window's rows of the span were read before it went
+          // (removeMessages). The only other range removed here is what a
+          // sharded addMessage that failed partway wrote, whose rows it reads
+          // first too, since a host's listener of the add may have presented
+          // a shard (appendMessage), and whose ids it knows where that read
+          // failed. Holds can be probed by asking the slot, since every held
+          // row is this slot's; the window can't, since it also holds rows of
+          // the auxiliary slots, and a row of a slot this manager no longer
+          // merges would read as removed and leave the window for good. The
+          // rows leave the window even when the pruning throws, as the
+          // 'remove' case's row does.
+          if (this.removing) this.retractOnRemoval(this.removing.ids, this.removing.rows);
         }
-        // For range removes, we need to check all affected messages
-        // This is a simplification - in practice we'd need to track the IDs
-        //
-        // The window's rows of the span were read before it went
-        // (removeMessages). The only other range removed here is what a
-        // sharded addMessage that failed partway wrote, whose rows it reads
-        // first too, since a host's listener of the add may have presented
-        // a shard (appendMessage). Holds can be probed by asking the slot,
-        // since every held row is this slot's; the window can't, since it
-        // also holds rows of the auxiliary slots, and a row of a slot this
-        // manager no longer merges would read as removed and leave the
-        // window for good.
-        if (this.removing) this.retractOnRemoval(this.removing.map((m) => m.id), this.removing);
         break;
     }
   }
@@ -4095,11 +4272,13 @@ export class ContextManager {
    * that closes the manager, sets a strategy or starts an initialization
    * (a setStrategy() or switchBranch() called before its first await) stops
    * the calls after it, even when that initialization finished before the
-   * hook returned. The rows it hasn't been given go nowhere after close(),
-   * and otherwise wait for the initialization (deferPresented): once it has
-   * finished they are heard where the window of the branch it initialized
-   * on holds them, at once for a strategy with no initialize. The strategy
-   * it let go hears no more.
+   * hook returned, and so does one that moves the store's branch itself or,
+   * once a host presents, takes the next row out of the window. The rows it
+   * hasn't been given go nowhere after close(), and otherwise wait for the
+   * initialization (deferPresented): once it has finished they are heard
+   * where the window of the branch it initialized on holds them, at once
+   * for a strategy with no initialize or one that is initialized still.
+   * The strategy it let go hears no more.
    *
    * Fire and forget: the write doesn't wait for the strategy, and the
    * strategy's failure isn't the write's (#288). A hook that isn't async can
@@ -4108,9 +4287,12 @@ export class ContextManager {
    * way the rows stay stored and in the window, as do a sharded body's
    * remaining shards, and the strategy isn't offered them again. Only the
    * strategy's call is caught: the manager's own work around it, the
-   * context it hands the strategy among it, still fails the write, as
-   * onMessage's note says. The log is logThrown's, which survives a thrown
-   * value that can't be formatted.
+   * context it hands the strategy among it, still fails an add, as
+   * onMessage's note says. A presentRows or retractRows, whose window
+   * write has landed by then, logs it instead, and the rows wait to be
+   * heard at the strategy's next notification (tellPresentation). The
+   * log is logThrown's, which survives a thrown value that can't be
+   * formatted.
    */
   private notifyPresented(rows: readonly StoredMessage[]): void {
     if (rows.length === 0 || this.closed) return;
@@ -4118,8 +4300,8 @@ export class ContextManager {
     // once it is initialized, so they wait while one without a row hook
     // initializes too: a replacement set meanwhile hears them. They wait
     // too behind calls a delivery that failed to read left waiting, once
-    // those are tried again (unheardStillWaiting).
-    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
+    // those are tried again (callWaits).
+    if (this.callWaits()) {
       this.waitToBeHeard(rows, this.windowIndex.mode() === 'legacy');
       return;
     }
@@ -4141,17 +4323,37 @@ export class ContextManager {
       }
       return;
     }
-    // The initialization the calls are made under, and the window the rows
-    // entered, before any hook runs.
-    const attempt = this.initializationAttempt;
+    // The strategy, initialization and branch the calls are made under, and
+    // the window the rows entered, before any hook runs.
+    const scope = this.hookScope();
     const legacy = this.windowIndex.mode() === 'legacy';
+    // Whether a presented row is in the window still: a hook can take it
+    // out. A read that throws can't tell, so the row waits, as below.
+    const inWindow = (id: MessageId) => {
+      try {
+        return this.windowIndex.ordinalOf(id) !== undefined;
+      } catch {
+        return false;
+      }
+    };
+    // A check that throws (the store's branch can't be read) can't tell
+    // either, so the rest wait: once a hook has run nothing here throws.
+    const stopsBefore = (row: StoredMessage) => {
+      try {
+        return !this.inHookScope(scope) || (!legacy && !inWindow(row.id));
+      } catch {
+        return true;
+      }
+    };
     for (let i = 0; i < rows.length; i++) {
-      if (i > 0 && (this.closed || this.strategy !== strategy || this.initializationAttempt !== attempt)) {
-        // The previous row's hook closed the manager, set a strategy or
-        // started an initialization, which may have finished before the hook
-        // returned (a strategy with no initialize): the rest wait for it as
-        // rows presented while it ran do, and are heard once it has, those
-        // the window of the branch it initialized on holds.
+      if (i > 0 && stopsBefore(rows[i]!)) {
+        // The previous row's hook closed the manager, set a strategy,
+        // started an initialization, which may have finished before the
+        // hook returned (a strategy with no initialize), moved the store's
+        // branch, or took this row out of the window: the rest wait, as rows
+        // presented while an initialization runs do, and are heard once
+        // the strategy is initialized (at once where it is), those the
+        // window of the branch it initialized on holds.
         this.deferPresented(rows.slice(i), legacy);
         return;
       }
@@ -4252,7 +4454,7 @@ export class ContextManager {
     // As notifyPresented's rows, the call waits for the manager's strategy,
     // whether or not the one initializing has the hook, and behind calls a
     // delivery that failed to read left waiting.
-    if (this.initializedAttempt !== this.initializationAttempt || this.unheardStillWaiting()) {
+    if (this.callWaits()) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
       this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
@@ -4281,10 +4483,24 @@ export class ContextManager {
   private deliveringUnheard = false;
   /** While deliverRetractedUnheard makes its calls: a call made meanwhile waits behind those it hasn't made. */
   private drainingRetracted = false;
+  /** While deliverPresentedUnheard makes its calls: rows presented meanwhile wait behind the rows it hasn't given. */
+  private drainingPresented = false;
 
   /** Whether a call waits for the initialized strategy, or a delivery of them is making its calls. */
   private unheardWaiting(): boolean {
-    return this.drainingRetracted || this.retractedUnheard.length > 0 || this.presentedUnheard.size > 0;
+    return this.drainingRetracted || this.drainingPresented || this.retractedUnheard.length > 0 || this.presentedUnheard.size > 0;
+  }
+
+  /**
+   * Whether a notification's own call waits (notifyPresented,
+   * notifyRetracted): while the strategy isn't initialized, while calls
+   * still wait once those a delivery that failed to read left waiting have
+   * been tried again, and where a hook of those retried calls set a
+   * strategy or started an initialization, which the call then waits for.
+   */
+  private callWaits(): boolean {
+    if (this.initializedAttempt !== this.initializationAttempt) return true;
+    return this.unheardStillWaiting() || this.initializedAttempt !== this.initializationAttempt;
   }
 
   /**
@@ -4333,18 +4549,20 @@ export class ContextManager {
   /**
    * The calls of onRetracted made while the strategy wasn't initialized,
    * in the order they came. A row is given when it left the window of the
-   * branch the strategy initialized on: that window doesn't hold it at the
-   * ordinal it left, whether it is out or was presented again since, or
-   * the branch's record no longer holds it (a removal whose tombstone
-   * failed). A branch made before it left holds it there, in its window
-   * and its record, and a branch in legacy mode holds every row of its
-   * record, so neither is told. A call left with no row isn't made. A row
-   * the call didn't keep is read then, from the record of that branch, and
-   * given where it holds it; one it no longer holds is told by its id
-   * alone. A call whose hook closes the manager, sets a strategy or starts
-   * an initialization leaves the calls after it waiting, as a call made
-   * then would. False when a read failed: the call it was for and those
-   * after it wait still.
+   * branch the strategy initialized on: that branch's index took it out,
+   * or holds it at another ordinal (presented again since), or the branch's
+   * record no longer holds it (a removal whose tombstone failed). A branch
+   * made before it left holds it there, in its window and its record, a
+   * branch made before it was presented never held it, and a branch in
+   * legacy mode holds every row of its record, so none of them is told. A
+   * call left with no row isn't made. A row the call didn't keep is read
+   * then, from the record of that branch, and given where it holds it; one
+   * it no longer holds is told by its id alone, with `removed`, in a call
+   * of its own after the rest of an ordinary call's rows, as retractRows
+   * tells it. A call whose hook closes the manager, sets a strategy or
+   * starts an initialization leaves the calls after it waiting, as a call
+   * made then would. False when a read failed: the call it was for and
+   * those after it wait still.
    */
   private deliverRetractedUnheard(): boolean {
     const queued = this.retractedUnheard;
@@ -4355,21 +4573,47 @@ export class ContextManager {
       for (; i < queued.length; i++) {
         if (this.closed || this.initializedAttempt !== this.initializationAttempt) return true;
         const { left, info } = queued[i]!;
-        let told: RetractedRow[];
         try {
           const presented = this.windowIndex.mode() === 'presented';
           const merged = presented ? this.mergedMessageView() : null;
-          // A row told with no ordinal was removed where the index couldn't
-          // be read: it left where the record no longer holds it.
-          const leftHere = ({ id, ordinal }: RetractedRow) =>
-            (ordinal !== undefined && this.windowIndex.ordinalOf(id) !== ordinal) || !holdsRow(merged!, id);
+          const tookOut = presented ? this.windowIndex.left() : null;
+          // A row out of this window left it where this branch's index took
+          // it out; one it never held (a branch made before the row was
+          // presented) didn't. A row the window issues left where it holds it
+          // at another ordinal (presented again since), or where the record
+          // no longer holds it (a removal whose tombstone failed, told with
+          // no ordinal where the index couldn't be read then).
+          const leftHere = ({ id, ordinal }: RetractedRow) => {
+            const here = this.windowIndex.ordinalOf(id);
+            if (here === undefined) return tookOut?.has(id) === true;
+            return (ordinal !== undefined && here !== ordinal) || !holdsRow(merged!, id);
+          };
           const withRow = (l: RetractedRow): RetractedRow => {
             if (l.row) return l;
             const row = merged!.get(l.id);
             return row ? { ...l, row } : l;
           };
-          told = presented ? left.filter(leftHere).map(withRow) : [];
-          this.tellRetracted(told, info);
+          const told = presented ? left.filter(leftHere).map(withRow) : [];
+          // A row of an ordinary call the record no longer holds (another
+          // manager removed it meanwhile) is told by its id alone, with
+          // `removed`, in a call of its own after the rest, as retractRows
+          // tells it; where the first call's hook moved the manager on, that
+          // call is made next, where a call made then would be.
+          const gone = info.removed ? [] : told.filter((l) => !l.row);
+          const held = gone.length === 0 ? told : told.filter((l) => l.row);
+          const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
+          this.tellRetracted(held, info);
+          if (gone.length > 0) {
+            const rest = { left: gone, info: { undone: info.undone, removed: true } };
+            if (scope === null || this.inHookScope(scope)) {
+              // Should the manager's own work around this call throw, it
+              // waits alone: the rows told before it aren't told again.
+              queued[i] = rest;
+              this.tellRetracted(rest.left, rest.info);
+            } else {
+              queued.splice(i + 1, 0, rest);
+            }
+          }
         } catch (err) {
           logThrown(
             '[context-manager] telling the strategy of rows that left the window while it initialized failed; it is told at its next notification:',
@@ -4396,9 +4640,11 @@ export class ContextManager {
    * and the rows given are those an add entered into a legacy window (a
    * sharded add's later shards, after a hook of an earlier one started the
    * initialization) that the record holds; a row presented on a branch
-   * whose index was written down isn't given there. False when the read of
-   * the window failed, or the manager's own work around the call: the rows
-   * wait still.
+   * whose index was written down isn't given there. Rows a hook presents
+   * while it makes its calls wait behind the rows it hasn't given, as a
+   * call made while deliverRetractedUnheard makes its calls does. False
+   * when the read of the window failed, or the manager's own work around
+   * the call: the rows wait still.
    */
   private deliverPresentedUnheard(): boolean {
     const waiting = this.presentedUnheard;
@@ -4416,6 +4662,7 @@ export class ContextManager {
       return false;
     }
     this.presentedUnheard = new Map();
+    this.drainingPresented = true;
     try {
       this.tellPresented(rows);
     } catch (err) {
@@ -4424,6 +4671,8 @@ export class ContextManager {
       for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
       logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
       return false;
+    } finally {
+      this.drainingPresented = false;
     }
     return true;
   }
@@ -4597,6 +4846,38 @@ export class ContextManager {
 }
 
 /**
+ * The rows of a call's record by id, as the record holds them, for telling
+ * the strategy what a window write that threw did (presentRows,
+ * retractRows). The map is built at the first look-up, so a call whose
+ * write doesn't throw builds none. `keep` narrows it to the rows a write
+ * whose outcome was unknown named, and lets the record go: that write's
+ * telling waits for a later write on its branch (WindowIndex settled), so
+ * what waits holds those rows, not the record.
+ */
+interface RowsAsFound {
+  get(id: MessageId): StoredMessage | undefined;
+  keep(ids: readonly MessageId[]): void;
+}
+
+function rowsAsFound(record: readonly StoredMessage[]): RowsAsFound {
+  let listing: readonly StoredMessage[] | null = record;
+  let byId: Map<MessageId, StoredMessage> | null = null;
+  return {
+    get(id) {
+      byId ??= new Map(listing!.map((m) => [m.id, m] as const));
+      return byId.get(id);
+    },
+    keep(ids) {
+      const named = new Set(ids);
+      const kept = new Map<MessageId, StoredMessage>();
+      for (const m of byId ? byId.values() : listing!) if (named.has(m.id)) kept.set(m.id, m);
+      byId = kept;
+      listing = null;
+    },
+  };
+}
+
+/**
  * Whether one of the slots `merged` merges holds the row on the store's
  * branch, looked up by its sequence (MessageStoreView.sequenceOf) rather
  * than read whole.
@@ -4646,6 +4927,16 @@ function describeLeft(left: readonly RetractedRow[]): string {
   if (left.every((l) => l.row)) return describeRows(left.map((l) => l.row!), 'taken out');
   if (left.length === 1) return `message ${left[0]!.id}`.replaceAll('%', '%%');
   return `${left.length} messages taken out, ${left[0]!.id} to ${left[left.length - 1]!.id}`.replaceAll('%', '%%');
+}
+
+/**
+ * What a removal through the manager takes (ContextManager.removing): the
+ * ids of its rows, and the rows as they were before they went, where they
+ * could be read.
+ */
+interface Removing {
+  ids: readonly MessageId[];
+  rows: readonly StoredMessage[];
 }
 
 /** How rows left a window, as ContextStrategy.onRetracted is told (with the ids of each call's rows). */

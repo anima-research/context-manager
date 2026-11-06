@@ -19,6 +19,8 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, WindowWriteOutcomeUnknownError, windowIndexStateId } from '../src/index.js';
@@ -177,6 +179,117 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.presentRows([x!, y!]);
     assert.deepEqual(strategy.log, [`presented ${x},${y}`], 'only the retry is heard');
     cm.close();
+  });
+
+  // CM #350 bot review, wave 2, findings 10 and 33: what a write whose
+  // outcome was unknown did is told from the call's own record, so a
+  // removal before it settles doesn't leave it rows to look up.
+  it('presentRows, the write kept: a removal of its row before the next write tells the row as it was stored, then its leaving', async () => {
+    for (const hook of ['onPresented', 'onNewMessage'] as const) {
+      class HearsRows extends PassthroughStrategy {
+        log: string[] = [];
+        async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+          this.log.push(`presented ${rows.map((m) => m?.id).join(',')}`);
+          throw new Error('zz-hook-failed');
+        }
+        async onNewMessage(message: StoredMessage): Promise<void> {
+          this.log.push(`new ${message?.id}`);
+          throw new Error('zz-hook-failed');
+        }
+        async onRetracted(_rows: readonly StoredMessage[], _ctx: unknown, info: { ids: readonly MessageId[]; removed: boolean }): Promise<void> {
+          this.log.push(`retracted ${info.ids.join(',')}${info.removed ? ' removed' : ''}`);
+        }
+      }
+      const strategy = new HearsRows();
+      if (hook === 'onNewMessage') (strategy as { onPresented?: unknown }).onPresented = undefined;
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const x = cm.addMessage('alice', [text('x')]);
+      const restore = failNextWriteUnread(cm, true);
+      try {
+        throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+      } finally {
+        restore();
+      }
+      const unhandled: string[] = [];
+      const onUnhandled = (err: unknown) => { unhandled.push(String(err)); };
+      process.on('unhandledRejection', onUnhandled);
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        cm.removeMessage(x);
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        console.error = error;
+        process.off('unhandledRejection', onUnhandled);
+      }
+      assert.deepEqual(strategy.log, [hook === 'onPresented' ? `presented ${x}` : `new ${x}`, `retracted ${x} removed`], `${hook}: the row as stored, then its leaving`);
+      assert.ok(logged.some((line) => line.includes(`failed for message ${x}`) && line.includes('zz-hook-failed')), `${hook}: the hook's failure is logged, naming the row: ${logged.join('\n')}`);
+      assert.deepEqual(unhandled, [], hook);
+      cm.close();
+    }
+  });
+
+  // CM #350 bot review, wave 2, finding 45: what waits for a later write
+  // holds the rows the write named, not the call's record.
+  it("a write whose outcome is unknown doesn't keep the record its call read while its telling waits", async () => {
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    for (const operation of ['presentRows', 'retractRows', 'retractAbsentRows'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Hearing() });
+      cm.presentRows([]);
+      const rows = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t.repeat(1000))]));
+      if (operation !== 'presentRows') cm.presentRows(rows);
+      if (operation === 'retractAbsentRows') {
+        const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-other', strategy: new PassthroughStrategy() });
+        other.removeMessage(rows[0]!);
+        other.close();
+      }
+      // Each listing of the record the call reads.
+      const listings: WeakRef<object>[] = [];
+      const own = cm as unknown as { mergedMessageView: () => object };
+      const real = own.mergedMessageView;
+      own.mergedMessageView = function (this: unknown) {
+        const view = real.call(this) as { getAll: () => object };
+        return new Proxy(view, {
+          get(target, prop) {
+            if (prop === 'getAll') {
+              return () => {
+                const listing = target.getAll();
+                listings.push(new WeakRef(listing));
+                return listing;
+              };
+            }
+            const value = Reflect.get(target, prop, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      };
+      const restore = failNextWriteUnread(cm, true);
+      try {
+        assert.throws(
+          () => (operation === 'presentRows' ? cm.presentRows([rows[0]!]) : operation === 'retractRows' ? cm.retractRows([rows[0]!]) : cm.retractAbsentRows()),
+          WindowWriteOutcomeUnknownError,
+          operation,
+        );
+      } finally {
+        restore();
+        delete (own as { mergedMessageView?: unknown }).mergedMessageView;
+      }
+      assert.ok(listings.length > 0, `${operation}, setup: the call read the record`);
+      // A listing the store caches is let go once the record changes.
+      cm.addMessage('alice', [text('c')]);
+      cm.getAllMessages();
+      for (let i = 0; i < 5; i++) {
+        gc();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.deepEqual(listings.map((ref) => ref.deref() === undefined), listings.map(() => true), `${operation}: the record the call read is let go`);
+      cm.presentRows([]);
+      assert.equal((cm.getStrategy() as Hearing).log.length > 0, true, `${operation}: the write is still told once it settles`);
+      cm.close();
+    }
   });
 
   it('a write that settles waits while the index still can\'t be read, and settles at the write after', async () => {

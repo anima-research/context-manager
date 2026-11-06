@@ -887,6 +887,40 @@ describe('the repair CLI on a store with a stray and no crossing', () => {
   });
 });
 
+// CM #350 bot review, wave 2, finding 11: once a host presents rows, the
+// strategy reads, and the verification's audit checks, the window's order,
+// so the plan is made over it.
+describe('the repair CLI on a store whose rows are presented out of record order', () => {
+  const STORE = './test-topology-repair-cli-presented';
+  const CLI = join(process.cwd(), 'dist/scripts/repair-topology.js');
+  const wipe = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
+  before(wipe);
+  after(wipe);
+
+  test("plans in the window's order: an L1 whose rows the window holds apart is crossed", async () => {
+    const seed = new AutobiographicalStrategy(STRAY_CFG);
+    const manager = await ContextManager.open({ path: STORE, strategy: seed, namespace: 'probe', membrane: STRAY_MEMBRANE as never });
+    manager.presentRows([]);
+    const m = ['a', 'b', 'c'].map((t) => manager.addMessage('user', [{ type: 'text', text: `message ${t} ` + 'w '.repeat(20) }]));
+    for (const i of [0, 2, 1]) manager.presentRows([m[i]!]);
+    assert.deepEqual(manager.getPresentedMessages().map((x) => x.id), [m[0], m[2], m[1]], 'setup: the window holds c between a and b');
+    const one = (id: string, sourceIds: string[]): SummaryEntry => ({
+      id, level: 1, content: `s ${id}`, tokens: 50, sourceLevel: 0, sourceIds, sourceRange: { first: sourceIds[0]!, last: sourceIds.at(-1)! }, created: 1,
+    } as SummaryEntry);
+    const summaries = [one('X', [m[0]!, m[1]!]), one('Y', [m[2]!])];
+    const records = summaries.map((s) => ({ id: `c-${s.id}`, sourceIds: s.sourceIds, compressed: true, summaryId: s.id }));
+    const internals = seed as unknown as { store: { setStateJson(id: string, v: unknown): void }; summariesStateId: string; chunksStateId: string };
+    internals.store.setStateJson(internals.summariesStateId, summaries);
+    internals.store.setStateJson(internals.chunksStateId, records);
+    manager.close();
+
+    const dry = spawnSync(process.execPath, [CLI, STORE, '--namespace', 'probe'], { encoding: 'utf8' });
+    assert.ok(dry.stdout.includes('3 messages, 2 summaries, 2 records — 1 crossed\n'), `${dry.stdout}\n${dry.stderr}`);
+    assert.ok(dry.stdout.includes('\n  crossed L1 X: 2 leaves'), dry.stdout);
+    assert.match(dry.stderr, /DRY RUN/);
+  });
+});
+
 describe('a rebuild applied and drained', () => {
   const STORE = './test-topology-repair-drain-store';
   const CLI = join(process.cwd(), 'dist/scripts/repair-topology.js');

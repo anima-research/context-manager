@@ -14,7 +14,10 @@
     gives a body (a strategy with only `onNewMessage` hears each shard in
     turn then). It heard each shard from inside that shard's append, so a
     hook of its could add a message or move the store between the shards. A
-    sharded write that fails tells it of none of its shards.
+    sharded write that fails tells it only of the shards it leaves stored
+    (`WriteLandedError`), once it has tried to remove them, in one call: on a
+    branch the write's listener moved to, once the strategy is initialized
+    there, where that branch's window holds them.
   - A listener that moves the store's branch between shards stops the write
     before the next shard, and `addMessage` throws `WriteLandedError` naming
     the shards stored, which stay on the branch the write started on, with a
@@ -22,3 +25,9 @@
     `unnamed` 1, where a shard's append threw after the move). Before, the
     later shards landed on the other branch, and the cleanup of a write that
     failed looked for the first shard there.
+  - A `removeMessage` or `removeMessages` made while a sharded `addMessage`
+    stores its shards (from an `onMessage` listener of a shard's add) is
+    refused, with an error that says a removal then could split the body or
+    move the rows the write removes if it fails. Before, it was taken: the
+    body's later shards stayed with no first shard, and a write that then
+    failed left them stored and threw as if none stayed.
