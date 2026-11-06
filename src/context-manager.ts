@@ -4348,7 +4348,10 @@ export class ContextManager {
    * keeps its ordinal until retractAbsentRows, retractRemoved or
    * retractRows takes it out. The strategy is told of every row the window
    * held all the same, since the row has left what it reads: the ordinals
-   * are read before the tombstones are written. Where the index can't be
+   * are read before the tombstones are written. Where the tombstones land,
+   * it is told of the rows they took out, so a row a hook took out first,
+   * as it heard what an earlier window write did (WindowIndex.settled), is
+   * told once, by that hook's call. Where the index can't be
    * read to tell which rows it held, or whether it is in legacy mode, the
    * strategy is told of every row removed, in the order given, with no
    * ordinal: a strategy that kept nothing of a row takes the call as
@@ -4362,7 +4365,11 @@ export class ContextManager {
     let held: RetractedRow[] | null = null;
     try {
       // One reading of the index, null in legacy mode, where nothing is
-      // written or told.
+      // written or told. It stands for what the window held only where the
+      // tombstones' write throws: retractRemoved first settles a write
+      // whose outcome was unknown, and a hook that hears it can take a row
+      // out itself (retractRows), which tells the strategy then, so the
+      // rows retractRemoved takes out are the ones to tell.
       const ordinals = this.windowIndex.ordinals();
       const inWindow: LeftRow[] = [];
       if (ordinals) {
@@ -4373,7 +4380,7 @@ export class ContextManager {
         inWindow.sort((a, b) => a.ordinal - b.ordinal);
       }
       held = inWindow;
-      this.windowIndex.retractRemoved(ids);
+      held = this.windowIndex.retractRemoved(ids);
     } catch (err) {
       // A format string, since the error follows it: a '%' in an id is doubled.
       const rows = ids.length === 1 ? `removed message ${ids[0]}` : `${ids.length} removed messages`;

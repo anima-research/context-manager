@@ -231,6 +231,34 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     }
   });
 
+  // CM #350 bot review, wave 4, finding 31: the settlement a removal runs
+  // can take its row out first, through a hook.
+  it("presentRows, the write kept: a removal whose settlement's hook takes the row out tells the row's leaving once", async () => {
+    let cm!: ContextManager;
+    /** Hearing, whose onPresented takes the rows it hears out of the window again, by their ids, before it returns. */
+    class RetractsOnPresented extends Hearing {
+      async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+        this.log.push(`presented ${rows.map((m) => m.id).join(',')}`);
+        cm.retractRows(rows.map((m) => m.id));
+      }
+    }
+    const strategy = new RetractsOnPresented();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    cm.removeMessage(x);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cm.ordinalOf(x), undefined, 'setup: the row is out of the window');
+    assert.deepEqual(strategy.log, [`presented ${x}`, `retracted ${x}`], 'the row as stored, then its leaving, once');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 45: what waits for a later write
   // holds the rows the write named, not the call's record.
   it("a write whose outcome is unknown doesn't keep the record its call read while its telling waits", async () => {
