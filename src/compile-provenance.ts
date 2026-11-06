@@ -377,17 +377,9 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
 
 /**
  * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and each of the body's results with a
- * moved id is carried, unaltered and in any order, by a block of its own:
- * one the repair placed for this entry that is still in the request, or a
- * result with that id still in the entry that the repair placed for no
- * entry. Each block carries one result, including one the repair placed
- * within the entry's own message, which folding a cut message's parts back
- * puts in its content too. Another entry's result with its id, even with the
- * same content, doesn't stand in for it, nor does one the repair placed for
- * another entry inside this entry's message. An entry that names no placed
- * blocks (`relocatedBlocks`) is judged by id instead: a result with a moved
- * id is carried by any result with its id in the request that covers it.
+ * when it carries the rest unaltered and each moved result reached the
+ * request unaltered where the repair put it. A result altered there, or
+ * missing from the request, does not carry it.
  */
 function carriesWithRelocated(
   entry: ContextEntry,

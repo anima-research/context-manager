@@ -684,12 +684,9 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the nearest call with its id before it, in its own message or an earlier
- * one, at any distance; pairing repair (relocateOrDropMissingResults) pairs
- * it with the same call where its look-ahead reaches. A later call can reuse
- * an id, and the earlier call is then answered by no result after it. A
- * result whose nearest call a result has already answered goes with that
- * call, as a further result; a result with no call before it with its id
- * answers none.
+ * one; a result whose nearest call a result has already answered goes with
+ * that call, as a further result; a result with no call before it with its
+ * id answers none.
  * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
@@ -19709,12 +19706,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
-    // The ids whose every result in this entry answers the previous entry's
-    // call with the id: those it held more than one call with, all but the
-    // last dropped, and those whose earlier call, in an earlier entry, went
-    // with a stub where the look-ahead met that call (`laterCalls`).
     let prevRunIds = new Set<string>();
-    const laterCalls = new Map<ContextEntry, Set<string>>();
+    const stubbed = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
@@ -19751,16 +19744,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Rule A when we reach it). Move the real block up into position and
         // only stub the ids for which no real result exists — so tool output
         // is preserved, not silently replaced by a placeholder.
-        const results = missing.length > 0 ? this.relocateOrDropMissingResults(entries, i, missing, unitOf, laterCalls) : [];
-        // A run id's call takes every further result with its id up to the
-        // next call with it, within the look-ahead, after the one it has.
+        const results = missing.length > 0 ? this.relocateOrDropMissingResults(entries, i, missing, unitOf, stubbed) : [];
         const further = this.gatherRunResults(entries, i, [...prevRunIds].filter((id) => !entry.content.some((b) => b.type === 'tool_use' && b.id === id)), unitOf);
         if (results.length > 0 || further.length > 0) {
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
             // sit together (the API wants tool_result blocks at the head of
-            // the message), and put a run's further results after its own.
+            // the message).
             const last = entry.content.reduce((at, b, k) => (b.type === 'tool_result' ? k : at), -1);
             entry.content = [...results, ...entry.content.slice(0, last + 1), ...further, ...entry.content.slice(last + 1)];
           } else {
@@ -19788,7 +19779,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id);
       prevRunIds = new Set(entry.content.flatMap((b, p) => (b.type === 'tool_use' && later(b, p) ? [b.id] : [])));
       if (prevRunIds.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => !later(b, p)));
-      for (const id of laterCalls.get(entry) ?? []) prevRunIds.add(id);
+      for (const b of entry.content) if (b.type === 'tool_use' && stubbed.delete(b.id)) prevRunIds.add(b.id);
 
       prevUseIds = new Set();
       for (const b of entry.content) {
@@ -19827,21 +19818,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     survives the repair;
    *   - otherwise emit a stub.
    *
-   * A result answers the nearest call before it with its id
-   * (answeredToolCalls), and a later call can reuse an id: a provider that
-   * leaves a streamed call's id out can get the same id in every response.
-   * So the search for an id ends at the next call with it, from `afterIndex`
-   * on, leaving a result past that call to it. The entry at `afterIndex`
-   * holds no result for a `missing` id, since its results are already
-   * matched, so there the search can meet only a later call. A result with
-   * the id in an entry before `afterIndex` answers an earlier call.
+   * A later call can reuse an id: a provider that leaves a streamed call's
+   * id out can get the same id in every response.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],
     afterIndex: number,
     missing: string[],
     unitOf: (entry: ContextEntry) => ContextEntry,
-    laterCalls: Map<ContextEntry, Set<string>>,
+    stubbed: Set<string>,
   ): ContentBlock[] {
     const end = this.lookAheadEnd(entries, afterIndex, unitOf);
     return missing.map(id => {
@@ -19851,21 +19836,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
         );
         if (bi === -1) continue;
-        if (src.content[bi]!.type === 'tool_use') {
-          let ids = laterCalls.get(src);
-          if (!ids) laterCalls.set(src, ids = new Set());
-          ids.add(id);
-          break;
-        }
+        if (src.content[bi]!.type === 'tool_use') break;
         return this.moveResult(src, bi, unitOf);
       }
+      stubbed.add(id);
       return this.createToolResultStub(id);
     });
   }
 
-  /** The end, exclusive, of pairing repair's look-ahead from `afterIndex`:
-   *  six units on, where a unit is one entry or the parts of one cut
-   *  message. */
   private lookAheadEnd(entries: ContextEntry[], afterIndex: number, unitOf: (entry: ContextEntry) => ContextEntry): number {
     const LOOKAHEAD = 6;
     let end = afterIndex + 1;
@@ -19878,11 +19856,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return end;
   }
 
-  /**
-   * Takes `src.content[bi]`, a tool result, out of its entry and returns the
-   * block to place for it, recording the move on `src`. An entry left empty
-   * says the result moved, and a part of a cut message left empty is empty.
-   */
   private moveResult(src: ContextEntry, bi: number, unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock {
     const source = src.content;
     const real = source[bi]!;
@@ -19896,9 +19869,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The result still reaches the request, next to its tool_use:
     // provenance credits the source body with it there.
     (src.relocatedResults ??= []).push((real as { toolUseId: string }).toolUseId);
-    // A block of its own for each placement: one stored block can be
-    // moved twice, and provenance and the image strip tell the
-    // placements apart by identity.
     const moved = { ...releaseSharedRawFormsOnMove(real, source) };
     (src.relocatedBlocks ??= []).push(moved);
     // Where it came from, for the image strip (applyImageStripping's
@@ -19907,25 +19877,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return moved;
   }
 
-  /**
-   * For each of `ids`, run ids whose call the entry at `afterIndex` answers,
-   * moves every result with the id after that entry, within the look-ahead,
-   * up to the next call with the id, and returns the blocks to place there,
-   * in their order. Each answers that call, the nearest before it with its
-   * id, as a further result.
-   */
   private gatherRunResults(entries: ContextEntry[], afterIndex: number, ids: string[], unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock[] {
     if (ids.length === 0) return [];
     const end = this.lookAheadEnd(entries, afterIndex, unitOf);
+    const open = new Set(ids);
     const gathered: ContentBlock[] = [];
-    for (const id of ids) {
-      scan: for (let j = afterIndex + 1; j < end; j++) {
-        const src = entries[j]!;
-        for (let bi = 0; bi < src.content.length;) {
-          const b = src.content[bi]!;
-          if (b.type === 'tool_use' && b.id === id) break scan;
-          if (b.type === 'tool_result' && b.toolUseId === id) gathered.push(this.moveResult(src, bi, unitOf));
-          else bi++;
+    for (let j = afterIndex + 1; j < end && open.size > 0; j++) {
+      const src = entries[j]!;
+      for (let bi = 0; bi < src.content.length;) {
+        const b = src.content[bi]!;
+        if (b.type === 'tool_result' && open.has(b.toolUseId)) gathered.push(this.moveResult(src, bi, unitOf));
+        else {
+          if (b.type === 'tool_use') open.delete(b.id);
+          bi++;
         }
       }
     }

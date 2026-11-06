@@ -37,6 +37,8 @@
   `OpenAIResponsesFormatter` as further outputs for its `call_id`. The repair
   kept every call, and `NativeFormatter` refuses two calls with one id in one
   assistant turn, so a request holding such a message couldn't be sent.
+  Compile provenance now reports such a message's body as not complete
+  (`missing: ['content']`), since the calls the repair drops aren't sent.
 - A host that stores a call's result late, after a later call has reused the
   call's id, now has that result paired with the later call: the earlier call
   goes with a stub. Every other result with the id after the later call, up to
