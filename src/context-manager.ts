@@ -750,7 +750,10 @@ export class ContextManager {
   /**
    * The window index as a strategy reads it (StrategyContext.window), live:
    * each read asks the index on the branch the store is on, and the
-   * lookups by sequence read the merged record as it stands.
+   * lookups by sequence read the merged record as it stands, once a host
+   * presents: in legacy mode they give undefined without listing it, so a
+   * strategy that looks one up at every move (WindowedPassthroughStrategy's
+   * setAnchor) costs what it did before the index.
    */
   private windowIndexView(): WindowIndexView {
     const index = this.windowIndex;
@@ -760,8 +763,8 @@ export class ContextManager {
       ordinals: () => index.ordinals(),
       left: () => index.left(),
       length: () => index.length(),
-      ordinalFrom: (sequence) => index.ordinalFrom(sequence, record()),
-      sequenceFrom: (ordinal) => index.sequenceFrom(ordinal, record()),
+      ordinalFrom: (sequence) => (index.mode() === 'legacy' ? undefined : index.ordinalFrom(sequence, record())),
+      sequenceFrom: (ordinal) => (index.mode() === 'legacy' ? undefined : index.sequenceFrom(ordinal, record())),
     };
   }
 

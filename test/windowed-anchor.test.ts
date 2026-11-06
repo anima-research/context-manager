@@ -79,6 +79,35 @@ describe('windowed passthrough: the anchor while the window is the record', () =
     assert.equal(cm.windowMode(), 'legacy');
     cm.close();
   });
+
+  // CM #350 bot review, wave 5, finding 35: in legacy mode a move has no
+  // ordinal to look up, so it reads no listing of the record.
+  it('a move reads no listing of the record', async () => {
+    const { cm, strategy } = await open(freshPath());
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    const own = cm as unknown as { mergedMessageView: () => unknown };
+    const merged = own.mergedMessageView;
+    let moving = false;
+    let listings = 0;
+    own.mergedMessageView = function (this: unknown) {
+      if (moving) listings++;
+      return merged.call(this);
+    };
+    try {
+      for (const id of ids) {
+        moving = true;
+        strategy.setAnchor(sequenceOf(cm, id));
+        moving = false;
+        cm.addMessage('u', text('after'));
+      }
+    } finally {
+      delete (own as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[2]!) }, 'setup: the moves were made');
+    assert.equal(listings, 0, 'no move read the merged record');
+    cm.close();
+  });
 });
 
 describe('windowed passthrough: a sequence anchor once rows are presented', () => {
