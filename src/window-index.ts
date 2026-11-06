@@ -20,7 +20,8 @@
  * by listing it among the states the manager owns. Rows are stored before
  * they are presented, so the index as of any sequence names only rows the
  * record held by then. Chronicle carries a state's chain, not its
- * registration, so a branch made before the first presentation has no
+ * registration, so a branch made before the window was first written down
+ * (a host's first presentRows, or a retractRows that names a row) has no
  * index, and is in legacy mode, as its parent was then. Its items are:
  *
  * - a header, `{ v: 1 }`, naming the format: the last item of the write-down

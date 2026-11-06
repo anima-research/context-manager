@@ -1571,6 +1571,10 @@ export class ContextManager {
   /**
    * Remove a range of messages from the store. Every row of the range the
    * window holds leaves it, and the strategy is told, as removeMessage says.
+   * The store's event names only the range's ends, so its rows are read
+   * before it goes: where that read fails (logged), the removal goes ahead,
+   * and the window's rows of the range keep their ordinals, untold, until
+   * retractAbsentRows takes them out and tells the strategy.
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
@@ -4842,8 +4846,10 @@ export class ContextManager {
    * Whether calls still wait for the initialized strategy once the ones a
    * delivery that failed to read left waiting have been tried again: a
    * notification's own call then waits behind them, so the strategy hears
-   * the calls in the order they came, and a row that left and was
-   * presented again is heard to go before it is heard to enter.
+   * it after them, in the order deliverUnheard makes them (the waiting
+   * retractions first, then the rows presented meanwhile), and a row that
+   * left and was presented again is heard to go before it is heard to
+   * enter.
    */
   private unheardStillWaiting(): boolean {
     if (!this.unheardWaiting()) return false;

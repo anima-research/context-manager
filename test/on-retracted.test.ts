@@ -12,8 +12,10 @@
  * probe on #291). The manager calls the hook once per call, after the rows
  * are out and before the call returns, fire and forget as onPresented (a
  * retractRows that names rows the store no longer holds calls it a second
- * time, for those, by their ids alone); while the strategy initializes the
- * calls wait, and are made before the rows presented meanwhile are heard.
+ * time, for those, by their ids alone; where the manager's own work around
+ * the call fails, it is logged and the call waits for the strategy's next
+ * notification); while the strategy initializes the calls wait, and are
+ * made before the rows presented meanwhile are heard.
  * In legacy mode a removal takes the row out of the record and the window
  * at once, and nothing is called: a strategy that folded the row keeps it,
  * as it always has (#291 question 14).

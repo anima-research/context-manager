@@ -336,7 +336,11 @@ export interface ContextStrategy {
    * window order, every shard of a body, and a context whose view holds
    * them, unless the manager's view filter leaves them out: a row the filter
    * leaves out is given here all the same, and the view doesn't list it or
-   * give it a position. A presentRows call is one record, so one the store
+   * give it a position. A presentRows whose outcome was unknown
+   * (WindowWriteOutcomeUnknownError) is heard at a later write, with the
+   * rows as that call found them: a row removed meanwhile is given as it
+   * was stored, though the view no longer holds it, and onRetracted with
+   * `removed` follows. A presentRows call is one record, so one the store
    * refuses presents nothing and calls nothing. In an index a pre-release
    * build wrote one record per row (see ContextManager.presentRows), a
    * presentRows cut short can have left a body's first shards in the

@@ -6,7 +6,9 @@
  * the strategy's view (record order in legacy mode, window order once a
  * host presents rows):
  * another live representation sits inside its span. The load-time audit
- * (`topologyPolicy`) refuses such a store. Known causes: issue #122 (the head
+ * (`topologyPolicy`) refuses such a store under 'reject' (once a host
+ * presents, an open that isn't audit-only first demotes what the audit
+ * names; see `topologyPolicy`). Known causes: issue #122 (the head
  * ratchet minted late L1s over opening messages that merged with the
  * frontier by chunk-record order), issue #95 (demand-path merges folded across
  * an unlanded neighbour), restore/branch interleavings, hand surgery.
