@@ -427,7 +427,8 @@ export class InitializationSupersededError extends Error {
  * Its add may have gone unheard: a failure in the manager's own listener
  * ends the event before a host's onMessage listener hears it, and before
  * the strategy does in legacy mode, where a sharded write that fails tells
- * the strategy of none of its shards. Once a host presents rows on the
+ * the strategy only of the shards its own listener heard that stay, in one
+ * call before this is thrown. Once a host presents rows on the
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
  * a host that presents each row as it is stored does: present only the
@@ -1138,13 +1139,30 @@ export class ContextManager {
           if (onBranch()) this.notifyPresented(heard);
           else this.deferPresented(heard, true);
         } catch (err) {
+          const heard = this.writingShards?.heard ?? [];
           this.writingShards = null;
+          // The shards a failed write leaves stored are in a legacy window,
+          // so the strategy hears those it took in, as it hears a write that
+          // completes: at once on the branch the write started on, and after
+          // a move once the strategy is initialized, where the window of
+          // the branch it initialized on holds them.
+          const hearStayed = (stayed: readonly MessageId[]) => {
+            const ids = new Set(stayed);
+            const rows = heard.filter((m) => ids.has(m.id));
+            try {
+              if (onBranch()) this.notifyPresented(rows);
+              else this.deferPresented(rows, true);
+            } catch (error) {
+              logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
+            }
+          };
           // A write the store's branch moved under stopped there, or failed
           // after it moved: what it stored is on the branch it started on,
           // which the store no longer reads, so nothing is read or removed.
           // The shards it stored stayed; a shard whose append threw may have
           // landed there too.
           if (!onBranch()) {
+            hearStayed(stored);
             throw err === moved ? new WriteLandedError(stored, err) : new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err);
           }
           // A write that fails partway leaves no part of the body in the
@@ -1204,6 +1222,7 @@ export class ContextManager {
             const stayed = this.rowsStillStored(wrote);
             if (stayed === null) throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
             if (stayed.length > 0) {
+              hearStayed(stayed);
               throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
             }
           } finally {

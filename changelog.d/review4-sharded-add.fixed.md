@@ -14,7 +14,10 @@
     gives a body (a strategy with only `onNewMessage` hears each shard in
     turn then). It heard each shard from inside that shard's append, so a
     hook of its could add a message or move the store between the shards. A
-    sharded write that fails tells it of none of its shards.
+    sharded write that fails tells it only of the shards it leaves stored
+    (`WriteLandedError`), once it has tried to remove them, in one call: on a
+    branch the write's listener moved to, once the strategy is initialized
+    there, where that branch's window holds them.
   - A listener that moves the store's branch between shards stops the write
     before the next shard, and `addMessage` throws `WriteLandedError` naming
     the shards stored, which stay on the branch the write started on, with a

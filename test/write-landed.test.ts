@@ -674,6 +674,46 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     }
   });
 
+  // CM #350 bot review, wave 2, finding 27: a legacy window holds the
+  // shards a failed write leaves stored, so the strategy hears them.
+  it('in legacy mode the strategy hears the shards a failed write leaves stored, in one call', async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('propagation failed');
+    failOwnListenerAfterAdd(cm, 2, failure);
+    failRemoval(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ']);
+    assert.deepEqual(strategy.presented, [[stored[0]!.id], err.landed], 'one call with the shards that stayed, which the window holds');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  it("in legacy mode the shards a write stopped by a branch move leaves stored are heard where the branch the strategy initializes on holds them", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore();
+    const start = cm.currentBranch().name;
+    let switched: Promise<void> | undefined;
+    // The listener moves to a branch made after the first shard landed, so
+    // its record, the window there, holds that shard.
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || switched) return;
+      switched = cm.switchBranch(store.createBranchAt('zz-after-shard', start, store.currentSequence()).name);
+    });
+    const err = thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]));
+    await switched;
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one ']);
+    assert.deepEqual(strategy.presented.at(-1), err.landed, 'the shard that stayed, heard once the strategy initialized there');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 2: a removal from a listener would
   // take a shard the write's failure removes, or move the rows it reads back.
   it('a removal while a sharded addMessage stores its shards is refused, saying why, and a write that then fails leaves none of the body', async () => {
