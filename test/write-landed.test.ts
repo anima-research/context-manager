@@ -859,6 +859,45 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 3, finding 1: only an error from a shard's own
+  // append can leave a row unnamed. One after the last append, once that
+  // shard's listener moved the store's branch, names every shard.
+  it("a write that fails once every shard is stored, after the last shard's listener moved the store's branch, names every shard", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore();
+    const start = cm.currentBranch().name;
+    let adds = 0;
+    let switched: Promise<void> | undefined;
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || ++adds !== 3) return;
+      switched = cm.switchBranch(store.createBranchAt('zz-after-body', start, store.currentSequence()).name);
+    });
+    // The manager's own work after the loop, which makes the body wait to be
+    // heard on the branch the write started on, fails once.
+    const failure = new Error('zz-defer-failed');
+    const own = cm as unknown as { deferPresented: (...args: unknown[]) => void };
+    const defer = own.deferPresented.bind(cm);
+    let failed = false;
+    own.deferPresented = (...args: unknown[]) => {
+      if (failed) return defer(...args);
+      failed = true;
+      throw failure;
+    };
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    delete (cm as unknown as { deferPresented?: unknown }).deferPresented;
+    await switched;
+    assert.ok(failed, 'setup: the write failed after the loop');
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    assert.equal(err.cause, failure);
+    assert.equal(cm.currentBranch().name, 'zz-after-body', 'setup: the last shard\'s listener moved the branch');
+    await cm.switchBranch(start);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ', 'three'], 'every shard stays where the write started');
+    assert.deepEqual(err.landed, stored.slice(1).map((m) => m.id), 'and is named');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 3, finding 21: the rows the strategy is to hear
   // are kept until it has heard them.
   it("in legacy mode the strategy hears the shards that stayed when telling it of the stored body failed in the manager's own work", async () => {
