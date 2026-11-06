@@ -377,6 +377,9 @@ describe('load-time topology audit', () => {
   test("'reject' throws StoreTopologyError; 'report' records and goes critical", () => {
     const { p, store } = crossedFixture();
     assert.throws(() => p.gate(store), (e: unknown) => e instanceof StoreTopologyError && e.violations.length === 1 && /L2-x/.test(e.message));
+    // Wave 2, finding 31: the message says the open that threw has written already.
+    assert.throws(() => p.gate(store), (e: unknown) => e instanceof StoreTopologyError &&
+      e.message.includes('this open has already written its load-time repairs (and, once a host presents, what it demoted and let go of)'));
     const r = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, topologyPolicy: 'report' });
     const { p: fixture } = crossedFixture();
     r.setChunks((fixture as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.map((c) => c.messages.map((m) => m.id)));

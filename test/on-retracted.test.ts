@@ -1038,6 +1038,54 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     assert.ok(!again.some((line) => line.includes('the window holds the leaves of')), again.join('\n'));
   });
 
+  // Wave 2, finding 13: a row presented again right after the rest of the
+  // rows of what covers it leaves them together in the window, out of
+  // order. The open's audit asked only for holes, so the summary, or an
+  // uncompressed record, over them in their old order survived.
+  it('a row presented again next to the rest of its rows, which no folding strategy heard go: the open demotes what holds them out of order', async () => {
+    for (const compressed of [true, false]) {
+      const label = compressed ? 'an L1' : 'an uncompressed record';
+      const path = freshPath();
+      const { cm, strategy, ids } = await folding(path);
+      await drain(cm);
+      const at = (id: MessageId) => ids.indexOf(id);
+      // The newest record of the kind, over two rows at least.
+      const record = internals(strategy).chunkRecords
+        .filter((r) => r.compressed === compressed && r.sourceIds.length >= 2)
+        .sort((x, y) => at(x.sourceIds[x.sourceIds.length - 1]!) - at(y.sourceIds[y.sourceIds.length - 1]!))
+        .pop();
+      assert.ok(record, `${label}: premise: the drain left one: ${JSON.stringify(internals(strategy).chunkRecords)}`);
+      const [a, b] = record.sourceIds.slice(-2) as [MessageId, MessageId];
+      const later = ids.slice(at(b) + 1);
+      cm.close();
+      // Through a strategy without the hook, as a crash between the window's
+      // tombstone and the folding strategy's own writes leaves the store:
+      // the rows after the record's go, and its next-to-last row is
+      // presented again, right after its last.
+      const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+      if (later.length > 0) plain.retractRows(later, { undone: true });
+      plain.retractRows([a], { undone: true });
+      plain.presentRows([a]);
+      assert.deepEqual(plain.getPresentedMessages().slice(-2).map((m) => m.id), [b, a], `${label}: premise: the window holds the rows together, out of order`);
+      plain.close();
+
+      const next = autobiographical();
+      let reopened!: ContextManager;
+      const lines = await linesDuring(async () => {
+        reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+      });
+      if (compressed) {
+        assert.equal(reopened.getSummary(record.summaryId!), null, `${label}: the L1 over the rows in their old order is dropped: ${lines.join('\n')}`);
+      }
+      const kept = internals(next).chunkRecords.find((r) => r.id === record.id);
+      assert.ok(kept && !kept.compressed, `${label}: its record is to be compressed again: ${lines.join('\n')}`);
+      assert.deepEqual(kept.sourceIds.slice(-2), [b, a], `${label}: over the rows in window order: ${lines.join('\n')}`);
+      await drain(reopened);
+      rendersWindowOnce(reopened, await reopened.compile(BIG), label);
+      reopened.close();
+    }
+  });
+
   it('a folded row taken out while a strategy with no row hook initializes: the folding strategy set in its place lets go of it', async () => {
     for (const hooked of [false, true]) {
       const { cm, strategy, ids } = await folding();

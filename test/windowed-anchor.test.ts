@@ -255,7 +255,7 @@ describe('windowed passthrough: a failed write of the anchor', () => {
       assert.deepEqual(slot(cm), { anchor: start }, 'setup: the conversion is unwritten');
       const said = warned.filter((line) => line.includes('[windowed-passthrough]'));
       assert.equal(said.length, 1, warned.join('\n'));
-      assert.match(said[0]!, new RegExp(`the anchor converted to ordinal ${ordinal} couldn't be written; it is written at the next compile or read of the anchor, and a reload before then converts its sequence ${start} again: zz-slot-write-failed`));
+      assert.match(said[0]!, new RegExp(`the anchor converted to ordinal ${ordinal} couldn't be written; it is tried again at each compile or read of the anchor until a write lands, and a reload before then converts its sequence ${start} again: zz-slot-write-failed`));
 
       // b, stored before the start, is taken out and presented again; c
       // arrives and is presented. The next compile writes the conversion.
@@ -295,6 +295,61 @@ describe('windowed passthrough: a failed write of the anchor', () => {
     cm.close();
     ({ cm, strategy } = await open(path));
     assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c']);
+    cm.close();
+  });
+});
+
+describe('windowed passthrough: a move retried after its write threw', () => {
+  // Wave 2, finding 41: a retry of the same move returned at the equality
+  // check, reporting success with the slot still unwritten.
+  function failAnchorWrites(cm: ContextManager, count: number): () => void {
+    const store = cm.getStore() as unknown as { setStateJson: (id: string, value: unknown) => unknown };
+    const write = store.setStateJson;
+    let left = count;
+    store.setStateJson = function (this: unknown, id: string, value: unknown) {
+      if (id === ANCHOR && left > 0) {
+        left--;
+        throw new Error('zz-slot-write-failed');
+      }
+      return write.call(this, id, value);
+    };
+    return () => { store.setStateJson = write; };
+  }
+
+  it('setAnchor of the same sequence writes it again, and its failure reaches the caller', async () => {
+    const { cm, strategy } = await open(freshPath());
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    const start = sequenceOf(cm, ids[1]!);
+    const restore = failAnchorWrites(cm, 2);
+    try {
+      assert.throws(() => strategy.setAnchor(start), /zz-slot-write-failed/);
+      assert.throws(() => strategy.setAnchor(start), /zz-slot-write-failed/, 'the retry wrote the slot, which threw again');
+    } finally {
+      restore();
+    }
+    assert.equal(slot(cm), null, 'setup: still unwritten');
+    strategy.setAnchor(start);
+    assert.deepEqual(slot(cm), { anchor: start }, 'the retry that lands writes the move');
+    cm.close();
+  });
+
+  it('setAnchorOrdinal of the same ordinal writes it again, and its failure reaches the caller', async () => {
+    const { cm, strategy } = await open(freshPath());
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    const ordinal = cm.ordinalOf(ids[1]!)!;
+    // The move's write, the read's try again and the retry's write all throw.
+    const restore = failAnchorWrites(cm, 3);
+    try {
+      assert.throws(() => strategy.setAnchorOrdinal(ordinal), /zz-slot-write-failed/);
+      assert.throws(() => strategy.setAnchorOrdinal(ordinal), /zz-slot-write-failed/, 'the retry wrote the slot, which threw again');
+    } finally {
+      restore();
+    }
+    assert.equal(slot(cm), null, 'setup: still unwritten');
+    strategy.setAnchorOrdinal(ordinal);
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal, v: 2, moved: true }, 'the retry that lands writes the move');
     cm.close();
   });
 });
@@ -525,6 +580,30 @@ describe('windowed passthrough: a persisted anchor that names no place', () => {
     assert.equal(reopened.strategy.getAnchorOrdinal(), cm.ordinalOf(cm.getAllMessages()[0]!.id));
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b'], 'the window from its start, not from b');
     cm.close();
+  });
+
+  it('a format-2 slot whose ordinal is missing or not a whole number from 0 is warned of, and its sequence converted again', async () => {
+    // Wave 2, finding 42: such a slot was read as a sequence slot with no word.
+    for (const ordinal of [undefined, -1, 1.5, '1']) {
+      const path = freshPath();
+      let { cm } = await open(path);
+      cm.addMessage('u', text('a'));
+      const b = cm.addMessage('u', text('b'));
+      cm.presentRows([]);
+      cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, b), ...(ordinal === undefined ? {} : { ordinal }), v: 2 });
+      cm.close();
+
+      const reopened = await reopenWarned(path);
+      cm = reopened.cm;
+      const named = ordinal === undefined ? 'missing' : JSON.stringify(ordinal);
+      assert.ok(
+        reopened.warned.some((w) => w.startsWith(`[windowed-passthrough] persisted anchor ordinal ${named} is not an ordinal`) &&
+          w.includes(`its sequence ${sequenceOf(cm, b)} is converted again`)),
+        `${named}: ${reopened.warned.join('\n')}`,
+      );
+      assert.deepEqual(texts(await cm.compile(BIG)), ['b'], `${named}: the window from b, by its sequence`);
+      cm.close();
+    }
   });
 
   it('a sequence past the head resets to 0 in presented mode too', async () => {

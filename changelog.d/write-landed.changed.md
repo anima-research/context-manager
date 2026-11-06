@@ -15,3 +15,10 @@
   couldn't be read to tell whether that shard landed, logged that removing
   what it wrote threw, though no removal ran. It logs that the read threw,
   so the shard may be stored.
+- One failure point of an add is new: after the row lands, the manager's own
+  add listener reads the window index, to tell whether a host presents rows
+  on the branch (in legacy mode the strategy hears the row there). Where
+  that read throws, an add that succeeded before fails after its row
+  landed: `addMessage` throws `WriteLandedError` naming the row, the
+  strategy isn't told the row entered, and an add listener registered
+  after the manager's doesn't hear it.
