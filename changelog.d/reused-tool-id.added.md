@@ -2,7 +2,8 @@
   placed for an entry's `relocatedResults`, one for each move. Where it's
   set, attribution credits a moved result only through one of those blocks
   still in the request, unaltered, or through a result with its id still in
-  the entry that repair placed for no entry, so another result with the same
-  id and content doesn't stand in for it, even one repair placed for another
-  entry inside the entry's message. `AutobiographicalStrategy` and
-  `KnowledgeStrategy` set it.
+  the entry that isn't among the blocks repair recorded as placed for any
+  entry. A stub repair generated, or a copy that releasing a raw form made of
+  a block it placed, isn't recorded, so either counts as a carrier wherever it
+  covers the moved result.
+  `AutobiographicalStrategy` and `KnowledgeStrategy` set it.

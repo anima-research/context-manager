@@ -375,12 +375,6 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
   return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
 }
 
-/**
- * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and each moved result reached the
- * request unaltered where the repair put it. A result altered there, or
- * missing from the request, does not carry it.
- */
 function carriesWithRelocated(
   entry: ContextEntry,
   sourceMessages: readonly StoredMessage[],
