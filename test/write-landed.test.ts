@@ -464,7 +464,8 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
   });
 
   it("where the store can't be read to tell which shards a failed removal left, the error says the manager can't tell, naming every shard the write stored", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
@@ -483,12 +484,17 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.equal(err.unnamed, 0);
     assert.equal(err.cause, failure);
     assert.ok(err.message.includes(`can't tell whether the store holds 2 rows of the message (${err.unknown.join(', ')}): propagation failed`), err.message);
+    // CM #350 bot review, wave 4, finding 12: the shards whose outcome is
+    // unknown wait, and are heard where the window holds them.
+    assert.deepEqual(strategy.presented, [[stored[0]!.id], err.unknown], 'the strategy hears the shards the legacy window holds, in one call');
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 
   it("a removal that took the shards out and then failed, where the store can't be read to tell, isn't taken to have left them", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
-    cm.addMessage('bob', [text('before')]);
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
     const messages = internals(cm).messageStore;
@@ -509,6 +515,10 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.deepEqual(err.unknown, written);
     assert.equal(err.unnamed, 0);
     assert.equal(err.unknown.length, 2);
+    cm.addMessage('bob', [text('after')]);
+    assert.deepEqual(strategy.presented.slice(0, 1), [[before]]);
+    assert.ok(!strategy.presented.flat().some((id) => written.includes(id)), 'no shard the removal took out is heard');
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 
@@ -558,7 +568,8 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
   });
 
   it("where the failing shard's landing can't be read and removing the shards fails too, the error names the shards that stayed and says the manager can't tell about the failing one", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
     cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 2, failure);
@@ -574,6 +585,10 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.equal(err.unnamed, 1, 'the second shard, whose append threw');
     assert.equal(err.cause, failure);
     assert.ok(err.message.includes(`a row of the append that threw; it holds message ${stored[1]!.id}: propagation failed`), err.message);
+    // CM #350 bot review, wave 4, finding 12: the failing shard, which the
+    // manager couldn't name, is heard with the shard it knows stayed.
+    assert.deepEqual(strategy.presented.at(-1), stored.slice(1).map((m) => m.id), 'the strategy hears both shards the legacy window holds, in one call');
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 

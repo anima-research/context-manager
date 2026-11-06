@@ -1186,6 +1186,19 @@ export class ContextManager {
               logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
             }
           };
+          // Where which shards stayed is unknown (a read that would tell
+          // threw, or a shard's own append threw and its row has no id
+          // here), every shard the legacy window took in waits, and the
+          // delivery tells those the window's listing then holds
+          // (deliverPresentedUnheard), at once where it reads, and at the
+          // strategy's next notification where it doesn't.
+          const hearWhatStayed = () => {
+            try {
+              this.deferPresented(heard, true);
+            } catch (error) {
+              logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
+            }
+          };
           // A write the store's branch moved under stopped there, or failed
           // after it moved: what it stored is on the branch it started on,
           // which the store no longer reads, so nothing is read or removed.
@@ -1204,7 +1217,8 @@ export class ContextManager {
             away = true;
           }
           if (away) {
-            hearStayed(stored);
+            if (appending) hearWhatStayed();
+            else hearStayed(stored);
             throw appending ? new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err) : new WriteLandedError(stored, err);
           }
           // A write that fails partway leaves no part of the body in the
@@ -1263,9 +1277,13 @@ export class ContextManager {
             // stayed, a failing shard's row that landed with them, or none
             // of them did.
             const stayed = this.rowsStillStored(wrote);
-            if (stayed === null) throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
+            if (stayed === null) {
+              hearWhatStayed();
+              throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
+            }
             if (stayed.length > 0) {
-              hearStayed(stayed);
+              if (unnamed === 0) hearStayed(stayed);
+              else hearWhatStayed();
               throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
             }
           } finally {
