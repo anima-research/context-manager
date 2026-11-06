@@ -652,11 +652,13 @@ export class ContextManager {
    */
   private retractedUnheard: Array<{ left: RetractedRow[]; info: Retraction }> = [];
   /**
-   * While removeMessage or removeMessages removes rows in presented mode:
-   * the rows, read before they went, for the strategy to be told of them
-   * (handleMessageStoreEvent).
+   * While a removal through this manager runs (removeMessage,
+   * removeMessages, a failed sharded addMessage's removal of its shards):
+   * the rows it takes, read before they went, for the strategy to be told
+   * of them (handleMessageStoreEvent), and their ids, which a removal that
+   * names its rows keeps where that read failed (rowsBeforeRemoval).
    */
-  private removing: StoredMessage[] | null = null;
+  private removing: Removing | null = null;
 
   private constructor(
     store: JsStore,
@@ -1183,7 +1185,7 @@ export class ContextManager {
           // for the store's event (handleMessageStoreEvent).
           const removingBefore = this.removing;
           try {
-            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, () =>
+            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, wrote, () =>
               wrote.flatMap((id) => {
                 const row = this.messageStore.get(id);
                 return row ? [row] : [];
@@ -1453,15 +1455,17 @@ export class ContextManager {
    * here: a host takes that row out of this window with retractRemoved,
    * naming it, or retractAbsentRows, which finds every such row, and this
    * manager's strategy is told then, by the row's id, as this one's is told
-   * here.
+   * here. A removal made while a sharded addMessage stores its shards (from
+   * an onMessage listener of a shard's add) is refused (see onMessage).
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
+    this.refuseWhileWritingShards('removeMessage');
     this.write(() => {
       // The row is gone by the time the store's event is heard, so it is
       // read here first, for the strategy (handleMessageStoreEvent), as
       // removeMessages reads its range.
-      this.removing = this.rowsBeforeRemoval(`message ${messageId}`, () => {
+      this.removing = this.rowsBeforeRemoval(`message ${messageId}`, [messageId], () => {
         const row = this.messageStore.get(messageId);
         return row ? [row] : [];
       });
@@ -1480,11 +1484,12 @@ export class ContextManager {
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
+    this.refuseWhileWritingShards('removeMessages');
     this.write(() => {
       // The store's event names the range by its ends, and its rows are gone
       // by the time the event is heard, so they are read here first
       // (handleMessageStoreEvent).
-      this.removing = this.rowsBeforeRemoval(`messages ${fromId} to ${toId}`, () => this.slotRowsBetween(fromId, toId));
+      this.removing = this.rowsBeforeRemoval(`messages ${fromId} to ${toId}`, null, () => this.slotRowsBetween(fromId, toId));
       try {
         this.messageStore.removeRange(fromId, toId);
       } finally {
@@ -1497,25 +1502,43 @@ export class ContextManager {
   /**
    * The rows a removal is about to take, as `read` finds them in this
    * manager's slot, for the store's event to take out of the window
-   * (retractOnRemoval). They are read in either mode, without asking the
-   * window: an index that can't be read doesn't keep the strategy from
-   * being told, and in legacy mode the event writes and tells nothing. The
-   * removal goes ahead whatever happens here, as it does when a tombstone
-   * can't be written: a read that fails is logged, and a removal of a
-   * range, whose event names only its ends, then leaves the window's rows
-   * of it their ordinals, untold.
+   * (retractOnRemoval), with their ids: `ids`, for a removal that names its
+   * rows (removeMessage, a failed sharded addMessage's removal of what it
+   * stored), else the ids of the rows read. They are read in either mode,
+   * without asking the window: an index that can't be read doesn't keep
+   * the strategy from being told, and in legacy mode the event writes and
+   * tells nothing. The removal goes ahead whatever happens here, as it does
+   * when a tombstone can't be written: a read that fails is logged, and the
+   * rows a removal names leave the window by their ids, told by their ids
+   * alone. A removal of a range, whose event names only its ends, then
+   * leaves the window's rows of it their ordinals, untold (null).
    */
-  private rowsBeforeRemoval(what: string, read: () => StoredMessage[]): StoredMessage[] | null {
+  private rowsBeforeRemoval(what: string, ids: readonly MessageId[] | null, read: () => StoredMessage[]): Removing | null {
     try {
-      return read();
+      const rows = read();
+      return { ids: ids ?? rows.map((m) => m.id), rows };
     } catch (err) {
       // A format string, since the error follows it: a '%' in an id is doubled.
       const message =
         `[context-manager] reading the rows before removing ${what} failed; ` +
-        `the removal goes ahead, and the window's rows of it keep their ordinals:`;
+        (ids ? `the removal goes ahead, and the window's rows of it leave by their ids:` : `the removal goes ahead, and the window's rows of it keep their ordinals:`);
       logThrown(message.replaceAll('%', '%%'), err, this.diag);
-      return null;
+      return ids ? { ids, rows: [] } : null;
     }
+  }
+
+  /**
+   * Refuses a removal made while a sharded addMessage stores its shards
+   * (from an onMessage listener of a shard's add, or a strategy hook that
+   * listener runs): a shard it took would split the body, and any row it
+   * took would move the rows that write's failure reads back and removes.
+   */
+  private refuseWhileWritingShards(operation: 'removeMessage' | 'removeMessages'): void {
+    if (!this.writingShards) return;
+    throw new Error(
+      `ContextManager.${operation} refused: a sharded addMessage is storing its shards, and a removal now could split the body ` +
+        'or move the rows that call removes if it fails. Remove it once that call has returned.',
+    );
   }
 
   /** The rows of this manager's slot from `fromId` to `toId`, in slot order; empty when either isn't there. */
@@ -1576,8 +1599,10 @@ export class ContextManager {
    * would land between a body's shards and split the body (body-runs.ts), so
    * an addMessage made while a sharded addMessage stores its shards is
    * refused. Add it after the call returns (a microtask or later) instead.
-   * Nor may it move the store's branch then: the sharded write stops before
-   * its next shard and throws (WriteLandedError). A listener
+   * Nor may it remove a message then (removeMessage, removeMessages are
+   * refused, as a removal could split the body or move the rows the sharded
+   * write removes if it fails), or move the store's branch: the sharded
+   * write stops before its next shard and throws (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
    * heard stands: the throw doesn't reach the caller. A listener that calls
    * close() lets the write that ran it finish (see close()). Each call
@@ -3957,13 +3982,13 @@ export class ContextManager {
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          this.retractOnRemoval([event.messageId], this.removing ?? []);
+          this.retractOnRemoval([event.messageId], this.removing?.rows ?? []);
         }
         break;
       case 'removeRange':
         // Ids of the removed span aren't in the event; prune holds whose
         // message no longer exists.
-        {
+        try {
           const before = this.compressionHolds.size;
           for (const id of [...this.compressionHolds]) {
             if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
@@ -3972,20 +3997,23 @@ export class ContextManager {
             if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
           }
           if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+        } finally {
+          // For range removes, we need to check all affected messages
+          // This is a simplification - in practice we'd need to track the IDs
+          //
+          // The window's rows of the span were read before it went
+          // (removeMessages). The only other range removed here is what a
+          // sharded addMessage that failed partway wrote, whose rows it reads
+          // first too, since a host's listener of the add may have presented
+          // a shard (appendMessage), and whose ids it knows where that read
+          // failed. Holds can be probed by asking the slot, since every held
+          // row is this slot's; the window can't, since it also holds rows of
+          // the auxiliary slots, and a row of a slot this manager no longer
+          // merges would read as removed and leave the window for good. The
+          // rows leave the window even when the pruning throws, as the
+          // 'remove' case's row does.
+          if (this.removing) this.retractOnRemoval(this.removing.ids, this.removing.rows);
         }
-        // For range removes, we need to check all affected messages
-        // This is a simplification - in practice we'd need to track the IDs
-        //
-        // The window's rows of the span were read before it went
-        // (removeMessages). The only other range removed here is what a
-        // sharded addMessage that failed partway wrote, whose rows it reads
-        // first too, since a host's listener of the add may have presented
-        // a shard (appendMessage). Holds can be probed by asking the slot,
-        // since every held row is this slot's; the window can't, since it
-        // also holds rows of the auxiliary slots, and a row of a slot this
-        // manager no longer merges would read as removed and leave the
-        // window for good.
-        if (this.removing) this.retractOnRemoval(this.removing.map((m) => m.id), this.removing);
         break;
     }
   }
@@ -4635,6 +4663,16 @@ function describeLeft(left: readonly RetractedRow[]): string {
   if (left.every((l) => l.row)) return describeRows(left.map((l) => l.row!), 'taken out');
   if (left.length === 1) return `message ${left[0]!.id}`.replaceAll('%', '%%');
   return `${left.length} messages taken out, ${left[0]!.id} to ${left[left.length - 1]!.id}`.replaceAll('%', '%%');
+}
+
+/**
+ * What a removal through the manager takes (ContextManager.removing): the
+ * ids of its rows, and the rows as they were before they went, where they
+ * could be read.
+ */
+interface Removing {
+  ids: readonly MessageId[];
+  rows: readonly StoredMessage[];
 }
 
 /** How rows left a window, as ContextStrategy.onRetracted is told (with the ids of each call's rows). */
