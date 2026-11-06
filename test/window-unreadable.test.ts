@@ -404,6 +404,52 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // Weft's plant on 6a18406: the other form of that message. Where the
+  // store says the branch the write was made on, before the write or only
+  // after it, the write waits there, and the error says the strategy hears
+  // what it did at the next write to the window, which it then does.
+  it("a write whose outcome is unknown, where the store says the branch it was made on, says the strategy hears what it did at the next write to the window", async () => {
+    for (const read of ['before and after', 'before only', 'after only'] as const) {
+      const strategy = new Hearing();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const x = cm.addMessage('alice', [text('x')]);
+      type Settled = (operation: string) => { state: unknown; branch: string | null };
+      const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+      if (read === 'after only') {
+        // The index's read of the store's branch before the write fails.
+        const settled = index.settled;
+        index.settled = function (this: unknown, operation: string) {
+          return { ...settled.call(this, operation), branch: null };
+        };
+      }
+      let warned: string[];
+      try {
+        const restore = failNextWriteUnread(cm, true, 1, read === 'before only');
+        try {
+          ({ warned } = await warnings(async () =>
+            throwsUnknown(() => cm.presentRows([x]), {
+              operation: 'presentRows',
+              entering: [x],
+              leaving: [],
+              cause: 'zz-index-kept-then-failed',
+              says: /windowStatusOf tells which once the index reads, and the strategy hears what it did at the next write to the window: zz-index-kept-then-failed$/,
+            }),
+          ));
+        } finally {
+          restore();
+        }
+      } finally {
+        delete (index as { settled?: unknown }).settled;
+      }
+      assert.ok(!warned.some((line) => line.includes('nothing waits')), `${read}: ${warned.join('\n')}`);
+      assert.deepEqual(strategy.log, [], `${read}: nothing is told while the outcome is unknown`);
+      cm.presentRows([]);
+      assert.deepEqual(strategy.log, [`presented ${x}`], `${read}: the next write to the window tells the strategy, as the error says`);
+      cm.close();
+    }
+  });
+
   // CM #350 bot review, wave 4, finding 5: windowStatusOf reads 'absent' for
   // a row the store no longer holds, whether or not a repair took it out.
   it("retractRemoved and retractAbsentRows, the outcome unknown: the error says ordinalOf tells which, and that the call can be made again", async () => {
