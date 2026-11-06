@@ -19358,10 +19358,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // covers it is kept: its summary, or, for one the dedup guard found
     // covered by L1s under other boundaries, an L1 over each of its rows. A
     // summary a retraction dropped (onRetracted) no longer covers the rows,
-    // which are folded again.
+    // which are folded again. The L1 index is read once for the chunk: each
+    // read checks it against every summary.
+    const coveredByL1s = (): boolean => {
+      const covered = this.l1ByMessageIndex();
+      return chunk.messages.every((m) => covered.has(m.id));
+    };
     if (existing && (existing.summaryId !== undefined
       ? this.summaryById(existing.summaryId) !== undefined
-      : chunk.messages.every((m) => this.l1ByMessageIndex().has(m.id)))) {
+      : coveredByL1s())) {
       chunk.compressed = true;
       chunk.summaryId = existing.summaryId;
     }

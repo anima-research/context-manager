@@ -1338,6 +1338,39 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     }
   });
 
+  // CM #350 bot review, wave 3, finding 9: a chunk the dedup guard found
+  // covered by L1s under other boundaries (compressed, no summary of its
+  // own) stays compressed across a rebuild while an L1 covers each of its
+  // rows. Each read of the L1 index checks it against every summary, so it
+  // is read once for the chunk, not once per row.
+  it('KnowledgeStrategy: a rebuild reads the L1 index once for a chunk kept compressed under no summary of its own', async () => {
+    const mock = mockMembrane();
+    const strategy = new KnowledgeStrategy({ ...FOLDING, recentWindowTokens: 0 });
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'agent', strategy, membrane: mock.membrane });
+    for (let i = 0; i < TAGS; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+    await drain(cm);
+    const state = strategy as unknown as {
+      chunks: Array<{ messages: StoredMessage[]; compressed: boolean; summaryId?: string }>;
+      l1ByMessageIndex(): Map<MessageId, string>;
+    };
+    const chunk = state.chunks.find((c) => c.compressed && c.messages.length >= 3);
+    assert.ok(chunk, 'premise: a folded chunk of three rows or more');
+    const rows = chunk.messages.map((m) => m.id).join();
+    delete chunk.summaryId; // as the dedup guard marks a chunk L1s under other boundaries cover
+    const kept = () => state.chunks.find((c) => c.messages.map((m) => m.id).join() === rows);
+    let reads = 0;
+    const real = state.l1ByMessageIndex.bind(strategy);
+    state.l1ByMessageIndex = () => { reads++; return real(); };
+    try {
+      cm.addMessage('User', [text('one more ' + 'word '.repeat(60))]);
+    } finally {
+      delete (state as { l1ByMessageIndex?: unknown }).l1ByMessageIndex;
+    }
+    assert.ok(kept()?.compressed && kept()?.summaryId === undefined, 'premise: the rebuild kept the chunk compressed under no summary');
+    assert.equal(reads, 1, `the L1 index was read once for the chunk, not once per row (${chunk.messages.length})`);
+    cm.close();
+  });
+
   // House review of #350, code finding 7: a record that keeps a row that
   // came back holds its rows in window order, as windowRuns reads them, not
   // in the order the record held them before.
