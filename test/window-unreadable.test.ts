@@ -468,7 +468,8 @@ describe('a write the store threw on, where the index then can\'t be read', () =
           entering: [],
           leaving: [rows[0]!],
           cause: 'zz-index-kept-then-failed',
-          says: /ordinalOf tells which once the index reads \(undefined for a row taken out\), and calling it again takes out only what is still there/,
+          // "It" would be ordinalOf, a read (CM #350 bot review, wave 5, finding 30).
+          says: new RegExp(`ordinalOf tells which once the index reads \\(undefined for a row taken out\\), and calling ${repair} again takes out only what is still there`),
         });
       } finally {
         restore();

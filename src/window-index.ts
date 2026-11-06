@@ -219,7 +219,7 @@ export class WindowWriteOutcomeUnknownError extends Error {
     // windowStatusOf reads as absent whether or not the write landed.
     const repair = operation === 'retractRemoved' || operation === 'retractAbsentRows';
     const which = repair
-      ? 'ordinalOf tells which once the index reads (undefined for a row taken out), and calling it again takes out only what is still there'
+      ? `ordinalOf tells which once the index reads (undefined for a row taken out), and calling ${operation} again takes out only what is still there`
       : 'windowStatusOf tells which once the index reads';
     const hears = waiting
       ? 'the strategy hears what it did at the next write to the window'
