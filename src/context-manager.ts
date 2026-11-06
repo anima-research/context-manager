@@ -392,8 +392,9 @@ export class InitializationSupersededError extends Error {
  * `landed` names those rows, in store order: the message's one row, or the
  * shards of a sharded body that stayed. The store holds no other row of the
  * message. `cause` is the write's own error, and this error's message ends
- * with its message, so a check of the message that matched the write's own
- * error still matches.
+ * with its message, so a check that the message contains or ends with the
+ * write's own error's message still matches; one that compares the whole
+ * message, or is anchored at its start, doesn't.
  *
  * What addMessage throws tells which of three things happened:
  * - WriteLandedError: the store holds the rows of the message `landed`
@@ -435,8 +436,10 @@ export class InitializationSupersededError extends Error {
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
  * a host that presents each row as it is stored does, or taken one out
- * again: present the first row of `landed` that windowStatusOf doesn't
- * read `'in'`, if any, which presentRows takes as naming the rest of the
+ * again: on the branch the write started on (after a branch move, `cause`
+ * names it: switch back to it first), present the first row of `landed`
+ * that windowStatusOf doesn't read `'in'`, if any, which presentRows takes
+ * as naming the rest of the
  * body, since it refuses a row the window holds and a later shard whose
  * earlier shards aren't all in it. Where the add placed a holdCompression
  * hold on them, it stays: releaseCompression(landed) releases it.
@@ -506,8 +509,10 @@ export class WriteLandedError extends Error {
  * As for WriteLandedError, the add may have gone unheard; once a host
  * presents rows on the branch, a row of `landed` is out of the window until
  * it is presented, unless a listener of the add presented it already, so a
- * host presents the first row of `landed` that windowStatusOf doesn't read
- * `'in'`, if any, which presentRows takes as naming the rest of the body;
+ * host presents, on the branch the write started on (after a branch move,
+ * `cause` names it: switch back to it first), the first row of `landed`
+ * that windowStatusOf doesn't read `'in'`, if any, which presentRows takes
+ * as naming the rest of the body;
  * and a holdCompression hold the add placed stays on any row of it that is
  * stored (getCompressionHolds lists it, and releaseCompression releases
  * it).
@@ -2303,7 +2308,12 @@ export class ContextManager {
     return 'undone';
   }
 
-  /** The ordinal the next presented row will take: every ordinal below it has been issued on this branch. 0 in legacy mode. */
+  /**
+   * The index's length: every ordinal below it has been issued on this
+   * branch, to rows, tombstones and the header. A presentation's rows take
+   * ordinals from it on, after any tombstones the same write puts first (a
+   * body moved whole). 0 in legacy mode.
+   */
   indexLength(): number {
     return this.windowIndex.length();
   }
@@ -2392,11 +2402,15 @@ export class ContextManager {
    * Once a host presents rows on the branch (see presentRows), a row is in
    * the window only from the write that presented it, which comes after the
    * row's own. For a row the window holds, the branch is then cut at that
-   * write, the last of its body's shards, so the new branch's window holds
-   * the row and every row presented before it. Rows stored after the row and
-   * not presented by then are in the new branch's record, arrived and not
-   * presented. A row the window doesn't hold, and every row in legacy mode,
-   * is cut at its own sequence, as before.
+   * write, the one that presented the last of its body's shards, and never
+   * before its body's last shard's own sequence, so the new branch's record
+   * holds the whole body. The new branch's window is the window as it stood
+   * at the cut: the row, and every row in the window then (a row taken out
+   * before the cut isn't). Rows stored after the row but before the cut,
+   * and not presented by then, are in the new branch's record, arrived and
+   * not presented; rows stored after the cut are not. A row the window
+   * doesn't hold, and every row in legacy mode, is cut at its own sequence,
+   * as before.
    *
    * One presentRows call is one record, so it is one presentation point: a
    * row it presented is cut after the whole call, and the new branch's
@@ -3307,9 +3321,10 @@ export class ContextManager {
    * a layout whose shape changed after compile returned it: members out of
    * order, unit counts that aren't positive whole numbers adding up to the
    * members, not one id and one sequence for each member, or a word of what
-   * its members count that the journal doesn't know. A layout with no word
-   * of it, as compile returned before RenderedLayout was `v: 3` (one carried
-   * across the upgrade), is read as counting store sequences, which it did.
+   * its members count that the journal doesn't know. A `v: 2` layout, which
+   * has no word of it (one an earlier release's compile returned, carried
+   * across the upgrade), is read as counting store sequences, which it did;
+   * a layout of any other version without it is refused, writing nothing.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -4288,7 +4303,8 @@ export class ContextManager {
       const rows = ids.length === 1 ? `removed message ${ids[0]}` : `${ids.length} removed messages`;
       const message =
         `[context-manager] taking ${rows} out of the window failed; ` +
-        `the window leaves them out of what it lists, and their ordinals stay issued:`;
+        `the window leaves them out of what it lists, and their ordinals stay issued until retractAbsentRows takes them ` +
+        `out, unless the store kept the tombstone before it threw:`;
       logThrown(message.replaceAll('%', '%%'), err, this.diag);
     }
     const told = held ?? [...new Set(ids)].map((id): RetractedRow => ({ id }));
@@ -4352,8 +4368,10 @@ export class ContextManager {
    * once a host presents, takes the next row out of the window. The rows it
    * hasn't been given go nowhere after close(), and otherwise wait for the
    * initialization (deferPresented): once it has finished they are heard
-   * where the window of the branch it initialized on holds them, at once
-   * for a strategy with no initialize or one that is initialized still.
+   * where the window of the branch the store is on when they are delivered
+   * holds them (the branch it initialized on, unless a hook moved the store
+   * itself, which leaves the strategy to setStrategy(getStrategy())), at
+   * once for a strategy with no initialize or one that is initialized still.
    * The strategy it let go hears no more.
    *
    * Fire and forget: the write doesn't wait for the strategy, and the
@@ -4448,7 +4466,9 @@ export class ContextManager {
    * Rows whose onNewMessage calls a hook stopped (notifyPresented): they
    * wait for the initialization it started, as rows presented while it runs
    * do, and are given at once if it has finished, which delivers only those
-   * the window of the branch it initialized on holds. Nothing after close().
+   * the window of the branch the store is on then holds (the branch it
+   * initialized on, unless a hook moved the store itself). Nothing after
+   * close().
    */
   private deferPresented(rows: readonly StoredMessage[], legacy: boolean): void {
     if (this.closed) return;
@@ -4709,8 +4729,10 @@ export class ContextManager {
 
   /**
    * The rows that entered the window while the strategy wasn't initialized
-   * that are still in the window of the branch it initialized on, in window
-   * order. Once a host presents there, that is the rows its index holds,
+   * that are still in the window of the branch the store is on when they are
+   * delivered (the branch it initialized on, unless a hook moved the store
+   * itself, which leaves the strategy to setStrategy(getStrategy())), in
+   * window order. Once a host presents there, that is the rows its index holds,
    * however each entered: a row presented on another branch has no ordinal
    * there. While that branch is in legacy mode its window is its record,
    * and the rows given are those an add entered into a legacy window (a
@@ -4849,11 +4871,13 @@ export class ContextManager {
    * throw. close() throws the store's own error when closing a store the
    * manager owns fails at its final sync; the store is closed all the same.
    * A second close() does nothing. A close() from inside a listener (onMessage,
-   * onFoldReceipt) lets the write it interrupted finish and starts nothing
-   * new: the write's remaining shards are stored and its receipt committed,
-   * nothing after the close() reaches the strategy, and a store the manager
-   * owns closes once that write returns, a failure of that close logged
-   * rather than thrown.
+   * onFoldReceipt), or from a strategy hook a manager call runs (a
+   * notification's, or one hearing what an earlier window write did), lets
+   * the write it interrupted finish and starts nothing new: the write's
+   * remaining shards are stored, its receipt committed and the call's own
+   * window write made, nothing after the close() reaches the strategy, and
+   * a store the manager owns closes once that write returns, a failure of
+   * that close logged rather than thrown.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
