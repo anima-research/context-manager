@@ -3999,6 +3999,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const fromMs = opts.fromMs ?? -Infinity;
     const toMs = opts.toMs ?? Infinity;
 
+    // A summary's messages first and last in the record, by sequence, from
+    // its leaves (memoized per summary). Until a host presents rows out of
+    // record order these are sourceRange's ends; once it does, a chunk is in
+    // the window's order (agent-framework #291), and its ends needn't be the
+    // earliest and latest messages it covers.
+    const sequenceOf = (id: string) => (store.sequenceOf ? store.sequenceOf(id) : store.get(id)?.sequence);
+    const ends = new Map<string, { first: string; firstAt: number; last: string; lastAt: number } | null>();
+    const endsOf = (summary: SummaryEntry): { first: string; firstAt: number; last: string; lastAt: number } | null => {
+      if (ends.has(summary.id)) return ends.get(summary.id)!;
+      ends.set(summary.id, null);
+      let found: { first: string; firstAt: number; last: string; lastAt: number } | null = null;
+      const take = (first: string, firstAt: number, last: string, lastAt: number) => {
+        if (!found) found = { first, firstAt, last, lastAt };
+        else {
+          if (firstAt < found.firstAt) Object.assign(found, { first, firstAt });
+          if (lastAt > found.lastAt) Object.assign(found, { last, lastAt });
+        }
+      };
+      for (const source of summary.sourceIds) {
+        if (summary.sourceLevel === 0) {
+          const at = sequenceOf(source);
+          if (at !== undefined) take(source, at, source, at);
+        } else {
+          const child = this.summaryById(source);
+          const span = child ? endsOf(child) : null;
+          if (span) take(span.first, span.firstAt, span.last, span.lastAt);
+        }
+      }
+      ends.set(summary.id, found);
+      return found;
+    };
+
     const out: TimeRangeSummaryEntry[] = [];
     for (const entry of this.summaries) {
       if (opts.level !== undefined && entry.level !== opts.level) continue;
@@ -4007,8 +4039,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A source message can in principle be gone (redacted) by the time
       // this runs; skip rather than throw so one stale entry doesn't blank
       // the whole table-of-contents.
-      const firstMsg = store.get(entry.sourceRange.first);
-      const lastMsg = store.get(entry.sourceRange.last);
+      if (!store.get(entry.sourceRange.first) || !store.get(entry.sourceRange.last)) continue;
+      const span = endsOf(entry);
+      const firstMsg = span ? store.get(span.first) : null;
+      const lastMsg = span ? store.get(span.last) : null;
       if (!firstMsg || !lastMsg) continue;
       const startMs = firstMsg.timestamp.getTime();
       const endMs = lastMsg.timestamp.getTime();

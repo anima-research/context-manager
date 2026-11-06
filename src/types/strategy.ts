@@ -1129,9 +1129,14 @@ export interface TimeRangeSummaryEntry {
   level: number;
   content: string;
   tokens: number;
-  /** `sourceRange.first` message's `timestamp`, in epoch ms. */
+  /**
+   * The `timestamp`, in epoch ms, of the first message the summary covers
+   * in the record (by sequence): `sourceRange.first`'s, until a host
+   * presents rows out of record order, after which a chunk is in the
+   * window's order and its first row needn't be its earliest.
+   */
   startMs: number;
-  /** `sourceRange.last` message's `timestamp`, in epoch ms. */
+  /** Likewise the last message's: `sourceRange.last`'s until then. */
   endMs: number;
   /**
    * Exact identity/order boundaries of the covered span, ALONGSIDE the
@@ -1141,8 +1146,9 @@ export interface TimeRangeSummaryEntry {
    * not `startMs`/`endMs` alone: two distinct messages can share a
    * timestamp (wall-clock ms resolution, rapid-fire appends), but
    * `sequence` (chronicle's per-record sequence number) is strictly
-   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
-   * resolved `StoredMessage.id`/`.sequence`.
+   * monotonic and never ties. The `StoredMessage.id`/`.sequence` of the
+   * messages `startMs` and `endMs` are read from: `sourceRange.first`/
+   * `.last`'s until a host presents rows out of record order.
    */
   firstMessageId: string;
   lastMessageId: string;
