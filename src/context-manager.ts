@@ -4396,18 +4396,20 @@ export class ContextManager {
   /**
    * The calls of onRetracted made while the strategy wasn't initialized,
    * in the order they came. A row is given when it left the window of the
-   * branch the strategy initialized on: that window doesn't hold it at the
-   * ordinal it left, whether it is out or was presented again since, or
-   * the branch's record no longer holds it (a removal whose tombstone
-   * failed). A branch made before it left holds it there, in its window
-   * and its record, and a branch in legacy mode holds every row of its
-   * record, so neither is told. A call left with no row isn't made. A row
-   * the call didn't keep is read then, from the record of that branch, and
-   * given where it holds it; one it no longer holds is told by its id
-   * alone. A call whose hook closes the manager, sets a strategy or starts
-   * an initialization leaves the calls after it waiting, as a call made
-   * then would. False when a read failed: the call it was for and those
-   * after it wait still.
+   * branch the strategy initialized on: that branch's index took it out,
+   * or holds it at another ordinal (presented again since), or the branch's
+   * record no longer holds it (a removal whose tombstone failed). A branch
+   * made before it left holds it there, in its window and its record, a
+   * branch made before it was presented never held it, and a branch in
+   * legacy mode holds every row of its record, so none of them is told. A
+   * call left with no row isn't made. A row the call didn't keep is read
+   * then, from the record of that branch, and given where it holds it; one
+   * it no longer holds is told by its id alone, with `removed`, in a call
+   * of its own after the rest of an ordinary call's rows, as retractRows
+   * tells it. A call whose hook closes the manager, sets a strategy or
+   * starts an initialization leaves the calls after it waiting, as a call
+   * made then would. False when a read failed: the call it was for and
+   * those after it wait still.
    */
   private deliverRetractedUnheard(): boolean {
     const queued = this.retractedUnheard;
@@ -4418,21 +4420,41 @@ export class ContextManager {
       for (; i < queued.length; i++) {
         if (this.closed || this.initializedAttempt !== this.initializationAttempt) return true;
         const { left, info } = queued[i]!;
-        let told: RetractedRow[];
         try {
           const presented = this.windowIndex.mode() === 'presented';
           const merged = presented ? this.mergedMessageView() : null;
-          // A row told with no ordinal was removed where the index couldn't
-          // be read: it left where the record no longer holds it.
-          const leftHere = ({ id, ordinal }: RetractedRow) =>
-            (ordinal !== undefined && this.windowIndex.ordinalOf(id) !== ordinal) || !holdsRow(merged!, id);
+          const tookOut = presented ? this.windowIndex.left() : null;
+          // A row out of this window left it where this branch's index took
+          // it out; one it never held (a branch made before the row was
+          // presented) didn't. A row the window issues left where it holds it
+          // at another ordinal (presented again since), or where the record
+          // no longer holds it (a removal whose tombstone failed, told with
+          // no ordinal where the index couldn't be read then).
+          const leftHere = ({ id, ordinal }: RetractedRow) => {
+            const here = this.windowIndex.ordinalOf(id);
+            if (here === undefined) return tookOut?.has(id) === true;
+            return (ordinal !== undefined && here !== ordinal) || !holdsRow(merged!, id);
+          };
           const withRow = (l: RetractedRow): RetractedRow => {
             if (l.row) return l;
             const row = merged!.get(l.id);
             return row ? { ...l, row } : l;
           };
-          told = presented ? left.filter(leftHere).map(withRow) : [];
-          this.tellRetracted(told, info);
+          const told = presented ? left.filter(leftHere).map(withRow) : [];
+          // A row of an ordinary call the record no longer holds (another
+          // manager removed it meanwhile) is told by its id alone, with
+          // `removed`, in a call of its own after the rest, as retractRows
+          // tells it; where the first call's hook moved the manager on, that
+          // call is made next, where a call made then would be.
+          const gone = info.removed ? [] : told.filter((l) => !l.row);
+          const held = gone.length === 0 ? told : told.filter((l) => l.row);
+          const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
+          this.tellRetracted(held, info);
+          if (gone.length > 0) {
+            const removed: Retraction = { undone: info.undone, removed: true };
+            if (scope === null || this.inHookScope(scope)) this.tellRetracted(gone, removed);
+            else queued.splice(i + 1, 0, { left: gone, info: removed });
+          }
         } catch (err) {
           logThrown(
             '[context-manager] telling the strategy of rows that left the window while it initialized failed; it is told at its next notification:',

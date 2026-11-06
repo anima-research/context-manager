@@ -520,6 +520,57 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 2, finding 37: a branch whose window never
+  // held the row isn't told it left.
+  it('a call waiting on an initialization of a branch made before the row was stored is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    // Presented, and made before a was stored: neither its record nor its window ever held a.
+    const older = store.createBranchAt('zz-older', cm.currentBranch().name, store.currentSequence()).name;
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([a]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(older);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, older);
+    assert.equal(cm.windowMode(), 'presented', 'setup: the branch is presented');
+    assert.deepEqual(strategy.retracted, [], "a never entered this branch's window");
+    await settle();
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
+  // store no longer holds is told by its id, removed, as retractRows tells it.
+  it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {
+    const writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a, b], { undone: true });
+    writer.removeMessage(b);
+    open();
+    await initialized;
+    assert.deepEqual(strategy.retracted.map((l) => [l.rows, l.info]), [
+      [[a], { undone: true, removed: false, ids: [a] }],
+      [[], { undone: true, removed: true, ids: [b] }],
+    ]);
+    await settle();
+    cm.close();
+    writer.close();
+  });
+
   // CM #350 bot review finding 21: while initialization stays failed the
   // calls wait without bound, so what each keeps is kept small.
   it('while initialization stays failed, a row taken out and presented again and again waits once to be heard, and a waiting call keeps no row the store holds, which is read when the call is made', async () => {
