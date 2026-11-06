@@ -6062,10 +6062,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the store, which this one didn't hear, so left() no longer names them
    * (rowsOutOfWindow), and a strategy that keeps no chunk records has none
    * that says so. A row presented again takes a new ordinal at the window's
-   * end. So a row is named whose ordinal differs from the one `before`
-   * read (windowOrdinalsOf, as the work began), and, read alone, a row the
-   * window holds after a row of the span it held them before (the rule the
-   * open's demoteSplitSummaries applies). None in legacy mode.
+   * end, past every row the window held. So a row is named whose ordinal
+   * differs from the one `before` read (windowOrdinalsOf, as the work
+   * began), and, with or without `before`, one the window holds past every
+   * later row of the span, which finds a row presented again before the
+   * work began too. The span's last row has no later row, so only `before`
+   * finds it moved. A row the window holds after one later row of the span
+   * and before another isn't named: no presentation puts a row there, and
+   * a span stands so with nothing moved, as the leaves of two summaries
+   * whose rows cross do (a merge's topology check refuses those). The
+   * ordinals can't tell a row presented again from one a summary was
+   * minted over past a run of rows the next summary holds (one L1 over A
+   * and D, the next over B and C): that row is named. None in legacy mode.
    */
   private rowsMovedInWindow(
     ids: readonly MessageId[],
@@ -6075,15 +6083,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ordinals = ctx.window?.ordinals();
     if (!ordinals) return [];
     const moved = new Set<MessageId>();
-    let least = Infinity;
+    // The highest ordinal among the span's rows after the one read.
+    let latest: number | undefined;
     for (let i = ids.length - 1; i >= 0; i--) {
       const id = ids[i]!;
       const at = ordinals.get(id);
       if (at === undefined) continue;
       const was = before?.get(id);
       if (was !== undefined && was !== at) moved.add(id);
-      if (at > least) moved.add(id);
-      else least = at;
+      if (latest !== undefined && at > latest) moved.add(id);
+      latest = latest === undefined ? at : Math.max(latest, at);
     }
     return ids.filter((id) => moved.has(id));
   }
@@ -8181,7 +8190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the chunks then still held the row. What the writes didn't do, the
     // next open repairs, as after a stop between them.
     try {
-      const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
+      const unfolded = this.unfoldRowsThatLeft(leaving, ctx);
       if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
         this.diag.warn(
           `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
@@ -8234,7 +8243,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) leaving.add(id);
     if (leaving.size === 0) return;
-    const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
+    const unfolded = this.unfoldRowsThatLeft(leaving, ctx);
     this.diag.warn(
       `[autobiographical] ${leaving.size} row(s) out of the window are still folded (they left while no strategy that folds ` +
         `heard them go): letting go of [${[...leaving].join(', ')}]; dropped the summaries covering them ` +
@@ -8257,8 +8266,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private unfoldRowsThatLeft(
     leaving: ReadonlySet<MessageId>,
-    view: MessageStoreView,
+    ctx: StrategyContext,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
+    const view = ctx.messageStore;
     // The L1s holding a row that left among their sources, the L1 of each
     // chunk record holding one, and (in unfold) every summary above them.
     const seeds = new Set<string>();
@@ -8289,12 +8299,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A record that keeps a row that came back holds its rows as the
       // window does, as windowRuns took them: the row stands after the rows
       // of its run that it followed in the window, wherever the record held
-      // it before. A record with a row the view doesn't list (hidden by the
-      // view filter) keeps its own order.
-      inWindowOrder = (ids) =>
-        ids.some((id) => returned.has(id)) && ids.every((id) => position.has(id))
-          ? [...ids].sort((a, b) => position.get(a)! - position.get(b)!)
-          : ids;
+      // it before. A row the view doesn't list (hidden by the view filter)
+      // stands at its own ordinal, which counts the window before the
+      // filter; one with no ordinal follows the row it followed in the
+      // record. So the record's chunk is in window order too: kept in
+      // record order, its rows stood out of window order with nothing
+      // moving, which each L1's check over it read as a row presented
+      // again (rowsMovedInWindow), discarding the L1.
+      const place = ctx.window?.ordinals() ?? position;
+      inWindowOrder = (ids) => (ids.some((id) => returned.has(id)) ? windowOrdered(ids, place) : ids);
     }
 
     // Each record holding a row that left, or naming a dropped L1, is
@@ -13334,8 +13347,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // failed. A merge would cover the row again. This instance lets go of
     // the row as its onRetracted would have, which drops the source. So
     // with a row under them that left and was presented again, which the
-    // window holds out of their order (rowsMovedInWindow). The rows'
-    // ordinals now are what the check after the call compares with.
+    // window holds past every later row under them (rowsMovedInWindow);
+    // sources whose rows cross, with nothing moved, are left to the
+    // topology check below. The rows' ordinals now are what the check
+    // after the call compares with.
     const leafRows = this.leafRowsOf(sources);
     const outBefore = this.rowsOutOfWindow(leafRows, ctx);
     const movedBefore = this.rowsMovedInWindow(leafRows, ctx).filter((id) => !outBefore.includes(id));
@@ -22051,6 +22066,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       restore();
     }
   }
+}
+
+/**
+ * `ids`, a record's rows, in the order `place` gives them (the window's
+ * ordinals, or a listing's positions), each row it doesn't place right
+ * after the row it followed in `ids`, and one that follows none first. A
+ * row the view filter hides has an ordinal, which counts the window before
+ * the filter, so the ordinals put it where the window holds it; a
+ * listing's positions don't place it.
+ */
+function windowOrdered(ids: readonly MessageId[], place: ReadonlyMap<MessageId, number>): MessageId[] {
+  const lead: MessageId[] = [];
+  const placed: MessageId[][] = [];
+  for (const id of ids) {
+    if (place.has(id)) placed.push([id]);
+    else (placed[placed.length - 1] ?? lead).push(id);
+  }
+  placed.sort((a, b) => place.get(a[0]!)! - place.get(b[0]!)!);
+  return [...lead, ...placed.flat()];
 }
 
 /**
