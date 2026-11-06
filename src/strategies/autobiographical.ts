@@ -6040,15 +6040,72 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The ordinal of each row of `ids` in the window as it stands, from one
+   * reading of the index, for rowsMovedInWindow to compare with later.
+   * Undefined in legacy mode.
+   */
+  private windowOrdinalsOf(ids: Iterable<MessageId>, ctx: StrategyContext): ReadonlyMap<MessageId, number> | undefined {
+    const ordinals = ctx.window?.ordinals();
+    if (!ordinals) return undefined;
+    const kept = new Map<MessageId, number>();
+    for (const id of ids) {
+      const at = ordinals.get(id);
+      if (at !== undefined) kept.set(id, at);
+    }
+    return kept;
+  }
+
+  /**
+   * The rows of `ids`, a span's rows in the order it holds them, that left
+   * the window and were presented again: through another instance sharing
+   * the store, which this one didn't hear, so left() no longer names them
+   * (rowsOutOfWindow), and a strategy that keeps no chunk records has none
+   * that says so. A row presented again takes a new ordinal at the window's
+   * end. So a row is named whose ordinal differs from the one `before`
+   * read (windowOrdinalsOf, as the work began), and, read alone, a row the
+   * window holds after a row of the span it held them before (the rule the
+   * open's demoteSplitSummaries applies). None in legacy mode.
+   */
+  private rowsMovedInWindow(
+    ids: readonly MessageId[],
+    ctx: StrategyContext,
+    before?: ReadonlyMap<MessageId, number>,
+  ): MessageId[] {
+    const ordinals = ctx.window?.ordinals();
+    if (!ordinals) return [];
+    const moved = new Set<MessageId>();
+    let least = Infinity;
+    for (let i = ids.length - 1; i >= 0; i--) {
+      const id = ids[i]!;
+      const at = ordinals.get(id);
+      if (at === undefined) continue;
+      const was = before?.get(id);
+      if (was !== undefined && was !== at) moved.add(id);
+      if (at > least) moved.add(id);
+      else least = at;
+    }
+    return ids.filter((id) => moved.has(id));
+  }
+
+  /**
    * Whether another instance sharing the store let go of a row of the
    * chunk's span since its compression began, which this instance didn't
    * hear: the store no longer holds the chunk's record as it began
-   * (chunkRecordChangedInStore), or a row of the span is out of the window
-   * (rowsOutOfWindow). Nothing is written.
+   * (chunkRecordChangedInStore), a row of the span is out of the window
+   * (rowsOutOfWindow), or one left it and was presented again (against
+   * `ordinals`, the span's as the compression began: rowsMovedInWindow).
+   * Nothing is written.
    */
-  private spanLetGoElsewhere(chunk: Chunk, sources: readonly MessageId[] | undefined, ctx: StrategyContext): boolean {
+  private spanLetGoElsewhere(
+    chunk: Chunk,
+    sources: readonly MessageId[] | undefined,
+    ctx: StrategyContext,
+    ordinals: ReadonlyMap<MessageId, number> | undefined,
+  ): boolean {
+    const ids = chunk.messages.map((m) => m.id);
     return this.chunkRecordChangedInStore(chunk.recordId, sources) ||
-      this.rowsOutOfWindow(chunk.messages.map((m) => m.id), ctx).length > 0;
+      this.rowsOutOfWindow(ids, ctx).length > 0 ||
+      this.rowsMovedInWindow(ids, ctx, ordinals).length > 0;
   }
 
   /**
@@ -6058,13 +6115,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * record changed in the store: this instance takes up the store's state,
    * and the rebuild from its records queues the record again over the rows
    * it keeps. A row out of the window the record still holds, or with no
-   * record kept: the instance lets go of the row as its own onRetracted
-   * would have (letGoOfRowsOutOfWindow). Returns whether it did either.
+   * record kept, or one presented again since (rowsMovedInWindow): the
+   * instance lets go of the row as its own onRetracted would have
+   * (letGoOfRowsOutOfWindow), and the rebuild chunks a row presented again
+   * where the window now holds it. Returns whether it did either.
    */
   private takeUpSpanLetGoElsewhere(
     chunk: Chunk,
     sources: readonly MessageId[] | undefined,
     ctx: StrategyContext,
+    ordinals: ReadonlyMap<MessageId, number> | undefined,
     discarding: string,
   ): boolean {
     if (this.chunkRecordChangedInStore(chunk.recordId, sources)) {
@@ -6076,13 +6136,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.rebuildChunks(ctx.messageStore);
       return true;
     }
-    const outOfWindow = this.rowsOutOfWindow(chunk.messages.map((m) => m.id), ctx);
-    if (outOfWindow.length === 0) return false;
-    this.diag.warn(
-      `[autobiographical] ${discarding}: row(s) [${outOfWindow.join(', ')}] of its span left the window mid-request ` +
-        'through another instance sharing the store, which this one did not hear',
-    );
-    this.letGoOfRowsOutOfWindow(outOfWindow, ctx);
+    const ids = chunk.messages.map((m) => m.id);
+    const outOfWindow = this.rowsOutOfWindow(ids, ctx);
+    const moved = this.rowsMovedInWindow(ids, ctx, ordinals).filter((id) => !outOfWindow.includes(id));
+    if (outOfWindow.length === 0 && moved.length === 0) return false;
+    if (outOfWindow.length > 0) {
+      this.diag.warn(
+        `[autobiographical] ${discarding}: row(s) [${outOfWindow.join(', ')}] of its span left the window mid-request ` +
+          'through another instance sharing the store, which this one did not hear',
+      );
+    }
+    if (moved.length > 0) {
+      this.diag.warn(
+        `[autobiographical] ${discarding}: row(s) [${moved.join(', ')}] of its span left the window and were presented ` +
+          'again elsewhere in it mid-request, through another instance sharing the store, which this one did not hear',
+      );
+    }
+    this.letGoOfRowsOutOfWindow([...outOfWindow, ...moved], ctx);
     return true;
   }
 
@@ -10402,6 +10472,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const recordSources = chunk.recordId === undefined
       ? undefined
       : this.chunkRecords.find((record) => record.id === chunk.recordId)?.sourceIds.slice();
+    // The span's ordinals in the window as the compression begins, which a
+    // row presented again since no longer has (rowsMovedInWindow).
+    const spanOrdinals = this.windowOrdinalsOf(chunk.messages.map((m) => m.id), ctx);
 
     // ---- Duplicate-formation guards (layered) ----
     // Merged from two independent fixes for the same disease:
@@ -11563,7 +11636,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * the ledger's lock: through this instance (windowLost marks it), or
        * through another sharing the store (spanLetGoElsewhere).
        */
-      const spanInWindow = (): boolean => !this._spanLeftWindow.has(chunk) && !this.spanLetGoElsewhere(chunk, recordSources, ctx);
+      const spanInWindow = (): boolean => !this._spanLeftWindow.has(chunk) && !this.spanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals);
       /** The opt-in compression log's line for an exhaustion, at either exit: the record the ladder wrote. */
       const logExhausted = (): void => logCompressionCall({
         event: 'compression:curve-exhausted',
@@ -11592,7 +11665,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (exhaustion === undefined) return;
         if (exhaustion === 'left') {
           if (!this.spanLeftWindowMidRequest(chunk)) {
-            this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, 'the ladder ended with no summary and quarantines nothing');
+            this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'the ladder ended with no summary and quarantines nothing');
           }
           return;
         }
@@ -12704,7 +12777,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // instance's writes after the window's tombstone failed), the row
       // out of the window, let go of here. Nothing between these reads and
       // the writes below awaits.
-      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, 'discarding L1')) return;
+      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'discarding L1')) return;
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
@@ -13245,16 +13318,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // summaries still hold the source: another instance sharing the store
     // took the row out, and its own writes after the window's tombstone
     // failed. A merge would cover the row again. This instance lets go of
-    // the row as its onRetracted would have, which drops the source.
-    const outBefore = this.rowsOutOfWindow(this.leafRowsOf(sources), ctx);
-    if (outBefore.length > 0) {
+    // the row as its onRetracted would have, which drops the source. So
+    // with a row under them that left and was presented again, which the
+    // window holds out of their order (rowsMovedInWindow). The rows'
+    // ordinals now are what the check after the call compares with.
+    const leafRows = this.leafRowsOf(sources);
+    const outBefore = this.rowsOutOfWindow(leafRows, ctx);
+    const movedBefore = this.rowsMovedInWindow(leafRows, ctx).filter((id) => !outBefore.includes(id));
+    if (outBefore.length > 0 || movedBefore.length > 0) {
       this.diag.warn(
-        `executeMerge: row(s) [${outBefore.join(', ')}] under its sources left the window through another instance ` +
-          'sharing the store, which this one did not hear; skipping stale queue entry',
+        `executeMerge: row(s) [${[...outBefore, ...movedBefore].join(', ')}] under its sources left the window ` +
+          `${movedBefore.length > 0 ? `(and [${movedBefore.join(', ')}] were presented again elsewhere in it) ` : ''}` +
+          'through another instance sharing the store, which this one did not hear; skipping stale queue entry',
       );
-      this.letGoOfRowsOutOfWindow(outBefore, ctx);
+      this.letGoOfRowsOutOfWindow([...outBefore, ...movedBefore], ctx);
       return false;
     }
+    const leafOrdinals = this.windowOrdinalsOf(leafRows, ctx);
 
     // A held source (mergeHeldSourceIds: an operator hold, or a source a
     // merge-quarantine record holds out of merges) invalidates the entry the
@@ -13901,13 +13981,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // sharing the store while the call was out, and the store's summaries
       // still hold the source, that instance's writes after the window's
       // tombstone having failed: this one lets go of the row, as at entry.
-      const outSince = this.rowsOutOfWindow(this.leafRowsOf(sources), ctx);
-      if (outSince.length > 0) {
+      // So with a row that left and was presented again, whose ordinal
+      // isn't the one read at entry (rowsMovedInWindow).
+      const leafRowsSince = this.leafRowsOf(sources);
+      const outSince = this.rowsOutOfWindow(leafRowsSince, ctx);
+      const movedSince = this.rowsMovedInWindow(leafRowsSince, ctx, leafOrdinals).filter((id) => !outSince.includes(id));
+      if (outSince.length > 0 || movedSince.length > 0) {
         this.diag.warn(
-          `executeMerge: row(s) [${outSince.join(', ')}] under its sources left the window while the L${targetLevel} ` +
-            "merge's call was out, through another instance sharing the store, which this one did not hear; its summary is not written",
+          `executeMerge: row(s) [${[...outSince, ...movedSince].join(', ')}] under its sources left the window while the L${targetLevel} ` +
+            `merge's call was out${movedSince.length > 0 ? ` (and [${movedSince.join(', ')}] were presented again elsewhere in it)` : ''}, ` +
+            'through another instance sharing the store, which this one did not hear; its summary is not written',
         );
-        this.letGoOfRowsOutOfWindow(outSince, ctx);
+        this.letGoOfRowsOutOfWindow([...outSince, ...movedSince], ctx);
         return false;
       }
 

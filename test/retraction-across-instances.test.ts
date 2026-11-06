@@ -102,6 +102,18 @@ const strategyFor = () => new AutobiographicalStrategy({
   maxSpeculativeL1s: 1,
 });
 
+/** A KnowledgeStrategy, which keeps no chunk records, set as strategyFor is. */
+const knowledgeFor = () => new KnowledgeStrategy({
+  compressionModel: 'm',
+  targetChunkTokens: 50,
+  headWindowTokens: 0,
+  recentWindowTokens: 0,
+  autoTickOnNewMessage: false,
+  minChunkCharsForLLM: 0,
+  mergeThreshold: 2,
+  maxSpeculativeL1s: 1,
+});
+
 interface Internals {
   summaries: SummaryEntry[];
   chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
@@ -294,16 +306,6 @@ describe('a retraction through another instance sharing the store', () => {
   it('an L1 in flight in a KnowledgeStrategy over a row the other instance took out writes nothing', async () => {
     // A KnowledgeStrategy keeps no chunk records, so the store's record
     // can't say that the row left: the window does.
-    const knowledgeFor = () => new KnowledgeStrategy({
-      compressionModel: 'm',
-      targetChunkTokens: 50,
-      headWindowTokens: 0,
-      recentWindowTokens: 0,
-      autoTickOnNewMessage: false,
-      minChunkCharsForLLM: 0,
-      mergeThreshold: 2,
-      maxSpeculativeL1s: 1,
-    });
     const { store, strategy: A, cm: a, calls, membrane } = await instanceA(knowledgeFor);
     let b: ContextManager | undefined;
     try {
@@ -326,6 +328,87 @@ describe('a retraction through another instance sharing the store', () => {
       const summaries = stored(store, SUMMARIES);
       assert.ok(summaries.every((s) => !s.sourceIds.includes(row)), `no summary covers the row: ${JSON.stringify(summaries)}`);
       assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), 'nor does one the instance holds');
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  // Wave 3 (finding 2): a row the other instance took out and presented
+  // again is in the window, so left() no longer names it, and a
+  // KnowledgeStrategy keeps no chunk record to say so. Its new ordinal does.
+  for (const [where, at] of [['first', 0], ['last', -1]] as const) {
+    it(`an L1 in flight in a KnowledgeStrategy over a row the other instance took out and presented again (the span's ${where}) writes nothing`, async () => {
+      const { store, strategy: A, cm: a, calls, membrane } = await instanceA(knowledgeFor);
+      let b: ContextManager | undefined;
+      try {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === 1);
+        const work = internals(A).pendingCompressionWork;
+        assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+        const span = work.chunk.messages.map((m) => m.id);
+        assert.ok(span.length >= 2, `premise: the span holds rows to move: ${span.join()}`);
+        const row = span.at(at)!;
+        const order = () => a.getPresentedMessages().map((m) => m.id);
+        assert.ok(order().indexOf(span.at(-1)!) < order().length - 1, 'premise: rows the span lacks follow it in the window');
+
+        b = await ContextManager.open({ store, strategy: knowledgeFor(), membrane });
+        const lines = await linesDuring(async () => {
+          b!.retractRows([row], { undone: true });
+          b!.presentRows([row]);
+          assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
+          assert.equal(order().at(-1), row, 'premise: at its end');
+          calls[0]!.release();
+          await ticking;
+        });
+        assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
+        const summaries = stored(store, SUMMARIES);
+        assert.ok(summaries.every((s) => !s.sourceIds.includes(row)), `no summary covers the row: ${JSON.stringify(summaries)}`);
+        assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), 'nor does one the instance holds');
+      } finally {
+        for (const call of calls) call.release();
+        b?.close();
+        a.close();
+        store.close();
+      }
+    });
+  }
+
+  it("a merge in flight over a row the other instance took out and presented again, whose own writes then failed, writes nothing", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const merging = a.tick();
+      await waitFor(() => calls.length === 3);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'sourceIds' in work && calls[2]!.merge, 'premise: a merge is in flight');
+      const source = work.sourceIds[0]!;
+      const row = internals(A).summaries.find((s) => s.id === source)!.sourceIds[0]!;
+
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      const lines = await linesDuring(async () => {
+        refusingWrites(store, [SUMMARIES, CHUNKS], () => {
+          b!.retractRows([row], { undone: true });
+          b!.presentRows([row]);
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
+        assert.ok(stored(store, SUMMARIES).some((s) => s.id === source), "premise: the other instance's summaries write failed");
+        calls[2]!.release();
+        await merging;
+      });
+      assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
+      const after = stored(store, SUMMARIES);
+      assert.ok(after.every((s) => !s.sourceIds.includes(source)), `no summary was written over ${source}: ${lines.join('\n')}`);
+      assert.ok(after.every((s) => !s.sourceIds.includes(row)), `the instance let go of the row: ${JSON.stringify(after.map((s) => s.id))}`);
     } finally {
       for (const call of calls) call.release();
       b?.close();
