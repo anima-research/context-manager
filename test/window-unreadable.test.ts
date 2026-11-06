@@ -365,6 +365,56 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 29: a write can't tell whether an
+  // earlier write waits on its branch while the store can't say which that
+  // is, so it writes nothing, as while the index can't be read.
+  it("a write while the store can't say its branch, and an earlier write's outcome waits, writes nothing, and the earlier write settles first once it can", async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    // The index reads; the store's branch, read where the index settles, doesn't.
+    type Settled = (operation: string) => unknown;
+    const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+    const store = cm.getStore() as unknown as Record<string, unknown>;
+    const currentBranch = store.currentBranch as (this: unknown) => unknown;
+    const settled = index.settled;
+    let settling = false;
+    index.settled = function (this: unknown, operation: string) {
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
+    };
+    store.currentBranch = function (this: unknown) {
+      if (settling) throw new Error('zz-branch-read-failed');
+      return currentBranch.call(this);
+    };
+    try {
+      assert.throws(() => cm.retractRows([x]), (error: Error) => {
+        assert.match(error.message, /^ContextManager\.retractRows: the store can't say its branch/);
+        assert.ok(error.message.endsWith('zz-branch-read-failed'), error.message);
+        return true;
+      });
+    } finally {
+      delete (index as { settled?: unknown }).settled;
+      delete store.currentBranch;
+    }
+    assert.deepEqual(strategy.log, [], 'nothing is told while it waits');
+    assert.equal(cm.windowStatusOf(x), 'in', 'nothing was written');
+    cm.retractRows([x]);
+    assert.deepEqual(strategy.log, [`presented ${x}`, `retracted ${x}`], 'once the store says its branch, x is heard entering, then leaving');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 4, finding 13: where the store can't say its
   // branch before the write or after it, nothing waits, and the error says so.
   it("a write whose outcome is unknown, where the store can't say its branch before the write either, says nothing waits to tell the strategy", async () => {

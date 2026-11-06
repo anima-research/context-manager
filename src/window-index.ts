@@ -670,15 +670,25 @@ export class WindowIndex {
    * call's own write waits on if its outcome is unknown (afterThrow): read
    * here, before the write, so a store that can't say its branch once the
    * write has thrown doesn't drop it. Null where the store can't say it
-   * here either.
+   * here either, and nothing waits to be settled. Where something waits,
+   * a store that can't say its branch can't say whether it waits on this
+   * one, so this throws, settling nothing and writing nothing, as while
+   * the index can't be read: the write after it, once the store says its
+   * branch, settles it first.
    */
   private settled(operation: string): { state: IndexState; branch: string | null } {
     const state = this.current();
     let branch: { id: string; name: string };
     try {
       branch = this.store.currentBranch();
-    } catch {
-      return { state, branch: null };
+    } catch (error) {
+      if (this.unsettled.length === 0) return { state, branch: null };
+      throw new Error(
+        `ContextManager.${operation}: the store can't say its branch, so whether a window write whose outcome was ` +
+          'unknown waits to be settled on it, before this call, is unknown, and this call writes nothing; call it ' +
+          `again once the store says its branch: ${describeThrown(error)}`,
+        { cause: error },
+      );
     }
     const due = this.unsettled.filter((write) => write.branch === branch.id);
     if (due.length === 0) return { state, branch: branch.id };
