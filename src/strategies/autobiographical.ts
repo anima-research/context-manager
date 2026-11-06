@@ -7487,6 +7487,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * L1 is dropped and its record compressed again over the run in window
    * order, and such a record holds its run in window order.
    *
+   * The audit's index places only rows a chunk or an L1 owns, so a row
+   * presented again after a row no chunk owns (one in the recent window,
+   * or kept raw by a pin) stands next to the rest of them there. Where the
+   * window holds such a row between two owned rows that the record
+   * doesn't hold it between, the runs here are parted at it
+   * (withCrossingGaps), so an L1 over rows on both sides is dropped, and
+   * an L1's record, or an uncompressed one, trimmed to its longest run,
+   * as for a hole. A row the record holds between them too is one a
+   * summary may have been minted across before merges were kept apart at
+   * such rows, which the audit leaves as it stands, and so does this.
+   *
    * In legacy mode the window is the record and its rows never move, so a
    * non-contiguous summary there is a store the gate refuses, as it always
    * has; under `'report'` the gate records it for inspection, and an
@@ -7504,7 +7515,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const passes = this.summaries.length + 1;
     for (let pass = 0; pass < passes; pass++) {
       const violations = this.auditStoreTopology(messages);
-      const position = this.ownershipPositionIndex();
+      const owned = this.ownershipPositionIndex();
+      // The ownership index places only owned rows, so a row no chunk owns
+      // (recent, or kept raw by a pin) that a leaf was presented again
+      // after stands nowhere in it. Where the window holds such a row
+      // between two owned rows the record doesn't hold it between, it
+      // makes a gap (withCrossingGaps): an L1, or a record, over rows on
+      // both sides of it is split. One the record holds between them too
+      // makes none: a summary minted across it, which the audit leaves.
+      const position = withCrossingGaps(owned, messages);
       const outOfOrder = (ids: readonly MessageId[]): boolean => {
         let last = -1;
         for (const id of ids) {
@@ -7528,7 +7547,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const named = new Set(violations.map((v) => v.id));
       const live = this.liveL1Ids();
       const reordered = this.summaries
-        .filter((summary) => summary.level === 1 && live.has(summary.id) && !named.has(summary.id) && outOfOrder(summary.sourceIds))
+        .filter((summary) => summary.level === 1 && live.has(summary.id) && !named.has(summary.id) &&
+          (outOfOrder(summary.sourceIds) || windowRuns(summary.sourceIds, position).length > windowRuns(summary.sourceIds, owned).length))
         .map((summary) => summary.id);
       if (violations.length === 0 && reordered.length === 0 && split.size === 0) return;
       const l1s = new Set([...violations.filter((v) => v.level === 1).map((v) => v.id), ...reordered]);
@@ -22259,6 +22279,38 @@ function windowOrdered(ids: readonly MessageId[], place: ReadonlyMap<MessageId, 
  */
 function storedCanonicalJson(value: unknown): string {
   return canonicalJson(JSON.parse(storedJson(value).toString('utf8')));
+}
+
+/**
+ * `position`, an index of owned rows in window order (the ownership
+ * index), with a gap left after each owned row that a row `position`
+ * doesn't place follows in `listing` (the view, in window order), where
+ * that row's sequence isn't between those of the owned rows on either
+ * side of it: the window holds it between them and the record doesn't,
+ * so one of them, or it, was presented again since they were chunked.
+ * windowRuns then parts a run there. A row the record holds between them
+ * too makes no gap. An owned row the listing lacks keeps its place after
+ * every listed one.
+ */
+function withCrossingGaps(position: ReadonlyMap<MessageId, number>, listing: readonly StoredMessage[]): Map<MessageId, number> {
+  const gapped = new Map<MessageId, number>();
+  let shift = 0;
+  let previous: StoredMessage | undefined;
+  let between: StoredMessage[] = [];
+  for (const message of listing) {
+    const at = position.get(message.id);
+    if (at === undefined) {
+      if (previous) between.push(message);
+      continue;
+    }
+    const after = previous;
+    if (after && between.some((row) => !(after.sequence < row.sequence && row.sequence < message.sequence))) shift++;
+    between = [];
+    previous = message;
+    gapped.set(message.id, at + shift);
+  }
+  for (const [id, at] of position) if (!gapped.has(id)) gapped.set(id, at + shift);
+  return gapped;
 }
 
 /**

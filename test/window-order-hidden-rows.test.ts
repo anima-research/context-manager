@@ -1,7 +1,8 @@
 /**
  * The autobiographical strategy's reads of the window's order, where a
- * record holds a row the view filter hides, and where a merge's sources
- * cross (CM #350 bot review, wave 4, findings 6 and 24).
+ * record holds a row the view filter hides, where a merge's sources
+ * cross (CM #350 bot review, wave 4, findings 6 and 24), and where a row no
+ * chunk owns stands between an L1's leaves (wave 5, finding 14).
  *
  * The check an L1 or a merge makes for a row another instance took out and
  * presented again (rowsMovedInWindow) named a row at any inversion of the
@@ -21,6 +22,13 @@
  * holds together and released the rest, a hidden row among them, which the
  * view never lists, so no chunk took it again. A hidden row now stays in
  * the record.
+ *
+ * The demote judged runs and order by the ownership index, which places
+ * only owned rows: a row presented again after a row no chunk owns (in the
+ * recent window, or kept raw by a pin) stood next to the rest of its L1
+ * there, and the L1 was kept. The runs are now parted at such a row where
+ * the window holds it between two owned rows and the record doesn't; an
+ * L1 minted across it, which both hold between its leaves, stays.
  */
 
 import { describe, it, after } from 'node:test';
@@ -223,6 +231,78 @@ describe('a record that holds a row the view filter hides', () => {
     assert.ok(kept.sourceIds.includes(h), `the hidden row keeps its chunk ownership: ${JSON.stringify(kept)}`);
     assert.ok(internals(next).chunkRecords.filter((r) => r.sourceIds.includes(h)).length === 1, 'in one record');
     assert.deepEqual(kept.sourceIds, [...rows.filter((id) => id !== back), back], 'in window order');
+    cm.close();
+  });
+});
+
+/**
+ * A store holding the rows `stored` (TAG names, stored in that order) in a
+ * presented window, with `back` taken out and presented again, and an L1
+ * over `over` whose chunk record is compressed: seeded through a
+ * PassthroughStrategy, so no strategy heard the row go.
+ */
+async function seededL1(stored: string[], back: string | undefined, over: string[]) {
+  const path = freshPath();
+  const seed = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+  seed.presentRows([]);
+  const id = new Map<string, MessageId>();
+  for (const tag of stored) {
+    const row = seed.addMessage('User', [text(`${tag} ` + 'word '.repeat(60))]);
+    seed.presentRows([row]);
+    id.set(tag, row);
+  }
+  if (back) {
+    seed.retractRows([id.get(back)!], { undone: true });
+    seed.presentRows([id.get(back)!]);
+  }
+  const sourceIds = over.map((tag) => id.get(tag)!);
+  const l1 = {
+    id: 'L1-zz', level: 1, content: 's', tokens: 50, sourceLevel: 0, sourceIds,
+    sourceRange: { first: sourceIds[0]!, last: sourceIds.at(-1)! }, created: 1,
+  } as SummaryEntry;
+  const store = seed.getStore();
+  store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+  store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+  store.setStateJson('agent/autobio:summaries', [l1]);
+  store.setStateJson('agent/autobio:chunks', [{ id: 'c-zz', sourceIds, compressed: true, summaryId: l1.id }]);
+  const window = seed.getPresentedMessages().map((m) => m.id);
+  seed.close();
+  return { path, id, window };
+}
+
+describe("the open's demote, where a row no chunk owns stands between an L1's leaves", () => {
+  // Wave 5, finding 14: the demote judged order by the ownership index,
+  // which places only owned rows, so a row no chunk owns (recent, or kept
+  // raw by a pin) that a leaf was presented again after stood nowhere, and
+  // the L1 read as whole and in order.
+  it('demotes the L1 where a leaf was presented again after that row, which stood after it in the record', async () => {
+    const { path, id, window } = await seededL1(['TAG0', 'TAG1', 'TAG2'], 'TAG1', ['TAG0', 'TAG1']);
+    const [a, b, c] = ['TAG0', 'TAG1', 'TAG2'].map((tag) => id.get(tag)!);
+    assert.deepEqual(window, [a, c, b], 'premise: the window holds the unowned row between the leaves');
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    let cm!: ContextManager;
+    const lines = await linesDuring(async () => {
+      cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of 1 summary apart or out of order [L1-zz]')), lines.join('\n'));
+    assert.ok(!internals(strategy).summaries.some((s) => s.id === 'L1-zz'), 'the L1 is dropped');
+    const record = internals(strategy).chunkRecords.find((r) => r.id === 'c-zz');
+    assert.deepEqual(record?.sourceIds, [a], `its record keeps its longest run, and the leaf presented again is released: ${JSON.stringify(record)}`);
+    cm.close();
+  });
+
+  it('keeps an L1 minted across that row, which the window and the record both hold between its leaves', async () => {
+    const { path, id, window } = await seededL1(['TAG0', 'TAG1', 'TAG2'], undefined, ['TAG0', 'TAG2']);
+    const [a, b, c] = ['TAG0', 'TAG1', 'TAG2'].map((tag) => id.get(tag)!);
+    assert.deepEqual(window, [a, b, c], 'premise: the window holds the rows as the record does');
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    let cm!: ContextManager;
+    const lines = await linesDuring(async () => {
+      cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane().membrane });
+    });
+    assert.ok(!lines.some((line) => line.includes('the window holds the')), lines.join('\n'));
+    assert.ok(internals(strategy).summaries.some((s) => s.id === 'L1-zz'), 'the L1 stays');
+    assert.deepEqual(internals(strategy).chunkRecords.find((r) => r.id === 'c-zz')?.sourceIds, [a, c], 'and its record');
     cm.close();
   });
 });
