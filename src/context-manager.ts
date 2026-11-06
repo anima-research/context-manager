@@ -3938,7 +3938,14 @@ export class ContextManager {
    * So does a presentation of it that fails, or whose strategy hook closes
    * the manager, sets a strategy, moves the store's branch or takes the
    * transition out of the window again, and a read of the window, before
-   * the presentation or after it, that fails. An add of the
+   * the presentation or after it, that fails. Each such refusal says where
+   * the transition stands as the window and then the store tell it when
+   * the call refuses: presented, stored and out of the window, or no
+   * longer stored (a listener or a hook removed it); where they can't
+   * tell (the store is on another branch, or can't be read), it says what
+   * the call last knew, such as stored, or stored and maybe presented.
+   * Legacy mode reads no record before the reset itself, as before: a
+   * transition a listener removed there is reset at all the same. An add of the
    * transition that fails after storing it rejects with addMessage's
    * WriteLandedError, naming it, without resetting the head window, and one
    * where the store can't be read to tell whether it was stored rejects with
@@ -3956,16 +3963,25 @@ export class ContextManager {
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
     this.requireInitialized('resetHeadWindow', attempt);
 
+    // The branch the add stores the transition on, for whereNow below.
+    let addedOn: string | null;
+    try {
+      addedOn = this.store.currentBranch().id;
+    } catch {
+      addedOn = null;
+    }
+
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
       { type: 'text', text: `[Topic Transition]\n\n${summary}` },
     ], options?.metadata);
     // A listener of that add may have closed the manager, set a strategy or
     // moved the store's branch. The add stands and the strategy isn't told,
-    // and the refusal says the message is stored. It gives the reason without
-    // the advice to retry or to recover, and says instead what a later call
-    // that goes ahead does: it stores a second transition. After a close(), or
-    // while a strategy initializes, a later call refuses at once.
+    // and the refusal says where the message stands (whereNow). It gives the
+    // reason without the advice to retry or to recover, and says instead
+    // what a later call that goes ahead does: it stores a second transition.
+    // After a close(), or while a strategy initializes, a later call refuses
+    // at once.
     const refuse = (reason: string, where: string): Error =>
       new Error(
         `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
@@ -3973,10 +3989,37 @@ export class ContextManager {
           'another transition message.',
       );
     const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    // Where the transition stands now, for a refusal: a listener of its add,
+    // or a hook its presentation ran, can have presented it, taken it out of
+    // the window or removed it. The window, then the store, are asked, each
+    // read guarded. `known` is what the call knows where they can't tell:
+    // the store is on another branch than the one the add stored it on, or
+    // can't say its branch. `out` is where the window lacks it and the store
+    // holds it.
+    const whereNow = (known: string, out = 'stored'): string => {
+      try {
+        if (addedOn === null || this.store.currentBranch().id !== addedOn) return known;
+      } catch {
+        return known;
+      }
+      let inWindow: boolean | undefined;
+      try {
+        inWindow = this.windowIndex.ordinalOf(msgId) !== undefined;
+      } catch {
+        inWindow = undefined;
+      }
+      if (inWindow === true) return 'stored and presented';
+      try {
+        if (this.messageStore.sequenceOf(msgId) === undefined) return 'no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
+      } catch {
+        // The store can't say: it was stored.
+      }
+      return inWindow === undefined ? 'stored, and may be presented' : out;
+    };
     try {
       this.requireInitialized('resetHeadWindow', attempt, false);
     } catch (error) {
-      throw refuse(reasonOf(error), 'stored');
+      throw refuse(reasonOf(error), whereNow('stored'));
     }
 
     // Once rows are presented, the head window can start only at a row the
@@ -4001,7 +4044,7 @@ export class ContextManager {
     try {
       presenting = this.windowIndex.mode() === 'presented' && outOfWindow();
     } catch (error) {
-      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, 'stored, and may be presented');
+      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, whereNow('stored, and may be presented'));
     }
     if (presenting) {
       try {
@@ -4011,26 +4054,13 @@ export class ContextManager {
         // whether the transition is in it; where it can't be read, it may be.
         // One the window lacks may be gone from the store: a listener of its
         // add can remove it, and the presentation then refuses its id.
-        let where = 'stored';
-        try {
-          if (this.windowIndex.ordinalOf(msgId) !== undefined) where = 'stored and presented';
-        } catch {
-          where = 'stored, and may be presented';
-        }
-        if (where === 'stored') {
-          try {
-            if (this.messageStore.sequenceOf(msgId) === undefined) where = 'no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
-          } catch {
-            // The store can't say: it was stored.
-          }
-        }
-        throw refuse(`ContextManager.resetHeadWindow's presentation of its transition failed: ${reasonOf(error)}`, where);
+        throw refuse(`ContextManager.resetHeadWindow's presentation of its transition failed: ${reasonOf(error)}`, whereNow('stored'));
       }
       // The strategy's hook for the presentation may have done what a listener of the add can.
       try {
         this.requireInitialized('resetHeadWindow', attempt, false);
       } catch (error) {
-        throw refuse(reasonOf(error), 'stored and presented');
+        throw refuse(reasonOf(error), whereNow('stored and presented', 'stored and out of the window'));
       }
       // It may also have taken the transition out again, or a shard of it,
       // moving nothing else: the head window can't start at a row the
@@ -4039,10 +4069,16 @@ export class ContextManager {
       try {
         out = outOfWindow();
       } catch (error) {
-        throw refuse(`ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`, 'stored, and may be presented');
+        throw refuse(
+          `ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`,
+          whereNow('stored, and may be presented', 'stored and out of the window'),
+        );
       }
       if (out) {
-        throw refuse("ContextManager.resetHeadWindow: the strategy's hook for its transition's presentation took the transition out of the window", 'stored and out of the window');
+        throw refuse(
+          "ContextManager.resetHeadWindow: the strategy's hook for its transition's presentation took the transition out of the window",
+          whereNow('stored and out of the window', 'stored and out of the window'),
+        );
       }
     }
 

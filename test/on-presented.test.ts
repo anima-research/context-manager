@@ -1087,6 +1087,53 @@ describe('resetHeadWindow once a host presents', () => {
     await settle();
     cm.close();
   });
+
+  // CM #350 bot review, wave 4, finding 16: every refusal asks the window
+  // and the store where the transition stands, not only the presentation's.
+  it("a refusal after a listener or a hook removed the transition says it is no longer stored, whichever refusal it is", async () => {
+    for (const removes of ['listener, then close()', 'hook', 'hook, then close()'] as const) {
+      let cm!: ContextManager;
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+        onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          const transition = rows.find((m) => m.participant === 'Context Manager');
+          if (transition && removes !== 'listener, then close()') {
+            cm.removeMessage(transition.id);
+            if (removes === 'hook, then close()') cm.close();
+          }
+          return super.onPresented(rows, ctx);
+        }
+      }
+      const strategy = new Resettable();
+      // An app-owned store, which stays open after close(), so the store can be asked.
+      const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      let removed: MessageId | undefined;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || event.message.participant !== 'Context Manager') return;
+        removed = event.message.id;
+        if (removes === 'listener, then close()') {
+          cm.removeMessage(removed);
+          cm.close();
+        }
+      });
+      const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      assert.ok(removed !== undefined && owner.getMessage(removed) === null, `${removes}, setup: the transition was removed`);
+      assert.deepEqual(strategy.resets, [], `${removes}: the head window wasn't reset`);
+      assert.ok(!err.message.includes(`message ${removed} is stored`), `${removes}: ${err.message}`);
+      assert.ok(err.message.includes(`message ${removed} is no longer stored`), `${removes}: ${err.message}`);
+      await settle();
+      cm.close();
+      owner.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {
