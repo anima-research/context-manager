@@ -4563,12 +4563,55 @@ export class ContextManager {
     // once it is initialized, so they wait while one without a row hook
     // initializes too: a replacement set meanwhile hears them. They wait
     // too behind calls a delivery that failed to read left waiting, once
-    // those are tried again (callWaits).
+    // those are tried again (callWaits). A hook of those can move the
+    // store's branch itself, which starts no initialization: the rows then
+    // wait too, and are heard where the window of the branch the store is
+    // on holds them (deferPresented).
+    const scope = this.retryScope();
+    // Whether the rows entered a legacy window: read before a retried hook
+    // can move the store, where one may run; otherwise only if they wait.
+    let legacy: boolean | undefined;
+    if (scope !== null) {
+      try {
+        legacy = this.windowIndex.mode() === 'legacy';
+      } catch {
+        legacy = undefined;
+      }
+    }
     if (this.callWaits()) {
-      this.waitToBeHeard(rows, this.windowIndex.mode() === 'legacy');
+      this.waitToBeHeard(rows, legacy ?? this.windowIndex.mode() === 'legacy');
+      return;
+    }
+    if (!this.leftInScope(scope)) {
+      this.deferPresented(rows, legacy ?? false);
       return;
     }
     this.tellPresented(rows);
+  }
+
+  /**
+   * The hook scope a notification's own call is made under, read before it
+   * tries again the calls a failed delivery left waiting (callWaits), whose
+   * hooks can move the store's branch: null where nothing waits, so no
+   * hook runs, and where the store can't say its branch.
+   */
+  private retryScope(): ReturnType<ContextManager['hookScope']> | null {
+    if (!this.unheardWaiting()) return null;
+    try {
+      return this.hookScope();
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether the retried calls' hooks left the manager as `scope` found it (inHookScope); true for no scope, false where the check throws. */
+  private leftInScope(scope: ReturnType<ContextManager['hookScope']> | null): boolean {
+    if (scope === null) return true;
+    try {
+      return this.inHookScope(scope);
+    } catch {
+      return false;
+    }
   }
 
   /** Make notifyPresented's call of the initialized strategy, now. */
@@ -4718,11 +4761,18 @@ export class ContextManager {
     if (left.length === 0 || this.closed) return;
     // As notifyPresented's rows, the call waits for the manager's strategy,
     // whether or not the one initializing has the hook, and behind calls a
-    // delivery that failed to read left waiting.
+    // delivery that failed to read left waiting; and, where a hook of those
+    // moved the store's branch itself, it is made for the rows that left
+    // the window of the branch the store is on (deferRetracted).
+    const scope = this.retryScope();
     if (this.callWaits()) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
       this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
+      return;
+    }
+    if (!this.leftInScope(scope)) {
+      this.deferRetracted(left, info);
       return;
     }
     this.tellRetracted(left, info);
@@ -4762,6 +4812,9 @@ export class ContextManager {
    * still wait once those a delivery that failed to read left waiting have
    * been tried again, and where a hook of those retried calls set a
    * strategy or started an initialization, which the call then waits for.
+   * A hook of theirs that moves the store's branch itself starts none: the
+   * notification checks that apart (retryScope), and its call is then made
+   * for the rows the window of the branch the store is on holds, or left.
    */
   private callWaits(): boolean {
     if (this.initializedAttempt !== this.initializationAttempt) return true;

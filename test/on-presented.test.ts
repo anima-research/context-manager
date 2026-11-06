@@ -493,6 +493,67 @@ describe('onPresented in presented mode', () => {
     }
   });
 
+  // CM #350 bot review, wave 4, finding 28: a retried call's hook can move
+  // the store's branch itself, which starts no initialization.
+  it("a notification whose retried call's hook moves the store's branch itself is made where that branch's window holds its rows", async () => {
+    for (const next of ['presentRows', 'retractRows'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const store = cm.getStore();
+      cm.presentRows([]);
+      const x = cm.addMessage('alice', [text('x')]);
+      const y = cm.addMessage('bob', [text('y')]);
+      cm.presentRows(next === 'presentRows' ? [x] : [x, y]);
+      const start = cm.currentBranch().name;
+      // Made now: its window lacks y where y is presented next, and holds it
+      // where y is taken out next.
+      const other = store.createBranchAt('zz-other', start, store.currentSequence()).name;
+      class Moves extends GatedRecords {
+        moves = true;
+        async onRetracted(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean }): Promise<void> {
+          if (this.moves) {
+            this.moves = false;
+            store.switchBranch(other);
+          }
+          return super.onRetracted(rows, ctx, info);
+        }
+      }
+      const strategy = new Moves();
+      const { gate, open } = gated();
+      strategy.gate = gate;
+      const initialized = cm.setStrategy(strategy);
+      cm.retractRows([x]);
+      // The delivery's read of the record throws, once: the call waits.
+      const reads = cm as unknown as { mergedMessageView: () => unknown };
+      const read = reads.mergedMessageView;
+      let fail = true;
+      reads.mergedMessageView = function (this: unknown) {
+        if (fail) {
+          fail = false;
+          throw new Error('zz-record-read-failed');
+        }
+        return read.call(this);
+      };
+      try {
+        await errorsDuring(async () => {
+          open();
+          await initialized;
+        });
+      } finally {
+        delete (reads as { mergedMessageView?: unknown }).mergedMessageView;
+      }
+      assert.equal(strategy.retracted.length, 0, `${next}, setup: the call waits`);
+      if (next === 'presentRows') cm.presentRows([y]);
+      else cm.retractRows([y]);
+      assert.equal(cm.currentBranch().name, other, `${next}, setup: the retried call's hook moved the store`);
+      assert.deepEqual(strategy.retracted.map((r) => r.rows), [[x]], `${next}: the call that waited was made, on the branch it was made for`);
+      if (next === 'presentRows') assert.deepEqual(strategy.heard, [], "y isn't heard entering a window that never held it");
+      else assert.notEqual(cm.ordinalOf(y), undefined, `${next}, setup: the branch's window holds y`);
+      if (next === 'retractRows') assert.equal(strategy.retracted.length, 1, "y isn't heard leaving a window that holds it");
+      await settle();
+      cm.close();
+    }
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.
