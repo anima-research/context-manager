@@ -49,6 +49,7 @@ after(() => {
 
 const SUMMARIES = 'default/autobio:summaries';
 const CHUNKS = 'default/autobio:chunks';
+const QUEUE = 'default/autobio:mergeQueue';
 
 /** console.error's and console.warn's calls while `fn` runs. */
 async function linesDuring(fn: () => Promise<void>): Promise<string[]> {
@@ -66,16 +67,17 @@ async function linesDuring(fn: () => Promise<void>): Promise<string[]> {
   return lines;
 }
 
-/** A membrane that holds each call until the test releases it, noting whether it asks for a merge. */
+/** A membrane that holds each call until the test releases it (or fails it), noting whether it asks for a merge. */
 function heldMembrane() {
-  const calls: Array<{ merge: boolean; release: () => void }> = [];
+  const calls: Array<{ merge: boolean; release: () => void; fail: (error: Error) => void }> = [];
   const membrane = {
-    complete: (request: { messages: Array<{ content: Array<{ text?: string }> }> }) => new Promise((resolve) => {
+    complete: (request: { messages: Array<{ content: Array<{ text?: string }> }> }) => new Promise((resolve, reject) => {
       const n = calls.length + 1;
       const input = request.messages.flatMap((m) => m.content).map((b) => b.text ?? '').join('\n');
       calls.push({
         merge: input.includes('consolidate into a single L'),
         release: () => resolve({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${n}` }] }),
+        fail: reject,
       });
     }),
   } as never;
@@ -763,6 +765,62 @@ describe('a retraction through another instance sharing the store', () => {
         assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), 'the instance took up the store');
         assert.equal(calls.length, before, `no call is made: ${lines.join('\n')}`);
         assert.ok(lines.some((line) => line.includes(`not compressing chunk ${recordId}`)), `the log says why: ${lines.join('\n')}`);
+      } finally {
+        for (const call of calls) call.release();
+        b?.close();
+        a.close();
+        store.close();
+      }
+    });
+  }
+
+  // Wave 5, finding 6: a provider's rejection of the merge's call left
+  // through the catch, which asked only whether the branch was current, and
+  // tick counted it against the entry (recordMergeRejection), whose check
+  // is only that this instance's queue still holds it: it wrote this
+  // instance's queue whole, putting back the entry the other instance
+  // removed, or quarantined the obsolete group at the limit.
+  for (const limit of [5, 1] as const) {
+    it(`a merge whose call the provider rejects, after the other instance dropped a source, counts nothing and writes nothing (attempt limit ${limit})`, async () => {
+      const make = () => new AutobiographicalStrategy({
+        compressionModel: 'm',
+        targetChunkTokens: 50,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        autoTickOnNewMessage: false,
+        minChunkCharsForLLM: 0,
+        l1HoldbackChunks: 0,
+        mergeThreshold: 2,
+        maxSpeculativeL1s: 1,
+        mergeAttemptLimit: limit,
+      });
+      const { store, strategy: A, cm: a, calls, membrane } = await instanceA(make);
+      let b: ContextManager | undefined;
+      try {
+        for (let n = 1; n <= 2; n++) {
+          const ticking = a.tick();
+          await waitFor(() => calls.length === n);
+          calls[n - 1]!.release();
+          await ticking;
+        }
+        const merging = a.tick();
+        await waitFor(() => calls.length === 3);
+        const work = internals(A).pendingCompressionWork;
+        assert.ok(work && 'sourceIds' in work && calls[2]!.merge, 'premise: a merge is in flight');
+        const source = work.sourceIds[0]!;
+        const row = internals(A).summaries.find((s) => s.id === source)!.sourceIds[0]!;
+        const naming = () => stored(store, QUEUE).filter((entry) => entry.sourceIds.includes(source));
+
+        b = await ContextManager.open({ store, strategy: make(), membrane });
+        const lines = await linesDuring(async () => {
+          b!.retractRows([row], { undone: true });
+          assert.deepEqual(naming(), [], "premise: the other instance's let-go removed the queued merge from the store");
+          calls[2]!.fail(Object.assign(new Error('zz invalid_request failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 }));
+          await merging.catch(() => {});
+        });
+        assert.deepEqual(naming(), [], `the store's queue doesn't hold the merge again: ${lines.join('\n')}`);
+        assert.equal(A.getMergeQuarantineStatus().count, 0, `nothing is quarantined: ${lines.join('\n')}`);
+        assert.ok(lines.some((line) => line.includes("merge's call was out") && line.includes('its rejection is not counted')), lines.join('\n'));
       } finally {
         for (const call of calls) call.release();
         b?.close();

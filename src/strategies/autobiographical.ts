@@ -9133,6 +9133,76 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Whether the merge of `sources` was overtaken while its call was out,
+   * which executeMerge asks after the call, whatever it answered: the
+   * checks at entry made again, each logged with `outcome`, what the merge
+   * then doesn't do. Returns true where it writes nothing:
+   *
+   * - A source parented meanwhile (parentedMergeSources): another merge of
+   *   these sources was written, by another instance sharing the store
+   *   (taken up here, as at entry) or by any other path that brings two
+   *   merges of one group together. Its queue entry goes as a finished
+   *   merge's does. Where this instance took up the store's state, the
+   *   store's queue has replaced its own, and an entry for these sources
+   *   still in it goes when a later tick reaches it and the entry check
+   *   finds them parented.
+   * - A source dropped, a row under it having left the window: this
+   *   instance's onRetracted dropped it, or another instance sharing the
+   *   store did, and the read above took up the store's state, which no
+   *   longer holds it. A merge of it would cover that row again. Its queue
+   *   entry went with the source. Where the read took up the store's
+   *   state, the chunks are rebuilt from its records, as at entry.
+   * - A row under a source out of the window through another instance
+   *   sharing the store, whose summaries still hold the source, that
+   *   instance's writes after the window's tombstone having failed: this
+   *   one lets go of the row, as at entry. So with a row that left and was
+   *   presented again, whose ordinal isn't the one read at entry
+   *   (`leafOrdinals`; rowsMovedInWindow).
+   */
+  private mergeOvertakenDuringCall(
+    sources: readonly SummaryEntry[],
+    targetLevel: number,
+    leafOrdinals: ReadonlyMap<MessageId, number> | undefined,
+    ctx: StrategyContext,
+    outcome: string,
+  ): boolean {
+    const summariesBefore = this.summaries;
+    const parentedSince = this.parentedMergeSources(sources);
+    if (parentedSince.length > 0) {
+      this.diag.warn(
+        `executeMerge: ${parentedSince.length}/${sources.length} source(s) parented while the L${targetLevel} ` +
+          `merge's call was out (${parentedSince.join(', ')}); ${outcome}`,
+      );
+      return true;
+    }
+    const tookUpStore = this.summaries !== summariesBefore;
+    const droppedSince = sources.filter((source) => !this.summaryById(source.id));
+    if (droppedSince.length > 0) {
+      this.diag.warn(
+        `executeMerge: ${droppedSince.length}/${sources.length} source(s) dropped while the L${targetLevel} ` +
+          `merge's call was out, a row under them having left the window` +
+          `${tookUpStore ? ' of another instance sharing the store' : ''} ` +
+          `(${droppedSince.map((source) => source.id).join(', ')}); ${outcome}`,
+      );
+      if (tookUpStore) this.rebuildChunks(ctx.messageStore);
+      return true;
+    }
+    const leafRowsSince = this.leafRowsOf(sources);
+    const outSince = this.rowsOutOfWindow(leafRowsSince, ctx);
+    const movedSince = this.rowsMovedInWindow(leafRowsSince, ctx, leafOrdinals).filter((id) => !outSince.includes(id));
+    if (outSince.length > 0 || movedSince.length > 0) {
+      this.diag.warn(
+        `executeMerge: row(s) [${[...outSince, ...movedSince].join(', ')}] under its sources left the window while the L${targetLevel} ` +
+          `merge's call was out${movedSince.length > 0 ? ` (and [${movedSince.join(', ')}] were presented again elsewhere in it)` : ''}, ` +
+          `through another instance sharing the store, which this one did not hear; ${outcome}`,
+      );
+      this.letGoOfRowsOutOfWindow([...outSince, ...movedSince], ctx);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * The ids of `sources` a merge may no longer parent: each this instance
    * holds as parented, or the store's summary list does. A parent only the
    * store holds means the store has changed since this instance loaded, as
@@ -14043,6 +14113,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the generation's end makes one too.
     const stale = (error: unknown): boolean =>
       !isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch);
+    const rejectedObsolete = (error: unknown): boolean =>
+      compressionFailureKind(error) === 'rejection' &&
+      this.mergeOvertakenDuringCall(sources, targetLevel, leafOrdinals, ctx, 'its rejection is not counted, and nothing is written');
     // Preparing the request can run a subclass's prepareCompressionRequest(),
     // so the currency is checked again just before the call, as each L1
     // attempt checks it: a generation ended there makes no call.
@@ -14057,6 +14130,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // An error on work that lost its currency is discarded as its result
         // would be, before the carrier fallback: no second call follows.
         if (stale(error)) return false;
+        // A request-attributable rejection is counted against the queue
+        // entry (recordMergeRejection, through tick), which writes the queue
+        // whole, or quarantines the group at the limit. So the checks after
+        // the call are made first: where another merge parented a source
+        // meanwhile, or a row under one left the window (this instance's
+        // onRetracted, or another instance sharing the store, whose writes
+        // this one takes up here), the work is obsolete, and the rejection
+        // is dropped with it, writing nothing and making no second call.
+        if (rejectedObsolete(error)) return false;
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly. Only a failure
         // classified as a request-attributable rejection qualifies, which a
@@ -14083,6 +14165,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } catch (retryError) {
           noteDispatchedModel(retryError, acceptedRequest);
           if (stale(retryError)) return false;
+          if (rejectedObsolete(retryError)) return false;
           throw retryError;
         }
       }
@@ -14099,62 +14182,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const requestHash = sha256Json(acceptedRequest);
       if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
-      // A summary has one parent, so the check at entry is made again here,
-      // after the call: while the call was out, another merge of these
-      // sources may have been written, by another instance sharing the store
-      // (taken up here, as at entry) or by any other path that brings two
-      // merges of one group together. This one writes nothing, and its queue
-      // entry goes as a finished merge's does. Where this instance took up
-      // the store's state, the store's queue has replaced its own, and an
-      // entry for these sources still in it goes when a later tick reaches
-      // it and the entry check finds them parented. Nothing below awaits
+      // A summary has one parent, and a source a row under it left the
+      // window with is dropped, so the checks at entry are made again here,
+      // after the call (mergeOvertakenDuringCall). Nothing below awaits
       // before the writes.
-      const summariesBefore = this.summaries;
-      const parentedSince = this.parentedMergeSources(sources);
-      if (parentedSince.length > 0) {
-        this.diag.warn(
-          `executeMerge: ${parentedSince.length}/${sources.length} source(s) parented while the L${targetLevel} ` +
-            `merge's call was out (${parentedSince.join(', ')}); its summary is not written`,
-        );
-        return false;
-      }
-      // A row under a source left the window while the call was out, which
-      // dropped the source: this instance's onRetracted dropped it, or
-      // another instance sharing the store did, and the read above took up
-      // the store's state, which no longer holds it. A merge of it would
-      // cover that row again. It writes nothing, and its queue entry went
-      // with the source. Where the read took up the store's state, the
-      // chunks are rebuilt from its records, as at entry.
-      const tookUpStore = this.summaries !== summariesBefore;
-      const droppedSince = sources.filter((source) => !this.summaryById(source.id));
-      if (droppedSince.length > 0) {
-        this.diag.warn(
-          `executeMerge: ${droppedSince.length}/${sources.length} source(s) dropped while the L${targetLevel} ` +
-            `merge's call was out, a row under them having left the window` +
-            `${tookUpStore ? ' of another instance sharing the store' : ''} ` +
-            `(${droppedSince.map((source) => source.id).join(', ')}); its summary is not written`,
-        );
-        if (tookUpStore) this.rebuildChunks(ctx.messageStore);
-        return false;
-      }
-      // A row under a source left the window through another instance
-      // sharing the store while the call was out, and the store's summaries
-      // still hold the source, that instance's writes after the window's
-      // tombstone having failed: this one lets go of the row, as at entry.
-      // So with a row that left and was presented again, whose ordinal
-      // isn't the one read at entry (rowsMovedInWindow).
-      const leafRowsSince = this.leafRowsOf(sources);
-      const outSince = this.rowsOutOfWindow(leafRowsSince, ctx);
-      const movedSince = this.rowsMovedInWindow(leafRowsSince, ctx, leafOrdinals).filter((id) => !outSince.includes(id));
-      if (outSince.length > 0 || movedSince.length > 0) {
-        this.diag.warn(
-          `executeMerge: row(s) [${[...outSince, ...movedSince].join(', ')}] under its sources left the window while the L${targetLevel} ` +
-            `merge's call was out${movedSince.length > 0 ? ` (and [${movedSince.join(', ')}] were presented again elsewhere in it)` : ''}, ` +
-            'through another instance sharing the store, which this one did not hear; its summary is not written',
-        );
-        this.letGoOfRowsOutOfWindow([...outSince, ...movedSince], ctx);
-        return false;
-      }
+      if (this.mergeOvertakenDuringCall(sources, targetLevel, leafOrdinals, ctx, 'its summary is not written')) return false;
 
       // Terminal-disposition gate (2026-08-01): a consolidation may become
       // canonical only after a COMPLETE accepted disposition — `end_turn` +
