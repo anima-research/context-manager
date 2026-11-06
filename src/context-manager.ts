@@ -4454,7 +4454,7 @@ export class ContextManager {
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          if (this.stillOnRemovalBranch(removedOn, [event.messageId])) this.retractOnRemoval([event.messageId], removing?.rows ?? []);
+          if (this.stillOnRemovalBranch(removedOn, [event.messageId])) this.retractOnRemoval([event.messageId], removing?.rows ?? [], removedOn);
         }
         break;
       }
@@ -4488,7 +4488,7 @@ export class ContextManager {
           // merges would read as removed and leave the window for good. The
           // rows leave the window even when the pruning throws, as the
           // 'remove' case's row does.
-          if (removing && this.stillOnRemovalBranch(removedOn, removing.ids)) this.retractOnRemoval(removing.ids, removing.rows);
+          if (removing && this.stillOnRemovalBranch(removedOn, removing.ids)) this.retractOnRemoval(removing.ids, removing.rows, removedOn);
         }
         break;
       }
@@ -4556,8 +4556,16 @@ export class ContextManager {
    * nothing to do. A failure of the manager's own work telling it (the
    * context it builds) is logged too, and the call waits, to be made at the
    * strategy's next notification, as a call made while it initializes does.
+   *
+   * `removedOn` is the branch the removal was made on (removalBranch). The
+   * tombstones' write first settles a write whose outcome was unknown, and
+   * a hook that hears it can move the store's branch, which makes the write
+   * refuse (WindowIndex.settled): then no strategy is told, as where the
+   * hold-release hook moved it (stillOnRemovalBranch), since the rows read
+   * before are of the removal's branch, and the window of the branch the
+   * store is on now may hold them.
    */
-  private retractOnRemoval(ids: readonly MessageId[], removed: readonly StoredMessage[]): void {
+  private retractOnRemoval(ids: readonly MessageId[], removed: readonly StoredMessage[], removedOn: { id: string; name: string } | null): void {
     // The rows the window held, in window order; null while the index
     // hasn't been read.
     let held: RetractedRow[] | null = null;
@@ -4587,6 +4595,7 @@ export class ContextManager {
         `the window leaves them out of what it lists, and their ordinals stay issued until retractAbsentRows takes them ` +
         `out, unless the store kept the tombstone before it threw:`;
       logThrown(message.replaceAll('%', '%%'), err, this.diag);
+      if (!this.stillOnRemovalBranch(removedOn, ids)) return;
     }
     const told = held ?? [...new Set(ids)].map((id): RetractedRow => ({ id }));
     if (told.length === 0) return;

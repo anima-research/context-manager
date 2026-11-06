@@ -702,6 +702,38 @@ describe("a hook that hears what an unknown write did, and moves the store's bra
     assert.deepEqual(strategy.log, [`presented ${x}`]);
     cm.close();
   });
+
+  // CM #350 bot review, wave 5, finding 16: a removal's settlement can run
+  // that hook too, which makes the tombstones' write refuse; the rows read
+  // before it aren't told then, on the branch the store moved to.
+  it("a removal whose settlement's hook moves the store tells no strategy of the removed row, and leaves the other branch's window as it was", async () => {
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const a = cm.addMessage('alice', [text('a')]);
+    cm.presentRows([a]);
+    // Made now: its record and its window hold a.
+    const side = store.createBranchAt('zz-side', cm.currentBranch().name, store.currentSequence()).name;
+    const x = cm.addMessage('alice', [text('x')]);
+    presentUnread(cm, x);
+    strategy.log.length = 0;
+    strategy.to = side;
+    const error = console.error;
+    console.error = () => {};
+    let warned: string[];
+    try {
+      ({ warned } = await warnings(async () => cm.removeMessage(a)));
+    } finally {
+      console.error = error;
+    }
+    assert.equal(cm.currentBranch().name, side, 'setup: the settlement\'s hook moved the store');
+    assert.deepEqual(strategy.log, [`presented ${x}`], 'the earlier write is settled, once, and no strategy is told a left');
+    assert.ok(warned.some((line) => line.includes("moved the store's branch") && line.includes(`removed message ${a}`)), warned.join('\n'));
+    assert.equal(cm.windowStatusOf(a), 'in', "the other branch's window still holds a");
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
 });
 
 describe('a window state that holds no index this version reads', () => {
