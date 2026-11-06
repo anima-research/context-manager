@@ -1637,11 +1637,13 @@ export class ContextManager {
 
   /**
    * Refuses a branch cut asked for while a sharded addMessage stores its
-   * shards (branchAt, branchSequenceOf): the record holds only the shards
-   * stored so far, so the cut would come before the body's last shard, and
-   * the new branch's record would hold part of the body.
+   * shards (branchAt, branchSequenceOf, and fork and derive, which cut at
+   * the head): the record holds only the shards stored so far, so the cut
+   * would come before the body's last shard, and the new branch's record
+   * would hold part of the body. A fork would also move the store's branch,
+   * which stops the write.
    */
-  private refuseCutWhileWritingShards(operation: 'branchAt' | 'branchSequenceOf'): void {
+  private refuseCutWhileWritingShards(operation: 'branchAt' | 'branchSequenceOf' | 'fork' | 'derive'): void {
     if (!this.writingShards) return;
     throw new Error(
       `ContextManager.${operation} refused: a sharded addMessage is storing its shards, and a cut now would come before ` +
@@ -1711,10 +1713,11 @@ export class ContextManager {
    * microtask or later) instead. Nor may it remove a message then
    * (removeMessage, removeMessages on this manager are refused, as a
    * removal could split the body or move the rows the sharded
-   * write removes if it fails), nor ask for a branch cut (branchAt and
-   * branchSequenceOf on this manager are refused, as the record holds only
-   * the shards stored so far), or move the store's branch: the sharded
-   * write stops before its next shard and throws (WriteLandedError). A listener
+   * write removes if it fails), nor ask for a branch cut (branchAt,
+   * branchSequenceOf, fork and derive on this manager are refused, as the
+   * record holds only the shards stored so far), or move the store's
+   * branch: the sharded write stops before its next shard and throws
+   * (WriteLandedError). A listener
    * that throws is logged, naming the message it missed, and the write it
    * heard stands: the throw doesn't reach the caller. A listener that calls
    * close() lets the write that ran it finish (see close()). Each call
@@ -2653,8 +2656,14 @@ export class ContextManager {
    * newer initialization supersedes this one, the call rejects with
    * InitializationSupersededError naming the branch it created, so a caller
    * never retries a fork to learn whether it happened.
+   *
+   * A fork made while a sharded addMessage of this manager stores its
+   * shards (from an onMessage listener of a shard's add) is refused before
+   * it makes a branch, as branchAt is: the head holds only the shards
+   * stored so far, and the move would stop the write.
    */
   async fork(name?: string): Promise<string> {
+    this.refuseCutWhileWritingShards('fork');
     this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
     const currentBranch = this.store.currentBranch();
@@ -2723,8 +2732,14 @@ export class ContextManager {
    *
    * The derived context persists. Keep `getDerivation()` and reopen it
    * later with {@link ContextManager.reopenDerived}.
+   *
+   * A derive made while a sharded addMessage of this manager stores its
+   * shards (from an onMessage listener of a shard's add) is refused before
+   * it makes a branch, as branchAt is: the checkpoint would hold only the
+   * shards stored so far.
    */
   async derive(options: DeriveContextOptions): Promise<ContextManager> {
+    this.refuseCutWhileWritingShards('derive');
     if (!ContextManager.supportsDerivation(this.store)) {
       throw new ContextDerivationUnsupportedError();
     }

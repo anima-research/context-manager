@@ -892,6 +892,36 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 2: fork() cuts at the head and moves
+  // the store there, and derive() cuts a child at the head, so either would
+  // hold only the shards stored so far.
+  it('a fork or derive while a sharded addMessage stores its shards is refused, saying why, and the body is stored whole on the branch it started on', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
+    const start = cm.currentBranch().name;
+    const refusals: Array<[string, Promise<unknown>]> = [];
+    let first = true;
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || !first) return;
+      first = false;
+      refusals.push(['fork', cm.fork('zz-mid-add-fork')]);
+      refusals.push(['derive', cm.derive({ branch: 'zz-mid-add-derive', strategy: new PassthroughStrategy() })]);
+    });
+    const doc = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+    assert.equal(refusals.length, 2, 'setup: both were asked for');
+    for (const [operation, refusal] of refusals) {
+      await assert.rejects(refusal, (err: Error) => {
+        assert.match(err.message, new RegExp(`^ContextManager\\.${operation} refused: a sharded addMessage is storing its shards`), operation);
+        assert.match(err.message, /whole body/, operation);
+        return true;
+      });
+    }
+    assert.ok(!cm.listBranches().some((b) => b.name.startsWith('zz-mid-add')), 'no branch was made');
+    assert.equal(cm.currentBranch().name, start, 'the store stayed on the branch the add started on');
+    assert.deepEqual(cm.getAllMessages().map(textOf), ['one ', 'two ', 'three'], 'the body is stored whole');
+    assert.equal(cm.getAllMessages()[0]!.id, doc);
+    cm.close();
+  });
+
   it("a listener that moves the store's branch between shards stops the write: the error names the shards stored, on the branch it started on", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
     cm.addMessage('bob', [text('before')]);

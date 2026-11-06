@@ -44,4 +44,9 @@
     such a listener, after it presents a shard) is refused too, with an error
     that says the cut would come before the body's later shards. Before, the
     cut was taken over the shards stored so far, so the new branch's record
-    held part of the body, though `branchAt` promises the whole body.
+    held part of the body, though `branchAt` promises the whole body. So are
+    a `fork` and a `derive` on the same manager made then, before either
+    makes a branch: each cuts at the head, which holds only the shards stored
+    so far. Before, a fork moved the store, so the body's later shards landed
+    on the new branch and the branch the write started on kept only the
+    first, and a derive's child held part of the body.
