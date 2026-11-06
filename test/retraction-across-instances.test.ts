@@ -14,13 +14,23 @@
  * merge source the stored summaries lack, or an L1's chunk record changed
  * in the store since the compression began, writes nothing, and the
  * instance takes up the store's state.
+ *
+ * Wave 2 (findings 5, 7 and 39): those reads judged by the store's chunk
+ * records and summaries alone. A KnowledgeStrategy keeps no chunk records,
+ * and the other instance writes its own after the window's tombstone, so a
+ * write of theirs that failed left them unchanged: either way the L1, or
+ * the merge, was written over the row. An exhaustion asked only its own
+ * instance's mark, and quarantined the obsolete span. Each now also asks
+ * the window, which the other instance's tombstone changed: a row of the
+ * span out of it writes nothing, and the instance lets go of it, as its
+ * onRetracted would have.
  */
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy } from '../src/index.js';
 import type { MessageId, SummaryEntry } from '../src/index.js';
 
 const BASE = './test-retraction-across-instances';
@@ -99,12 +109,44 @@ interface Internals {
 }
 const internals = (strategy: AutobiographicalStrategy) => strategy as unknown as Internals;
 
+/** A membrane that holds its first call until the test releases it, then answers every call with empty text. */
+function emptyMembrane() {
+  let calls = 0;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const membrane = {
+    complete: async () => {
+      calls++;
+      await released;
+      return { stopReason: 'end_turn', content: [{ type: 'text', text: '' }], usage: { input_tokens: 10, output_tokens: 1 } };
+    },
+  } as never;
+  return { calls: () => calls, release, membrane };
+}
+
+/**
+ * Run `fn` with the store refusing every write of `ids` (setStateJson), as a
+ * write that fails after the window's tombstone landed does.
+ */
+function refusingWrites<T>(store: JsStore, ids: readonly string[], fn: () => T): T {
+  const real = store.setStateJson.bind(store);
+  (store as unknown as { setStateJson: typeof real }).setStateJson = (id: string, value: unknown) => {
+    if (ids.includes(id)) throw new Error(`zz the store refused the write of ${id}`);
+    return real(id, value);
+  };
+  try {
+    return fn();
+  } finally {
+    (store as unknown as { setStateJson: typeof real }).setStateJson = real;
+  }
+}
+
 /** Instance A on a fresh store, its window holding 24 presented rows. */
-async function instanceA() {
+async function instanceA(make: () => AutobiographicalStrategy = strategyFor) {
   const path = freshPath();
   const store = JsStore.openOrCreate({ path });
   const held = heldMembrane();
-  const strategy = strategyFor();
+  const strategy = make();
   const cm = await ContextManager.open({ store, strategy, membrane: held.membrane });
   cm.presentRows([]);
   for (let i = 0; i < 24; i++) {
@@ -234,6 +276,200 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'nothing folded since covers the row');
     } finally {
       for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it('an L1 in flight in a KnowledgeStrategy over a row the other instance took out writes nothing', async () => {
+    // A KnowledgeStrategy keeps no chunk records, so the store's record
+    // can't say that the row left: the window does.
+    const knowledgeFor = () => new KnowledgeStrategy({
+      compressionModel: 'm',
+      targetChunkTokens: 50,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 2,
+      maxSpeculativeL1s: 1,
+    });
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA(knowledgeFor);
+    let b: ContextManager | undefined;
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const span = work.chunk.messages.map((m) => m.id);
+      assert.ok(span.length >= 2, `premise: the span holds rows to take out: ${span.join()}`);
+      const row = span[1]!;
+
+      b = await ContextManager.open({ store, strategy: knowledgeFor(), membrane });
+      const lines = await linesDuring(async () => {
+        b!.retractRows([row], { undone: true });
+        assert.equal(a.windowStatusOf(row), 'undone', 'premise: the row is out of the window the instances share');
+        calls[0]!.release();
+        await ticking;
+      });
+      assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
+      const summaries = stored(store, SUMMARIES);
+      assert.ok(summaries.every((s) => !s.sourceIds.includes(row)), `no summary covers the row: ${JSON.stringify(summaries)}`);
+      assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), 'nor does one the instance holds');
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it("an L1 in flight over a row the other instance took out, whose own writes then failed, writes nothing and lets go of the row", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const span = work.chunk.messages.map((m) => m.id);
+      const recordId = work.chunk.recordId!;
+      const row = span[1]!;
+
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      const lines = await linesDuring(async () => {
+        refusingWrites(store, [SUMMARIES, CHUNKS], () => { b!.retractRows([row], { undone: true }); });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(a.windowStatusOf(row), 'undone', 'premise: the tombstone landed');
+        assert.ok(stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), "premise: the other instance's record write failed");
+        calls[0]!.release();
+        await ticking;
+      });
+      assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
+      assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
+      const summaries = stored(store, SUMMARIES);
+      assert.ok(summaries.every((s) => !s.sourceIds.includes(row)), `no summary covers the row: ${JSON.stringify(summaries)}`);
+      assert.ok(
+        stored(store, CHUNKS).every((r) => !r.sourceIds.includes(row)),
+        `the instance let go of the row, as its onRetracted would have: ${JSON.stringify(stored(store, CHUNKS))}`,
+      );
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it("a merge in flight over a row the other instance took out, whose own writes then failed, writes nothing", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const merging = a.tick();
+      await waitFor(() => calls.length === 3);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'sourceIds' in work && calls[2]!.merge, 'premise: a merge is in flight');
+      const source = work.sourceIds[0]!;
+      const row = internals(A).summaries.find((s) => s.id === source)!.sourceIds[0]!;
+
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      const lines = await linesDuring(async () => {
+        refusingWrites(store, [SUMMARIES, CHUNKS], () => { b!.retractRows([row], { undone: true }); });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(a.windowStatusOf(row), 'undone', 'premise: the tombstone landed');
+        assert.ok(stored(store, SUMMARIES).some((s) => s.id === source), "premise: the other instance's summaries write failed");
+        calls[2]!.release();
+        await merging;
+      });
+      assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
+      const after = stored(store, SUMMARIES);
+      assert.ok(after.every((s) => !s.sourceIds.includes(source)), `no summary was written over ${source}: ${lines.join('\n')}`);
+      assert.ok(after.every((s) => !s.sourceIds.includes(row)), `the instance let go of the row: ${JSON.stringify(after.map((s) => s.id))}`);
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it("a merge over a row the other instance took out before it began, whose own writes then failed, makes no call", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+      const row = l1.sourceIds[0]!;
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      await linesDuring(async () => {
+        refusingWrites(store, [SUMMARIES, CHUNKS], () => { b!.retractRows([row], { undone: true }); });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), "premise: the other instance's summaries write failed");
+      const before = calls.length;
+      const lines = await linesDuring(async () => {
+        const ticking = a.tick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        for (const call of calls) call.release();
+        await ticking;
+      });
+      assert.ok(!calls.slice(before).some((call) => call.merge), `no merge call was made: ${lines.join('\n')}`);
+      assert.ok(lines.some((line) => line.includes('left the window through another instance') && line.includes(row)), lines.join('\n'));
+      const after = stored(store, SUMMARIES);
+      assert.ok(after.every((s) => !s.sourceIds.includes(l1.id) && !s.sourceIds.includes(row)), `the instance let go of the row: ${lines.join('\n')}`);
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it('a ladder ending with no summary over a record the other instance changed quarantines nothing', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const gate = emptyMembrane();
+    const A = strategyFor();
+    const a = await ContextManager.open({ store, strategy: A, membrane: gate.membrane });
+    let b: ContextManager | undefined;
+    try {
+      a.presentRows([]);
+      for (let i = 0; i < 24; i++) {
+        a.presentRows([a.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: `${i} ${'word '.repeat(30)}` }])]);
+      }
+      await a.compile();
+      const ticking = a.tick();
+      await waitFor(() => gate.calls() === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const row = work.chunk.messages[1]!.id;
+      const recordId = work.chunk.recordId!;
+
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane: gate.membrane });
+      const lines = await linesDuring(async () => {
+        b!.retractRows([row], { undone: true });
+        assert.ok(!stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), 'premise: the other instance gave the row up from the record');
+        gate.release();
+        await ticking;
+      });
+      const alerts = lines.filter((line) => line.includes('"compression:quarantine-alert"'));
+      assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
+      assert.deepEqual(alerts, [], 'no alert was sent');
+      assert.ok(lines.some((line) => line.includes('quarantines nothing') && line.includes(recordId)), lines.join('\n'));
+    } finally {
+      gate.release();
       b?.close();
       a.close();
       store.close();
