@@ -234,7 +234,7 @@ describe('a retraction through another instance sharing the store', () => {
         await ticking;
       });
       assert.ok(!calls.slice(before).some((call) => call.merge), `no merge call was made: ${lines.join('\n')}`);
-      assert.ok(lines.some((line) => line.includes('dropped from the store by another instance')), lines.join('\n'));
+      assert.ok(lines.some((line) => line.includes('missing from the store (dropped by another instance sharing it')), lines.join('\n'));
       assert.ok(
         stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(l1.id)),
         `no summary was written over ${l1.id}: ${lines.join('\n')}`,

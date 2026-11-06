@@ -81,6 +81,9 @@ const FOLDING = {
 interface Internals {
   summaries: SummaryEntry[];
   chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+  chunks: Array<{ messages: Array<{ id: MessageId }> }>;
+  summariesStateId: string;
+  chunksStateId: string;
 }
 const internals = (strategy: AutobiographicalStrategy) => strategy as unknown as Internals;
 
@@ -233,6 +236,61 @@ describe('a half-written unfold', () => {
       open.close();
     });
     assert.ok(!again.some((line) => line.includes('the window holds the')), again.join('\n'));
+  });
+
+  // CM #350 bot review, wave 3, finding 14: unfold set each mirror before
+  // its write, so a write that threw in a live process left the strategy's
+  // memory apart from the store (the L1 gone from memory and kept in the
+  // store, or the records changed in memory and not in the store), and
+  // windowLost stopped before its rebuild, so the chunks still held the row.
+  it('a retraction whose state write throws leaves memory as the store holds it, and the chunks rebuilt over the window', async () => {
+    for (const [label, failing] of [['the summaries', 0], ['the chunk records', 1]] as const) {
+      const path = freshPath();
+      const strategy = new AutobiographicalStrategy(FOLDING);
+      const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+      cm.presentRows([]);
+      const ids: MessageId[] = [];
+      for (let i = 0; i < 24; i++) {
+        const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+        cm.presentRows([id]);
+        ids.push(id);
+      }
+      await drain(cm);
+      const row = ids[3]!;
+      const state = internals(strategy);
+      assert.ok(state.summaries.some((s) => s.level === 1 && s.sourceIds.includes(row)), `${label}: premise: the row is folded`);
+
+      const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+      const real = store.setStateJson;
+      const states = [state.summariesStateId, state.chunksStateId];
+      let writes = 0;
+      store.setStateJson = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (states.includes(id) && writes++ === failing) throw new Error(`zz the store refused the write of ${id}`);
+        return real.call(this, id, ...rest);
+      };
+      let lines: string[];
+      try {
+        lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+      } finally {
+        delete (store as { setStateJson?: unknown }).setStateJson;
+      }
+      assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `${label}: premise: ${lines.join('\n')}`);
+      const ofStore = (id: string) => ((store.getStateJson(id) as Array<{ id: string }> | null) ?? []);
+      assert.deepEqual(state.summaries.map((s) => s.id), ofStore(state.summariesStateId).map((s) => s.id), `${label}: the summaries in memory are the store's`);
+      assert.deepEqual(state.chunkRecords, ofStore(state.chunksStateId), `${label}: the chunk records in memory are the store's`);
+      assert.ok(state.chunks.every((chunk) => !chunk.messages.some((m) => m.id === row)), `${label}: the chunks were rebuilt over the window, which lacks the row`);
+      cm.close();
+
+      // The next open lets go of what still covers the row out of the window.
+      const next = new AutobiographicalStrategy(FOLDING);
+      let reopened!: ContextManager;
+      await linesDuring(async () => {
+        reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane() });
+      });
+      assert.ok(internals(next).summaries.every((s) => !s.sourceIds.includes(row)), `${label}: no summary covers the row after the next open`);
+      assert.ok(internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row)), `${label}: no record holds it`);
+      reopened.close();
+    }
   });
 
   it("under 'report' and in an audit-only open, the record is left as it was found", async () => {

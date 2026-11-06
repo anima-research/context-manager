@@ -8175,19 +8175,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const chunk of [...inFlight, ...this.chunks]) {
       if (chunk.messages.some((m) => leaving.has(m.id))) this._spanLeftWindow.add(chunk);
     }
-    const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
-    if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
-      this.diag.warn(
-        `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
-          `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
-          `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
-      );
-    }
+    // The chunks are rebuilt over the window whatever the writes do: a write
+    // that throws (unfold) leaves the mirrors as the store holds them, and
+    // the chunks then still held the row. What the writes didn't do, the
+    // next open repairs, as after a stop between them.
+    try {
+      const unfolded = this.unfoldRowsThatLeft(leaving, ctx.messageStore);
+      if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
+        this.diag.warn(
+          `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
+            `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
+            `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
+        );
+      }
 
-    // A drop can end an overlap the guard refused, so the queue build tests
-    // those chunks again, as after a load.
-    this._overlapBlocked.clear();
-    this.rebuildChunks(ctx.messageStore);
+      // A drop can end an overlap the guard refused, so the queue build tests
+      // those chunks again, as after a load.
+      this._overlapBlocked.clear();
+    } finally {
+      this.rebuildChunks(ctx.messageStore);
+    }
     if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
       // A merge-quarantine record naming a dropped summary no longer stands.
       this.sweepPaidOffMergeQuarantine();
@@ -8309,8 +8316,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * changed, as the open changes one, never a summary in place.
    *
    * The summaries are written first, then the records, then the queue,
-   * each a write of its own: the store writes no two states at once.
-   * Should the records' write not follow, the open makes a record whose L1
+   * each a write of its own: the store writes no two states at once. Each
+   * is set in memory once its write returns, so a write that throws leaves
+   * this instance holding what the store holds, and the writes after it
+   * aren't made. Should the records' write not follow, the open makes a record whose L1
    * it lacks compressible again (releaseUnsummarizedRecords) and, once a
    * host presents, trims one whose rows the window holds apart to its
    * longest run (demoteSplitSummaries); should the queue's not follow, the
@@ -8368,16 +8377,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mergeQueue = dropped.size === 0 ? this.mergeQueue : this.mergeQueue.filter((merge) => !merge.sourceIds.some((id) => dropped.has(id)));
 
     if (dropped.size > 0) {
+      this.store?.setStateJson(this.summariesStateId, summaries);
       this.summaries = summaries;
-      this.store?.setStateJson(this.summariesStateId, this.summaries);
     }
     if (refolded.length > 0 || emptied.length > 0) {
+      this.store?.setStateJson(this.chunksStateId, records);
       this.chunkRecords = records;
-      this.store?.setStateJson(this.chunksStateId, this.chunkRecords);
     }
     if (mergeQueue.length !== this.mergeQueue.length) {
+      this.store?.setStateJson(this.mergeQueueStateId, mergeQueue);
       this.mergeQueue = mergeQueue;
-      this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
     }
     return { dropped: [...dropped], orphaned, refolded, emptied };
   }
@@ -13304,12 +13313,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // left that instance's window), which the read above took up the
     // store's state without: a merge of it would cover the row again. The
     // chunks are rebuilt from the store's records, so the record the drop
-    // gave the row up from is queued again over the rows it keeps.
+    // gave the row up from is queued again over the rows it keeps. A
+    // summary this instance kept in memory when its own write of it failed
+    // (pushSummary) is missing from the store too, and the read dropped it
+    // the same way.
     const droppedBefore = sources.filter((source) => !this.summaryById(source.id));
     if (droppedBefore.length > 0) {
       this.diag.warn(
-        `executeMerge: ${droppedBefore.length}/${sources.length} source(s) dropped from the store by another instance ` +
-          `sharing it (${droppedBefore.map((source) => source.id).join(', ')}); skipping stale queue entry`,
+        `executeMerge: ${droppedBefore.length}/${sources.length} source(s) missing from the store (dropped by another instance ` +
+          `sharing it, or a write of this one's that failed) (${droppedBefore.map((source) => source.id).join(', ')}); ` +
+          'skipping stale queue entry',
       );
       this.rebuildChunks(ctx.messageStore);
       return false;
