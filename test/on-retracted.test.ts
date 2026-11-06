@@ -1160,6 +1160,59 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     assert.ok(!again.some((line) => line.includes('the window holds the leaves of')), again.join('\n'));
   });
 
+  // CM #350 bot review, wave 3, finding 8: crossed ownership the store held
+  // before its window was first written down (#122's cross-era merges, hand
+  // surgery) is demoted at the first presented open, not refused.
+  it('a store whose ownership was crossed in legacy mode, then written down by another strategy: the first folding open demotes the summary instead of refusing the store', async () => {
+    const path = freshPath();
+    const seed = new PassthroughStrategy();
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy: seed });
+    const rows = Array.from({ length: 9 }, (_, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
+    // crossedFixture's shape (topology-guard.test.ts): the L2 owns a stray
+    // L1 over the opening row and the L1s over rows 5..8, across the L1s
+    // over rows 1..4, which nothing merged.
+    const summary = (id: string, level: number, sourceIds: string[], leaves: MessageId[], mergedInto?: string): SummaryEntry => ({
+      id, level, content: `s ${id}`, tokens: 50, sourceLevel: level - 1, sourceIds,
+      sourceRange: { first: leaves[0]!, last: leaves.at(-1)! }, created: 1, ...(mergedInto ? { mergedInto } : {}),
+    } as SummaryEntry);
+    const l1s = [
+      summary('L1-stray', 1, [rows[0]!], [rows[0]!], 'L2-x'),
+      summary('L1-a', 1, rows.slice(1, 3), rows.slice(1, 3)),
+      summary('L1-b', 1, rows.slice(3, 5), rows.slice(3, 5)),
+      summary('L1-c', 1, rows.slice(5, 7), rows.slice(5, 7), 'L2-x'),
+      summary('L1-d', 1, rows.slice(7, 9), rows.slice(7, 9), 'L2-x'),
+    ];
+    const l2 = summary('L2-x', 2, ['L1-stray', 'L1-c', 'L1-d'], [rows[0]!, ...rows.slice(5, 9)]);
+    const store = cm.getStore();
+    store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+    store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+    store.setStateJson('agent/autobio:summaries', [...l1s, l2]);
+    store.setStateJson('agent/autobio:chunks', l1s.map((s) => ({ id: `c-${s.id}`, sourceIds: s.sourceIds, compressed: true, summaryId: s.id })));
+    cm.close();
+
+    // Premise: in legacy mode the store is refused, as before.
+    await assert.rejects(
+      ContextManager.open({ path, namespace: 'agent', strategy: autobiographical(), membrane: mockMembrane().membrane }),
+      (e: unknown) => e instanceof Error && e.name === 'StoreTopologyError' && e.message.includes('L2-x'),
+    );
+
+    // A strategy without the fold writes the window down.
+    const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    plain.presentRows([]);
+    assert.equal(plain.windowMode(), 'presented');
+    plain.close();
+
+    const next = autobiographical();
+    let reopened!: ContextManager;
+    const lines = await linesDuring(async () => {
+      reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of')), lines.join('\n'));
+    assert.equal(reopened.getSummary('L2-x'), null, 'the crossed L2 is dropped');
+    assert.deepEqual(next.getTopologyViolations(), [], 'nothing crossed is left');
+    reopened.close();
+  });
+
   // Wave 2, finding 13: a row presented again right after the rest of the
   // rows of what covers it leaves them together in the window, out of
   // order. The open's audit asked only for holes, so the summary, or an
