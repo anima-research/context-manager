@@ -182,6 +182,48 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 11: a host listener's throw is
+  // caught, but logging it goes through console.error, which a host can
+  // make throw too. Then the append throws after the listener moved the
+  // store's branch, and the row landed on the branch the add started on.
+  it("a message stored as one row whose append throws after a listener moved the store's branch says the manager can't tell, and names no row of the other branch", async () => {
+    for (const other of ['a plain row where the row would be', 'no row there'] as const) {
+      const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+      cm.addMessage('bob', [text('before')]);
+      const store = cm.getStore();
+      const start = cm.currentBranch().name;
+      const moved = store.createBranchAt('zz-other', start, store.currentSequence()).name;
+      if (other === 'a plain row where the row would be') {
+        await cm.switchBranch(moved);
+        cm.addMessage('carol', [text('on the other branch')]);
+        await cm.switchBranch(start);
+      }
+      const failure = new Error('zz-console-failed');
+      cm.onMessage((event) => {
+        if (event.type !== 'add') return;
+        store.switchBranch(moved);
+        throw new Error('zz-listener-failed');
+      });
+      const consoleError = console.error;
+      console.error = () => { throw failure; };
+      let err: unknown;
+      try {
+        err = thrownBy(() => cm.addMessage('alice', [text('one')]));
+      } finally {
+        console.error = consoleError;
+      }
+      assert.equal(store.currentBranch().name, moved, `${other}, setup: the listener moved the store`);
+      assert.ok(err instanceof WriteOutcomeUnknownError, `${other}: a WriteOutcomeUnknownError, not ${String(err)}`);
+      assert.deepEqual(err.landed, [], `${other}: no row of the other branch is named`);
+      assert.deepEqual(err.unknown, []);
+      assert.equal(err.unnamed, 1, `${other}: the row, whose append returned no id`);
+      assert.equal(err.cause, failure);
+      await cm.switchBranch(start);
+      assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one'], `${other}: the row landed where the add started`);
+      cm.close();
+    }
+  });
+
   it('once a host presents rows, the row named is out of the window until the host presents it', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     cm.presentRows([]);

@@ -482,7 +482,10 @@ export class WriteLandedError extends Error {
  * and `unnamed` counts. It is thrown:
  * - For a message stored as one row whose append threw, where the store
  *   can't be read to tell whether the row landed (`unnamed` 1). The manager
- *   logs the failed read.
+ *   logs the failed read. So too where the append threw after a listener
+ *   of the add moved the store to another branch, or where the store then
+ *   can't say its branch: the row landed on the branch the add started
+ *   on, if it did, which the store no longer reads, or may not.
  * - For a sharded write whose first shard's append threw, likewise. Nothing
  *   is removed, since no id names what to remove (`unnamed` 1). The manager
  *   logs the failed read.
@@ -1305,13 +1308,33 @@ export class ContextManager {
       }
     }
     const lengthBefore = this.messageStore.length();
+    // The branch the row lands on, read guarded: where the store can't say
+    // it here, a failure is read back as before.
+    let startedOn: string | null;
+    try {
+      startedOn = this.store.currentBranch().id;
+    } catch {
+      startedOn = null;
+    }
     try {
       return this.messageStore.append(participant, content, metadata, causedBy).id;
     } catch (err) {
       // The append can throw after its row landed: the manager's own
       // listener runs inside it, and its failure fails the write (see
       // onMessage). The row stays, and the error names it. Where the store
-      // can't be read to tell, the error says the manager can't.
+      // can't be read to tell, the error says the manager can't. So too
+      // where a listener of the add moved the store's branch before the
+      // append threw (a host listener's throw is caught and logged, but the
+      // log can throw too): the row landed on the branch the add started
+      // on, if it landed, which the store no longer reads, and the other
+      // branch's row at that place says nothing of it.
+      let moved: boolean;
+      try {
+        moved = startedOn !== null && this.store.currentBranch().id !== startedOn;
+      } catch {
+        moved = true;
+      }
+      if (moved) throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, err);
       let landed: MessageId | null;
       try {
         landed = this.rowLandedAt(lengthBefore);
