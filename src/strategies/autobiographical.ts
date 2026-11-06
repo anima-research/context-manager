@@ -7357,6 +7357,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (releaseUnsummarizedRecords), and nothing else stops it being
    * compressed across the window into an L1 the next open demotes again.
    *
+   * The audit asks only for holes, so an L1, or an uncompressed record,
+   * whose rows the window holds together but in another order is taken
+   * here too: a row presented again right after the rest of them, which
+   * this strategy never heard go, stands at the end of their run, where
+   * releaseRowsThatLeft doesn't see it (it is in the window again). Such an
+   * L1 is dropped and its record compressed again over the run in window
+   * order, and such a record holds its run in window order.
+   *
    * In legacy mode the window is the record and its rows never move, so a
    * non-contiguous summary there is a store the gate refuses, as it always
    * has; under `'report'` the gate records it for inspection, and an
@@ -7375,15 +7383,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let pass = 0; pass < passes; pass++) {
       const violations = this.auditStoreTopology(messages);
       const position = this.ownershipPositionIndex();
+      const outOfOrder = (ids: readonly MessageId[]): boolean => {
+        let last = -1;
+        for (const id of ids) {
+          const at = position.get(id);
+          if (at === undefined) continue;
+          if (at < last) return true;
+          last = at;
+        }
+        return false;
+      };
+      let reorderedRecords = 0;
       const split = new Set(
-        this.chunkRecords.filter((record) => !record.compressed && windowRuns(record.sourceIds, position).length > 1).map((record) => record.id),
+        this.chunkRecords.filter((record) => {
+          if (record.compressed) return false;
+          if (windowRuns(record.sourceIds, position).length > 1) return true;
+          if (!outOfOrder(record.sourceIds)) return false;
+          reorderedRecords++;
+          return true;
+        }).map((record) => record.id),
       );
-      if (violations.length === 0 && split.size === 0) return;
-      const l1s = new Set(violations.filter((v) => v.level === 1).map((v) => v.id));
+      const named = new Set(violations.map((v) => v.id));
+      const live = this.liveL1Ids();
+      const reordered = this.summaries
+        .filter((summary) => summary.level === 1 && live.has(summary.id) && !named.has(summary.id) && outOfOrder(summary.sourceIds))
+        .map((summary) => summary.id);
+      if (violations.length === 0 && reordered.length === 0 && split.size === 0) return;
+      const l1s = new Set([...violations.filter((v) => v.level === 1).map((v) => v.id), ...reordered]);
       const released: MessageId[] = [];
       const trimmed: string[] = [];
       const releasedUncompressed: MessageId[] = [];
-      const unfolded = this.unfold(new Set(violations.map((v) => v.id)), (record) => {
+      const unfolded = this.unfold(new Set([...named, ...reordered]), (record) => {
         const demoted = record.summaryId !== undefined && l1s.has(record.summaryId);
         if (!demoted && !split.has(record.id)) return undefined;
         const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
@@ -7393,10 +7423,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!demoted) trimmed.push(record.id);
         return longest;
       });
-      if (violations.length > 0) {
+      const demoted = violations.length + reordered.length;
+      if (demoted > 0) {
         const refolded = unfolded.refolded.filter((id) => !split.has(id));
         this.diag.warn(
-          `[autobiographical] the window holds the leaves of ${violations.length} summar${violations.length === 1 ? 'y' : 'ies'} apart ` +
+          `[autobiographical] the window holds the leaves of ${demoted} summar${demoted === 1 ? 'y' : 'ies'} apart` +
+            `${reordered.length > 0 ? ` or out of order [${reordered.join(', ')}]` : ''} ` +
             `(a row that left the window and was presented again before this strategy heard it go, or crossed ownership ` +
             `the store held already): dropped ` +
             `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
@@ -7406,7 +7438,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (trimmed.length > 0) {
         this.diag.warn(
-          `[autobiographical] the window holds the rows of ${trimmed.length} uncompressed chunk record(s) apart (a drop of ` +
+          `[autobiographical] the window holds the rows of ${trimmed.length} uncompressed chunk record(s) apart` +
+            `${reorderedRecords > 0 ? ' or out of order' : ''} (a drop of ` +
             `their L1 stopped between its writes of the summaries and of the chunk records): trimmed [${trimmed.join(', ')}] ` +
             `to their longest run in the window, releasing [${releasedUncompressed.join(', ')}] to be chunked where the window holds them`,
         );
