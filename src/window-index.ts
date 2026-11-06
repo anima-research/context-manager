@@ -139,10 +139,16 @@ export type WindowMode = 'legacy' | 'presented';
  */
 export type WindowStatus = 'in' | 'out' | 'undone' | 'absent';
 
-/** A row that left the window: its id, and the ordinal it held there. */
+/**
+ * A row that left the window: its id, the ordinal it held there, and the
+ * identity of the record whose write presented it at that ordinal (its
+ * `by` stamp, where the item carries one), which a branch shares with the
+ * one it was made from only for the presentations before the branch point.
+ */
 export interface LeftRow {
   id: MessageId;
   ordinal: number;
+  by?: string;
 }
 
 /**
@@ -300,6 +306,13 @@ interface IndexState {
   issued: Array<MessageId | null>;
   /** Per ordinal, the sequence of the record that wrote the item, where it says. */
   at: Array<number | undefined>;
+  /**
+   * Per ordinal, the identity of the record that wrote the item (its `by`
+   * stamp), where it says. Sequences repeat across branches; a record's
+   * identity doesn't, so two branches share it only for an item before
+   * the branch point (issuedBy).
+   */
+  by: Array<string | undefined>;
   /** The ordinal of every row in the window. */
   ordinals: Map<MessageId, number>;
   /** Rows of an undone turn, out of the window until presented again. */
@@ -340,6 +353,7 @@ function emptyState(branchId: unknown, revision: number | null): IndexState {
     rows: [],
     issued: [],
     at: [],
+    by: [],
     ordinals: new Map(),
     undone: new Set(),
     left: new Set(),
@@ -424,8 +438,9 @@ function inEffect(state: IndexState): boolean {
  * Applies one item at `ordinal`, the next one; false for an item this
  * version can't read, which leaves a hole. A header leaves a hole too.
  */
-function apply(state: IndexState, item: unknown, ordinal: number, at: number | undefined): boolean {
+function apply(state: IndexState, item: unknown, ordinal: number, at: number | undefined, by: string | undefined): boolean {
   state.at[ordinal] = at;
+  state.by[ordinal] = by;
   state.rows[ordinal] = null;
   state.issued[ordinal] = null;
   if (typeof item !== 'object' || item === null) {
@@ -741,9 +756,10 @@ export class WindowIndex {
     }
     if (state.found === null && Array.isArray(items)) {
       for (let i = 0; i < items.length; i++) {
-        const item = items[i] as { at?: unknown } | null;
+        const item = items[i] as { at?: unknown; by?: unknown } | null;
         const at = typeof item?.at === 'number' ? item.at : undefined;
-        apply(state, item, i, at);
+        const by = typeof item?.by === 'string' ? item.by : undefined;
+        apply(state, item, i, at, by);
       }
     } else if (state.found === null && items !== undefined) {
       // A state with a record holds a value, JSON null among them: a state
@@ -832,6 +848,19 @@ export class WindowIndex {
   issuedTo(ordinal: number): MessageId | undefined {
     const state = this.current();
     return inEffect(state) ? (state.issued[ordinal] ?? undefined) : undefined;
+  }
+
+  /**
+   * The identity of the record whose write presented a row at `ordinal` on
+   * this branch (its `by` stamp; see LeftRow), kept after a tombstone takes
+   * the row out. A branch made from another shares it only for an ordinal
+   * issued before the branch point: one the branch issued on its own, at
+   * the same ordinal, to the same row, comes from a record of its own.
+   * Undefined where issuedTo is, and where the item carries no stamp.
+   */
+  issuedBy(ordinal: number): string | undefined {
+    const state = this.current();
+    return inEffect(state) && state.issued[ordinal] != null ? state.by[ordinal] : undefined;
   }
 
   /** Ordinals issued on this branch: the one the next item takes. 0 in legacy mode. */
@@ -1070,7 +1099,7 @@ export class WindowIndex {
       if (state.ordinals.has(name.rows[0]!)) continue;
       for (const id of name.rows.slice(1)) {
         const ordinal = state.ordinals.get(id);
-        if (ordinal !== undefined) moving.push({ id, ordinal });
+        if (ordinal !== undefined) moving.push({ id, ordinal, by: state.by[ordinal] });
       }
     }
     const moves = new Set(moving.map((row) => row.id));
@@ -1140,8 +1169,11 @@ export class WindowIndex {
     // Written down first in legacy mode, so each row has the ordinal the
     // write-down gave it before its tombstone takes it out.
     if (legacy) this.writeDownWindow('retractRows', state, record);
-    const held = this.current().ordinals;
-    const left = leaving.map((id): LeftRow => ({ id, ordinal: held.get(id)! }));
+    const now = this.current();
+    const left = leaving.map((id): LeftRow => {
+      const ordinal = now.ordinals.get(id)!;
+      return { id, ordinal, by: now.by[ordinal] };
+    });
     const tombstones = leaving.map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
     this.writeLeaving('retractRows', tombstones, left, branch, cutShort);
     return inWindowOrder(left);
@@ -1162,7 +1194,7 @@ export class WindowIndex {
     const left: LeftRow[] = [];
     for (const id of new Set(ids)) {
       const ordinal = state.ordinals.get(id);
-      if (ordinal !== undefined) left.push({ id, ordinal });
+      if (ordinal !== undefined) left.push({ id, ordinal, by: state.by[ordinal] });
     }
     this.writeLeaving('retractRemoved', left.map((row): IndexItem => ({ retract: row.id })), left, branch, cutShort);
     return inWindowOrder(left);
@@ -1184,7 +1216,7 @@ export class WindowIndex {
     if (!inEffect(state)) return [];
     const held = positionsIn(record);
     const left: LeftRow[] = [];
-    for (const [id, ordinal] of state.ordinals) if (!held.has(id)) left.push({ id, ordinal });
+    for (const [id, ordinal] of state.ordinals) if (!held.has(id)) left.push({ id, ordinal, by: state.by[ordinal] });
     this.writeLeaving('retractAbsentRows', left.map((row): IndexItem => ({ retract: row.id })), left, branch, cutShort);
     return inWindowOrder(left);
   }
@@ -1233,6 +1265,7 @@ export class WindowIndex {
       rows: [...state.rows],
       issued: [...state.issued],
       at: [...state.at],
+      by: [...state.by],
       ordinals: new Map(state.ordinals),
       undone: new Set(state.undone),
       left: new Set(state.left),
@@ -1338,10 +1371,10 @@ export class WindowIndex {
           this.state = null;
           return;
         }
-        items.forEach((item, i) => apply(state, item, firstOrdinal + i, record.sequence));
+        items.forEach((item, i) => apply(state, item, firstOrdinal + i, record.sequence, record.id));
       } else {
         const record = this.store.appendToStateJsonWithIdentity(this.stateId, items[0]!, 'by', 'at');
-        apply(state, items[0]!, state.rows.length, record.sequence);
+        apply(state, items[0]!, state.rows.length, record.sequence, record.id);
       }
     } catch (error) {
       this.state = null;

@@ -2043,7 +2043,7 @@ export class ContextManager {
   private tellPresentation(left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage): void {
     let leftTold = left.length === 0;
     try {
-      const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
+      const leftRows = left.map(({ id, ordinal, by }) => ({ id, row: rowOf(id), ordinal, by }));
       const enteredRows = entered.map(rowOf);
       const scope = leftRows.length > 0 ? this.hookScope() : null;
       this.notifyRetracted(leftRows, { undone: false, removed: false });
@@ -2063,7 +2063,7 @@ export class ContextManager {
       if (scope === null || (this.inHookScope(scope) && stillIn())) this.notifyPresented(enteredRows);
       else this.deferPresented(enteredRows, false);
     } catch (error) {
-      if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal }) => ({ id, ordinal })), info: { undone: false, removed: false } });
+      if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal, by }) => ({ id, ordinal, by })), info: { undone: false, removed: false } });
       for (const id of entered) this.presentedUnheard.set(id, this.presentedUnheard.get(id) === true);
       throw error;
     }
@@ -2183,14 +2183,14 @@ export class ContextManager {
    */
   private tellRetraction(left: readonly LeftRow[], info: Retraction, rowOf: (id: MessageId) => StoredMessage | undefined): void {
     const removed: Retraction = { undone: info.undone, removed: true };
-    let waiting: { left: RetractedRow[]; info: Retraction } = { left: left.map(({ id, ordinal }) => ({ id, ordinal })), info };
+    let waiting: { left: RetractedRow[]; info: Retraction } = { left: left.map(({ id, ordinal, by }) => ({ id, ordinal, by })), info };
     try {
       const held: RetractedRow[] = [];
       const gone: RetractedRow[] = [];
-      for (const { id, ordinal } of left) {
+      for (const { id, ordinal, by } of left) {
         const row = rowOf(id);
-        if (row === undefined) gone.push({ id, ordinal });
-        else held.push({ id, row, ordinal });
+        if (row === undefined) gone.push({ id, ordinal, by });
+        else held.push({ id, row, ordinal, by });
       }
       const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
       this.notifyRetracted(held, info);
@@ -2336,7 +2336,7 @@ export class ContextManager {
    * notification, and the error is thrown on.
    */
   private tellGone(left: readonly LeftRow[]): void {
-    const told = left.map(({ id, ordinal }): RetractedRow => ({ id, ordinal }));
+    const told = left.map(({ id, ordinal, by }): RetractedRow => ({ id, ordinal, by }));
     const info: Retraction = { undone: false, removed: true };
     try {
       this.notifyRetracted(told, info);
@@ -4581,7 +4581,7 @@ export class ContextManager {
       if (ordinals) {
         for (const id of new Set(ids)) {
           const ordinal = ordinals.get(id);
-          if (ordinal !== undefined) inWindow.push({ id, ordinal });
+          if (ordinal !== undefined) inWindow.push({ id, ordinal, by: this.windowIndex.issuedBy(ordinal) });
         }
         inWindow.sort((a, b) => a.ordinal - b.ordinal);
       }
@@ -4600,9 +4600,9 @@ export class ContextManager {
     const told = held ?? [...new Set(ids)].map((id): RetractedRow => ({ id }));
     if (told.length === 0) return;
     const byId = new Map(removed.map((m) => [m.id, m] as const));
-    const left = told.map(({ id, ordinal }): RetractedRow => {
+    const left = told.map(({ id, ordinal, by }): RetractedRow => {
       const row = byId.get(id);
-      return row ? { id, row, ordinal } : { id, ordinal };
+      return row ? { id, row, ordinal, by } : { id, ordinal, by };
     });
     const info: Retraction = { undone: false, removed: true };
     try {
@@ -4844,7 +4844,7 @@ export class ContextManager {
    */
   private deferRetracted(left: readonly RetractedRow[], info: Retraction): void {
     if (left.length === 0 || this.closed) return;
-    this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
+    this.retractedUnheard.push({ left: left.map(({ id, row, ordinal, by }) => (info.removed && row ? { id, row, ordinal, by } : { id, ordinal, by })), info });
     if (this.initializedAttempt === this.initializationAttempt) this.deliverUnheard();
   }
 
@@ -4909,7 +4909,7 @@ export class ContextManager {
     if (this.callWaits()) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
-      this.retractedUnheard.push({ left: left.map(({ id, row, ordinal }) => (info.removed && row ? { id, row, ordinal } : { id, ordinal })), info });
+      this.retractedUnheard.push({ left: left.map(({ id, row, ordinal, by }) => (info.removed && row ? { id, row, ordinal, by } : { id, ordinal, by })), info });
       return;
     }
     if (!this.leftInScope(scope)) {
@@ -5013,12 +5013,13 @@ export class ContextManager {
    * The calls of onRetracted made while the strategy wasn't initialized,
    * in the order they came. A row is given when it left the window of the
    * branch the strategy initialized on: that branch's index took it out,
-   * or holds it at another ordinal and once issued it the call's
-   * (presented again since), or the branch's record no longer holds it (a
-   * removal whose tombstone failed). A branch made before it left holds it
-   * there, in its window and its record, a branch made before it was
-   * presented never held it, or presented it on its own at an ordinal of
-   * its own, and a branch in
+   * or holds it at another ordinal and once issued it the call's, in the
+   * record that issued it there where the call left it (presented again
+   * since), or the branch's record no longer holds it (a removal whose
+   * tombstone failed). A branch made before it left holds it there, in its
+   * window and its record, a branch made before it was presented never
+   * held it, or presented it on its own, in records of its own, whatever
+   * ordinal they gave it (WindowIndex.issuedBy), and a branch in
    * legacy mode holds every row of its record, so none of them is told. A
    * call left with no row isn't made. A row the call didn't keep is read
    * then, from the record of that branch, and given where it holds it; one
@@ -5046,15 +5047,21 @@ export class ContextManager {
           // it out; one it never held (a branch made before the row was
           // presented) didn't. A row the window holds left where it holds it
           // at another ordinal than the call's, and this branch's own index
-          // issued the call's ordinal to it (presented again since), or where
-          // the record no longer holds it (a removal whose tombstone failed,
+          // issued the call's ordinal to it, in the record that presented it
+          // where the call left it (presented again since), or where the
+          // record no longer holds it (a removal whose tombstone failed,
           // told with no ordinal where the index couldn't be read then). A
           // branch made before the row was presented, which presented it on
-          // its own, never issued it the call's ordinal, so isn't told.
-          const leftHere = ({ id, ordinal }: RetractedRow) => {
+          // its own, issued it the call's ordinal in a record of its own, if
+          // at all, so isn't told.
+          const leftHere = ({ id, ordinal, by }: RetractedRow) => {
             const here = this.windowIndex.ordinalOf(id);
             if (here === undefined) return tookOut?.has(id) === true;
-            return (ordinal !== undefined && here !== ordinal && this.windowIndex.issuedTo(ordinal) === id) || !holdsRow(merged!, id);
+            const sharedPresentation =
+              ordinal !== undefined &&
+              this.windowIndex.issuedTo(ordinal) === id &&
+              (by === undefined || this.windowIndex.issuedBy(ordinal) === by);
+            return (ordinal !== undefined && here !== ordinal && sharedPresentation) || !holdsRow(merged!, id);
           };
           const withRow = (l: RetractedRow): RetractedRow => {
             if (l.row) return l;
@@ -5427,4 +5434,6 @@ interface RetractedRow {
   id: MessageId;
   row?: StoredMessage;
   ordinal?: number;
+  /** The identity of the record that presented the row at `ordinal` (LeftRow). */
+  by?: string;
 }

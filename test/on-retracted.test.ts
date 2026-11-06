@@ -623,6 +623,41 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 5, finding 32: a branch made before the row
+  // was presented can present it on its own at the same ordinal, so the
+  // ordinal and the id alone don't make it the presentation the call left.
+  it('a call waiting on an initialization of a branch that presented the row on its own at the same ordinal, and again since, is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    const a = cm.addMessage('alice', [text('a')]);
+    // Made once a is stored and before it is presented: its record holds a, and its window doesn't.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, at the ordinal it took on the other
+    // branch, then takes it out and presents it again, before the strategy
+    // initializes there.
+    cm.presentRows([a]);
+    assert.equal(cm.ordinalOf(a), left, 'setup: the branch presented a at the same ordinal');
+    cm.retractRows([a]);
+    cm.presentRows([a]);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, diverged);
+    assert.ok(cm.ordinalOf(a) !== undefined && cm.ordinalOf(a) !== left, 'setup: the branch holds a, at a later ordinal');
+    assert.deepEqual(strategy.log, ['retracted a', 'presented a'], "the branch's own retraction of a is told, once, and the other branch's isn't");
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
   // store no longer holds is told by its id, removed, as retractRows tells it.
   it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {
