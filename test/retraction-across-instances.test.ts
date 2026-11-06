@@ -222,6 +222,9 @@ describe('a retraction through another instance sharing the store', () => {
       assert.deepEqual(mirror?.sourceIds, stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds, "the instance took up the store's records");
 
       // Compressed again over the rows the record keeps, never over the row.
+      const kept = stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds ?? [];
+      assert.ok(kept.length > 0, 'premise: the record keeps rows');
+      const asked = calls.length;
       const drain = (async () => {
         for (let i = 0; i < 20; i++) {
           const next = a.tick();
@@ -232,6 +235,12 @@ describe('a retraction through another instance sharing the store', () => {
       })();
       await linesDuring(() => drain);
       assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'nothing folded since covers the row');
+      // CM #350 bot review (wave 2), finding 51: the drain did compress again.
+      assert.ok(calls.length > asked, 'the drain asked the model again');
+      assert.ok(
+        stored(store, SUMMARIES).some((s) => s.level === 1 && JSON.stringify(s.sourceIds) === JSON.stringify(kept)),
+        `an L1 covers the rows the record keeps (${kept.join(', ')}): ${JSON.stringify(stored(store, SUMMARIES).map((s) => [s.level, s.sourceIds]))}`,
+      );
     } finally {
       for (const call of calls) call.release();
       b?.close();

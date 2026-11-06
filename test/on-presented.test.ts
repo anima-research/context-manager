@@ -355,10 +355,19 @@ describe('onPresented in presented mode', () => {
       initializing.gate = gate;
       const first = cm.setStrategy(initializing);
       cm.presentRows([a]);
-      const replacement = new Records();
-      await cm.setStrategy(replacement);
+      // CM #350 bot review (wave 2), finding 47: the replacement's own
+      // initialize waits too, so the test tells after it from before it.
+      const replacement = new GatedRecords();
+      const own = gated();
+      replacement.gate = own.gate;
+      const second = cm.setStrategy(replacement);
+      const superseded = assert.rejects(first, /supersed/i);
       open();
-      await assert.rejects(first, /supersed/i);
+      await settle();
+      assert.equal(replacement.heard.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
+      own.open();
+      await second;
+      await superseded;
       assert.deepEqual(replacement.heard.map((h) => h.rows), [[a]], `${hooked ? 'control' : 'probe'}: the replacement hears the row once, after its initialize`);
       await settle();
       cm.close();

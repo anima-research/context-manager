@@ -313,6 +313,37 @@ describe('writing the window down', () => {
     cm.close();
   });
 
+  // CM #350 bot review (wave 2), finding 50: the rows a write-down cut
+  // short wrote are a prefix of the record only while every row stored
+  // since sorts after them. A slot merged since can hold older rows.
+  it('finishing it over a slot merged since, which holds an older row, writes the window in record order', async () => {
+    const path = freshPath();
+    const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+    const store = main.getStore();
+    const a = main.addMessage('alice', [text('a, the shared slot')]);
+    let cm = await ContextManager.open({ store, namespace: 'zz-agent', isolate: true, strategy: new PassthroughStrategy() });
+    const b = cm.addMessage('Reader', [text('b, its own slot')]);
+    cutShortWriteDown(cm, 2);
+    assert.deepEqual(indexItems(cm), [{ id: b }], 'setup: the write-down wrote b, and no header');
+    cm.close();
+
+    // Opened again merging the shared slot: its window is the record, a then b.
+    cm = await ContextManager.open({ store, namespace: 'zz-agent', isolate: true, strategy: new PassthroughStrategy(), auxiliaryMessageViews: [{}] });
+    assert.equal(cm.windowMode(), 'legacy');
+    const legacy = await cm.compile(BIG);
+    assert.deepEqual(texts(legacy), ['a, the shared slot', 'b, its own slot']);
+    assert.deepEqual(cm.presentRows([]), []);
+    assert.equal(cm.windowMode(), 'presented');
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b], 'the window is the record, in record order');
+    assert.deepEqual((await cm.compile(BIG)).messages, legacy.messages, 'byte-identical across the finish');
+    // b, written before a's slot was merged, is written again after a, in the finish's one record.
+    assert.deepEqual(indexItems(cm), [{ id: b }, { retract: b }, { id: a }, { id: b }, { v: 1 }]);
+    assert.deepEqual([a, b].map((id) => cm.ordinalOf(id)), [2, 3]);
+    assert.deepEqual(cm.getUnpresentedMessages(), []);
+    cm.close();
+    main.close();
+  });
+
   it('retractRows([]) writes nothing in either mode; any other retract in legacy mode writes the window down first', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));

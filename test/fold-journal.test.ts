@@ -2374,6 +2374,26 @@ describe('fold journal over a presented window', () => {
     cm.close();
   });
 
+  // CM #350 bot review (wave 2), finding 52: only a v 2 layout is read as
+  // keyed by sequence for want of keyedBy. A v 3 layout that lost it says
+  // nothing of what its members count, and may count ordinals.
+  it('refuses a v 3 layout without keyedBy, writing nothing, rather than read its ordinals as sequences', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    cm.presentRows([]);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    assert.equal(provenance.layout!.keyedBy, 'ordinal', 'setup: a layout keyed by ordinal');
+    const { keyedBy: _keyedBy, memberSequences: _memberSequences, ...rest } = provenance.layout!;
+    const stripped = { ...provenance, layout: rest as unknown as RenderedLayout };
+    assert.throws(
+      () => cm.acceptRound({ provenance: stripped }),
+      /can't be accepted: it doesn't say whether its members are store sequences or window-index ordinals/,
+    );
+    assert.deepEqual(formats(cm.getStore()), [], 'nothing is written');
+    assert.equal(cm.acceptRound({ provenance })?.kind, 'baseline', 'the layout as compile returned it is accepted');
+    cm.close();
+  });
+
   it('a branch whose layouts count sequences starts again from one baseline at its first presentation, and keeps listing its receipts', async () => {
     let { cm, strategy } = await open();
     const ids = add(cm, 4);

@@ -176,8 +176,12 @@ describe('ContextManager initialization fence', () => {
   for (const mode of ['manager', 'direct-store'] as const) {
     it(`a summary written while the branch moved (${mode}) is refused, as the transition it is for would be`, async () => {
       const summaryGate = gate();
+      // CM #350 bot review (wave 2), finding 48: the strategy's summary is in
+      // flight across the move, not refused before it is asked for.
+      let entered = false;
       class TransitionStrategy extends PassthroughStrategy {
         async generateTransitionSummary(): Promise<string> {
+          entered = true;
           await summaryGate.promise;
           return 'summary of the old branch';
         }
@@ -187,6 +191,7 @@ describe('ContextManager initialization fence', () => {
         manager.addMessage('user', text('original'));
         store.createBranch('target');
         const summary = manager.generateTransitionSummary();
+        assert.equal(entered, true, "setup: the strategy's summary was asked for before the move");
         if (mode === 'manager') await manager.switchBranch('target');
         else store.switchBranch('target');
         const sequence = store.currentSequence();

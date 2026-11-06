@@ -719,7 +719,10 @@ describe('a store handle without the batched append', () => {
     } finally {
       restore();
     }
-    assert.equal(cm.getStore().currentSequence(), head, 'nothing is written, not even the index state\'s registration');
+    assert.equal(cm.getStore().currentSequence(), head, 'nothing is written');
+    // CM #350 bot review (wave 2), finding 22: a registration is a
+    // checkpoint, not a record, so the sequence alone can't say.
+    assert.ok(!cm.getStore().listStates().some((state) => state.id === INDEX), 'not even the index state\'s registration');
     assert.equal(cm.windowMode(), 'legacy');
     assert.deepEqual(indexItems(cm), []);
     assert.equal(cm.getPresentedMessages(), cm.getAllMessages(), 'the window is still the record');
