@@ -22,3 +22,14 @@
   landed: `addMessage` throws `WriteLandedError` naming the row, the
   strategy isn't told the row entered, and an add listener registered
   after the manager's doesn't hear it.
+- A sharded `addMessage` that fails partway where the store then can't say
+  its branch removes nothing, as after a branch move, and logs the failed
+  read: it throws `WriteLandedError` naming the shards stored, on the branch
+  the write started on (`WriteOutcomeUnknownError`, with `unnamed` 1, where
+  a shard's append threw). In legacy mode the strategy hears those shards
+  once the store reads again. Before, the branch read's own error was thrown,
+  which says none of the message was stored.
+- `unnamed` is 1 only where a shard's append threw: a sharded `addMessage`
+  that fails once every shard is stored (in legacy mode, the manager's own
+  work telling the strategy of the body) and whose removal of them fails
+  names every shard, with `WriteLandedError`.

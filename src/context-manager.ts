@@ -416,7 +416,10 @@ export class InitializationSupersededError extends Error {
  *   another branch stops before the next shard, which would land on that
  *   branch: `landed` names the shards stored, which stay on the branch the
  *   write started on, and `cause` says the branch moved. Nothing is
- *   removed, since the store no longer reads that branch.
+ *   removed, since the store no longer reads that branch. Nor is it where
+ *   a sharded write fails partway and the store then can't say its branch
+ *   (the failed read is logged): `landed` names the shards stored, on the
+ *   branch the write started on, and `cause` is the write's own error.
  *
  * A write that fails before a row lands throws its own error, unwrapped: a
  * refusal of the message, or of a shard as the strategy chunked it
@@ -490,10 +493,11 @@ export class WriteLandedError extends Error {
  *   store can't be read to tell whether the shards stayed (`unknown`, and
  *   `unnamed` 1 if the failing shard's landing can't be read either).
  * - For a sharded write whose shard's append threw after a listener moved
- *   the store to another branch: the shards stored before it stay on the
- *   branch the write started on (`landed`), which the store no longer
- *   reads to tell whether the failing shard's row landed there (`unnamed`
- *   1), and nothing is removed.
+ *   the store to another branch, or where the store then can't say its
+ *   branch: the shards stored before it stay on the branch the write
+ *   started on (`landed`), which the store no longer reads, or may not, to
+ *   tell whether the failing shard's row landed there (`unnamed` 1), and
+ *   nothing is removed.
  *
  * A host that stores the message another way when an add stored none of it
  * can't tell from this error whether doing so stores it twice: a read of
@@ -985,7 +989,9 @@ export class ContextManager {
    * the strategy hears the shards once every one is stored, in one call,
    * so no hook of its runs between them. A listener that moves the store's
    * branch between shards stops the write there, and its WriteLandedError
-   * names the shards stored, on the branch the write started on.
+   * names the shards stored, on the branch the write started on. A write
+   * that fails partway where the store then can't say its branch removes
+   * nothing either, and its error names the shards stored likewise.
    */
   addMessage(
     participant: string,
@@ -1113,18 +1119,24 @@ export class ContextManager {
         // under the same name doesn't share.
         const branch = this.store.currentBranch();
         const onBranch = () => this.store.currentBranch().id === branch.id;
-        let moved: Error | null = null;
-        this.writingShards = { heard: [] };
+        // The rows a legacy window took in, which the strategy hears; kept
+        // here, so a failure after the loop still tells the shards that stay.
+        const heard: StoredMessage[] = [];
+        // Set while a shard's append runs: an error from it may follow its
+        // row landing, which then has no id here. Any other error comes
+        // between appends, or after the last, when every row is named.
+        let appending = false;
+        this.writingShards = { heard };
         try {
           for (const shard of ordered) {
             if (stored.length > 0 && !onBranch()) {
-              moved = new Error(
+              throw new Error(
                 `the store's branch moved from ${branch.name} to ${this.store.currentBranch().name} while addMessage stored ` +
                   `the shards of body group ${decision.bodyGroupId}, after ${stored.length} of ${shardCount}; the rest weren't ` +
                   `stored, and those that were are on ${branch.name}`,
               );
-              throw moved;
             }
+            appending = true;
             const message = this.messageStore.append(
               participant,
               shard.content,
@@ -1136,28 +1148,34 @@ export class ContextManager {
                 shardCount,
               }
             );
+            appending = false;
             stored.push(message.id);
           }
           // The strategy hears the shards a legacy window took in, once every
           // shard is stored, where the last shard's listeners left the store:
           // on another branch they wait, as rows a hook stopped do.
-          const { heard } = this.writingShards;
           this.writingShards = null;
           if (onBranch()) this.notifyPresented(heard);
           else this.deferPresented(heard, true);
         } catch (err) {
-          const heard = this.writingShards?.heard ?? [];
           this.writingShards = null;
           // The shards a failed write leaves stored are in a legacy window,
           // so the strategy hears those it took in, as it hears a write that
           // completes: at once on the branch the write started on, and after
           // a move once the strategy is initialized, where the window of
           // the branch it initialized on holds them.
+          // Where the store can't say its branch, they wait as after a move.
           const hearStayed = (stayed: readonly MessageId[]) => {
             const ids = new Set(stayed);
             const rows = heard.filter((m) => ids.has(m.id));
             try {
-              if (onBranch()) this.notifyPresented(rows);
+              let here: boolean;
+              try {
+                here = onBranch();
+              } catch {
+                here = false;
+              }
+              if (here) this.notifyPresented(rows);
               else this.deferPresented(rows, true);
             } catch (error) {
               logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
@@ -1166,11 +1184,23 @@ export class ContextManager {
           // A write the store's branch moved under stopped there, or failed
           // after it moved: what it stored is on the branch it started on,
           // which the store no longer reads, so nothing is read or removed.
-          // The shards it stored stayed; a shard whose append threw may have
-          // landed there too.
-          if (!onBranch()) {
+          // So too where the store can't say its branch: the shards it
+          // stored are on the branch it started on, and the store may not
+          // read it. The shards it stored stayed; a shard whose append threw
+          // may have landed there too.
+          let away: boolean;
+          try {
+            away = !onBranch();
+          } catch (read) {
+            this.diag.error(
+              `[context-manager] a sharded addMessage failed partway, and reading the store's branch threw, so nothing is ` +
+                `removed, and body group ${decision.bodyGroupId} may be left short: ${describeThrown(read)}`,
+            );
+            away = true;
+          }
+          if (away) {
             hearStayed(stored);
-            throw err === moved ? new WriteLandedError(stored, err) : new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err);
+            throw appending ? new WriteOutcomeUnknownError({ landed: stored, unknown: [], unnamed: 1 }, err) : new WriteLandedError(stored, err);
           }
           // A write that fails partway leaves no part of the body in the
           // store: remove what it wrote (the failing shard too, if it
@@ -1185,10 +1215,11 @@ export class ContextManager {
           // naming what the manager knows (WriteOutcomeUnknownError).
           const wrote = [...stored];
           // 1 when the store can't be read to tell whether the failing
-          // shard's row landed, which then has no id here.
+          // shard's row landed, which then has no id here. Only an append
+          // can leave a row: a write that failed outside one has none.
           let unnamed = 0;
           try {
-            const failing = this.rowLandedAt(lengthBefore + stored.length, decision.bodyGroupId);
+            const failing = appending ? this.rowLandedAt(lengthBefore + stored.length, decision.bodyGroupId) : null;
             if (failing !== null) wrote.push(failing);
           } catch (read) {
             unnamed = 1;

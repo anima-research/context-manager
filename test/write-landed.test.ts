@@ -98,6 +98,22 @@ function failTailRead(cm: ContextManager): () => void {
   return () => { messages.getTail = getTail; };
 }
 
+/**
+ * The next `createStrategyContext` the manager makes throws `error`; the
+ * ones after it are made. In legacy mode a sharded add's first is the one
+ * that tells the strategy of the stored body, once every shard is stored.
+ */
+function failContextOnce(cm: ContextManager, error: unknown): void {
+  const own = internals(cm);
+  const build = own.createStrategyContext.bind(cm);
+  let failed = false;
+  own.createStrategyContext = () => {
+    if (failed) return build();
+    failed = true;
+    throw error;
+  };
+}
+
 /** What `fn` threw. */
 function thrownBy(fn: () => unknown): unknown {
   try {
@@ -801,6 +817,87 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     const stored = cm.getAllMessages();
     assert.deepEqual(stored.map(textOf), ['before', 'one '], 'the first shard stays where the write started');
     assert.deepEqual(err.landed, [stored[1]!.id]);
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 3, finding 1: the read of the store's branch
+  // in the failure's handling can throw too.
+  it("where the store can't say its branch once a shard is stored, the error names the shards stored, and the strategy hears them once it can", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
+    const store = cm.getStore() as unknown as Record<string, unknown>;
+    const own = Object.prototype.hasOwnProperty.call(store, 'currentBranch');
+    const currentBranch = store.currentBranch as (this: unknown) => unknown;
+    let unreadable = false;
+    store.currentBranch = function (this: unknown) {
+      if (unreadable) throw new Error('zz-branch-unreadable');
+      return currentBranch.call(this);
+    };
+    // A host's listener of the first shard's add runs after the manager's
+    // own: from then on the store can't say its branch.
+    cm.onMessage((event) => { if (event.type === 'add') unreadable = true; });
+    let err: unknown;
+    let logged: string[];
+    try {
+      ({ result: err, logged } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]))));
+    } finally {
+      if (own) store.currentBranch = currentBranch;
+      else delete store.currentBranch;
+    }
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one '], 'the first shard stays, and nothing is removed');
+    assert.deepEqual(err.landed, [stored[1]!.id], 'no shard after it was appended, so none is unnamed');
+    assert.ok(err.cause instanceof Error && err.cause.message === 'zz-branch-unreadable', String(err.cause));
+    assert.ok(logged.some((l) => l.includes("reading the store's branch") && l.includes('zz-branch-unreadable')), logged.join('\n'));
+    // The shard that stayed is in the legacy window: the strategy hears it,
+    // once, by the next notification.
+    const after = cm.addMessage('bob', [text('after')]);
+    assert.deepEqual(strategy.presented.flat(), [before, stored[1]!.id, after]);
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 3, finding 21: the rows the strategy is to hear
+  // are kept until it has heard them.
+  it("in legacy mode the strategy hears the shards that stayed when telling it of the stored body failed in the manager's own work", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('zz-context-failed');
+    failContextOnce(cm, failure);
+    failRemoval(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ', 'three'], 'setup: every shard stayed');
+    assert.deepEqual(err.landed, stored.slice(1).map((m) => m.id));
+    assert.equal(err.cause, failure);
+    assert.deepEqual(strategy.presented, [[stored[0]!.id], err.landed], 'one call with the shards that stayed, which the window holds');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 3, finding 22: once every shard is stored, no
+  // append failed, so no row is unnamed.
+  it("a write that fails once every shard is stored names them all, and no row it can't, whatever the store's reads do", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    const failure = new Error('zz-context-failed');
+    failContextOnce(cm, failure);
+    failRemoval(cm);
+    // The read that tells whether a failing append's row landed.
+    (cm as unknown as { rowLandedAt: () => never }).rowLandedAt = () => { throw new Error('store unreadable'); };
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    delete (cm as unknown as { rowLandedAt?: unknown }).rowLandedAt;
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ', 'three']);
+    assert.deepEqual(err.landed, stored.slice(1).map((m) => m.id), 'every shard, which stayed');
+    assert.equal(err.cause, failure);
+    await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
 });
