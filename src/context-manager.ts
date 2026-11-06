@@ -1854,11 +1854,12 @@ export class ContextManager {
    * (the context it builds for the strategy), which doesn't throw here, as
    * the rows are in the window: they wait, and are heard at the strategy's
    * next notification. The first call, which writes the legacy window down, enters
-   * no new row, so the strategy hears nothing: it heard each row as it was
-   * stored. A call the store refuses tells it nothing; a call that throws
-   * after the store kept part of it tells the strategy the rows that left
-   * and entered before it, then throws; a call that completes a body tells
-   * it only the shards that entered then. Where the write throws and
+   * no row the window didn't already hold, which the strategy reads in its
+   * view, so it hears nothing. A call the store refuses tells it nothing; a
+   * call that throws after the store kept part of it tells the strategy the
+   * rows that left and entered before it, then throws; a call that
+   * completes a body tells it only the shards that entered then. Where the
+   * write throws and
    * the index can't be read again to tell whether it landed, the call
    * throws WindowWriteOutcomeUnknownError (its `cause` the write's own
    * error), and the strategy hears what the store kept at the next write
