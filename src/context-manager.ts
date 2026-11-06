@@ -1810,7 +1810,10 @@ export class ContextManager {
    * The strategy hears the rows that entered the window
    * (ContextStrategy.onPresented) once they are in it and before this
    * returns, fire and forget: its failure is logged, and the rows stay
-   * presented. The first call, which writes the legacy window down, enters
+   * presented. So is a failure of the manager's own work around the call
+   * (the context it builds for the strategy), which doesn't throw here, as
+   * the rows are in the window: they wait, and are heard at the strategy's
+   * next notification. The first call, which writes the legacy window down, enters
    * no new row, so the strategy hears nothing: it heard each row as it was
    * stored. A call the store refuses tells it nothing; a call that throws
    * after the store kept part of it tells the strategy the rows that left
@@ -1851,7 +1854,14 @@ export class ContextManager {
         throw error;
       }
       const { ordinals, entered, left } = presented;
-      this.tellPresentation(left, entered, (id) => record[positionOf(id)!]!);
+      // The rows are in the window: a failure of the manager's own work
+      // around the strategy's call is logged, not thrown, since a retry
+      // would be refused, and what it was for waits (tellPresentation).
+      try {
+        this.tellPresentation(left, entered, (id) => record[positionOf(id)!]!);
+      } catch (error) {
+        logThrown('[context-manager] presentRows presented its rows, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+      }
       return ordinals;
     });
   }
@@ -1863,15 +1873,27 @@ export class ContextManager {
    * `rowOf`. The rows are found before either hook runs, since a hook can
    * move the store's branch. The second call is made where the first's
    * hook leaves it, as notifyPresented makes a row's call after another
-   * row's hook (deferPresented).
+   * row's hook (deferPresented). Where the manager's own work around a
+   * call throws (the rows' reading, the context it builds), no hook of
+   * that call has run: the call's rows wait, as rows a delivery that
+   * failed to read left waiting do, to be heard at the strategy's next
+   * notification, and the error is thrown on.
    */
   private tellPresentation(left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage): void {
-    const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
-    const enteredRows = entered.map(rowOf);
-    const scope = leftRows.length > 0 ? this.hookScope() : null;
-    this.notifyRetracted(leftRows, { undone: false, removed: false });
-    if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
-    else this.deferPresented(enteredRows, false);
+    let leftTold = left.length === 0;
+    try {
+      const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
+      const enteredRows = entered.map(rowOf);
+      const scope = leftRows.length > 0 ? this.hookScope() : null;
+      this.notifyRetracted(leftRows, { undone: false, removed: false });
+      leftTold = true;
+      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
+      else this.deferPresented(enteredRows, false);
+    } catch (error) {
+      if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal }) => ({ id, ordinal })), info: { undone: false, removed: false } });
+      for (const id of entered) this.presentedUnheard.set(id, this.presentedUnheard.get(id) === true);
+      throw error;
+    }
   }
 
   /**
@@ -1923,6 +1945,8 @@ export class ContextManager {
    * The strategy is told the rows left (ContextStrategy.onRetracted, with
    * `undone` as given) once they are out of the window and before this
    * returns, fire and forget: its failure is logged, and the rows stay out.
+   * A failure of the manager's own work around the call is logged too, and
+   * the call waits, as presentRows' rows do.
    * A call that throws after the store kept its tombstones tells the
    * strategy the rows that left, then throws; where the index can't be read
    * again to tell, it throws WindowWriteOutcomeUnknownError and the
@@ -1956,10 +1980,16 @@ export class ContextManager {
         if (error instanceof WindowWriteOutcomeUnknownError) asFound.keep([...error.entering, ...error.leaving]);
         throw error;
       }
-      this.tellRetraction(left, info, (id) => {
-        const at = positionOf(id);
-        return at === undefined ? undefined : record[at];
-      });
+      // The rows are out of the window: as presentRows, a failure of the
+      // manager's own work around the call is logged, and the call waits.
+      try {
+        this.tellRetraction(left, info, (id) => {
+          const at = positionOf(id);
+          return at === undefined ? undefined : record[at];
+        });
+      } catch (error) {
+        logThrown('[context-manager] retractRows took its rows out, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+      }
     });
   }
 
@@ -1969,21 +1999,31 @@ export class ContextManager {
    * has none to give: it is told by its id, as removed, in a call of its
    * own. Both calls' rows are found before either hook runs, and the
    * second call is made where the first's hook leaves it (deferRetracted),
-   * as presentRows makes its second.
+   * as presentRows makes its second. Where the manager's own work around a
+   * call throws, what it was for waits, as tellPresentation's rows do (a
+   * waiting call tells a row the store no longer holds by its id, in a
+   * call of its own), and the error is thrown on.
    */
   private tellRetraction(left: readonly LeftRow[], info: Retraction, rowOf: (id: MessageId) => StoredMessage | undefined): void {
-    const held: RetractedRow[] = [];
-    const gone: RetractedRow[] = [];
-    for (const { id, ordinal } of left) {
-      const row = rowOf(id);
-      if (row === undefined) gone.push({ id, ordinal });
-      else held.push({ id, row, ordinal });
-    }
-    const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
     const removed: Retraction = { undone: info.undone, removed: true };
-    this.notifyRetracted(held, info);
-    if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
-    else this.deferRetracted(gone, removed);
+    let waiting: { left: RetractedRow[]; info: Retraction } = { left: left.map(({ id, ordinal }) => ({ id, ordinal })), info };
+    try {
+      const held: RetractedRow[] = [];
+      const gone: RetractedRow[] = [];
+      for (const { id, ordinal } of left) {
+        const row = rowOf(id);
+        if (row === undefined) gone.push({ id, ordinal });
+        else held.push({ id, row, ordinal });
+      }
+      const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
+      this.notifyRetracted(held, info);
+      waiting = { left: gone, info: removed };
+      if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
+      else this.deferRetracted(gone, removed);
+    } catch (error) {
+      if (waiting.left.length > 0) this.retractedUnheard.push(waiting);
+      throw error;
+    }
   }
 
   /**
@@ -4232,9 +4272,12 @@ export class ContextManager {
    * way the rows stay stored and in the window, as do a sharded body's
    * remaining shards, and the strategy isn't offered them again. Only the
    * strategy's call is caught: the manager's own work around it, the
-   * context it hands the strategy among it, still fails the write, as
-   * onMessage's note says. The log is logThrown's, which survives a thrown
-   * value that can't be formatted.
+   * context it hands the strategy among it, still fails an add, as
+   * onMessage's note says. A presentRows or retractRows, whose window
+   * write has landed by then, logs it instead, and the rows wait to be
+   * heard at the strategy's next notification (tellPresentation). The
+   * log is logThrown's, which survives a thrown value that can't be
+   * formatted.
    */
   private notifyPresented(rows: readonly StoredMessage[]): void {
     if (rows.length === 0 || this.closed) return;
@@ -4278,8 +4321,17 @@ export class ContextManager {
         return false;
       }
     };
+    // A check that throws (the store's branch can't be read) can't tell
+    // either, so the rest wait: once a hook has run nothing here throws.
+    const stopsBefore = (row: StoredMessage) => {
+      try {
+        return !this.inHookScope(scope) || (!legacy && !inWindow(row.id));
+      } catch {
+        return true;
+      }
+    };
     for (let i = 0; i < rows.length; i++) {
-      if (i > 0 && (!this.inHookScope(scope) || (!legacy && !inWindow(rows[i]!.id)))) {
+      if (i > 0 && stopsBefore(rows[i]!)) {
         // The previous row's hook closed the manager, set a strategy,
         // started an initialization, which may have finished before the
         // hook returned (a strategy with no initialize), moved the store's

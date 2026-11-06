@@ -293,18 +293,36 @@ describe('onPresented in presented mode', () => {
     main.close();
   });
 
-  it("the manager's own work around the call still fails presentRows, and the rows stay presented", async () => {
+  // CM #350 bot review, wave 2, finding 35: the write has landed by then, so
+  // presentRows doesn't throw, which a retry would meet as "in the window
+  // already"; the rows wait to be heard.
+  it("the manager's own work around the call failing is logged, the rows stay presented, and the strategy hears them at its next notification", async () => {
     const strategy = new Records();
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
     cm.presentRows([]);
     const a = cm.addMessage('alice', [text('a')]);
+    const b = cm.addMessage('bob', [text('b')]);
     // The context the manager builds for the hook is the manager's own work.
-    (cm as unknown as { createStrategyContext: () => never }).createStrategyContext = () => {
+    const own = cm as unknown as { createStrategyContext?: () => never };
+    own.createStrategyContext = () => {
       throw new Error('zz the manager failed');
     };
-    assert.throws(() => cm.presentRows([a]), /zz the manager failed/);
+    let ordinals: number[] = [];
+    let errors: unknown[][];
+    try {
+      errors = await errorsDuring(async () => {
+        ordinals = cm.presentRows([a]);
+      });
+    } finally {
+      delete own.createStrategyContext;
+    }
+    assert.equal(ordinals.length, 1, 'presentRows returned its ordinal');
+    assert.ok(errors.some((args) => args.map(String).join(' ').includes('zz the manager failed')), 'the failure is logged');
     assert.equal(strategy.heard.length, 0, 'the strategy was never called');
     assert.notEqual(cm.ordinalOf(a), undefined, 'the presentation stands');
+    cm.presentRows([b]);
+    assert.deepEqual(strategy.heard.map((h) => h.rows), [[a], [b]], 'a is heard at the next notification, first');
+    await settle();
     cm.close();
   });
 

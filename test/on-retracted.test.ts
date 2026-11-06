@@ -520,6 +520,36 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 2, finding 35: retractRows' tombstones have
+  // landed by then, so it doesn't throw; the call waits to be made.
+  it("the manager's own work around retractRows' call failing is logged, the rows stay out, and the strategy is told at its next notification", async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    strategy.log.length = 0;
+    const own = cm as unknown as { createStrategyContext?: () => never };
+    own.createStrategyContext = () => {
+      throw new Error('zz the manager failed');
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => {
+        cm.retractRows([a]);
+      });
+    } finally {
+      delete own.createStrategyContext;
+    }
+    assert.ok(lines.some((line) => line.includes('zz the manager failed')), lines.join('\n'));
+    assert.equal(strategy.log.length, 0, 'nothing was told');
+    assert.equal(cm.ordinalOf(a), undefined, 'the row is out');
+    cm.retractRows([b]);
+    assert.deepEqual(strategy.log, ['retracted a', 'retracted b'], 'the call that waited is made first');
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 37: a branch whose window never
   // held the row isn't told it left.
   it('a call waiting on an initialization of a branch made before the row was stored is not made there', async () => {
