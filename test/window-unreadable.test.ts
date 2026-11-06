@@ -392,6 +392,12 @@ describe('a window state that holds no index this version reads', () => {
       store.registerState({ id: INDEX, strategy: 'snapshot' });
       store.setStateJson(INDEX, 'zz');
     }, /holds a string \("zz"\), not a list of index items/],
+    // CM #350 bot review (wave 2), finding 25: a value of JSON null is a
+    // value, not the absence of one.
+    ['null', (store) => {
+      store.registerState({ id: INDEX, strategy: 'snapshot' });
+      store.setStateJson(INDEX, null);
+    }, /holds null, not a list of index items/],
     ['bytes that aren\'t JSON', (store) => {
       store.registerState({ id: INDEX, strategy: 'snapshot' });
       store.setState(INDEX, Buffer.from([0xff, 0x00, 0x13]));

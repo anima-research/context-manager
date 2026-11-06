@@ -103,10 +103,11 @@
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header
  * to say whose they are, and a state that holds no list of items at all: a
- * value of another kind, one that isn't JSON, or records the store can't
- * read back as one value. The manager reads the window as the record there,
- * with a warning that says what the state holds, and refuses to present or
- * retract, so it never writes its items into a state another format keeps.
+ * value of another kind (JSON null among them), one that isn't JSON, or
+ * records the store can't read back as one value. The manager reads the
+ * window as the record there, with a warning that says what the state
+ * holds, and refuses to present or retract, so it never writes its items
+ * into a state another format keeps.
  *
  * Not to be confused with two other senses of the word in this package:
  * kv-unified's presentation receipts (a provider submission's leaf layout)
@@ -289,9 +290,9 @@ interface IndexState {
   unreadable: number;
   /**
    * What the state holds where it holds no list of items this version can
-   * read, as an error names it: a value of another kind, one that isn't
-   * JSON, or records the store can't read back as one value. Null for a
-   * list, and for no value.
+   * read, as an error names it: a value of another kind (JSON null among
+   * them), one that isn't JSON, or records the store can't read back as
+   * one value. Null for a list, and for a state with no record.
    */
   found: string | null;
 }
@@ -362,8 +363,9 @@ function unreadableValue(store: JsStore, stateId: string, error: unknown): strin
   throw error;
 }
 
-/** A JSON value's kind as foreignness names it, with the start of the value: `an object ({"a":1})`. */
+/** A JSON value's kind as foreignness names it, with the start of the value: `an object ({"a":1})`, or `null`. */
 function kindOf(value: unknown): string {
+  if (value === null) return 'null';
   const kind = typeof value === 'object' ? 'an object' : `a ${typeof value}`;
   let shown: string;
   try {
@@ -673,7 +675,9 @@ export class WindowIndex {
         const at = typeof item?.at === 'number' ? item.at : undefined;
         apply(state, item, i, at);
       }
-    } else if (state.found === null && items !== null && items !== undefined) {
+    } else if (state.found === null && items !== undefined) {
+      // A state with a record holds a value, JSON null among them: a state
+      // with none has no revision, and was returned for above.
       state.found = `${kindOf(items)}, not a list of index items`;
     }
     const foreign = foreignness(state);
