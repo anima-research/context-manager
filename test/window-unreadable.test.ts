@@ -8,6 +8,11 @@
  *   settled at the next write through the index, on the branch it was made
  *   on: the strategy then hears the rows that entered or left, once, before
  *   that call's own work, and hears nothing of a write the store refused.
+ *   Where the store can't say its branch before the write or after it,
+ *   nothing waits, the error and a warning say so, and the strategy reads
+ *   the window at its next select (the nothing-waits case below); a write
+ *   made while the store can't say its branch, where a settlement waits,
+ *   writes nothing.
  * - A window state that holds no index this version reads, a value that
  *   isn't a list of items or one the store can't read back: the window is
  *   the record, with one warning saying what the state holds, and

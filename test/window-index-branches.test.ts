@@ -17,9 +17,11 @@
  *   shard's own sequence, so the new branch's window holds the row and its
  *   record the whole body; it finds a row of an auxiliary slot too. A row the window
  *   doesn't hold is cut at its own sequence, as in legacy mode. A row the
- *   write-down presented is cut at its own sequence too, and the new
- *   branch is in legacy mode; a body the write-down presented is cut at its
- *   last shard, where legacy mode cuts at the shard named.
+ *   window holds from the write-down is cut at its own sequence too, and
+ *   the new branch is in legacy mode; one taken out since and presented
+ *   again is cut at that presentation, and the new branch is in presented
+ *   mode. A body the write-down presented is cut at its last shard, where
+ *   legacy mode cuts at the shard named.
  * - A row removed from the manager's slot leaves the window as a
  *   tombstone, so no other row's ordinal moves, also when the context log
  *   throws on the removal. A window that can't be read before a range is

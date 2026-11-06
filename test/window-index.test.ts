@@ -242,7 +242,7 @@ function cutShortWriteDown(cm: ContextManager, failing: number): void {
 }
 
 describe('writing the window down', () => {
-  it('cut short at any item, it leaves legacy mode and the whole record, and the next presentRows([]) finishes it once', async () => {
+  it('cut short at any item, the branch stays in legacy mode with the whole record as its window, and the next presentRows([]) finishes it once', async () => {
     // Four rows and the header are five items, one record each. The header
     // is the last, so wherever the write-down stops, the index has none and
     // the window is still the record.
