@@ -96,7 +96,9 @@
  * such a prefix is not in effect: the manager stays in legacy mode, its
  * window still the whole record, and the next presentRows or retractRows
  * finishes the write-down in one record, the rows it hasn't written then
- * the header, before it does its own work. A body such an index holds in
+ * the header, before it does its own work (or, where a slot merged since
+ * puts older rows before the ones written, takes those out and writes the
+ * whole record again, in record order). A body such an index holds in
  * part is completed, or put back whole, by present. Such an index is read
  * as one written in batches is; this version writes none.
  *
@@ -1193,9 +1195,13 @@ export class WindowIndex {
    * module comment), leaves the manager in legacy mode. The next one
    * finishes it from where it stopped. A row it wrote that has since
    * left the record (a removal writes nothing in legacy mode) is taken out,
-   * and the rows it didn't write follow the ones it did: those were a
-   * prefix of the record and still are, since later rows are stored after
-   * them. Throws for an index this version must not write to (foreignness).
+   * and the rows it didn't write follow the ones it did, while those are
+   * still a prefix of the record, as they are while every row stored since
+   * is stored after them. A slot merged since (auxiliaryMessageViews) can
+   * hold older rows, which sort before them: then the rows it wrote are
+   * taken out and every row of the record written again, in record order,
+   * so the window is the record as legacy mode read it. Throws for an index
+   * this version must not write to (foreignness).
    */
   private writeDown(operation: string, state: IndexState, record: readonly StoredMessage[]): IndexItem[] {
     const foreign = foreignness(state);
@@ -1206,9 +1212,11 @@ export class WindowIndex {
       );
     }
     const held = messagesIn(record);
+    const written = [...state.ordinals].sort((a, b) => a[1] - b[1]).map(([id]) => id);
+    const prefix = written.filter((id) => held.has(id)).every((id, i) => record[i]!.id === id);
     const items: IndexItem[] = [];
-    for (const id of state.ordinals.keys()) if (!held.has(id)) items.push({ retract: id });
-    for (const message of record) if (!state.ordinals.has(message.id)) items.push({ id: message.id });
+    for (const id of written) if (!prefix || !held.has(id)) items.push({ retract: id });
+    for (const message of record) if (!prefix || !state.ordinals.has(message.id)) items.push({ id: message.id });
     items.push({ v: INDEX_FORMAT });
     return items;
   }
