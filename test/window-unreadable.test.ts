@@ -74,11 +74,12 @@ class Hearing extends PassthroughStrategy {
  * Makes the next append to the window index, single or batched, throw:
  * after the store kept it (`kept`), or before it wrote anything. Every read
  * of the index's revision then throws too, `reads` times, so the index
- * can't be read again to tell which. Returns the undo.
+ * can't be read again to tell which. With `branchUnread`, so does every
+ * read of the store's branch after the append throws. Returns the undo.
  */
-function failNextWriteUnread(cm: ContextManager, kept: boolean, reads = 1): () => void {
+function failNextWriteUnread(cm: ContextManager, kept: boolean, reads = 1, branchUnread = false): () => void {
   const store = cm.getStore() as unknown as Record<string, unknown>;
-  const names = ['appendToStateJsonWithIdentity', 'appendManyToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen'];
+  const names = ['appendToStateJsonWithIdentity', 'appendManyToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen', 'currentBranch'];
   const originals = new Map(names.map((name) => [name, { own: Object.prototype.hasOwnProperty.call(store, name), fn: store[name] }]));
   let failed = false;
   let failingReads = 0;
@@ -92,7 +93,14 @@ function failNextWriteUnread(cm: ContextManager, kept: boolean, reads = 1): () =
       throw new Error(kept ? 'zz-index-kept-then-failed' : 'zz-index-refused');
     };
   }
-  for (const name of names.slice(2)) {
+  if (branchUnread) {
+    const branch = originals.get('currentBranch')!.fn as (this: unknown) => unknown;
+    store.currentBranch = function (this: unknown) {
+      if (failed) throw new Error('zz-branch-read-failed');
+      return branch.call(this);
+    };
+  }
+  for (const name of names.slice(2, 4)) {
     const read = originals.get(name)!.fn as ((this: unknown, id: string) => unknown) | undefined;
     if (typeof read !== 'function') continue;
     store[name] = function (this: unknown, id: string) {
@@ -185,6 +193,26 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     assert.deepEqual(strategy.log, []);
     cm.presentRows([y!]);
     assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`]);
+    cm.close();
+  });
+
+  // CM #350 bot review (wave 2), finding 16: the write waits on the branch
+  // it was made on, read before it, so a store that can't say its branch
+  // once the write throws doesn't drop it.
+  it("a write that settles waits on the branch read before it, where the store can't say its branch after", async () => {
+    const strategy = new Hearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    const restore = failNextWriteUnread(cm, true, 1, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    assert.deepEqual(strategy.log, []);
+    cm.presentRows([]);
+    assert.deepEqual(strategy.log, [`presented ${x}`], 'the next write on the branch settles it');
     cm.close();
   });
 
