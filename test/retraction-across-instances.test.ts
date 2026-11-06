@@ -830,6 +830,73 @@ describe('a retraction through another instance sharing the store', () => {
     });
   }
 
+  // Wave 5, finding 47: the cases above change the record by retracting a
+  // row, which also takes it out of the window, so the window's read alone
+  // found the span let go of, and nothing pinned the record's own check.
+  // Here the other instance changes the stored record and every row keeps
+  // its ordinal.
+  it('a ladder ending with no summary over a record the other instance compressed, its rows all in the window, quarantines nothing', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const gate = emptyMembrane();
+    const A = strategyFor();
+    const a = await ContextManager.open({ store, strategy: A, membrane: gate.membrane });
+    try {
+      a.presentRows([]);
+      for (let i = 0; i < 24; i++) {
+        a.presentRows([a.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: `${i} ${'word '.repeat(30)}` }])]);
+      }
+      await a.compile();
+      const ticking = a.tick();
+      await waitFor(() => gate.calls() === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const recordId = work.chunk.recordId!;
+      const span = work.chunk.messages.map((m) => m.id);
+      const lines = await linesDuring(async () => {
+        // As the other instance's own L1 over the record lands: its summary and the record marked.
+        const l1 = { id: 'L1-zz', level: 1, content: 'zz', tokens: 5, sourceLevel: 0, sourceIds: span, sourceRange: { first: span[0], last: span.at(-1) }, created: 1 };
+        store.setStateJson(SUMMARIES, [...stored(store, SUMMARIES), l1]);
+        store.setStateJson(CHUNKS, stored(store, CHUNKS).map((r) => (r.id === recordId ? { ...r, compressed: true, summaryId: 'L1-zz' } : r)));
+        assert.ok(span.every((id) => a.windowStatusOf(id) === 'in'), 'premise: every row of the span is in the window');
+        gate.release();
+        await ticking;
+      });
+      assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
+      assert.deepEqual(lines.filter((line) => line.includes('"compression:quarantine-alert"')), [], 'no alert was sent');
+      assert.ok(lines.some((line) => line.includes('quarantines nothing') && line.includes(`chunk record ${recordId} changed in the store mid-request`)), lines.join('\n'));
+    } finally {
+      gate.release();
+      a.close();
+      store.close();
+    }
+  });
+
+  it('an L1 in flight over a record the other instance wrote again, its rows all in the window at their ordinals, writes nothing', async () => {
+    const { store, strategy: A, cm: a, calls } = await instanceA();
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const recordId = work.chunk.recordId!;
+      const span = work.chunk.messages.map((m) => m.id);
+      const lines = await linesDuring(async () => {
+        // The other instance's let-go of a returned row writes a record in window order: here, its rows in another order.
+        store.setStateJson(CHUNKS, stored(store, CHUNKS).map((r) => (r.id === recordId ? { ...r, sourceIds: [...r.sourceIds].reverse() } : r)));
+        assert.ok(span.every((id) => a.windowStatusOf(id) === 'in'), 'premise: every row of the span is in the window');
+        calls[0]!.release();
+        await ticking;
+      });
+      assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(`chunk record ${recordId} changed in the store mid-request`)), lines.join('\n'));
+      assert.ok(!stored(store, SUMMARIES).some((s) => s.level === 1 && s.sourceIds.join() === span.join()), 'no L1 over the span was written');
+    } finally {
+      for (const call of calls) call.release();
+      a.close();
+      store.close();
+    }
+  });
+
   it('an L1 in flight over a record no other instance changed is written (control)', async () => {
     const { store, cm: a, calls, membrane, strategy: A } = await instanceA();
     let b: ContextManager | undefined;
