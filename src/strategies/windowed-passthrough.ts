@@ -378,7 +378,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * active tune-out"). Moving the anchor earlier deliberately accepts one
    * full prefix invalidation. The sequence the anchor already has changes
    * nothing, so a host that sets a tune-out's start again at a restart
-   * keeps the window it had, but only while the anchor hasn't moved since.
+   * keeps the window it had, but only while the anchor hasn't moved since;
+   * while a write of the anchor is unwritten (one threw), it writes it
+   * again, and a throw reaches the caller.
    * A re-anchor (select, on overflow) gives the anchor the sequence of the
    * row it starts the window at, and setAnchorOrdinal that of the row at
    * its ordinal, so the tune-out's start is then converted again, which
@@ -407,7 +409,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    */
   setAnchor(sequence: Sequence): void {
     this.syncToBranch();
-    if (sequence === this.anchor && !this.anchorMoved) return;
+    if (sequence === this.anchor && !this.anchorMoved) {
+      // The anchor it has, but unwritten (a write of it threw): a caller's
+      // retry of a failed move writes it, and hears whether that landed.
+      if (this.anchorUnwritten) this.persistAnchor();
+      return;
+    }
     this.anchor = sequence;
     this.anchorOrdinal = this.window?.ordinalFrom(sequence) ?? null;
     this.anchorMoved = false;
@@ -424,6 +431,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * sequence when none is, for a reader that knows no ordinal (see the
    * class doc). Throws in legacy mode, where there are no ordinals, and
    * for an ordinal that isn't a whole number from 0 to the index length.
+   * The ordinal the anchor already has changes nothing, unless a write of
+   * the anchor is unwritten, as for setAnchor.
    */
   setAnchorOrdinal(ordinal: number): void {
     this.syncToBranch();
@@ -441,7 +450,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
           `a whole number from 0 to its index length ${length}`,
       );
     }
-    if (ordinal === this.presentedAnchor()?.from) return;
+    if (ordinal === this.presentedAnchor()?.from) {
+      // As in setAnchor: the read's own try again swallows its failure, so
+      // a retry of a move still unwritten writes it, and its failure
+      // reaches the caller.
+      if (this.anchorUnwritten) this.persistAnchor();
+      return;
+    }
     this.anchorOrdinal = ordinal;
     this.anchor = window.sequenceFrom(ordinal) ?? this.store!.currentSequence();
     this.anchorMoved = true;
@@ -494,9 +509,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         // stored before it has been presented after the row it names: the
         // next read writes it again (anchorUnwritten), until it lands.
         this.diag.warn(
-          `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written; it is written at the ` +
-            `next compile or read of the anchor, and a reload before then converts its sequence ${this.anchor} again: ` +
-            `${describeThrown(err)}`,
+          `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written; it is tried again at ` +
+            `each compile or read of the anchor until a write lands, and a reload before then converts its sequence ` +
+            `${this.anchor} again: ${describeThrown(err)}`,
         );
       }
     }
@@ -583,9 +598,22 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       return;
     }
     this.anchor = value;
+    if (format !== ANCHOR_SLOT_FORMAT) return;
     const ordinal = persisted!.ordinal;
-    if (format !== ANCHOR_SLOT_FORMAT || typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0) return;
     if (!this.window?.ordinals()) return;
+    if (typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0) {
+      // A slot of this format names its ordinal: one missing or damaged
+      // names no place in the window, so the sequence beside it is
+      // converted again (presentedAnchor), which can give another window
+      // once rows have been presented out of record order. Said, not
+      // passed over as a sequence slot.
+      this.diag.warn(
+        `[windowed-passthrough] persisted anchor ordinal ${ordinal === undefined ? 'missing' : JSON.stringify(ordinal)} ` +
+          `is not an ordinal, a whole number from 0 (${this.store.currentBranch().name}); its sequence ${value} is ` +
+          `converted again, against the window as it stands`,
+      );
+      return;
+    }
     const length = this.window.length();
     if (ordinal > length) {
       // As a sequence past the head: an ordinal this branch's index never
