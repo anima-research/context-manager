@@ -266,6 +266,9 @@ describe('a write the store threw on, where the index then can\'t be read', () =
           },
         });
       };
+      // CM #350 bot review, wave 3, finding 31: the setup's presentRows(rows)
+      // logged already, so what the settled write tells is what follows.
+      const heardBefore = (cm.getStrategy() as Hearing).log.length;
       const restore = failNextWriteUnread(cm, true);
       try {
         assert.throws(
@@ -287,7 +290,11 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       }
       assert.deepEqual(listings.map((ref) => ref.deref() === undefined), listings.map(() => true), `${operation}: the record the call read is let go`);
       cm.presentRows([]);
-      assert.equal((cm.getStrategy() as Hearing).log.length > 0, true, `${operation}: the write is still told once it settles`);
+      assert.deepEqual(
+        (cm.getStrategy() as Hearing).log.slice(heardBefore),
+        [`${operation === 'presentRows' ? 'presented' : 'retracted'} ${rows[0]}`],
+        `${operation}: the write is still told once it settles`,
+      );
       cm.close();
     }
   });

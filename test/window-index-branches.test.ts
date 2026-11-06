@@ -426,10 +426,15 @@ describe('branchAt and the window', () => {
     assert.equal(cm.getAllMessages().length, 4, 'setup: the body is stored as three shards');
     cm.presentRows([u, doc]);
     const shards = ids(cm.getPresentedMessages()).slice(1);
+    // CM #350 bot review, wave 3, finding 35: a row stored and presented
+    // after the cut, so the cut isn't the store's head.
+    const later = cm.addMessage('User', [text('later')]);
+    cm.presentRows([later]);
     cm.branchAt(doc, 'zz-at-doc');
     await cm.switchBranch('zz-at-doc');
     assert.deepEqual(ids(cm.getPresentedMessages()), [u, ...shards], 'the body is in the branch\'s window whole');
     assert.deepEqual(texts(await cm.compile(BIG)), ['u', 'p1', 'p2', 'p3']);
+    assert.ok(!ids(cm.getAllMessages()).includes(later), 'the row stored after the cut is not in the branch\'s record');
     cm.close();
   });
 
@@ -500,11 +505,17 @@ describe('branchAt and the window', () => {
     cm.retractRows([a]);
     cm.presentRows([a]);
     assert.deepEqual(ids(cm.getPresentedMessages()), [b, c, a], 'setup: a holds an ordinal after the header');
+    // CM #350 bot review, wave 3, finding 35: a row stored and presented
+    // after the cut, so the cut isn't the store's head.
+    const d = cm.addMessage('alice', [text('d')]);
+    cm.presentRows([d]);
     const atA = cm.branchAt(a, 'zz-at-a');
     assert.ok(branchPoint(cm, atA)! > cm.getMessage(c)!.sequence);
+    assert.ok(branchPoint(cm, atA)! < cm.getMessage(d)!.sequence, 'the cut is before the later row was stored');
     await cm.switchBranch(atA);
     assert.equal(cm.windowMode(), 'presented');
     assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c', 'a']);
+    assert.ok(!ids(cm.getAllMessages()).includes(d), 'the row stored after the cut is not in the branch\'s record');
     cm.close();
   });
 
@@ -591,10 +602,15 @@ describe('branchAt and the window', () => {
     const s2 = side.addMessage('Subconscious', [text('s2')]);
     side.presentRows([s2]);
     side.presentRows([m2]); // the other slot's row, presented at the reader's next boundary
+    // CM #350 bot review, wave 3, finding 35: a row stored and presented
+    // after the cut, so the cut isn't the store's head.
+    const s3 = side.addMessage('Subconscious', [text('s3')]);
+    side.presentRows([s3]);
     side.branchAt(m2, 'zz-at-m2');
     await side.switchBranch('zz-at-m2');
     assert.deepEqual(texts(await side.compile(BIG)), ['m1', 's1', 's2', 'm2']);
     assert.deepEqual(ids(side.getPresentedMessages()), [m1, s1, s2, m2]);
+    assert.ok(!ids(side.getAllMessages()).includes(s3), 'the row stored after the cut is not in the branch\'s record');
     side.close();
     main.close();
   });

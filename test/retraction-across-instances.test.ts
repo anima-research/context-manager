@@ -82,6 +82,23 @@ function heldMembrane() {
   return { calls, membrane };
 }
 
+/**
+ * Await `work`, releasing every call the membrane holds as it comes, until
+ * `work` settles (CM #350 bot review, wave 3, finding 33): a call that
+ * reaches the membrane late is released too, where a release after a fixed
+ * delay left it held and the test waiting for good.
+ */
+async function releasingUntil<T>(calls: ReadonlyArray<{ release: () => void }>, work: Promise<T>): Promise<T> {
+  let settled = false;
+  const done = work.finally(() => { settled = true; });
+  done.catch(() => {}); // the caller hears a rejection through the return
+  while (!settled) {
+    for (const call of calls) call.release();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return done;
+}
+
 async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
@@ -228,10 +245,7 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(internals(A).summaries.some((s) => s.id === l1.id), 'premise: the instance still holds the dropped L1');
       const before = calls.length;
       const lines = await linesDuring(async () => {
-        const ticking = a.tick();
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        for (const call of calls) call.release();
-        await ticking;
+        await releasingUntil(calls, a.tick());
       });
       assert.ok(!calls.slice(before).some((call) => call.merge), `no merge call was made: ${lines.join('\n')}`);
       assert.ok(lines.some((line) => line.includes('missing from the store (dropped by another instance sharing it')), lines.join('\n'));
@@ -280,12 +294,7 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(kept.length > 0, 'premise: the record keeps rows');
       const asked = calls.length;
       const drain = (async () => {
-        for (let i = 0; i < 20; i++) {
-          const next = a.tick();
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          for (const call of calls) call.release();
-          await next;
-        }
+        for (let i = 0; i < 20; i++) await releasingUntil(calls, a.tick());
       })();
       await linesDuring(() => drain);
       assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'nothing folded since covers the row');
@@ -512,10 +521,7 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), "premise: the other instance's summaries write failed");
       const before = calls.length;
       const lines = await linesDuring(async () => {
-        const ticking = a.tick();
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        for (const call of calls) call.release();
-        await ticking;
+        await releasingUntil(calls, a.tick());
       });
       assert.ok(!calls.slice(before).some((call) => call.merge), `no merge call was made: ${lines.join('\n')}`);
       assert.ok(lines.some((line) => line.includes('left the window through another instance') && line.includes(row)), lines.join('\n'));

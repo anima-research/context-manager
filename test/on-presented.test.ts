@@ -1084,6 +1084,9 @@ describe('onPresented in legacy mode', () => {
       assert.equal(shards.length, 3, 'setup: the add stored three shards');
       assert.equal(cm.windowMode(), 'legacy');
       assert.deepEqual(first.heard, [shards[0]], 'the strategy the hook replaced heard only the first shard');
+      // CM #350 bot review, wave 3, finding 30: nothing reaches the
+      // replacement while its initialize is held.
+      if (next instanceof Reacts) assert.deepEqual(next.heard, [], 'probe: the replacement hears nothing before its initialize');
       open();
       await replaced;
       const heard = next instanceof Reacts ? next.heard : next.heard.map((h) => h.id);
