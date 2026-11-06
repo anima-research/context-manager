@@ -420,10 +420,19 @@ describe('onRetracted', () => {
       initializing.gate = gate;
       const first = cm.setStrategy(initializing);
       cm.retractRows([a], { undone: true });
-      const replacement = new Records();
-      await cm.setStrategy(replacement);
+      // CM #350 bot review (wave 2), finding 47: the replacement's own
+      // initialize waits too, so the test tells after it from before it.
+      const replacement = new Gated();
+      const own = gated();
+      replacement.gate = own.gate;
+      const second = cm.setStrategy(replacement);
+      const superseded = assert.rejects(first, /supersed/i);
       open();
-      await assert.rejects(first, /supersed/i);
+      await settle();
+      assert.equal(replacement.retracted.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
+      own.open();
+      await second;
+      await superseded;
       assert.deepEqual(
         replacement.retracted.map((l) => [l.rows, l.info]),
         [[[a], { undone: true, removed: false, ids: [a] }]],
