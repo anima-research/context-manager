@@ -154,8 +154,10 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * presentation, is converted when the branch is first read in presented
  * mode: to the ordinal of the first row in the window stored at that
  * sequence or after (WindowIndexView.ordinalFrom), which is written to the
- * slot then. The window is then the one the sequence gave, since the index
- * is first written down in record order. From then on a row stored before
+ * slot then. The window is then the one the sequence gave, where no row
+ * stored before the sequence has been presented after the row it names
+ * since the write-down (the index is first written down in record order;
+ * see below for such a row). From then on a row stored before
  * the anchor's sequence but presented after that row is in the window,
  * where a sequence anchor would leave it out: the window is what the agent
  * was shown since, not what was stored since. The conversion gives the
