@@ -1,6 +1,9 @@
 /**
  * A half-written unfold is repaired by the next open (CM #350 bot review,
- * finding 2).
+ * finding 2), where that open demotes: under `topologyPolicy` 'reject', the
+ * default, in an open that isn't audit-only. 'report' and an audit-only
+ * open leave the record as they find it, as the last case shows (wave 4,
+ * finding 45).
  *
  * The autobiographical strategy writes what it lets go of (unfold) as three
  * states, one after another: the summaries, then the chunk records, then
