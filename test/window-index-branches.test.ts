@@ -351,6 +351,57 @@ describe('fork and the window', () => {
     assert.deepEqual([cm.ordinalOf(a!), cm.ordinalOf(b!)], ordinals);
     cm.close();
   });
+
+  // CM #350 bot review, wave 5, finding 13: a write whose bookkeeping fails
+  // after it landed leaves no reading behind, so a branch whose index ends
+  // at the record before the write reads its own.
+  it("a write whose read of the index's revision throws after it landed leaves no reading a fork made before it takes for its own", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [a, x] = ['a', 'x'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a]);
+    const store = cm.getStore();
+    const main = cm.currentBranch().name;
+    // Made now: its index ends at the record main's does, so it holds a, not x.
+    const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
+    // The window's append lands; the next two reads of the index's revision
+    // throw (the write's own, and the read after the throw), then read.
+    const handle = store as unknown as Record<string, (id: string, ...rest: unknown[]) => unknown>;
+    const saved: Record<string, (id: string, ...rest: unknown[]) => unknown> = {};
+    let landed = false;
+    let failing = 2;
+    for (const name of ['appendManyToStateJsonWithIdentity', 'appendToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen']) {
+      const real = handle[name];
+      if (typeof real !== 'function') continue;
+      saved[name] = real;
+      handle[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (id !== INDEX) return real.call(this, id, ...rest);
+        if (name.startsWith('append')) {
+          const result = real.call(this, id, ...rest);
+          landed = true;
+          return result;
+        }
+        if (landed && failing > 0) {
+          failing--;
+          throw new Error('zz-revision-unreadable');
+        }
+        return real.call(this, id, ...rest);
+      };
+    }
+    try {
+      assert.throws(() => cm.presentRows([x]), /zz-revision-unreadable/);
+    } finally {
+      for (const [name, real] of Object.entries(saved)) handle[name] = real;
+    }
+    assert.equal(failing, 0, 'setup: both reads failed');
+    await cm.switchBranch(fork);
+    assert.equal(cm.ordinalOf(x), undefined, "the fork's window doesn't hold x, which main's write presented");
+    assert.equal(cm.windowStatusOf(x), 'out');
+    assert.deepEqual(ids(cm.getPresentedMessages()), [a]);
+    await cm.switchBranch(main);
+    assert.equal(cm.windowStatusOf(x), 'in', 'main holds it, as the store kept the write');
+    cm.close();
+  });
 });
 
 describe('branchAt and the window', () => {

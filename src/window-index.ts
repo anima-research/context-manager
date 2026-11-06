@@ -1376,11 +1376,14 @@ export class WindowIndex {
         const record = this.store.appendToStateJsonWithIdentity(this.stateId, items[0]!, 'by', 'at');
         apply(state, items[0]!, state.rows.length, record.sequence, record.id);
       }
+      // Read inside the try: the reading was changed in place, and kept
+      // under the revision it had before the write, a branch whose index
+      // ends at that record would take it for its own.
+      state.revision = this.revision();
     } catch (error) {
       this.state = null;
       throw error;
     }
-    state.revision = this.revision();
     state.version = ++versions;
     state.presented = null;
   }
