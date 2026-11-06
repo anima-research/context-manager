@@ -479,8 +479,10 @@ describe('resetHeadWindow with metadata', () => {
     try {
       await assert.rejects(cm.resetHeadWindow('topic'), (error: Error) => {
         transition = cm.getAllMessages().at(-1)?.id;
-        return /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-index-append-failed\. Its transition add finished: message \S+ is stored, and the head window wasn't reset\./.test(error.message)
-          && error.message.includes(`message ${transition} is stored`);
+        // Once a host presents, a transition the window lacks is stored and
+        // out of it (CM #350 bot review, wave 5, finding 38).
+        return /^ContextManager\.resetHeadWindow's presentation of its transition failed: zz-index-append-failed\. Its transition add finished: message \S+ is stored and out of the window, and the head window wasn't reset\./.test(error.message)
+          && error.message.includes(`message ${transition} is stored and out of the window`);
       });
     } finally {
       restore();

@@ -4002,11 +4002,16 @@ export class ContextManager {
    * the manager, sets a strategy, moves the store's branch or takes the
    * transition out of the window again, and a read of the window, before
    * the presentation or after it, that fails. Each such refusal says where
-   * the transition stands as the window and then the store tell it when
-   * the call refuses: presented, stored and out of the window, or no
-   * longer stored (a listener or a hook removed it); where they can't
-   * tell (the store is on another branch, or can't be read), it says what
-   * the call last knew, such as stored, or stored and maybe presented.
+   * the transition stands as the store and then the window tell it when
+   * the call refuses: no longer stored (a listener or a hook removed it,
+   * through this manager or another on the slot), presented, presented in
+   * part (a listener of a sharded transition's first shard's add presented
+   * the shards stored by then), stored and out of the window, or, in
+   * legacy mode, where the window is the record, stored. Where they can't
+   * tell (the store is on another branch than the one the transition was
+   * added on, or can't say its branch), it says what the call last knew of
+   * that branch, such as stored, or stored and maybe presented, and that it
+   * is what the call last knew.
    * Legacy mode reads no record before the reset itself, as before: a
    * transition a listener removed there is reset at all the same. An add of the
    * transition that fails after storing it rejects with addMessage's
@@ -4047,37 +4052,61 @@ export class ContextManager {
     // at once.
     const refuse = (reason: string, where: string): Error =>
       new Error(
-        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
+        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} ` +
           `${where}, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds ` +
           'another transition message.',
       );
     const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    // Where the transition stands now, for a refusal: a listener of its add,
-    // or a hook its presentation ran, can have presented it, taken it out of
-    // the window or removed it. The window, then the store, are asked, each
-    // read guarded. `known` is what the call knows where they can't tell:
-    // the store is on another branch than the one the add stored it on, or
-    // can't say its branch. `out` is where the window lacks it and the store
-    // holds it.
-    const whereNow = (known: string, out = 'stored'): string => {
+    // How much of the transition's body the window holds: every shard,
+    // some, or none. A listener of a sharded transition's first shard can
+    // present that shard before the rest is stored. One the record no
+    // longer holds is judged by its id.
+    const heldOfBody = (): 'all' | 'some' | 'none' => {
+      const merged = this.mergedMessageView();
+      const record = merged.getAll();
+      const at = recordPositionOf(merged, record, msgId);
+      if (at === undefined) return this.windowIndex.ordinalOf(msgId) === undefined ? 'none' : 'all';
+      const { from, to } = bodyBoundsIn(record, at);
+      let held = 0;
+      for (let k = from; k <= to; k++) if (this.windowIndex.ordinalOf(record[k]!.id) !== undefined) held++;
+      return held === 0 ? 'none' : held === to - from + 1 ? 'all' : 'some';
+    };
+    // Where the transition stands now, for a refusal, as the words after
+    // its id: a listener of its add, or a hook its presentation ran, can
+    // have presented it, taken it out of the window or removed it. The
+    // store is asked first, since a removal through another manager on the
+    // slot leaves the row's ordinal issued here (see ordinalOf), then the
+    // window, which judges the body whole, each read guarded. `known` is
+    // what the call last knew, given where the reads can't tell: the store
+    // is on another branch than the one the add stored it on, or can't say
+    // its branch; the words say so. `out` is where the window lacks it and
+    // the store holds it: once a host presents, stored and out of the
+    // window, and in legacy mode, where the window is the record, stored.
+    const whereNow = (known: string, out?: string): string => {
+      const lastKnown = (why: string) => `was ${known} on the branch it was added on, as the call last knew, and ${why}`;
+      if (addedOn === null) return lastKnown("the store couldn't say its branch when the call added it");
       try {
-        if (addedOn === null || this.store.currentBranch().id !== addedOn) return known;
+        if (this.store.currentBranch().id !== addedOn) return lastKnown('the store is on another branch now');
       } catch {
-        return known;
+        return lastKnown("the store can't say its branch now");
       }
-      let inWindow: boolean | undefined;
       try {
-        inWindow = this.windowIndex.ordinalOf(msgId) !== undefined;
-      } catch {
-        inWindow = undefined;
-      }
-      if (inWindow === true) return 'stored and presented';
-      try {
-        if (this.messageStore.sequenceOf(msgId) === undefined) return 'no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
+        if (this.messageStore.sequenceOf(msgId) === undefined) return 'is no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
       } catch {
         // The store can't say: it was stored.
       }
-      return inWindow === undefined ? 'stored, and may be presented' : out;
+      let held: 'all' | 'some' | 'none' | undefined;
+      let presented: boolean | undefined;
+      try {
+        presented = this.windowIndex.mode() === 'presented';
+        held = heldOfBody();
+      } catch {
+        held = undefined;
+      }
+      if (held === 'all') return 'is stored and presented';
+      if (held === 'some') return 'is stored, and presented in part';
+      if (held === undefined) return 'is stored, and may be presented';
+      return `is ${out ?? (presented ? 'stored and out of the window' : 'stored')}`;
     };
     try {
       this.requireInitialized('resetHeadWindow', attempt, false);
@@ -4093,21 +4122,13 @@ export class ContextManager {
     // stored, and presentRows puts the rest in. Where the window can't be
     // read to tell, the call refuses as a presentation that fails does,
     // naming the stored transition, which a listener may have presented.
-    const outOfWindow = (): boolean => {
-      const merged = this.mergedMessageView();
-      const record = merged.getAll();
-      const at = recordPositionOf(merged, record, msgId);
-      // One a listener removed is out: its presentation refuses its id.
-      if (at === undefined) return this.windowIndex.ordinalOf(msgId) === undefined;
-      const { from, to } = bodyBoundsIn(record, at);
-      for (let k = from; k <= to; k++) if (this.windowIndex.ordinalOf(record[k]!.id) === undefined) return true;
-      return false;
-    };
+    // One a listener removed is out: its presentation refuses its id.
+    const outOfWindow = (): boolean => heldOfBody() !== 'all';
     let presenting: boolean;
     try {
       presenting = this.windowIndex.mode() === 'presented' && outOfWindow();
     } catch (error) {
-      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, whereNow('stored, and may be presented'));
+      throw refuse(`ContextManager.resetHeadWindow couldn't read the window to present its transition: ${reasonOf(error)}`, whereNow('stored and maybe presented'));
     }
     if (presenting) {
       try {
@@ -4134,7 +4155,7 @@ export class ContextManager {
       } catch (error) {
         throw refuse(
           `ContextManager.resetHeadWindow couldn't read the window once its transition was presented: ${reasonOf(error)}`,
-          whereNow('stored, and may be presented', 'stored and out of the window'),
+          whereNow('stored and maybe presented', 'stored and out of the window'),
         );
       }
       if (out) {

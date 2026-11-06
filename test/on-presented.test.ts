@@ -1254,6 +1254,141 @@ describe('resetHeadWindow once a host presents', () => {
       owner.close();
     }
   });
+
+  // CM #350 bot review, wave 5, finding 36: a listener of a sharded
+  // transition's first shard can present it before the rest is stored, so
+  // a refusal then judges the body whole, as the presentation does.
+  it('a refusal after a listener presented a sharded transition in part says it is presented in part', async () => {
+    class ShardsTransition extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      chunkIngressMessage(participant: string, content: ContentBlock[]) {
+        if (participant !== 'Context Manager') return null;
+        const whole = (content[0] as { text: string }).text;
+        const half = Math.floor(whole.length / 2);
+        return { bodyGroupId: 'zz-transition', shards: [whole.slice(0, half), whole.slice(half)].map((t, shardIndex) => ({ content: [text(t)], shardIndex })) };
+      }
+    }
+    const strategy = new ShardsTransition();
+    // An app-owned store, which stays open after close(), so the window can be asked.
+    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+    const cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    // A host that presents each row it hears stored, the transition's first
+    // shard before the second is stored, and then closes the manager.
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || event.message.shardIndex !== 0) return;
+      cm.presentRows([event.message.id]);
+      cm.close();
+    });
+    const err = await cm.resetHeadWindow('zz-transition, long enough to split').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const shards = owner.getAllMessages().filter((m) => m.participant === 'Context Manager').map((m) => m.id);
+    assert.equal(shards.length, 2, 'setup: the transition is stored as two shards');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${shards[0]} is stored and presented`), err.message);
+    assert.ok(err.message.includes(`message ${shards[0]} is stored, and presented in part, and the head window wasn't reset`), err.message);
+    await settle();
+    owner.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 17: a removal through another
+  // manager on the slot leaves the transition's ordinal issued here, so the
+  // refusal asks the store before the window.
+  it('a refusal after a hook removed the transition through another manager on the slot says it is no longer stored', async () => {
+    let cm!: ContextManager;
+    let writer!: ContextManager;
+    class Resettable extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        const transition = rows.find((m) => m.participant === 'Context Manager');
+        if (transition) {
+          writer.removeMessage(transition.id);
+          cm.close();
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Resettable();
+    // Another manager on the same store and slot, whose store stays open after cm's close().
+    writer = await ContextManager.open({ path: freshPath(), namespace: 'zz-writer', strategy: new PassthroughStrategy() });
+    cm = await ContextManager.open({ store: writer.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = strategy.heard.flatMap((h) => h.rows).at(-1)!;
+    assert.equal(writer.getMessage(transition), null, 'setup: the other manager removed the transition');
+    assert.notEqual(cm.ordinalOf(transition), undefined, "setup: this manager's ordinal for it stands");
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${transition} is stored`), err.message);
+    assert.ok(err.message.includes(`message ${transition} is no longer stored`), err.message);
+    await settle();
+    writer.close();
+  });
+
+  // The verifier's C10 at 6a18406, and CM #350 bot review, wave 5, finding
+  // 37: where a listener of the add, or the presentation's hook, moved the
+  // store's branch, the refusal says what the call last knew of the branch
+  // the transition was added on, not what the other branch holds, and says
+  // that it is what it last knew.
+  it("a refusal after a listener or a hook moved the store's branch says what the call last knew of the branch the transition was added on", async () => {
+    for (const moves of ['listener', 'hook', 'hook, after removing it'] as const) {
+      let cm!: ContextManager;
+      class Resettable extends Records {
+        resets: MessageId[] = [];
+        resetHeadWindow(fromMessageId: MessageId): void {
+          this.resets.push(fromMessageId);
+        }
+        async generateTransitionSummary(): Promise<string> {
+          return 'summary';
+        }
+        onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+          const transition = rows.find((m) => m.participant === 'Context Manager');
+          if (transition && moves !== 'listener') {
+            if (moves === 'hook, after removing it') cm.removeMessage(transition.id);
+            cm.getStore().switchBranch('zz-other');
+          }
+          return super.onPresented(rows, ctx);
+        }
+      }
+      const strategy = new Resettable();
+      // An app-owned store, as above.
+      const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+      cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const start = cm.currentBranch().name;
+      // A branch made before the reset, which lacks the transition.
+      cm.getStore().createBranchAt('zz-other', start, cm.getStore().currentSequence());
+      let transition: MessageId | undefined;
+      cm.onMessage((event) => {
+        if (event.type !== 'add' || event.message.participant !== 'Context Manager') return;
+        transition = event.message.id;
+        if (moves === 'listener') cm.getStore().switchBranch('zz-other');
+      });
+      const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+      assert.equal(owner.getStore().currentBranch().name, 'zz-other', `${moves}, setup: the store moved`);
+      assert.deepEqual(strategy.resets, [], `${moves}: the head window wasn't reset`);
+      assert.ok(!err.message.includes('no longer stored'), `${moves}: not what the other branch holds: ${err.message}`);
+      const knew = moves === 'listener' ? 'stored' : 'stored and presented';
+      assert.ok(!err.message.includes(`message ${transition} is ${knew}`), `${moves}: not stated as what holds now: ${err.message}`);
+      assert.ok(
+        err.message.includes(`message ${transition} was ${knew} on the branch it was added on, as the call last knew, and the store is on another branch now`),
+        `${moves}: ${err.message}`,
+      );
+      await settle();
+      cm.close();
+      owner.close();
+    }
+  });
 });
 
 describe('onPresented in legacy mode', () => {
