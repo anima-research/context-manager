@@ -25,8 +25,7 @@
     tell which shards stayed (`WriteOutcomeUnknownError`), every shard the
     window took in waits, and the strategy hears, in one call, those the
     window's listing holds when they are delivered: at once where the store
-    reads, and at its next notification where it doesn't. Before, it heard
-    none of them, or only those the error names as stayed.
+    reads, and at its next notification where it doesn't.
   - A listener that moves the store's branch between shards stops the write
     before the next shard, and `addMessage` throws `WriteLandedError` naming
     the shards stored, which stay on the branch the write started on, with a
