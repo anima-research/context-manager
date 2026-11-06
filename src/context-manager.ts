@@ -57,7 +57,7 @@ import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, M
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
-import { WindowIndex, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
+import { WindowIndex, WindowWriteOutcomeUnknownError, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -1835,41 +1835,64 @@ export class ContextManager {
     const merged = this.mergedMessageView();
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
-    // The later shards of a body whose first shard was out, which leave so
-    // the body can enter whole (WindowIndex.present), and the rows that
-    // entered. The rows are found before either hook runs: positionOf reads
-    // the store's branch, which a hook can move. The second call is made
-    // where the first's hook leaves it, as notifyPresented makes a row's
-    // call after another row's hook (deferPresented).
-    const tellAndHear = (left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage) => {
-      const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
-      const enteredRows = entered.map(rowOf);
-      const scope = leftRows.length > 0 ? this.hookScope() : null;
-      this.notifyRetracted(leftRows, { undone: false, removed: false });
-      if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
-      else this.deferPresented(enteredRows, false);
-    };
     // A write that threw tells the strategy its rows as this call's record
     // holds them, read from it by id, never from the store: one whose
     // outcome was unknown is told at a later write, when the store may no
     // longer hold a row of it (a removal meanwhile, whose own onRetracted
-    // follows), or can't be read.
+    // follows), or can't be read. What waits for that write keeps only the
+    // rows the write named (keep), not the record.
     const asFound = rowsAsFound(record);
     return this.write(() => {
-      const { ordinals, entered, left } = this.windowIndex.present(ids, record, positionOf, (enteredBefore, leftBefore) => {
-        // The rows a failed write got in stay in the window, and no later
-        // call presents them again: this is the strategy's one hearing of
-        // them, as of the rows it took out. The write's own error is the
-        // one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tellAndHear(leftBefore, enteredBefore, asFound);
-        } catch (error) {
-          logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that left or entered before it failed:', error, this.diag);
-        }
-      });
-      tellAndHear(left, entered, (id) => record[positionOf(id)!]!);
+      let presented: ReturnType<WindowIndex['present']>;
+      try {
+        presented = this.windowIndex.present(ids, record, positionOf, this.cutShortPresentation(asFound));
+      } catch (error) {
+        if (error instanceof WindowWriteOutcomeUnknownError) asFound.keep([...error.entering, ...error.leaving]);
+        throw error;
+      }
+      const { ordinals, entered, left } = presented;
+      this.tellPresentation(left, entered, (id) => record[positionOf(id)!]!);
       return ordinals;
     });
+  }
+
+  /**
+   * Tell the strategy what a presentRows did: the later shards of a body
+   * whose first shard was out, which left so the body could enter whole
+   * (WindowIndex.present), and the rows that entered, each read by
+   * `rowOf`. The rows are found before either hook runs, since a hook can
+   * move the store's branch. The second call is made where the first's
+   * hook leaves it, as notifyPresented makes a row's call after another
+   * row's hook (deferPresented).
+   */
+  private tellPresentation(left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage): void {
+    const leftRows = left.map(({ id, ordinal }) => ({ id, row: rowOf(id), ordinal }));
+    const enteredRows = entered.map(rowOf);
+    const scope = leftRows.length > 0 ? this.hookScope() : null;
+    this.notifyRetracted(leftRows, { undone: false, removed: false });
+    if (scope === null || this.inHookScope(scope)) this.notifyPresented(enteredRows);
+    else this.deferPresented(enteredRows, false);
+  }
+
+  /**
+   * presentRows' hook for a window write that threw (WindowIndex.present's
+   * `cutShort`): it tells the strategy the rows that left and entered
+   * before the throw, read from `rows`, and logs a failure to. It is made
+   * here, apart from the call, so a hook that waits for a later write
+   * holds `rows` and nothing else of the call.
+   */
+  private cutShortPresentation(rows: RowsAsFound): (entered: MessageId[], left: LeftRow[]) => void {
+    return (entered, left) => {
+      // The rows a failed write got in stay in the window, and no later
+      // call presents them again: this is the strategy's one hearing of
+      // them, as of the rows it took out. The write's own error is the
+      // one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        this.tellPresentation(left, entered, (id) => rows.get(id)!);
+      } catch (error) {
+        logThrown('[context-manager] presentRows was cut short, and telling the strategy of the rows that left or entered before it failed:', error, this.diag);
+      }
+    };
   }
 
   /**
@@ -1922,38 +1945,65 @@ export class ContextManager {
     const record = merged.getAll();
     const positionOf = (id: MessageId) => recordPositionOf(merged, record, id);
     const info: Retraction = { undone: options?.undone === true, removed: false };
-    // A row taken out by its id after the store dropped it has no row to
-    // give: it is told by its id, as removed, in a call of its own. Both
-    // calls' rows are found before either hook runs, and the second call is
-    // made where the first's hook leaves it (deferRetracted), as presentRows
-    // makes its second.
-    const tell = (left: readonly LeftRow[]) => {
-      const held: RetractedRow[] = [];
-      const gone: RetractedRow[] = [];
-      for (const { id, ordinal } of left) {
-        const at = positionOf(id);
-        if (at === undefined) gone.push({ id, ordinal });
-        else held.push({ id, row: record[at]!, ordinal });
-      }
-      const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
-      const removed: Retraction = { undone: info.undone, removed: true };
-      this.notifyRetracted(held, info);
-      if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
-      else this.deferRetracted(gone, removed);
-    };
+    // As presentRows' rows, a write that threw tells its rows as this
+    // call's record holds them, and what waits keeps only those.
+    const asFound = rowsAsFound(record);
     this.write(() => {
-      const left = this.windowIndex.retract(ids, record, positionOf, info.undone, (cutShort) => {
-        // The rows a failed write took out stay out, and no later call
-        // takes them out again: this is the strategy's one hearing of them.
-        // The write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tell(cutShort);
-        } catch (error) {
-          logThrown('[context-manager] retractRows was cut short, and telling the strategy of the rows that left before it failed:', error, this.diag);
-        }
+      let left: LeftRow[];
+      try {
+        left = this.windowIndex.retract(ids, record, positionOf, info.undone, this.cutShortRetraction(asFound, info));
+      } catch (error) {
+        if (error instanceof WindowWriteOutcomeUnknownError) asFound.keep([...error.entering, ...error.leaving]);
+        throw error;
+      }
+      this.tellRetraction(left, info, (id) => {
+        const at = positionOf(id);
+        return at === undefined ? undefined : record[at];
       });
-      tell(left);
     });
+  }
+
+  /**
+   * Tell the strategy the rows a retractRows took out, each with the row
+   * `rowOf` gives. A row taken out by its id after the store dropped it
+   * has none to give: it is told by its id, as removed, in a call of its
+   * own. Both calls' rows are found before either hook runs, and the
+   * second call is made where the first's hook leaves it (deferRetracted),
+   * as presentRows makes its second.
+   */
+  private tellRetraction(left: readonly LeftRow[], info: Retraction, rowOf: (id: MessageId) => StoredMessage | undefined): void {
+    const held: RetractedRow[] = [];
+    const gone: RetractedRow[] = [];
+    for (const { id, ordinal } of left) {
+      const row = rowOf(id);
+      if (row === undefined) gone.push({ id, ordinal });
+      else held.push({ id, row, ordinal });
+    }
+    const scope = held.length > 0 && gone.length > 0 ? this.hookScope() : null;
+    const removed: Retraction = { undone: info.undone, removed: true };
+    this.notifyRetracted(held, info);
+    if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
+    else this.deferRetracted(gone, removed);
+  }
+
+  /**
+   * retractRows' hook for a window write that threw (WindowIndex.retract's
+   * `cutShort`), as cutShortPresentation is presentRows': a row the store
+   * holds when it is told is given as the call's record held it, and one
+   * it no longer holds is told by its id.
+   */
+  private cutShortRetraction(rows: RowsAsFound, info: Retraction): (left: LeftRow[]) => void {
+    return (left) => {
+      // The rows a failed write took out stay out, and no later call
+      // takes them out again: this is the strategy's one hearing of them.
+      // The write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        const merged = this.mergedMessageView();
+        this.tellRetraction(left, info, (id) => (holdsRow(merged, id) ? rows.get(id) : undefined));
+      } catch (error) {
+        logThrown('[context-manager] retractRows was cut short, and telling the strategy of the rows that left before it failed:', error, this.diag);
+      }
+    };
   }
 
   /**
@@ -2040,22 +2090,34 @@ export class ContextManager {
    * error is thrown on. Returns the ids taken out, in window order.
    */
   private retractGone(operation: string, take: (cutShort: (left: LeftRow[]) => void) => LeftRow[]): MessageId[] {
-    const info: Retraction = { undone: false, removed: true };
-    const tell = (left: readonly LeftRow[]) => this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, ordinal })), info);
     return this.write(() => {
-      const left = take((cutShort) => {
-        // The rows a failed write took out stay out, and a later call passes
-        // over them: this is the strategy's one hearing of them here. The
-        // write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
-        try {
-          tell(cutShort);
-        } catch (error) {
-          logThrown(`[context-manager] ${operation} was cut short, and telling the strategy of the rows that left before it failed:`, error, this.diag);
-        }
-      });
-      tell(left);
+      const left = take(this.cutShortGone(operation));
+      this.tellGone(left);
       return left.map((row) => row.id);
     });
+  }
+
+  /** Tell the strategy rows retractGone took out, by their ids, with `removed`. */
+  private tellGone(left: readonly LeftRow[]): void {
+    this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, ordinal })), { undone: false, removed: true });
+  }
+
+  /**
+   * retractGone's hook for a write that threw, made apart from the call, as
+   * cutShortPresentation is, so one that waits for a later write holds
+   * nothing of the call (retractAbsentRows' record).
+   */
+  private cutShortGone(operation: string): (left: LeftRow[]) => void {
+    return (left) => {
+      // The rows a failed write took out stay out, and a later call passes
+      // over them: this is the strategy's one hearing of them here. The
+      // write's own error is the one thrown, or WindowWriteOutcomeUnknownError where the index couldn't be read again.
+      try {
+        this.tellGone(left);
+      } catch (error) {
+        logThrown(`[context-manager] ${operation} was cut short, and telling the strategy of the rows that left before it failed:`, error, this.diag);
+      }
+    };
   }
 
   /**
@@ -4711,16 +4773,34 @@ export class ContextManager {
 }
 
 /**
- * The rows of a listing by id, as the listing holds them, for a call that
- * tells the strategy what a window write that threw did (presentRows): the
- * map is built at the first look-up, so a call whose write doesn't throw
- * builds none.
+ * The rows of a call's record by id, as the record holds them, for telling
+ * the strategy what a window write that threw did (presentRows,
+ * retractRows). The map is built at the first look-up, so a call whose
+ * write doesn't throw builds none. `keep` narrows it to the rows a write
+ * whose outcome was unknown named, and lets the record go: that write's
+ * telling waits for a later write on its branch (WindowIndex settled), so
+ * what waits holds those rows, not the record.
  */
-function rowsAsFound(listing: readonly StoredMessage[]): (id: MessageId) => StoredMessage {
+interface RowsAsFound {
+  get(id: MessageId): StoredMessage | undefined;
+  keep(ids: readonly MessageId[]): void;
+}
+
+function rowsAsFound(record: readonly StoredMessage[]): RowsAsFound {
+  let listing: readonly StoredMessage[] | null = record;
   let byId: Map<MessageId, StoredMessage> | null = null;
-  return (id) => {
-    byId ??= new Map(listing.map((m) => [m.id, m] as const));
-    return byId.get(id)!;
+  return {
+    get(id) {
+      byId ??= new Map(listing!.map((m) => [m.id, m] as const));
+      return byId.get(id);
+    },
+    keep(ids) {
+      const named = new Set(ids);
+      const kept = new Map<MessageId, StoredMessage>();
+      for (const m of byId ? byId.values() : listing!) if (named.has(m.id)) kept.set(m.id, m);
+      byId = kept;
+      listing = null;
+    },
   };
 }
 
