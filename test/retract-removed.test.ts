@@ -665,3 +665,106 @@ describe("a removal through the manager where the window can't be read", () => {
     cm.close();
   });
 });
+
+/** The next `createStrategyContext` `cm` makes throws; the ones after it are made. */
+function failContextOnce(cm: ContextManager): void {
+  const own = cm as unknown as { createStrategyContext: () => unknown };
+  const build = own.createStrategyContext.bind(cm);
+  let failed = false;
+  own.createStrategyContext = () => {
+    if (failed) return build();
+    failed = true;
+    throw new Error('zz-context-failed');
+  };
+}
+
+// CM #350 bot review, wave 3, finding 10: the tombstones have landed, so a
+// failure of the manager's own work telling the strategy isn't the call's.
+describe("the manager's own work telling the strategy of rows a removal took fails", () => {
+  it('retractRemoved and retractAbsentRows return the rows taken out, log it, and the strategy is told at its next notification', async () => {
+    for (const operation of ['retractRemoved', 'retractAbsentRows'] as const) {
+      const strategy = new Records();
+      const { writer, cm } = await writerAndReader(strategy);
+      const [a, b] = ['a', 'b'].map((t) => writer.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      cm.presentRows([a, b]);
+      writer.removeMessage(a);
+      failContextOnce(cm);
+      let taken: MessageId[] = [];
+      const lines = await linesDuring(() => { taken = operation === 'retractRemoved' ? cm.retractRemoved([a]) : cm.retractAbsentRows(); });
+      assert.deepEqual(taken, [a], `${operation}: the row taken out`);
+      assert.equal(cm.ordinalOf(a), undefined, `${operation}: its tombstone landed`);
+      assert.ok(lines.some((line) => line.includes(`${operation} took its rows out, and telling the strategy of them failed`) && line.includes('zz-context-failed')), lines.join('\n'));
+      assert.deepEqual(strategy.retracted, [], `${operation}: not told yet`);
+      cm.retractRows([b]);
+      assert.deepEqual(strategy.retracted, [
+        { rows: [], info: { undone: false, removed: true, ids: [a] } },
+        { rows: [b], info: { undone: false, removed: false, ids: [b] } },
+      ], `${operation}: told at the next notification, before it`);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+      writer.close();
+    }
+  });
+
+  it('a removal through the manager logs it, and the strategy is told at its next notification, with the row as it was', async () => {
+    const strategy = new Records();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([a, b]);
+    failContextOnce(cm);
+    const lines = await linesDuring(() => cm.removeMessage(a));
+    assert.equal(cm.getMessage(a), null, 'the removal stands');
+    assert.equal(cm.ordinalOf(a), undefined, 'and its tombstone landed');
+    assert.ok(lines.some((line) => line.includes(`telling the strategy that removed message ${a} left the window failed`)), lines.join('\n'));
+    assert.deepEqual(strategy.retracted, [], 'not told yet');
+    cm.retractRows([b]);
+    assert.deepEqual(strategy.retracted, [
+      { rows: [a], info: { undone: false, removed: true, ids: [a] } },
+      { rows: [b], info: { undone: false, removed: false, ids: [b] } },
+    ], 'told at the next notification, before it');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+});
+
+// CM #350 bot review, wave 3, finding 11: a removal the strategy's
+// hold-release hook makes is a removal of its own.
+describe("a removal from the strategy's hook for holds a removal released", () => {
+  /** Records, removing `next` through the manager from onCompressionHoldsReleased. */
+  class RemovesOnRelease extends Records {
+    cm!: ContextManager;
+    next: MessageId | null = null;
+    onCompressionHoldsReleased(): void {
+      const id = this.next;
+      this.next = null;
+      if (id) this.cm.removeMessage(id);
+    }
+  }
+
+  it("leaves the outer removal's rows taken out of the window and told, as they were", async () => {
+    for (const remove of ['removeMessage', 'removeMessages'] as const) {
+      const strategy = new RemovesOnRelease();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      strategy.cm = cm;
+      cm.presentRows([]);
+      const a = cm.addMessage('alice', [text('a')]);
+      const b = cm.addMessage('alice', [text('b')], undefined, undefined, { holdCompression: true });
+      const [c, d] = ['c', 'd'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      cm.presentRows([a, b, c, d]);
+      strategy.next = d;
+      const outer = remove === 'removeMessage' ? [b] : [a, b, c];
+      if (remove === 'removeMessage') cm.removeMessage(b);
+      else cm.removeMessages(a, c);
+      assert.equal(strategy.next, null, `${remove}, setup: the hook ran`);
+      assert.deepEqual(cm.getAllMessages().map((m) => m.id), remove === 'removeMessage' ? [a, c] : [], `${remove}: both removals stand`);
+      assert.deepEqual(ordinals(cm, [...outer, d]), [...outer, d].map(() => undefined), `${remove}: every row removed left the window`);
+      assert.deepEqual(strategy.retracted, [
+        { rows: [d], info: { undone: false, removed: true, ids: [d] } },
+        { rows: outer, info: { undone: false, removed: true, ids: outer } },
+      ], `${remove}: the hook's removal, then the outer one, with its rows as they were`);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
+  });
+});

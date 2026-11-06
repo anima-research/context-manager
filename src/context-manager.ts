@@ -2116,7 +2116,10 @@ export class ContextManager {
    * out of the window and before this returns: by their ids alone, since
    * the store holds no row of them to give, so a strategy that folded them
    * lets go of what it folded, as the manager that removed them did. It is
-   * fire and forget, as retractRows's call. The tombstones are one record,
+   * fire and forget, as retractRows's call, and as there a failure of the
+   * manager's own work around it (the context it builds) is logged, not
+   * thrown, since the rows are out: the call waits, to be made at the
+   * strategy's next notification. The tombstones are one record,
    * and a write the store refuses has taken nothing out and told nothing:
    * a later call takes the rows out. A closed manager refuses it.
    */
@@ -2172,14 +2175,32 @@ export class ContextManager {
   private retractGone(operation: string, take: (cutShort: (left: LeftRow[]) => void) => LeftRow[]): MessageId[] {
     return this.write(() => {
       const left = take(this.cutShortGone(operation));
-      this.tellGone(left);
+      // The rows are out of the window: as retractRows, a failure of the
+      // manager's own work around the call is logged, and the call waits.
+      try {
+        this.tellGone(left);
+      } catch (error) {
+        logThrown(`[context-manager] ${operation} took its rows out, and telling the strategy of them failed; it is told at its next notification:`, error, this.diag);
+      }
       return left.map((row) => row.id);
     });
   }
 
-  /** Tell the strategy rows retractGone took out, by their ids, with `removed`. */
+  /**
+   * Tell the strategy rows retractGone took out, by their ids, with
+   * `removed`. Where the manager's own work around the call throws, no hook
+   * of it has run: the call waits, to be made at the strategy's next
+   * notification, and the error is thrown on.
+   */
   private tellGone(left: readonly LeftRow[]): void {
-    this.notifyRetracted(left.map(({ id, ordinal }) => ({ id, ordinal })), { undone: false, removed: true });
+    const told = left.map(({ id, ordinal }): RetractedRow => ({ id, ordinal }));
+    const info: Retraction = { undone: false, removed: true };
+    try {
+      this.notifyRetracted(told, info);
+    } catch (error) {
+      if (told.length > 0) this.retractedUnheard.push({ left: told, info });
+      throw error;
+    }
   }
 
   /**
@@ -4167,16 +4188,22 @@ export class ContextManager {
       case 'edit':
         this.handleMessageEdit(event.messageId, event.newContent);
         break;
-      case 'remove':
+      case 'remove': {
         // The row is gone from the record whatever the context log makes of
-        // it, so it leaves the window even when that throws.
+        // it, so it leaves the window even when that throws. What this
+        // removal read of it is taken now: the strategy's hook for the holds
+        // it releases can remove a row too, which sets the slot and clears it.
+        const removing = this.removing;
         try {
           this.handleMessageRemove(event.messageId);
         } finally {
-          this.retractOnRemoval([event.messageId], this.removing?.rows ?? []);
+          this.retractOnRemoval([event.messageId], removing?.rows ?? []);
         }
         break;
-      case 'removeRange':
+      }
+      case 'removeRange': {
+        // As for 'remove', before any hook runs.
+        const removing = this.removing;
         // Ids of the removed span aren't in the event; prune holds whose
         // message no longer exists.
         try {
@@ -4203,9 +4230,10 @@ export class ContextManager {
           // merges would read as removed and leave the window for good. The
           // rows leave the window even when the pruning throws, as the
           // 'remove' case's row does.
-          if (this.removing) this.retractOnRemoval(this.removing.ids, this.removing.rows);
+          if (removing) this.retractOnRemoval(removing.ids, removing.rows);
         }
         break;
+      }
     }
   }
 
@@ -4223,7 +4251,9 @@ export class ContextManager {
    * read to tell which rows it held, or whether it is in legacy mode, the
    * strategy is told of every row removed, in the order given, with no
    * ordinal: a strategy that kept nothing of a row takes the call as
-   * nothing to do. A failure to tell it is logged too.
+   * nothing to do. A failure of the manager's own work telling it (the
+   * context it builds) is logged too, and the call waits, to be made at the
+   * strategy's next notification, as a call made while it initializes does.
    */
   private retractOnRemoval(ids: readonly MessageId[], removed: readonly StoredMessage[]): void {
     // The rows the window held, in window order; null while the index
@@ -4253,18 +4283,23 @@ export class ContextManager {
     }
     const told = held ?? [...new Set(ids)].map((id): RetractedRow => ({ id }));
     if (told.length === 0) return;
+    const byId = new Map(removed.map((m) => [m.id, m] as const));
+    const left = told.map(({ id, ordinal }): RetractedRow => {
+      const row = byId.get(id);
+      return row ? { id, row, ordinal } : { id, ordinal };
+    });
+    const info: Retraction = { undone: false, removed: true };
     try {
-      const byId = new Map(removed.map((m) => [m.id, m] as const));
-      this.notifyRetracted(
-        told.map(({ id, ordinal }) => {
-          const row = byId.get(id);
-          return row ? { id, row, ordinal } : { id, ordinal };
-        }),
-        { undone: false, removed: true },
-      );
+      this.notifyRetracted(left, info);
     } catch (err) {
+      // No hook of the call has run: the manager's own work around it threw.
+      this.retractedUnheard.push({ left, info });
       const rows = told.length === 1 ? `removed message ${told[0]!.id}` : `${told.length} removed messages`;
-      logThrown(`[context-manager] telling the strategy that ${rows} left the window failed; the removal stands:`.replaceAll('%', '%%'), err, this.diag);
+      logThrown(
+        `[context-manager] telling the strategy that ${rows} left the window failed; the removal stands, and it is told at its next notification:`.replaceAll('%', '%%'),
+        err,
+        this.diag,
+      );
     }
   }
 
