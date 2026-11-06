@@ -23,8 +23,9 @@
  * removed row whose window the host repairs with retractRemoved or
  * retractAbsentRows lets go of it (FW-CM-1). A row that left and was
  * presented again before the folding strategy heard it go is let go of at
- * its old place when the strategy hears it, and the open demotes the
- * summary such a row leaves non-contiguous instead of refusing the store.
+ * its old place when the strategy hears it, and the open, under
+ * topologyPolicy 'reject' (the default), demotes the summary such a row
+ * leaves non-contiguous instead of refusing the store.
  */
 
 import { describe, it, after } from 'node:test';
@@ -1174,7 +1175,9 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
     plain.presentRows([row]);
     plain.close();
 
-    // 'report' opens the store for inspection: it names the summaries and changes nothing.
+    // 'report' names the summaries and demotes none. (It would still let go
+    // of what covers a row out of the window, and write the load-time
+    // repairs: to inspect a store as it is, open a copy with auditOnly.)
     const inspected = new AutobiographicalStrategy({ ...FOLDING, topologyPolicy: 'report' });
     const inspector = await linesDuring(async () => {
       const open = await ContextManager.open({ path, namespace: 'agent', strategy: inspected, membrane: mockMembrane().membrane });
@@ -1201,6 +1204,59 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       open.close();
     });
     assert.ok(!again.some((line) => line.includes('the window holds the leaves of')), again.join('\n'));
+  });
+
+  // CM #350 bot review, wave 3, finding 8: crossed ownership the store held
+  // before its window was first written down (#122's cross-era merges, hand
+  // surgery) is demoted at the first presented open, not refused.
+  it('a store whose ownership was crossed in legacy mode, then written down by another strategy: the first folding open demotes the summary instead of refusing the store', async () => {
+    const path = freshPath();
+    const seed = new PassthroughStrategy();
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy: seed });
+    const rows = Array.from({ length: 9 }, (_, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]));
+    // crossedFixture's shape (topology-guard.test.ts): the L2 owns a stray
+    // L1 over the opening row and the L1s over rows 5..8, across the L1s
+    // over rows 1..4, which nothing merged.
+    const summary = (id: string, level: number, sourceIds: string[], leaves: MessageId[], mergedInto?: string): SummaryEntry => ({
+      id, level, content: `s ${id}`, tokens: 50, sourceLevel: level - 1, sourceIds,
+      sourceRange: { first: leaves[0]!, last: leaves.at(-1)! }, created: 1, ...(mergedInto ? { mergedInto } : {}),
+    } as SummaryEntry);
+    const l1s = [
+      summary('L1-stray', 1, [rows[0]!], [rows[0]!], 'L2-x'),
+      summary('L1-a', 1, rows.slice(1, 3), rows.slice(1, 3)),
+      summary('L1-b', 1, rows.slice(3, 5), rows.slice(3, 5)),
+      summary('L1-c', 1, rows.slice(5, 7), rows.slice(5, 7), 'L2-x'),
+      summary('L1-d', 1, rows.slice(7, 9), rows.slice(7, 9), 'L2-x'),
+    ];
+    const l2 = summary('L2-x', 2, ['L1-stray', 'L1-c', 'L1-d'], [rows[0]!, ...rows.slice(5, 9)]);
+    const store = cm.getStore();
+    store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+    store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+    store.setStateJson('agent/autobio:summaries', [...l1s, l2]);
+    store.setStateJson('agent/autobio:chunks', l1s.map((s) => ({ id: `c-${s.id}`, sourceIds: s.sourceIds, compressed: true, summaryId: s.id })));
+    cm.close();
+
+    // Premise: in legacy mode the store is refused, as before.
+    await assert.rejects(
+      ContextManager.open({ path, namespace: 'agent', strategy: autobiographical(), membrane: mockMembrane().membrane }),
+      (e: unknown) => e instanceof Error && e.name === 'StoreTopologyError' && e.message.includes('L2-x'),
+    );
+
+    // A strategy without the fold writes the window down.
+    const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    plain.presentRows([]);
+    assert.equal(plain.windowMode(), 'presented');
+    plain.close();
+
+    const next = autobiographical();
+    let reopened!: ContextManager;
+    const lines = await linesDuring(async () => {
+      reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of')), lines.join('\n'));
+    assert.equal(reopened.getSummary('L2-x'), null, 'the crossed L2 is dropped');
+    assert.deepEqual(next.getTopologyViolations(), [], 'nothing crossed is left');
+    reopened.close();
   });
 
   // Wave 2, finding 13: a row presented again right after the rest of the
@@ -1382,6 +1438,39 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       rendersWindowOnce(cm, await cm.compile(BIG), `${label}, drained`);
       cm.close();
     }
+  });
+
+  // CM #350 bot review, wave 3, finding 9: a chunk the dedup guard found
+  // covered by L1s under other boundaries (compressed, no summary of its
+  // own) stays compressed across a rebuild while an L1 covers each of its
+  // rows. Each read of the L1 index checks it against every summary, so it
+  // is read once for the chunk, not once per row.
+  it('KnowledgeStrategy: a rebuild reads the L1 index once for a chunk kept compressed under no summary of its own', async () => {
+    const mock = mockMembrane();
+    const strategy = new KnowledgeStrategy({ ...FOLDING, recentWindowTokens: 0 });
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'agent', strategy, membrane: mock.membrane });
+    for (let i = 0; i < TAGS; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+    await drain(cm);
+    const state = strategy as unknown as {
+      chunks: Array<{ messages: StoredMessage[]; compressed: boolean; summaryId?: string }>;
+      l1ByMessageIndex(): Map<MessageId, string>;
+    };
+    const chunk = state.chunks.find((c) => c.compressed && c.messages.length >= 3);
+    assert.ok(chunk, 'premise: a folded chunk of three rows or more');
+    const rows = chunk.messages.map((m) => m.id).join();
+    delete chunk.summaryId; // as the dedup guard marks a chunk L1s under other boundaries cover
+    const kept = () => state.chunks.find((c) => c.messages.map((m) => m.id).join() === rows);
+    let reads = 0;
+    const real = state.l1ByMessageIndex.bind(strategy);
+    state.l1ByMessageIndex = () => { reads++; return real(); };
+    try {
+      cm.addMessage('User', [text('one more ' + 'word '.repeat(60))]);
+    } finally {
+      delete (state as { l1ByMessageIndex?: unknown }).l1ByMessageIndex;
+    }
+    assert.ok(kept()?.compressed && kept()?.summaryId === undefined, 'premise: the rebuild kept the chunk compressed under no summary');
+    assert.equal(reads, 1, `the L1 index was read once for the chunk, not once per row (${chunk.messages.length})`);
+    cm.close();
   });
 
   // House review of #350, code finding 7: a record that keeps a row that

@@ -41,7 +41,10 @@
     write's shards before the failing one were heard as each was stored, so a
     listener that presents rows as they are added may have presented them.
     Once a host presents rows, present the first row of `landed` that
-    `windowStatusOf` doesn't read `'in'`, if any, which `presentRows` takes as
+    `windowStatusOf` doesn't read `'in'` on the branch the write started on
+    (where a listener moved the store's branch, switch back first: the
+    shards are there, and a `WriteLandedError`'s `cause` names that branch),
+    if any, which `presentRows` takes as
     naming the rest of the body: it refuses a row already in the window, and a
     later shard whose earlier shards aren't all in it (where a listener took a
     presented shard out again, say). A `holdCompression` hold the add placed

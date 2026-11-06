@@ -107,7 +107,12 @@ export interface WindowIndexView {
    * the view never lists such a row.
    */
   ordinals(): ReadonlyMap<MessageId, number> | null;
-  /** The ordinal the next presented row will take. 0 in legacy mode. */
+  /**
+   * The index's length: every ordinal below it has been issued on this
+   * branch, to rows, tombstones and the write-down's header. A
+   * presentation's rows take ordinals from it on, after any tombstones the
+   * same write puts first. 0 in legacy mode.
+   */
   length(): number;
   /**
    * The ordinal of the first row in the window, in window order, stored at
@@ -373,7 +378,12 @@ export interface ContextStrategy {
    * earlier shard started an initialization: the rows the record still
    * holds are carried, if the branch the strategy initialized on is still
    * in legacy mode, and the rows its
-   * window holds, if a host presented there meanwhile. They wait for the manager's strategy, not for
+   * window holds, if a host presented there meanwhile. The branch is the one
+   * the store is on when the call is made: the branch the strategy
+   * initialized on, unless a hook moved the store itself while the strategy
+   * stayed initialized, which leaves the host to initialize it again there
+   * (setStrategy(getStrategy())), and that initialize reads that branch's
+   * window, a row the call left out included. They wait for the manager's strategy, not for
    * this instance: a strategy set with setStrategy() while rows wait hears
    * them after its own initialize, though that initialize read a window
    * that held them.
@@ -467,7 +477,8 @@ export interface ContextStrategy {
    * meanwhile are heard. A row that has been presented again since is still
    * given, since what the strategy kept of it is at its old place: the
    * window holds it again, at a new ordinal, by the time this is called. A
-   * row the branch the strategy initialized on holds at the ordinal it
+   * row the branch the strategy initialized on (the branch the store is on
+   * when the call is made, as for onPresented's) holds at the ordinal it
    * left, in its window and its record (a branch made before it left), is
    * left out, as is every row while that branch is in legacy mode, and a
    * call left with no row isn't made. They wait for the manager's strategy,

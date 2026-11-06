@@ -6,9 +6,11 @@
  * manager stores it, and the strategy hears it from inside the add, as
  * onNewMessage did (#288; strategy-new-message-throw.test.ts pins that
  * order). Once a host presents rows, a stored row isn't in the window until
- * it is presented, so the strategy hears it from presentRows instead: once
- * per call, with the rows that entered, after they are in the window and
- * before presentRows returns, fire and forget. A hold is still placed at the
+ * it is presented, so the strategy hears it from presentRows instead: while
+ * the strategy is initialized, once per call, with the rows that entered,
+ * after they are in the window and before presentRows returns, fire and
+ * forget; while it isn't, the calls wait, and once it is, one call carries
+ * the rows still in the window, in window order. A hold is still placed at the
  * add. These are the presented-mode siblings of the #288 suite, and the
  * autobiographical strategy's chunk rebuild and background compression,
  * which follow the window: a stored row nobody presented is never folded.
@@ -1113,6 +1115,9 @@ describe('onPresented in legacy mode', () => {
       assert.equal(shards.length, 3, 'setup: the add stored three shards');
       assert.equal(cm.windowMode(), 'legacy');
       assert.deepEqual(first.heard, [shards[0]], 'the strategy the hook replaced heard only the first shard');
+      // CM #350 bot review, wave 3, finding 30: nothing reaches the
+      // replacement while its initialize is held.
+      if (next instanceof Reacts) assert.deepEqual(next.heard, [], 'probe: the replacement hears nothing before its initialize');
       open();
       await replaced;
       const heard = next instanceof Reacts ? next.heard : next.heard.map((h) => h.id);

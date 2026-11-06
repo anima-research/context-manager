@@ -2440,6 +2440,81 @@ describe('fold journal over a presented window', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 3, finding 34: the test above writes its
+  // format-3 records with this build's writer, so a writer and reader that
+  // drifted together would pass it. These are fixed literals, as the release
+  // before this one (0.24.x) writes them: a snapshot, then a delta whose
+  // receipt links back to the snapshot's (`pr`).
+  it("reads format-3 records as the release before this one wrote them, and links the first format-4 baseline to their receipts", async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 4);
+    assert.deepEqual(ids.map((id) => sequenceOf(cm, id)), [1, 2, 3, 4], 'setup: the sequences the records name');
+    const branch = cm.currentBranchRef();
+    const receiptOf = (compileId: string, acceptedAt: string) => ({
+      v: 1, acceptedAt, compileId, strategy: 'scripted', cause: 'unknown',
+      source: { runtime: 'unknown', storeId: 'zz-base-store', agent: 'unknown', namespace: 'agents/tester', dataDirectory: 'unknown', branch },
+      usage: { input: 'unknown', cacheRead: 'unknown', cacheWrite: 'unknown', scope: 'round' },
+      estimate: { calibration: 1 }, presentation: 'unknown',
+    });
+    const store = cm.getStore();
+    const snapshot = store.appendJson('context-manager/accepted-layout', {
+      v: 3, ns: 'agents/tester', branch, compileId: 'zz-base-1', totalTokens: 20,
+      kind: 'snapshot', m: 'AQEBAQ', units: [{ k: 'r', t: 5 }, { k: 'r', t: 5 }, { k: 'r', t: 5 }, { k: 'r', t: 5 }],
+      chain: 0, sb: 1033, db: 0,
+      receipt: {
+        ...receiptOf('zz-base-1', '2026-10-01T00:00:00.000Z'), kind: 'baseline', historyBefore: 'unknown',
+        layout: [{ first: { sequence: 1, messageId: ids[0] }, last: { sequence: 4, messageId: ids[3] }, messages: 4, form: { form: 'raw' }, estimatedTokens: 20 }],
+        renderedTokens: { before: 'unknown', after: 20 },
+      },
+    });
+    const delta = store.appendJson('context-manager/accepted-layout', {
+      v: 3, ns: 'agents/tester', branch, compileId: 'zz-base-2', totalTokens: 15, pr: snapshot.id,
+      kind: 'delta', prev: snapshot.id, p: 0, drop: 1, ins: [{ k: 'o', n: 1 }], chain: 1, sb: 1033, db: 1030,
+      receipt: {
+        ...receiptOf('zz-base-2', '2026-10-01T00:01:00.000Z'), kind: 'change',
+        changes: [{
+          first: { sequence: 1, messageId: ids[0] }, last: { sequence: 1, messageId: ids[0] }, messages: 1,
+          before: { form: 'raw' }, after: { form: 'omitted' }, estimatedTokensBefore: 5, estimatedTokensAfter: 0,
+        }],
+        renderedTokens: { before: 20, after: 15 },
+      },
+    });
+    cm.close();
+
+    ({ cm, strategy } = await open(strategy));
+    const listed = cm.listFoldReceipts({ limit: 10 });
+    assert.deepEqual(listed.receipts.map((r) => [r.id, r.kind]), [[delta.id, 'change'], [snapshot.id, 'baseline']], 'their receipts are listed');
+    assert.equal(listed.receipts[0]!.changes![0]!.first.messageId, ids[0]);
+    assert.equal(listed.note, undefined);
+    // The delta rebuilt on the snapshot is the layout they hold, the first
+    // message omitted: a compile that also omits the second changes only it.
+    strategy.plan.set(ids[0]!, 'omit');
+    strategy.plan.set(ids[1]!, 'omit');
+    const change = await acceptCompile(cm);
+    assert.equal(change?.kind, 'change', 'compared with them');
+    assert.deepEqual(
+      change?.changes?.map((c) => [c.first.sequence, c.last.sequence, c.messages, c.before.form, c.after.form, c.estimatedTokensBefore]),
+      [[2, 2, 1, 'raw', 'omitted', 5]],
+      'only the second message changed, from the raw unit the snapshot holds',
+    );
+
+    // The first format-4 baseline links to them.
+    cm.presentRows([]);
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    } finally {
+      console.warn = warn;
+    }
+    // The two literals, this build's acceptance by sequence, then the baseline.
+    assert.deepEqual(formats(cm.getStore()).map(([v]) => v), [3, 3, 3, 4]);
+    const after = cm.listFoldReceipts({ limit: 10 });
+    assert.deepEqual(after.receipts.map((r) => r.kind), ['baseline', 'change', 'change', 'baseline']);
+    assert.deepEqual(after.receipts.slice(2).map((r) => r.id), [delta.id, snapshot.id], 'behind it, the records as the release before wrote them');
+    cm.close();
+  });
+
   it('a row taken out of the window or removed from the store leaves the members, and no other member moves', async () => {
     const { cm, strategy } = await open();
     const [a, b, c, d, e] = add(cm, 5);

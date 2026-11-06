@@ -135,6 +135,8 @@ describe('windowStatusOf', () => {
     assert.equal(side.windowMode(), 'legacy');
     assert.equal(main.windowMode(), 'legacy');
     assert.equal(main.getStore().getStateJson(windowIndexStateId('zz-side')), null, 'no window is written down');
+    // CM #350 bot review, wave 3, finding 17: nor is its state registered, which reads as null too.
+    assert.ok(!main.getStore().listStates().some((s) => s.id.endsWith('/window')), 'no window state is registered');
     side.close();
     main.close();
   });
@@ -462,6 +464,7 @@ describe('resetHeadWindow with metadata', () => {
     assert.deepEqual(transition.metadata, { zz: 'legacy' });
     assert.equal(cm.windowMode(), 'legacy');
     assert.equal(cm.getStore().getStateJson(INDEX), null);
+    assert.ok(!cm.getStore().listStates().some((s) => s.id === INDEX), 'the window state is not registered (CM #350 bot review, wave 3, finding 17)');
     assert.deepEqual(strategy.resets, [{ id: transition.id, ordinal: undefined }]);
     assert.deepEqual(strategy.heard.at(-1), transition.id, 'heard at its add, as before');
     cm.close();

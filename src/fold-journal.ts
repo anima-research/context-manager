@@ -152,10 +152,13 @@ export interface FoldSpanBound {
 
 /**
  * One run of messages whose form changed, as rendered before and after. A
- * run is consecutive in the layout's order, the window's: `first` and
+ * run is consecutive in the layout's order, the window's, among the
+ * messages both layouts hold: a message only one of them holds (new to the
+ * window, or gone from it) can stand between `first` and `last` without
+ * being in the run, and `messages` counts the run's own. `first` and
  * `last` name its first and last messages, not a range of sequences. While
  * the window is the record the two agree, and the run holds the messages
- * stored from `first.sequence` to `last.sequence` that the view held. Once
+ * stored from `first.sequence` to `last.sequence` that both layouts held. Once
  * rows are presented (format 4) they needn't: a run can hold a message
  * stored after `last` or before `first`, presented between them, and
  * `first.sequence` can exceed `last.sequence`. Read a run's messages from a

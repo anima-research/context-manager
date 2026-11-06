@@ -64,6 +64,7 @@ describe('ContextManager.generateTransitionSummary', () => {
       manager.addMessage('assistant', textBlock('two'));
       const before = manager.getAllMessages().map((m) => m.id);
       const sequence = manager.getStore().currentSequence();
+      const states = manager.getStore().listStates().length;
       const summary = await manager.generateTransitionSummary();
       assert.strictEqual(summary, 'summary of 2 rows');
       assert.strictEqual(strategy.contexts.length, 1, 'the strategy was asked once, with a context');
@@ -71,6 +72,8 @@ describe('ContextManager.generateTransitionSummary', () => {
       // CM #350 bot review (wave 2), finding 49: no record of any kind, a
       // state's included, not only no message.
       assert.strictEqual(manager.getStore().currentSequence(), sequence, 'no record was written');
+      // CM #350 bot review, wave 3, finding 17: nor a state registered, which writes no record.
+      assert.strictEqual(manager.getStore().listStates().length, states, 'no state was registered');
       // The same summary is what resetHeadWindow stores when given it.
       const stored = await manager.resetHeadWindow(summary);
       assert.strictEqual(stored, summary);

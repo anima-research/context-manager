@@ -45,7 +45,9 @@ export interface WindowedPassthroughOptions {
    * 0.5), or, when the store holds system changes, which go out wherever the
    * window starts, this fraction of the room they leave. Between jumps the
    * anchor never moves, so compiled output between re-anchors is a
-   * byte-stable prefix plus pure appends — and the strategy
+   * byte-stable prefix plus pure appends, apart from a row taken out of the
+   * window once a host presents rows (retractRows, or a removal), which
+   * changes the prefix from that row on — and the strategy
    * marks that prefix for the provider's prompt cache (see
    * {@link WindowedPassthroughStrategy} on cache markers), so the accepted
    * cost is one cache miss per jump, amortized over ~(1 - fraction) × that
@@ -392,8 +394,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * `sequence` or after. Once the manager presents rows on the branch, the
    * sequence is converted here, at the call, to an index ordinal: that of
    * the first row in the window stored at `sequence` or after, or the
-   * ordinal the next presented row will take when no row in the window is
-   * (WindowIndexView.ordinalFrom). The window is then that row and every
+   * index's length when no row in the window is (WindowIndexView.ordinalFrom
+   * and length: every ordinal below it is issued, and a presentation's rows
+   * take theirs from it on, after any tombstones its write puts first). The window is then that row and every
    * row presented after it, so a row stored before `sequence` and
    * presented later is in it: a tune-out's start given as the store's
    * `currentSequence()` keeps every row presented to the agent from then

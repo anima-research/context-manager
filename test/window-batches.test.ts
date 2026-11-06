@@ -6,8 +6,9 @@
  *   context-manager requires (chronicle ^0.6.0), a write-down, the rows of
  *   one presentRows call and the tombstones of one call are one record
  *   each, at one sequence. A single row is one record through the
- *   single form, as before, and a store whose window writes are all single
- *   keeps its MANIFEST at version 1; the first batch moves it to version 2.
+ *   single form, as before, and a store all of whose writes are single (the
+ *   window's and any other state's) keeps its MANIFEST at version 1; the
+ *   first batch the store records moves it to version 2.
  * - The window is the same as one an index written one record per item
  *   gives (pre-release builds wrote one so, before batched writes): the
  *   index's items (apart from the record each names), its ordinals, the
@@ -32,7 +33,10 @@
  *   written as before.
  * - A write the store kept and then threw on, or one an index written one
  *   record per item cut short, tells the strategy what it did before the
- *   error is thrown on; a refused repair batch tells it nothing.
+ *   error is thrown on; a refused repair batch tells it nothing. Where the
+ *   index can't be read again, the write throws
+ *   WindowWriteOutcomeUnknownError and the strategy hears at the next write
+ *   to the window on that branch (window-unreadable.test.ts).
  *
  * test/_harness/index-writes.ts stands in for the batched append on a
  * store handle, one record per item, to write such an index.
@@ -244,7 +248,7 @@ describe('one record per write', () => {
     assert.equal(manifestVersion(path), 2, 'the first batch moved the MANIFEST to version 2');
   });
 
-  it('a store whose window writes are all single rows keeps its MANIFEST at version 1', async () => {
+  it("a store all of whose writes are single, the window's and any other state's, keeps its MANIFEST at version 1", async () => {
     const path = freshPath();
     const cm = await ContextManager.open({ path, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     cm.presentRows([]); // an empty record's write-down is its header alone

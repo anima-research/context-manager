@@ -278,6 +278,7 @@ describe('retractRemoved and retractAbsentRows', () => {
     assert.deepEqual(cm.retractAbsentRows(), []);
     assert.equal(store.getStateLen(INDEX), null, 'no window is written down');
     assert.equal(store.getStateJson(INDEX), null);
+    assert.ok(!store.listStates().some((s) => s.id === INDEX), 'the window state is not registered (CM #350 bot review, wave 3, finding 17)');
     assert.equal(cm.windowMode(), 'legacy');
 
     // A write-down cut short is legacy mode too, and isn't finished.
@@ -307,14 +308,17 @@ describe('retractRemoved and retractAbsentRows', () => {
     for (const item of [{ id: a }, { v: 2 }]) store.appendToStateJsonWithIdentity(INDEX, item, 'by', 'at');
     const warn = console.warn;
     console.warn = () => {};
+    let sequence!: number;
     try {
       cm.removeMessage(a);
+      sequence = store.currentSequence();
       assert.deepEqual(cm.retractRemoved([a]), []);
       assert.deepEqual(cm.retractAbsentRows(), []);
     } finally {
       console.warn = warn;
     }
     assert.equal(store.getStateLen(INDEX), 2, 'nothing is written');
+    assert.equal(store.currentSequence(), sequence, 'nothing is written to any other state either (CM #350 bot review, wave 3, finding 17)');
     cm.close();
   });
 

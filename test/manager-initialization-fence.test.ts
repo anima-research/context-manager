@@ -195,9 +195,11 @@ describe('ContextManager initialization fence', () => {
         if (mode === 'manager') await manager.switchBranch('target');
         else store.switchBranch('target');
         const sequence = store.currentSequence();
+        const states = store.listStates().length;
         summaryGate.resolve();
         await assert.rejects(summary, { message: 'Branch or strategy changed during ContextManager.generateTransitionSummary; retry on the intended branch.' });
         assert.equal(store.currentSequence(), sequence, 'the refusal stores nothing');
+        assert.equal(store.listStates().length, states, 'nor registers a state (CM #350 bot review, wave 3, finding 17)');
       });
     });
 
