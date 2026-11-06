@@ -122,7 +122,7 @@ function failNextWriteUnread(cm: ContextManager, kept: boolean, reads = 1, branc
 /** Asserts `run` throws WindowWriteOutcomeUnknownError for `operation`, naming the rows and the cause. */
 function throwsUnknown(
   run: () => unknown,
-  expected: { operation: string; entering: MessageId[]; leaving: MessageId[]; cause: string },
+  expected: { operation: string; entering: MessageId[]; leaving: MessageId[]; cause: string; says?: RegExp },
 ): void {
   assert.throws(run, (error: unknown) => {
     assert.ok(error instanceof WindowWriteOutcomeUnknownError, `a WindowWriteOutcomeUnknownError: ${String(error)}`);
@@ -135,6 +135,7 @@ function throwsUnknown(
     assert.match(error.message, new RegExp(`^ContextManager\\.${expected.operation}: `));
     assert.match(error.message, /can't be read again to tell whether the write landed/);
     assert.ok(error.message.endsWith(`: ${expected.cause}`), 'the message ends with the cause\'s');
+    if (expected.says) assert.match(error.message, expected.says);
     return true;
   });
 }
@@ -261,6 +262,45 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       assert.deepEqual(strategy.log, [`retracted ${rows[0]},${rows[1]}`], 'that call settles it');
       cm.close();
     });
+  }
+
+  // CM #350 bot review (wave 2), finding 6: the write-down, in legacy mode,
+  // is a write to the index too. It puts no row in the window and takes
+  // none out, so the error names none and nothing waits to be heard;
+  // windowMode tells, once the index reads, whether it landed.
+  for (const kept of [true, false]) {
+    for (const operation of ['presentRows', 'retractRows'] as const) {
+      it(`${operation} in legacy mode, the write-down ${kept ? 'kept' : 'refused'}: throws outcome-unknown, naming no row`, async () => {
+        const strategy = new Hearing();
+        const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+        const [x, y] = ['x', 'y'].map((t) => cm.addMessage('alice', [text(t)]));
+        strategy.log.length = 0;
+        const restore = failNextWriteUnread(cm, kept);
+        try {
+          throwsUnknown(
+            () => (operation === 'presentRows' ? cm.presentRows([x!]) : cm.retractRows([x!])),
+            {
+              operation,
+              entering: [],
+              leaving: [],
+              cause: kept ? 'zz-index-kept-then-failed' : 'zz-index-refused',
+              says: /so whether the window was written down is unknown; .*windowMode tells which once the index reads/,
+            },
+          );
+        } finally {
+          restore();
+        }
+        assert.equal(cm.windowMode(), kept ? 'presented' : 'legacy', 'setup: the write-down landed, or not');
+        assert.deepEqual([x!, y!].map((id) => cm.windowStatusOf(id)), ['in', 'in'], 'the write-down took no row out');
+        if (operation === 'retractRows') {
+          cm.retractRows([x!]);
+          assert.deepEqual(strategy.log, [`retracted ${x}`], 'a call made again takes the row out, heard once');
+        } else {
+          assert.deepEqual(strategy.log, [], 'a write-down enters no row: nothing is heard');
+        }
+        cm.close();
+      });
+    }
   }
 });
 

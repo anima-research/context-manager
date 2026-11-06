@@ -158,7 +158,11 @@ export interface LeftRow {
  *
  * windowStatusOf tells which, once the index reads; a row that entered is
  * refused by presentRows as in the window already, and a row that left by
- * retractRows as not in it. The strategy hears what the write did
+ * retractRows as not in it. A write-down (the first presentRows or
+ * retractRows on a branch in legacy mode, which writes the window down
+ * before any work of its own) puts no row in the window and takes none
+ * out: `entering` and `leaving` are both empty, windowMode tells whether
+ * it landed, and the strategy has nothing to hear of it. The strategy hears what the write did
  * (onPresented, onRetracted) at the next write to the window on the branch
  * it was made on, once the index reads there, before that call's own work:
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
@@ -179,15 +183,21 @@ export class WindowWriteOutcomeUnknownError extends Error {
     cause: unknown,
     readError: unknown,
   ) {
-    const whether = [
-      ...(rows.entering.length > 0 ? [`${rowsNamed(rows.entering)} entered`] : []),
-      ...(rows.leaving.length > 0 ? [`${rowsNamed(rows.leaving)} left`] : []),
-    ].join(' and ');
+    const writeDown = rows.entering.length === 0 && rows.leaving.length === 0;
+    const whether = writeDown
+      ? 'the window was written down'
+      : [
+          ...(rows.entering.length > 0 ? [`${rowsNamed(rows.entering)} entered`] : []),
+          ...(rows.leaving.length > 0 ? [`${rowsNamed(rows.leaving)} left`] : []),
+        ].join(' and ') + ' the window';
+    const tells = writeDown
+      ? 'windowMode tells which once the index reads, and a write-down puts no row in the window or takes one out, ' +
+        'so the strategy has nothing to hear of it'
+      : 'windowStatusOf tells which once the index reads, and the strategy hears what it did at the next write to the window';
     super(
       `ContextManager.${operation}: the window index's write threw, and the index can't be read again to tell ` +
-        `whether the write landed (${describeThrown(readError)}), so whether ${whether} the window is unknown; ` +
-        `the store holds the write whole or not at all, windowStatusOf tells which once the index reads, and the ` +
-        `strategy hears what it did at the next write to the window: ${describeThrown(cause)}`,
+        `whether the write landed (${describeThrown(readError)}), so whether ${whether} is unknown; ` +
+        `the store holds the write whole or not at all, ${tells}: ${describeThrown(cause)}`,
     );
     this.name = 'WindowWriteOutcomeUnknownError';
     this.operation = operation;
@@ -954,7 +964,7 @@ export class WindowIndex {
       legacy ? undefined : (id) => state.ordinals.has(id),
     );
     if (legacy) {
-      this.write(this.writeDown('presentRows', state, record));
+      this.writeDownWindow('presentRows', state, record);
       const ordinals = this.current().ordinals;
       return { ordinals: ids.map((id) => ordinals.get(id)!), entered: [], left: [] };
     }
@@ -1039,7 +1049,7 @@ export class WindowIndex {
     const leaving = rows.filter(inWindow);
     // Written down first in legacy mode, so each row has the ordinal the
     // write-down gave it before its tombstone takes it out.
-    if (legacy) this.write(this.writeDown('retractRows', state, record));
+    if (legacy) this.writeDownWindow('retractRows', state, record);
     const held = this.current().ordinals;
     const left = leaving.map((id): LeftRow => ({ id, ordinal: held.get(id)! }));
     const tombstones = leaving.map((id): IndexItem => (undone ? { retract: id, undone: true } : { retract: id }));
@@ -1146,6 +1156,29 @@ export class WindowIndex {
       unreadable: state.unreadable,
       found: state.found,
     };
+  }
+
+  /**
+   * Write the window down (writeDown) for the manager's `operation`. A
+   * write-down puts no row in the window and takes none out, so a write
+   * that throws has nothing to tell the strategy, and its error is thrown
+   * on once the index is read again, which says whether it landed (the
+   * mode). Where that read throws too, the error is a
+   * WindowWriteOutcomeUnknownError naming no row, and nothing waits:
+   * windowMode tells, once the index reads.
+   */
+  private writeDownWindow(operation: string, state: IndexState, record: readonly StoredMessage[]): void {
+    const items = this.writeDown(operation, state, record);
+    try {
+      this.write(items);
+    } catch (error) {
+      try {
+        this.current();
+      } catch (readError) {
+        throw new WindowWriteOutcomeUnknownError(operation, { entering: [], leaving: [] }, error, readError);
+      }
+      throw error;
+    }
   }
 
   /**
