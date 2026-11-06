@@ -1173,20 +1173,49 @@ export class ContextManager {
           // a move once the strategy is initialized, where the window of
           // the branch it initialized on holds them.
           // Where the store can't say its branch, they wait as after a move.
+          // A shard can stay without the manager's listener having kept it:
+          // its append can land and throw before the event, or the
+          // listener's read of the window can throw first. On the branch
+          // the write started on, while the window reads legacy, such a
+          // shard is read from the slot (guarded), so the strategy hears
+          // every shard that stayed. Where the manager's own work telling
+          // it fails, the rows wait for the strategy's next notification,
+          // as tellPresentation's do.
           const hearStayed = (stayed: readonly MessageId[]) => {
             const ids = new Set(stayed);
             const rows = heard.filter((m) => ids.has(m.id));
+            let here: boolean;
             try {
-              let here: boolean;
+              here = onBranch();
+            } catch {
+              here = false;
+            }
+            if (here && rows.length < ids.size) {
               try {
-                here = onBranch();
+                if (this.windowIndex.mode() === 'legacy') {
+                  const kept = new Set(rows.map((m) => m.id));
+                  for (const id of stayed) {
+                    if (kept.has(id)) continue;
+                    const row = this.messageStore.get(id);
+                    if (row) rows.push(row);
+                  }
+                  const order = new Map(stayed.map((id, i) => [id, i] as const));
+                  rows.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
+                }
               } catch {
-                here = false;
+                // The rows the listener kept are told; the rest can't be read.
               }
+            }
+            try {
               if (here) this.notifyPresented(rows);
               else this.deferPresented(rows, true);
             } catch (error) {
-              logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
+              this.waitToBeHeard(rows, true);
+              logThrown(
+                '[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed; it is told at its next notification:',
+                error,
+                this.diag,
+              );
             }
           };
           // Where which shards stayed is unknown (a read that would tell
@@ -1246,13 +1275,16 @@ export class ContextManager {
           } catch (read) {
             unnamed = 1;
             // With no shard stored before it, no id names what to remove,
-            // so nothing is removed.
+            // so nothing is removed. The legacy window may have taken the
+            // shard in, so the strategy hears it where the window's listing
+            // holds it, as on the other exits whose outcome is unknown.
             if (stored.length === 0) {
               this.diag.error(
                 `[context-manager] a sharded addMessage failed on its first shard, and reading the store to tell whether that ` +
                   `shard landed threw, so it may be stored, leaving body group ${decision.bodyGroupId} short: ` +
                   describeThrown(read),
               );
+              hearWhatStayed();
               throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed }, err);
             }
           }

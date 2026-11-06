@@ -19,7 +19,9 @@
     sharded write that fails tells it only of the shards it leaves stored
     (`WriteLandedError`), once it has tried to remove them, in one call: on a
     branch the write's listener moved to, once the strategy is initialized
-    there, where that branch's window holds them. Where the manager can't
+    there, where that branch's window holds them; where the manager's own
+    work telling it fails (the context it builds), they wait for its next
+    notification. Where the manager can't
     tell which shards stayed (`WriteOutcomeUnknownError`), every shard the
     window took in waits, and the strategy hears, in one call, those the
     window's listing holds when they are delivered: at once where the store

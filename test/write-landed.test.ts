@@ -633,8 +633,9 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
   });
 
   it("where the store can't be read to tell whether a sharded write's first shard landed, nothing is removed, the failed read is logged, and the error says the manager can't tell", async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
-    cm.addMessage('bob', [text('before')]);
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
     const failure = new Error('propagation failed');
     failOwnListenerAfterAdd(cm, 1, failure);
     const readable = failTailRead(cm);
@@ -651,6 +652,11 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     );
     assert.ok(!logged.some((l) => l.includes('removing what it wrote threw')), `no removal was tried: ${logged.join('\n')}`);
     assert.deepEqual(cm.getAllMessages().map(textOf), ['before', 'one '], 'it was stored');
+    // CM #350 bot review, wave 5, finding 22: the legacy window took the
+    // shard in, so the strategy hears it, as on the other unknown exits.
+    const shard = cm.getAllMessages()[1]!.id;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(strategy.presented, [[before], [shard]], 'the strategy hears the shard the legacy window holds, once');
     cm.close();
   });
 
@@ -1160,6 +1166,71 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     assert.deepEqual(err.landed, stored.slice(1).map((m) => m.id));
     assert.equal(err.cause, failure);
     assert.deepEqual(strategy.presented, [[stored[0]!.id], err.landed], 'one call with the shards that stayed, which the window holds');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 21: where telling the strategy of
+  // the shards that stayed fails in the manager's own work too, they wait
+  // for its next notification, as tellPresentation's rows do.
+  it("in legacy mode the shards that stayed wait for the strategy's next notification when telling it of them fails in the manager's own work too", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
+    // The context the manager builds for the strategy fails twice: for the
+    // stored body, and for the shards that stayed.
+    const own = internals(cm);
+    const build = own.createStrategyContext.bind(cm);
+    let failures = 0;
+    own.createStrategyContext = () => {
+      if (failures < 2) {
+        failures++;
+        throw new Error('zz-context-failed');
+      }
+      return build();
+    };
+    failRemoval(cm);
+    const { result: err, logged } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.equal(failures, 2, 'setup: both failed');
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two ', 'three'], 'setup: every shard stayed');
+    assert.ok(logged.some((l) => l.includes('telling the strategy of the shards that stayed failed')), logged.join('\n'));
+    assert.deepEqual(strategy.presented, [[before]], 'nothing more is heard yet');
+    const after = cm.addMessage('bob', [text('after')]);
+    assert.deepEqual(strategy.presented, [[before], err.landed, [after]], 'the next notification tells the shards that stayed first, once');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
+  // CM #350 bot review, wave 5, finding 33: a shard can land without
+  // reaching the manager's listener, whose read of the window can throw
+  // before it keeps the row; the read-back names it all the same.
+  it("in legacy mode a shard that stayed without reaching the manager's listener is heard with the others, read from the slot", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.addMessage('bob', [text('before')]);
+    // The manager's listener reads the window's mode first: the second
+    // shard's read throws, after its row landed.
+    const index = (cm as unknown as { windowIndex: { mode: () => string } }).windowIndex;
+    const mode = index.mode;
+    let reads = 0;
+    index.mode = function (this: unknown) {
+      if (++reads === 2) throw new Error('zz-mode-unreadable');
+      return mode.call(this);
+    };
+    failRemoval(cm);
+    let err: unknown;
+    try {
+      ({ result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]))));
+    } finally {
+      delete (index as { mode?: unknown }).mode;
+    }
+    assert.ok(err instanceof WriteLandedError, `a WriteLandedError, not ${String(err)}`);
+    const stored = cm.getAllMessages();
+    assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two '], 'setup: the second shard landed, and the removal failed');
+    assert.deepEqual(err.landed, stored.slice(1).map((m) => m.id), 'the read-back names both');
+    assert.deepEqual(strategy.presented.at(-1), err.landed, 'the strategy hears both shards the legacy window holds, in one call');
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
