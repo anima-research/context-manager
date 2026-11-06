@@ -977,7 +977,9 @@ export class WindowIndex {
    * none, so it hears nothing. Where the index can't be read again to tell,
    * the call throws WindowWriteOutcomeUnknownError in place of the write's
    * error, and `cutShort` hears at the next write through the index on the
-   * branch, once the index reads there (settled).
+   * branch, once the index reads there (settled). A write that lands and
+   * whose read of the index after it throws is one that threw, its error
+   * the read's.
    */
   present(
     ids: readonly MessageId[],
@@ -1021,13 +1023,17 @@ export class WindowIndex {
     const moves = new Set(moving.map((row) => row.id));
     const rows = named.flatMap((name) => name.rows.filter((id) => moves.has(id) || !state.ordinals.has(id)));
     const items: IndexItem[] = [...moving.map((row): IndexItem => ({ retract: row.id })), ...rows.map((id): IndexItem => ({ id }))];
+    // The read of the ordinals the write gave is the write's too: one that
+    // throws after the write landed goes as a write that threw does, told
+    // where the index reads again and waiting where it doesn't.
+    let ordinals: ReadonlyMap<MessageId, number>;
     try {
       this.write(items);
+      ordinals = this.current().ordinals;
     } catch (error) {
       if (!cutShort) throw error;
       throw this.afterThrow('presentRows', error, { entering: rows, leaving: inWindowOrder(moving).map((row) => row.id) }, presentSettlement(rows, moving, cutShort), branch);
     }
-    const ordinals = this.current().ordinals;
     return { ordinals: ids.map((id) => ordinals.get(id)!), entered: rows, left: inWindowOrder(moving) };
   }
 

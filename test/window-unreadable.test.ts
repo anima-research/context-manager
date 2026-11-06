@@ -415,6 +415,65 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       });
     }
   }
+
+  // CM #350 bot review, wave 3, finding 20: the read of the ordinals a
+  // presentation wrote, after its write, is the write's too.
+  it("presentRows whose write lands and whose read of the index after it throws: told before the throw, or waiting as a write whose outcome is unknown", async () => {
+    for (const reads of [1, 2]) {
+      const label = reads === 1 ? 'read again' : 'unread';
+      const strategy = new Hearing();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const [x, y] = ['x', 'y'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      // The append lands, and the write's own read of the revision after it
+      // works; the `reads` reads of the index after that throw.
+      const store = cm.getStore() as unknown as Record<string, unknown>;
+      const names = ['appendToStateJsonWithIdentity', 'appendManyToStateJsonWithIdentity', 'stateHeadOffset', 'getStateLen'];
+      const originals = new Map(names.map((name) => [name, { own: Object.prototype.hasOwnProperty.call(store, name), fn: store[name] }]));
+      let landed = false;
+      let passing = 0;
+      let failing = 0;
+      for (const name of names.slice(0, 2)) {
+        const append = originals.get(name)!.fn as (this: unknown, id: string, ...rest: unknown[]) => unknown;
+        store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+          const written = append.call(this, id, ...rest);
+          if (id === INDEX && !landed) {
+            landed = true;
+            passing = 1;
+            failing = reads;
+          }
+          return written;
+        };
+      }
+      for (const name of names.slice(2)) {
+        const read = originals.get(name)!.fn as ((this: unknown, id: string) => unknown) | undefined;
+        if (typeof read !== 'function') continue;
+        store[name] = function (this: unknown, id: string) {
+          if (id === INDEX && passing > 0) passing--;
+          else if (id === INDEX && failing > 0) {
+            failing--;
+            throw new Error('zz-index-read-failed');
+          }
+          return read.call(this, id);
+        };
+      }
+      try {
+        if (reads === 1) assert.throws(() => cm.presentRows([x]), (error: unknown) => error instanceof Error && error.message === 'zz-index-read-failed', label);
+        else throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-read-failed' });
+      } finally {
+        for (const [name, { own, fn }] of originals) {
+          if (own) store[name] = fn;
+          else delete store[name];
+        }
+      }
+      assert.equal(cm.windowStatusOf(x), 'in', `${label}, setup: the write landed`);
+      assert.deepEqual(strategy.log, reads === 1 ? [`presented ${x}`] : [], `${label}: told once the index reads, before the error is thrown; nothing while it can't`);
+      assert.throws(() => cm.presentRows([x]), /in the window already/, `${label}: a retry is refused`);
+      cm.presentRows([y]);
+      assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`], `${label}: the row is heard once, before the next`);
+      cm.close();
+    }
+  });
 });
 
 // CM #350 bot review (wave 2), finding 1: a write settles what an earlier
