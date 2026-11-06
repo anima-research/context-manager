@@ -34,7 +34,9 @@
  * - A write the store kept and then threw on, or one an index written one
  *   record per item cut short, tells the strategy what it did before the
  *   error is thrown on; a refused repair batch tells it nothing. Where the
- *   index can't be read again, the write throws
+ *   manager's own work telling it fails (the context it builds), that is
+ *   logged, and the rows wait for the strategy's next notification. Where
+ *   the index can't be read again, the write throws
  *   WindowWriteOutcomeUnknownError and the strategy hears at the next write
  *   to the window on that branch (window-unreadable.test.ts).
  *
