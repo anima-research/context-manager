@@ -163,7 +163,8 @@ export interface LeftRow {
  * it was made on, once the index reads there, before that call's own work:
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
  * retractAbsentRows or a removal. Of a write the store didn't keep it
- * hears nothing.
+ * hears nothing. A hook of that hearing that moves the store's branch
+ * stops the call, which throws, writing nothing (WindowIndex.settled).
  */
 export class WindowWriteOutcomeUnknownError extends Error {
   readonly operation: string;
@@ -560,25 +561,40 @@ export class WindowIndex {
    * doesn't, since it can come from inside a strategy's own select or
    * drain, where they must not. Throws, settling nothing, while the index
    * can't be read.
+   *
+   * A hook that moves the store's branch as it hears stops the manager's
+   * `operation`, which throws, writing nothing: the call was given the
+   * record of the branch it was made on, and would write it into the
+   * window of the one the store is on now, or take out of that window
+   * every row the record lacks. The writes it heard of stay settled, and a
+   * call made again works on the branch the store is on.
    */
-  private settled(): IndexState {
+  private settled(operation: string): IndexState {
     const state = this.current();
     if (this.unsettled.length === 0) return state;
-    let branch: string;
+    let branch: { id: string; name: string };
     try {
-      branch = this.store.currentBranch().id;
+      branch = this.store.currentBranch();
     } catch {
       return state;
     }
-    const due = this.unsettled.filter((write) => write.branch === branch);
+    const due = this.unsettled.filter((write) => write.branch === branch.id);
     if (due.length === 0) return state;
-    this.unsettled = this.unsettled.filter((write) => write.branch !== branch);
+    this.unsettled = this.unsettled.filter((write) => write.branch !== branch.id);
     for (const write of due) {
       try {
         write.settle(state.ordinals);
       } catch (error) {
         logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
       }
+    }
+    const now = this.store.currentBranch();
+    if (now.id !== branch.id) {
+      throw new Error(
+        `ContextManager.${operation}: a strategy hook that heard what an earlier write to the window did moved the ` +
+          `store's branch from ${branch.name} to ${now.name}, and this call was given the record of ${branch.name}, ` +
+          `so it writes nothing; call it again on the branch the store is on`,
+      );
     }
     // A hook may have written to the index since.
     return this.current();
@@ -907,7 +923,7 @@ export class WindowIndex {
     positionOf: (id: MessageId) => number | undefined,
     cutShort?: (entered: MessageId[], left: LeftRow[]) => void,
   ): { ordinals: number[]; entered: MessageId[]; left: LeftRow[] } {
-    const state = this.settled();
+    const state = this.settled('presentRows');
     const legacy = !inEffect(state);
     // A cut-short write-down's rows aren't a window: in legacy mode the
     // window is the whole record, which holds no body in part.
@@ -984,7 +1000,7 @@ export class WindowIndex {
     undone: boolean,
     cutShort?: (left: LeftRow[]) => void,
   ): LeftRow[] {
-    const state = this.settled();
+    const state = this.settled('retractRows');
     const legacy = !inEffect(state);
     const rows = namedBodies('retractRows', ids, record, positionOf, (id) => {
       // In legacy mode the window is the record, so a row it doesn't hold
@@ -1025,7 +1041,7 @@ export class WindowIndex {
    * retract's.
    */
   retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
-    const state = this.settled();
+    const state = this.settled('retractRemoved');
     if (!inEffect(state)) return [];
     const left: LeftRow[] = [];
     for (const id of new Set(ids)) {
@@ -1048,7 +1064,7 @@ export class WindowIndex {
    * order; `cutShort` is as retract's.
    */
   retractAbsent(record: readonly StoredMessage[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
-    const state = this.settled();
+    const state = this.settled('retractAbsentRows');
     if (!inEffect(state)) return [];
     const held = positionsIn(record);
     const left: LeftRow[] = [];

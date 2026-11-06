@@ -22,7 +22,7 @@ import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, WindowWriteOutcomeUnknownError, windowIndexStateId } from '../src/index.js';
-import type { CompileResult, MessageId, StoredMessage } from '../src/index.js';
+import type { CompileResult, MessageId, StoredMessage, StrategyContext } from '../src/index.js';
 
 const BASE = './test-window-unreadable';
 let storeSeq = 0;
@@ -234,6 +234,84 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       cm.close();
     });
   }
+});
+
+// CM #350 bot review (wave 2), finding 1: a write settles what an earlier
+// write whose outcome was unknown did before its own work, and the hook that
+// hears it can move the store's branch. The call was given the record of
+// the branch it was made on, so it refuses, writing nothing, where it would
+// have written that record into the other branch's window.
+describe("a hook that hears what an unknown write did, and moves the store's branch", () => {
+  /** Hearing, whose onPresented moves the store to `to`, once, before it logs. */
+  class Moves extends Hearing {
+    to: string | null = null;
+    override async onPresented(rows: readonly StoredMessage[], ctx?: StrategyContext): Promise<void> {
+      if (this.to !== null && ctx) {
+        const to = this.to;
+        this.to = null;
+        ctx.store.switchBranch(to);
+      }
+      return super.onPresented(rows);
+    }
+  }
+
+  /** A presentRows([x]) whose write the store kept and whose outcome can't be read. */
+  function presentUnread(cm: ContextManager, x: MessageId): void {
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+  }
+
+  it("presentRows([]) refuses, writing nothing into the window of the legacy branch the hook moved to", async () => {
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    const a = cm.addMessage('alice', [text('a')]);
+    // Made before the first presentation: in legacy mode, its record a alone.
+    const before = store.createBranchAt('zz-before', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([]);
+    const x = cm.addMessage('alice', [text('x')]);
+    presentUnread(cm, x);
+    strategy.log.length = 0;
+    strategy.to = before;
+    assert.throws(() => cm.presentRows([]), /^Error: ContextManager\.presentRows: .*moved the store's branch from main to zz-before/);
+    assert.equal(cm.currentBranch().name, before, 'setup: the hook moved the store');
+    assert.deepEqual(strategy.log, [`presented ${x}`], 'the earlier write is settled, once');
+    assert.equal(cm.windowMode(), 'legacy', "nothing is written to the branch's window");
+    assert.equal(cm.ordinalOf(x), undefined);
+    cm.presentRows([]);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a], "a call made again writes down this branch's record");
+    assert.deepEqual(strategy.log, [`presented ${x}`]);
+    cm.close();
+  });
+
+  it("retractAbsentRows() refuses, taking nothing out of the window of the branch the hook moved to", async () => {
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const home = cm.currentBranch().name;
+    const side = store.createBranchAt('zz-side', home, store.currentSequence()).name;
+    await cm.switchBranch(side);
+    // A row of the side branch alone, in its window.
+    const s = cm.addMessage('alice', [text('s')]);
+    cm.presentRows([s]);
+    await cm.switchBranch(home);
+    const x = cm.addMessage('alice', [text('x')]);
+    presentUnread(cm, x);
+    strategy.log.length = 0;
+    strategy.to = side;
+    assert.throws(() => cm.retractAbsentRows(), /^Error: ContextManager\.retractAbsentRows: .*moved the store's branch from main to zz-side/);
+    assert.equal(cm.currentBranch().name, side, 'setup: the hook moved the store');
+    assert.deepEqual(strategy.log, [`presented ${x}`], 'the earlier write is settled, once');
+    assert.equal(cm.windowStatusOf(s), 'in', "the branch's own row stays in its window");
+    assert.deepEqual(cm.retractAbsentRows(), [], 'a call made again finds nothing to take out');
+    assert.deepEqual(strategy.log, [`presented ${x}`]);
+    cm.close();
+  });
 });
 
 describe('a window state that holds no index this version reads', () => {
