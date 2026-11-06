@@ -255,7 +255,7 @@ describe('windowed passthrough: a failed write of the anchor', () => {
       assert.deepEqual(slot(cm), { anchor: start }, 'setup: the conversion is unwritten');
       const said = warned.filter((line) => line.includes('[windowed-passthrough]'));
       assert.equal(said.length, 1, warned.join('\n'));
-      assert.match(said[0]!, new RegExp(`the anchor converted to ordinal ${ordinal} couldn't be written; it is tried again at each compile or read of the anchor until a write lands, and a reload before then converts its sequence ${start} again: zz-slot-write-failed`));
+      assert.match(said[0]!, new RegExp(`the anchor converted to ordinal ${ordinal} couldn't be written; it is tried again at each compile that isn't a dryRun and each getAnchorOrdinal\\(\\) \\(getAnchor\\(\\) doesn't read it\\) until a write lands, and a reload before then converts its sequence ${start} again: zz-slot-write-failed`));
 
       // b, stored before the start, is taken out and presented again; c
       // arrives and is presented. The next compile writes the conversion.

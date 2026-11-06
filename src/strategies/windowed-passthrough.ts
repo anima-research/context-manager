@@ -185,8 +185,10 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  * when it is made, since converting the same sequence later, once rows have
  * been presented out of record order, can give another ordinal, and so
  * another window, with no move: a reload has to read the ordinal the window
- * was sent from; a write of it that fails is made again at the next compile
- * or read of the anchor, until one lands. A load itself stays read-only, a
+ * was sent from; a write of it that fails is made again by each later read
+ * of the anchor's ordinal but a preview's (a compile that isn't a dryRun,
+ * getAnchorOrdinal(), setAnchorOrdinal() and renderAsNewest(); getAnchor()
+ * reads only the sequence), until one lands. A load itself stays read-only, a
  * preview (`dryRun`) converts without keeping or writing anything, and an
  * anchor of 0, the start, isn't written, as it converts to the whole window
  * whenever it is converted. `anchor` stays a sequence in both forms, at or
@@ -518,7 +520,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         // next read writes it again (anchorUnwritten), until it lands.
         this.diag.warn(
           `[windowed-passthrough] the anchor converted to ordinal ${from} couldn't be written; it is tried again at ` +
-            `each compile or read of the anchor until a write lands, and a reload before then converts its sequence ` +
+            `each compile that isn't a dryRun and each getAnchorOrdinal() (getAnchor() doesn't read it) until a write ` +
+            `lands, and a reload before then converts its sequence ` +
             `${this.anchor} again: ${describeThrown(err)}`,
         );
       }
