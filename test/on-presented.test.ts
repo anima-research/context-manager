@@ -1016,6 +1016,37 @@ describe('resetHeadWindow once a host presents', () => {
       cm.close();
     }
   });
+
+  // CM #350 bot review, wave 3, finding 24: a listener of the transition's
+  // add can remove it before the presentation, which then refuses its id.
+  it("a transition a listener of its add removed is refused by its presentation, and the refusal doesn't call it stored", async () => {
+    class Resettable extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+    }
+    const strategy = new Resettable();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    let removed: MessageId | undefined;
+    cm.onMessage((event) => {
+      if (event.type !== 'add' || event.message.participant !== 'Context Manager') return;
+      removed = event.message.id;
+      cm.removeMessage(removed);
+    });
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    assert.ok(removed !== undefined && cm.getMessage(removed) === null, 'setup: the listener removed the transition');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.match(err.message, new RegExp(`^ContextManager\\.resetHeadWindow's presentation of its transition failed: ContextManager\\.presentRows: no stored message has id ${removed}`));
+    assert.ok(!err.message.includes(`message ${removed} is stored`), err.message);
+    assert.ok(err.message.includes(`message ${removed} is no longer stored`), err.message);
+    await settle();
+    cm.close();
+  });
 });
 
 describe('onPresented in legacy mode', () => {

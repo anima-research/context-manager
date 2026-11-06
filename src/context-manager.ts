@@ -3954,11 +3954,20 @@ export class ContextManager {
       } catch (error) {
         // A presentation can land and then throw, so the window says
         // whether the transition is in it; where it can't be read, it may be.
+        // One the window lacks may be gone from the store: a listener of its
+        // add can remove it, and the presentation then refuses its id.
         let where = 'stored';
         try {
           if (this.windowIndex.ordinalOf(msgId) !== undefined) where = 'stored and presented';
         } catch {
           where = 'stored, and may be presented';
+        }
+        if (where === 'stored') {
+          try {
+            if (this.messageStore.sequenceOf(msgId) === undefined) where = 'no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
+          } catch {
+            // The store can't say: it was stored.
+          }
         }
         throw refuse(`ContextManager.resetHeadWindow's presentation of its transition failed: ${reasonOf(error)}`, where);
       }
