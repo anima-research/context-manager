@@ -388,6 +388,65 @@ describe('windowed passthrough: a move retried after its write threw', () => {
   });
 });
 
+describe('windowed passthrough: a move whose lookup in the window throws', () => {
+  // Wave 6, finding 5: each setter set one field of the move before the
+  // window's lookup that gives the other, which can throw (the index can't
+  // be read), so a retry with the same value read as the move made and
+  // returned, converting and writing nothing.
+  function failLookup(strategy: WindowedPassthroughStrategy, name: 'ordinalFrom' | 'sequenceFrom'): () => void {
+    const window = (strategy as unknown as { window: Record<string, (n: number) => number | undefined> }).window;
+    const lookup = window[name]!;
+    window[name] = () => { throw new Error('zz-index-unreadable'); };
+    return () => { window[name] = lookup; };
+  }
+
+  it('setAnchor keeps nothing of the move, so a retry with the same sequence makes it and writes it', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'setup: the whole window');
+    const start = sequenceOf(cm, ids[1]!);
+    const restore = failLookup(strategy, 'ordinalFrom');
+    try {
+      assert.throws(() => strategy.setAnchor(start), /zz-index-unreadable/);
+    } finally {
+      restore();
+    }
+    strategy.setAnchor(start);
+    assert.deepEqual(slot(cm), { anchor: start, ordinal: cm.ordinalOf(ids[1]!), v: 2 }, 'the retry wrote the move');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'and the window follows it');
+    cm.close();
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'across a reopen');
+    cm.close();
+  });
+
+  it('setAnchorOrdinal keeps nothing of the move, so a retry with the same ordinal makes it and writes it', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'setup: the whole window');
+    const ordinal = cm.ordinalOf(ids[1]!)!;
+    const restore = failLookup(strategy, 'sequenceFrom');
+    try {
+      assert.throws(() => strategy.setAnchorOrdinal(ordinal), /zz-index-unreadable/);
+    } finally {
+      restore();
+    }
+    strategy.setAnchorOrdinal(ordinal);
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal, v: 2, moved: true }, 'the retry wrote the move');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'and the window follows it');
+    cm.close();
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'across a reopen');
+    cm.close();
+  });
+});
+
 describe('windowed passthrough: the anchor as an ordinal', () => {
   it('setAnchor(currentSequence()) past the last row maps to the index length, and keeps every row presented after', async () => {
     const { cm, strategy } = await open(freshPath());
