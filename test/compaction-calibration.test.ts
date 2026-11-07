@@ -96,6 +96,12 @@ describe('calibration and compaction items', () => {
     });
     assert.ok(Math.abs(internals._calibration - 1.2) < 1e-9, `learned once the compile holds none: got ${internals._calibration}`);
     assert.strictEqual(third.filter((l) => /learned again/.test(l)).length, 1, `one line when learning resumes: ${JSON.stringify(third)}`);
+
+    const fourth = await calibrationLines(async () => {
+      await cm.compile(BUDGET);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
+    });
+    assert.deepStrictEqual(fourth.filter((l) => /compaction item/.test(l)), [], `no line about compaction once it learns again: ${JSON.stringify(fourth)}`);
     cm.close();
   });
 
@@ -121,7 +127,7 @@ describe('calibration and compaction items', () => {
     const seeded = await openManager('learned', HOSTED_CALL);
     await seeded.cm.compile(BUDGET);
     seeded.internals.store!.setStateJson(seeded.internals.calibrationStateId,
-      { multiplier: 1.3, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+      { multiplier: 1.3, at: 1, pricing: 6 });
     seeded.cm.close();
     const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
     const strategy = new AutobiographicalStrategy({ targetChunkTokens: 5_000, recentWindowTokens: 50_000, compressionModel: 'mock', adaptiveResolution: true });
