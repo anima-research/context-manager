@@ -93,7 +93,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
-import { isOpaqueCarrier, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { isCompactionCarrier, isOpaqueCarrier, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -3356,6 +3356,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._lastSelectStats = null;
     this._lastCompileEstimate = 0;
     this._lastCompileInjected = 0;
+    this._lastCompileHeldCompaction = false;
+    this._calibrationPausedForCompaction = false;
     this._storeView = null;
     // Prices memoized over the view just cleared: the next one may estimate otherwise.
     this._answerCostCache.clear();
@@ -16143,6 +16145,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
       this._lastCompileInjected = this.priceMessageInjections(opts?.messageInjections);
+      this._lastCompileHeldCompaction = merged.some((m) => m.content.some(isCompactionCarrier));
       this._calibrationArmed = true; // exactly one sample per compile
     }
     return merged;
@@ -16150,6 +16153,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _lastCompileEstimate = 0;
   private _lastCompileInjected = 0;
+  /** Whether the last committed compile holds a Responses compaction item.
+   *  OpenAI may count a request holding one from the item onward, so its
+   *  usage no longer measures the window this strategy priced, and no
+   *  calibration sample is learned from it (reportRealInputTokens). */
+  private _lastCompileHeldCompaction = false;
+  /** Whether calibration has stopped for compaction items, so the change is
+   *  logged once each way rather than at every sample. */
+  private _calibrationPausedForCompaction = false;
   private _storeView: MessageStoreView | null = null;
 
   /** Thinking the context manager left out after this strategy's committing
@@ -16208,6 +16219,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // exhausting the picker on every wake. One sample per compile, always.
     if (!this._calibrationArmed) return;
     this._calibrationArmed = false;
+    if (this._lastCompileHeldCompaction) {
+      if (!this._calibrationPausedForCompaction) {
+        this._calibrationPausedForCompaction = true;
+        this.diag.error(
+          `[estimator-calibration] this compile holds a compaction item, and the provider may count its request ` +
+            `from the item onward, so its usage doesn't measure the window: multiplier stays ` +
+            `${this._calibration.toFixed(2)}, and no sample is learned while compiles hold one`,
+        );
+      }
+      return;
+    }
+    if (this._calibrationPausedForCompaction) {
+      this._calibrationPausedForCompaction = false;
+      this.diag.error('[estimator-calibration] this compile holds no compaction item: samples are learned again');
+    }
     const declared = overhead != null;
 
     // The overhead in the window's units (current calibrated), so the implied
@@ -22307,6 +22333,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
       lastCompileInjected: this._lastCompileInjected,
+      lastCompileHeldCompaction: this._lastCompileHeldCompaction,
       calibrationArmed: this._calibrationArmed,
       calibrationLoaded: this._calibrationLoaded,
       calibration: this._calibration,
@@ -22339,6 +22366,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
       this._lastCompileInjected = saved.lastCompileInjected;
+      this._lastCompileHeldCompaction = saved.lastCompileHeldCompaction;
       this._calibrationArmed = saved.calibrationArmed;
       this._calibrationLoaded = saved.calibrationLoaded;
       this._calibration = saved.calibration;
