@@ -39,6 +39,10 @@ async function openManager(name: string, carrier?: ContentBlock) {
   return { cm, strategy, internals: strategy as unknown as Internals, carrierAt: carrierAt! };
 }
 
+function holds(messages: ReadonlyArray<{ content: ContentBlock[] }>, itemType: string): boolean {
+  return messages.some((m) => m.content.some((b) => ((b as { rawItem?: { type?: unknown } }).rawItem)?.type === itemType));
+}
+
 async function calibrationLines(fn: () => Promise<void> | void): Promise<string[]> {
   const lines: string[] = [];
   const { warn, error } = console;
@@ -90,7 +94,8 @@ describe('calibration and compaction items', () => {
     const { cm, strategy, internals } = await openManager('dry-select');
     await cm.compile(BUDGET);
     cm.addMessage('Claude', [COMPACTION, { type: 'text', text: 'a later answer' }]);
-    await cm.compile(BUDGET, undefined, { dryRun: true });
+    const dry = await cm.compile(BUDGET, undefined, { dryRun: true });
+    assert.ok(holds(dry.messages, 'compaction'), 'premise: the dry select holds the compaction item');
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     assert.ok(Math.abs(internals._calibration - 1.2) < 1e-9, `the live compile held no compaction item: got ${internals._calibration}`);
     cm.close();
@@ -98,7 +103,8 @@ describe('calibration and compaction items', () => {
 
   it('learns from a compile holding any other carrier, as from any other', async () => {
     const { cm, strategy, internals } = await openManager('hosted-call', HOSTED_CALL);
-    await cm.compile(BUDGET);
+    const live = await cm.compile(BUDGET);
+    assert.ok(holds(live.messages, 'web_search_call'), 'premise: the compile holds the hosted call');
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     assert.ok(Math.abs(internals._calibration - 1.2) < 1e-9, `got ${internals._calibration}`);
     cm.close();

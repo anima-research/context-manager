@@ -1437,8 +1437,8 @@ export class MessageStore {
    * a web search's results at their own. A route that leaves a carrier out
    * (a Responses item on Anthropic) is over-counted by it. Any other block is 0.
    */
-  static opaqueCarrierTokens(block: unknown): number {
-    if (!isOpaqueCarrier(block as ContentBlock)) return 0;
+  static opaqueCarrierTokens(block: ContentBlock): number {
+    if (!isOpaqueCarrier(block)) return 0;
     const item = (block as { rawItem: Record<string, unknown> }).rawItem;
     if (item.type === 'compaction' && typeof item.encrypted_content === 'string') {
       const { encrypted_content: ciphertext, ...rest } = item;
