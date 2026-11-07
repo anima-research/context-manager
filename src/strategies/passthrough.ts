@@ -32,7 +32,12 @@ export class PassthroughStrategy implements ContextStrategy {
   }
 
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
-    // No-op: context is rebuilt on select()
+    // No-op: context is rebuilt on select(). There is deliberately no
+    // onPresented beside it, so a subclass that overrides this still hears
+    // each row of this manager's slot as it enters the window, at the add
+    // in legacy mode and at its presentation once a host presents rows (a
+    // row of an auxiliary slot is heard only when a host presents it:
+    // ContextStrategy.onNewMessage).
   }
 
   select(
