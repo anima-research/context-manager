@@ -173,14 +173,19 @@ export interface LeftRow {
  * retractRows as not in it. For retractRemoved and retractAbsentRows,
  * whose rows the store no longer holds, windowStatusOf reads 'absent'
  * either way: ordinalOf tells (undefined for a row taken out), and calling
- * either again takes out only what is still there. A write-down (the
+ * either again takes out only what is still there. So it does for a row a
+ * retractRows takes out by its id once another manager removed it, which
+ * windowStatusOf reads as 'absent' too. A write-down (the
  * first presentRows or retractRows on a branch in legacy mode, which
  * writes the window down before any work of its own) puts no row in the
  * window and takes none out: `entering` and `leaving` are both empty,
  * windowMode tells whether it landed, and the strategy has nothing to
  * hear of it. The strategy hears what the write did (onPresented,
  * onRetracted) at the next write to the window on the branch it was made
- * on, once the index reads there, before that call's own work:
+ * on, once the index reads there, before that call's own work (where the
+ * manager's own work around the strategy's call fails, such as the context
+ * it builds, that is logged and the rows wait for the strategy's next
+ * notification):
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
  * retractAbsentRows or a removal. Of a write the store didn't keep it
  * hears nothing. A hook of that hearing that moves the store's branch
@@ -218,9 +223,13 @@ export class WindowWriteOutcomeUnknownError extends Error {
     // The rows of the repairs are ones the store no longer holds, which
     // windowStatusOf reads as absent whether or not the write landed.
     const repair = operation === 'retractRemoved' || operation === 'retractAbsentRows';
+    // So is a row a retractRows takes out by its id once another manager
+    // removed it.
     const which = repair
       ? `ordinalOf tells which once the index reads (undefined for a row taken out), and calling ${operation} again takes out only what is still there`
-      : 'windowStatusOf tells which once the index reads';
+      : operation === 'retractRows'
+        ? 'windowStatusOf tells which once the index reads (ordinalOf for a row the store no longer holds: undefined once taken out)'
+        : 'windowStatusOf tells which once the index reads';
     const hears = waiting
       ? 'the strategy hears what it did at the next write to the window'
       : 'nothing waits to tell the strategy what it did, so it reads the window at its next select';

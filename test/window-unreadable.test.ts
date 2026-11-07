@@ -7,7 +7,10 @@
  *   `cause` and the rows the write would have moved. What the write did is
  *   settled at the next write through the index, on the branch it was made
  *   on: the strategy then hears the rows that entered or left, once, before
- *   that call's own work, and hears nothing of a write the store refused.
+ *   that call's own work (where the manager's own work around the
+ *   strategy's call fails, such as the context it builds, that is logged
+ *   and the rows wait for the strategy's next notification), and hears
+ *   nothing of a write the store refused.
  *   Where the store can't say its branch before the write or after it,
  *   nothing waits, the error and a warning say so, and the strategy reads
  *   the window at its next select (the nothing-waits case below); a write
@@ -601,6 +604,34 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       assert.deepEqual(repair === 'retractRemoved' ? cm.retractRemoved([rows[0]!]) : cm.retractAbsentRows(), [], `${repair}: a second call takes out nothing more`);
       cm.close();
     }
+  });
+
+  // CM #350 bot review, wave 6, finding 6: retractRows takes out a row the
+  // store no longer holds by its id, and windowStatusOf reads 'absent' for
+  // it whether or not the write landed, so the error names ordinalOf.
+  it("retractRows of a row another manager removed, the outcome unknown: the error says ordinalOf tells which for such a row", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Hearing() });
+    cm.presentRows([]);
+    const rows = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+    cm.presentRows(rows);
+    const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-other', strategy: new PassthroughStrategy() });
+    other.removeMessage(rows[0]!);
+    other.close();
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.retractRows([rows[0]!]), {
+        operation: 'retractRows',
+        entering: [],
+        leaving: [rows[0]!],
+        cause: 'zz-index-kept-then-failed',
+        says: /windowStatusOf tells which once the index reads \(ordinalOf for a row the store no longer holds: undefined once taken out\)/,
+      });
+    } finally {
+      restore();
+    }
+    assert.equal(cm.windowStatusOf(rows[0]!), 'absent', "windowStatusOf can't tell");
+    assert.equal(cm.ordinalOf(rows[0]!), undefined, 'setup: the store kept the write, which ordinalOf tells');
+    cm.close();
   });
 
   it('retractRows, the write kept: throws outcome-unknown; the next write tells the strategy the rows left', async () => {
