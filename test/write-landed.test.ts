@@ -1389,6 +1389,81 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     }
   });
 
+  /**
+   * The store refuses the third shard's append, the removal of what the
+   * write stored fails, and then the read-back of which shards stayed
+   * (sequenceOf) fails once: the exit that can't say which stayed, naming
+   * every shard written (hearWhatStayed).
+   */
+  function failThirdShardThenReadBack(cm: ContextManager): void {
+    const messages = internals(cm).messageStore;
+    const append = messages.append.bind(messages);
+    messages.append = (...args: Parameters<MessageStore['append']>) => {
+      if (args[4]?.shardIndex === 2) throw new Error('disk full');
+      return append(...args);
+    };
+    const sequenceOf = messages.sequenceOf.bind(messages);
+    let removalTried = false;
+    messages.removeBodyGroup = () => {
+      removalTried = true;
+      throw new Error('removal failed');
+    };
+    messages.sequenceOf = (id: MessageId) => {
+      if (removalTried) {
+        removalTried = false;
+        throw new Error('zz-slot-unreadable');
+      }
+      return sequenceOf(id);
+    };
+  }
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): nothing reaches
+  // the strategy after close(), so a write a listener's close() interrupted
+  // leaves no shard waiting by its id. Every call refuses after close(), so
+  // this reads what the manager keeps (presentedUnheard), as on-retracted's
+  // finding-21 case does.
+  it("in legacy mode a failed sharded add that a listener's close() interrupted leaves no shard waiting by its id", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const before = cm.addMessage('bob', [text('before')]);
+    cm.onMessage((event) => { if (event.type === 'add' && event.message.shardIndex === 0) cm.close(); });
+    failThirdShardThenReadBack(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    assert.equal(err.unknown.length, 2, 'setup: the read-back named the two shards written, as unknown');
+    const kept = cm as unknown as { presentedUnheard: ReadonlyMap<MessageId, unknown> };
+    assert.equal(kept.presentedUnheard.size, 0, 'no shard waits by its id');
+    assert.deepEqual(strategy.presented, [[before]], 'and the strategy heard no shard');
+  });
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): once a host
+  // presents, a shard of a failed add is in the window only where a host
+  // presented it, which told the strategy then, so no shard waits by its id
+  // to be told again.
+  it("once a host presents, the shards of a failed sharded add that a host's listener presented, where which stayed can't be read, are heard once, at their presentation", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.presentRows([]);
+    const shown: MessageId[] = [];
+    cm.onMessage((event) => {
+      if (event.type !== 'add') return;
+      shown.push(event.message.id);
+      cm.presentRows([event.message.id]);
+    });
+    failThirdShardThenReadBack(cm);
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.ok(err instanceof WriteOutcomeUnknownError, `a WriteOutcomeUnknownError, not ${String(err)}`);
+    const shards = [...shown];
+    assert.deepEqual(err.unknown, shards, 'setup: the read-back named the two shards written, as unknown');
+    assert.deepEqual(shards.map((id) => cm.windowStatusOf(id)), ['in', 'in'], 'setup: the listener presented both');
+    assert.deepEqual(strategy.presented, shards.map((id) => [id]), 'the strategy heard each shard once, at its presentation');
+    // The listener presents the next row too.
+    const after = cm.addMessage('bob', [text('after')]);
+    assert.deepEqual(strategy.presented, [...shards.map((id) => [id]), [after]], 'and not again');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
   // CM #350 bot review, wave 3, finding 22: once every shard is stored, no
   // append failed, so no row is unnamed.
   it("a write that fails once every shard is stored names them all, and no row it can't, whatever the store's reads do", async () => {
