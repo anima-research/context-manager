@@ -430,9 +430,13 @@ export class InitializationSupersededError extends Error {
  *
  * Its add may have gone unheard: a failure in the manager's own listener
  * ends the event before a host's onMessage listener hears it, and before
- * the strategy does in legacy mode, where a sharded write that fails tells
- * the strategy only of the shards its own listener heard that stay, in one
- * call before this is thrown. Once a host presents rows on the
+ * the strategy does in legacy mode. There a sharded write that fails tells
+ * the strategy of the shards that stay, in one call before this is thrown:
+ * those its own listener heard and, on the branch the write started on
+ * while the window reads legacy, any it didn't, read from the slot. Where
+ * such a shard can't be read, or that telling fails in the manager's own
+ * work, they wait for the strategy's next notification, which tells those
+ * the window then holds. Once a host presents rows on the
  * branch, a row is out of the window until it is presented, as for any
  * add, but a host's listener of the add may have presented one already, as
  * a host that presents each row as it is stored does, or taken one out
@@ -1180,14 +1184,35 @@ export class ContextManager {
           // a move once the strategy is initialized, where the window of
           // the branch it initialized on holds them.
           // Where the store can't say its branch, they wait as after a move.
+          // Shards of the write that wait to be heard by their ids alone,
+          // where the store is on the branch the write started on and its
+          // window reads legacy: that window is the record, which holds a
+          // shard the store kept, so the delivery tells it as the add would
+          // have. Anywhere else nothing waits, since a presented window
+          // holds such a shard only once a host presents it, which tells
+          // the strategy itself.
+          const waitInLegacyWindow = (ids: readonly MessageId[]) => {
+            if (ids.length === 0 || this.closed) return;
+            try {
+              if (!onBranch() || this.windowIndex.mode() !== 'legacy') return;
+            } catch {
+              return;
+            }
+            for (const id of ids) this.presentedUnheard.set(id, true);
+          };
           // A shard can stay without the manager's listener having kept it:
           // its append can land and throw before the event, or the
           // listener's read of the window can throw first. On the branch
           // the write started on, while the window reads legacy, such a
           // shard is read from the slot (guarded), so the strategy hears
-          // every shard that stayed. Where the manager's own work telling
-          // it fails, the rows wait for the strategy's next notification,
-          // as tellPresentation's do.
+          // every shard that stayed. One whose row can't be read waits by
+          // its id (waitInLegacyWindow), and so do the rows read with it:
+          // the delivery tells them in one call, those the window's listing
+          // then holds. Where the window can't say it is legacy, a shard the
+          // listener didn't keep isn't told: a presented window doesn't
+          // hold it, and would hear it twice once a host presents it. Where
+          // the manager's own work telling it fails, the rows wait for the
+          // strategy's next notification, as tellPresentation's do.
           const hearStayed = (stayed: readonly MessageId[]) => {
             const ids = new Set(stayed);
             const rows = heard.filter((m) => ids.has(m.id));
@@ -1197,24 +1222,33 @@ export class ContextManager {
             } catch {
               here = false;
             }
+            const unread: MessageId[] = [];
             if (here && rows.length < ids.size) {
               try {
                 if (this.windowIndex.mode() === 'legacy') {
                   const kept = new Set(rows.map((m) => m.id));
                   for (const id of stayed) {
                     if (kept.has(id)) continue;
-                    const row = this.messageStore.get(id);
+                    let row: StoredMessage | null;
+                    try {
+                      row = this.messageStore.get(id);
+                    } catch {
+                      unread.push(id);
+                      continue;
+                    }
                     if (row) rows.push(row);
                   }
                   const order = new Map(stayed.map((id, i) => [id, i] as const));
                   rows.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
                 }
               } catch {
-                // The rows the listener kept are told; the rest can't be read.
+                // The rows the listener kept are told; the window can't say
+                // it is legacy, so the rest aren't.
               }
             }
+            waitInLegacyWindow(unread);
             try {
-              if (here) this.notifyPresented(rows);
+              if (here && unread.length === 0) this.notifyPresented(rows);
               else this.deferPresented(rows, true);
             } catch (error) {
               this.waitToBeHeard(rows, true);
@@ -1227,11 +1261,17 @@ export class ContextManager {
           };
           // Where which shards stayed is unknown (a read that would tell
           // threw, or a shard's own append threw and its row has no id
-          // here), every shard the legacy window took in waits, and the
+          // here), every shard the legacy window took in waits, and so does
+          // every shard the write names (`named`: what the read-back named,
+          // or every shard it stored where the read-back threw), by its id,
+          // where the window reads legacy (waitInLegacyWindow). The
           // delivery tells those the window's listing then holds
           // (deliverPresentedUnheard), at once where it reads, and at the
-          // strategy's next notification where it doesn't.
-          const hearWhatStayed = () => {
+          // strategy's next notification where it doesn't. A shard whose
+          // own append threw, where the read of whether it landed threw
+          // too, has no id, and waits only where the listener kept it.
+          const hearWhatStayed = (named: readonly MessageId[] = []) => {
+            waitInLegacyWindow(named);
             try {
               this.deferPresented(heard, true);
             } catch (error) {
@@ -1330,12 +1370,12 @@ export class ContextManager {
             }
             const stayed = here ? this.rowsStillStored(wrote) : null;
             if (stayed === null) {
-              hearWhatStayed();
+              hearWhatStayed(wrote);
               throw new WriteOutcomeUnknownError({ landed: [], unknown: wrote, unnamed }, err);
             }
             if (stayed.length > 0) {
               if (unnamed === 0) hearStayed(stayed);
-              else hearWhatStayed();
+              else hearWhatStayed(stayed);
               throw unnamed === 0 ? new WriteLandedError(stayed, err) : new WriteOutcomeUnknownError({ landed: stayed, unknown: [], unnamed }, err);
             }
           } finally {
