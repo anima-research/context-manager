@@ -106,6 +106,25 @@ async function releasingUntil<T>(calls: ReadonlyArray<{ release: () => void }>, 
   return done;
 }
 
+/**
+ * `work`, or a 'timed out' rejection after `ms` (wave 6, finding 33). A raw
+ * await of a tick or a merge whose model call a regression left held (a
+ * retry after a failure, a second call after an answer) would wait for
+ * good, and the test's finally, which releases the held calls and closes
+ * the managers, would never run: node:test sets no timeout of its own.
+ */
+async function deadline<T>(work: Promise<T>, ms = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms, the work still pending`)), ms);
+  });
+  try {
+    return await Promise.race([work, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
@@ -227,7 +246,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const merging = a.tick();
       await waitFor(() => calls.length === 3);
@@ -242,7 +261,7 @@ describe('a retraction through another instance sharing the store', () => {
         b!.retractRows([row], { undone: true });
         assert.ok(!stored(store, SUMMARIES).some((s) => s.id === source), 'premise: the other instance dropped the source in the store');
         calls[2]!.release();
-        await merging;
+        await deadline(merging);
       });
       assert.ok(lines.some((line) => /source\(s\) dropped while the L2 merge's call was out/.test(line)), lines.join('\n'));
       assert.ok(!lines.some((line) => line.includes('setMergedInto')), lines.join('\n'));
@@ -265,7 +284,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const l1 = internals(A).summaries.find((s) => s.level === 1)!;
       const B = strategyFor();
@@ -310,7 +329,7 @@ describe('a retraction through another instance sharing the store', () => {
         const record = stored(store, CHUNKS).find((r) => r.id === recordId);
         assert.ok(!record || !record.sourceIds.includes(row), 'premise: the other instance gave the row up from the record');
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(recordId)), lines.join('\n'));
       const summaries = stored(store, SUMMARIES);
@@ -360,7 +379,7 @@ describe('a retraction through another instance sharing the store', () => {
         b!.retractRows([row], { undone: true });
         assert.equal(a.windowStatusOf(row), 'undone', 'premise: the row is out of the window the instances share');
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
       const summaries = stored(store, SUMMARIES);
@@ -399,7 +418,7 @@ describe('a retraction through another instance sharing the store', () => {
           assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
           assert.equal(order().at(-1), row, 'premise: at its end');
           calls[0]!.release();
-          await ticking;
+          await deadline(ticking);
         });
         assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
         const summaries = stored(store, SUMMARIES);
@@ -422,7 +441,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const merging = a.tick();
       await waitFor(() => calls.length === 3);
@@ -441,7 +460,7 @@ describe('a retraction through another instance sharing the store', () => {
         assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
         assert.ok(stored(store, SUMMARIES).some((s) => s.id === source), "premise: the other instance's summaries write failed");
         calls[2]!.release();
-        await merging;
+        await deadline(merging);
       });
       assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
       const after = stored(store, SUMMARIES);
@@ -474,7 +493,7 @@ describe('a retraction through another instance sharing the store', () => {
         assert.equal(a.windowStatusOf(row), 'undone', 'premise: the tombstone landed');
         assert.ok(stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), "premise: the other instance's record write failed");
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
       assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
@@ -500,7 +519,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const merging = a.tick();
       await waitFor(() => calls.length === 3);
@@ -516,7 +535,7 @@ describe('a retraction through another instance sharing the store', () => {
         assert.equal(a.windowStatusOf(row), 'undone', 'premise: the tombstone landed');
         assert.ok(stored(store, SUMMARIES).some((s) => s.id === source), "premise: the other instance's summaries write failed");
         calls[2]!.release();
-        await merging;
+        await deadline(merging);
       });
       assert.ok(lines.some((line) => line.includes('zz the store refused')), `premise: the other instance's write threw: ${lines.join('\n')}`);
       const after = stored(store, SUMMARIES);
@@ -543,7 +562,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const l1 = internals(A).summaries.find((s) => s.level === 1)!;
       const row = l1.sourceIds[0]!;
@@ -581,7 +600,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const l1 = internals(A).summaries.find((s) => s.level === 1)!;
       const row = l1.sourceIds[0]!;
@@ -636,7 +655,7 @@ describe('a retraction through another instance sharing the store', () => {
         b!.presentRows([row]);
         assert.equal(a.windowStatusOf(row), 'in', 'premise: the row is in the window again');
         gate.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
       assert.deepEqual(lines.filter((line) => line.includes('"compression:quarantine-alert"')), [], 'no alert was sent');
@@ -674,7 +693,7 @@ describe('a retraction through another instance sharing the store', () => {
         b!.retractRows([row], { undone: true });
         assert.ok(!stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), 'premise: the other instance gave the row up from the record');
         gate.release();
-        await ticking;
+        await deadline(ticking);
       });
       const alerts = lines.filter((line) => line.includes('"compression:quarantine-alert"'));
       assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
@@ -700,7 +719,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const [first, second] = internals(A).summaries.filter((s) => s.level === 1);
       assert.ok(first && second, 'premise: two L1s');
@@ -822,7 +841,7 @@ describe('a retraction through another instance sharing the store', () => {
           const ticking = a.tick();
           await waitFor(() => calls.length === n);
           calls[n - 1]!.release();
-          await ticking;
+          await deadline(ticking);
         }
         const merging = a.tick();
         await waitFor(() => calls.length === 3);
@@ -837,7 +856,7 @@ describe('a retraction through another instance sharing the store', () => {
           b!.retractRows([row], { undone: true });
           assert.deepEqual(naming(), [], "premise: the other instance's let-go removed the queued merge from the store");
           calls[2]!.fail(Object.assign(new Error('zz invalid_request failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 }));
-          await merging.catch(() => {});
+          await deadline(merging.catch(() => {}));
         });
         assert.deepEqual(naming(), [], `the store's queue doesn't hold the merge again: ${lines.join('\n')}`);
         assert.equal(A.getMergeQuarantineStatus().count, 0, `nothing is quarantined: ${lines.join('\n')}`);
@@ -881,7 +900,7 @@ describe('a retraction through another instance sharing the store', () => {
         store.setStateJson(CHUNKS, stored(store, CHUNKS).map((r) => (r.id === recordId ? { ...r, compressed: true, summaryId: 'L1-zz' } : r)));
         assert.ok(span.every((id) => a.windowStatusOf(id) === 'in'), 'premise: every row of the span is in the window');
         gate.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
       assert.deepEqual(lines.filter((line) => line.includes('"compression:quarantine-alert"')), [], 'no alert was sent');
@@ -907,7 +926,7 @@ describe('a retraction through another instance sharing the store', () => {
         store.setStateJson(CHUNKS, stored(store, CHUNKS).map((r) => (r.id === recordId ? { ...r, sourceIds: [...r.sourceIds].reverse() } : r)));
         assert.ok(span.every((id) => a.windowStatusOf(id) === 'in'), 'premise: every row of the span is in the window');
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(`chunk record ${recordId} changed in the store mid-request`)), lines.join('\n'));
       assert.ok(!stored(store, SUMMARIES).some((s) => s.level === 1 && s.sourceIds.join() === span.join()), 'no L1 over the span was written');
@@ -931,7 +950,7 @@ describe('a retraction through another instance sharing the store', () => {
       b = await ContextManager.open({ store, strategy: B, membrane });
       const lines = await linesDuring(async () => {
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(stored(store, SUMMARIES).some((s) => s.level === 1 && s.sourceIds.join() === span.join()), lines.join('\n'));
     } finally {
@@ -954,7 +973,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === n);
         calls[n - 1]!.release();
-        await ticking;
+        await deadline(ticking);
       }
       const l1 = internals(A).summaries.find((s) => s.level === 1)!;
       // Rows past the last closed chunk, which no record holds yet.
@@ -1015,7 +1034,7 @@ describe('a retraction through another instance sharing the store', () => {
         const ticking = a.tick();
         await waitFor(() => calls.length === 1);
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
         const l1 = internals(A).summaries.find((s) => s.level === 1)!;
         const row = l1.sourceIds[0]!;
         const rowText = (a.getMessage(row)!.content[0] as { text: string }).text;
@@ -1071,7 +1090,7 @@ describe('a retraction through another instance sharing the store', () => {
       c.retractRows([row], { undone: true });
       const lines = await linesDuring(async () => {
         calls[0]!.release();
-        await ticking;
+        await deadline(ticking);
       });
       assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), `the instance adopted nothing over the row: ${lines.join('\n')}`);
       assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'and let go of the L1 over it in the store');
@@ -1114,8 +1133,8 @@ describe('a retraction through another instance sharing the store', () => {
       };
       const lines = await linesDuring(async () => {
         calls[0]!.release();
-        await producing;
-        await waiting;
+        await deadline(producing);
+        await deadline(waiting);
       });
       assert.ok(taken, `premise: the producer marked its record: ${lines.join('\n')}`);
       assert.ok(internals(B).summaries.every((s) => !s.sourceIds.includes(row)), `the waiter adopted nothing over the row: ${lines.join('\n')}`);
