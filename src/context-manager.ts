@@ -1252,10 +1252,9 @@ export class ContextManager {
               else this.deferPresented(rows, true);
             } catch (error) {
               this.waitToBeHeard(rows, true);
-              logThrown(
+              this.logOnFailedAdd(
                 '[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed; it is told at its next notification:',
                 error,
-                this.diag,
               );
             }
           };
@@ -1275,7 +1274,7 @@ export class ContextManager {
             try {
               this.deferPresented(heard, true);
             } catch (error) {
-              logThrown('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error, this.diag);
+              this.logOnFailedAdd('[context-manager] a sharded addMessage failed partway, and telling the strategy of the shards that stayed failed:', error);
             }
           };
           // A write the store's branch moved under stopped there, or failed
@@ -1289,7 +1288,7 @@ export class ContextManager {
           try {
             away = !onBranch();
           } catch (read) {
-            this.diag.error(
+            this.logOnFailedAdd(
               `[context-manager] a sharded addMessage failed partway, and reading the store's branch threw, so nothing is ` +
                 `removed, and body group ${decision.bodyGroupId} may be left short: ${describeThrown(read)}`,
             );
@@ -1326,7 +1325,7 @@ export class ContextManager {
             // shard in, so the strategy hears it where the window's listing
             // holds it, as on the other exits whose outcome is unknown.
             if (stored.length === 0) {
-              this.diag.error(
+              this.logOnFailedAdd(
                 `[context-manager] a sharded addMessage failed on its first shard, and reading the store to tell whether that ` +
                   `shard landed threw, so it may be stored, leaving body group ${decision.bodyGroupId} short: ` +
                   describeThrown(read),
@@ -1364,7 +1363,7 @@ export class ContextManager {
             this.removing = named && { ids: [...new Set([...named.ids, ...named.rows.map((m) => m.id)])], rows: named.rows };
             this.messageStore.removeBodyGroup(wrote[0]!);
           } catch (removal) {
-            this.diag.error(
+            this.logOnFailedAdd(
               `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
                 `${decision.bodyGroupId} (first shard ${wrote[0]}) may be left short: ` +
                 describeThrown(removal),
@@ -1432,13 +1431,30 @@ export class ContextManager {
       try {
         landed = this.rowLandedAt(lengthBefore);
       } catch (read) {
-        this.diag.error(
+        this.logOnFailedAdd(
           `[context-manager] addMessage failed, and reading the store to tell whether its row landed threw, so the row may be stored: ` +
             describeThrown(read),
         );
         throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, err);
       }
       throw landed === null ? err : new WriteLandedError([landed], err);
+    }
+  }
+
+  /**
+   * Log a line on a failed add's way to the error that says what the store
+   * holds of the message (WriteLandedError, WriteOutcomeUnknownError, or
+   * the write's own error, which says it holds none): a log that throws
+   * (a console.error that throws) is dropped, so that error is always
+   * built, and the log's error never reaches the host in its place. With
+   * a thrown value after the message, the line is logThrown's.
+   */
+  private logOnFailedAdd(message: string, ...thrown: [] | [unknown]): void {
+    try {
+      if (thrown.length === 0) this.diag.error(message);
+      else logThrown(message, thrown[0], this.diag);
+    } catch {
+      // A failed log isn't the add's outcome.
     }
   }
 

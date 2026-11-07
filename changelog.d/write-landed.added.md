@@ -13,8 +13,9 @@
   message.
   - `WriteLandedError` is thrown when a row stays: a message stored as one
     row, whose append failed after the row landed (the manager's own store
-    listener failing inside it; a host's `onMessage` listener can't fail a
-    write), or the shards of a sharded write that failed partway and whose
+    listener failing inside it; a host's `onMessage` listener's throw is
+    logged and doesn't fail the write, unless that log throws too: see
+    `onMessage`), or the shards of a sharded write that failed partway and whose
     removal of what it stored failed too, a body short of its `shardCount`.
   - `WriteOutcomeUnknownError` names what the manager knows: `landed`, the
     rows it knows are stored, possibly none; `unknown`, rows the write

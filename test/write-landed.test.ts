@@ -12,10 +12,12 @@
  *   before a row lands throws its own error, unwrapped, and so does a
  *   sharded write once it has removed the shards it stored.
  *
- * A host's onMessage listener can't fail a write (its throw is logged), so
- * the failure after a row landed is the manager's own: its listener runs
- * inside each append. These make it fail by wrapping that listener, or, in
- * legacy mode, the context it builds for the strategy there.
+ * A host's onMessage listener's throw is logged and doesn't fail the write,
+ * unless that log throws too (see onMessage), so the failure after a row
+ * landed is the manager's own: its listener runs inside each append. These
+ * make it fail by wrapping that listener, or, in legacy mode, the context
+ * it builds for the strategy there; one adds a listener of its own to the
+ * manager's slot, after the host's.
  */
 
 import { describe, it, after } from 'node:test';
@@ -730,6 +732,49 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.deepEqual(strategy.presented.at(-1), stored.slice(1).map((m) => m.id), 'the strategy hears both shards the legacy window holds, in one call');
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
+  });
+
+  // CM #350 bot review, wave 6, finding 7: the lines a failed add logs on
+  // its way to the error that says what the store holds can throw (a
+  // console.error that throws); the error is built all the same, so a host
+  // isn't told the store holds none of a message it holds.
+  it('a log that throws on the way to the error leaves the error to say what the store holds', async () => {
+    const cases = [
+      ['a message stored as one row whose landing can\'t be read', 1, false, false],
+      ["a sharded write's first shard whose landing can't be read", 1, true, false],
+      ['a sharded write whose removal of what it stored fails', 2, true, true],
+    ] as const;
+    for (const [label, nth, sharded, removalFails] of cases) {
+      const cm = await ContextManager.open({ path: freshPath(), strategy: sharded ? new Sharding() : new PassthroughStrategy() });
+      cm.addMessage('bob', [text('before')]);
+      const failure = new Error('propagation failed');
+      failOwnListenerAfterAdd(cm, nth, failure);
+      const readable = removalFails ? () => {} : failTailRead(cm);
+      if (removalFails) failRemoval(cm);
+      const error = console.error;
+      console.error = () => {
+        throw new Error('zz-log-failed');
+      };
+      let err: unknown;
+      try {
+        err = thrownBy(() => cm.addMessage('alice', sharded ? [text('one '), text('two '), text('three')] : [text('one')]));
+      } finally {
+        console.error = error;
+        readable();
+      }
+      const stored = cm.getAllMessages().slice(1).map((m) => m.id);
+      if (removalFails) {
+        assert.ok(err instanceof WriteLandedError, `${label}: a WriteLandedError, not ${String(err)}`);
+        assert.deepEqual(err.landed, stored, `${label}: naming the shards that stayed`);
+      } else {
+        assert.ok(err instanceof WriteOutcomeUnknownError, `${label}: a WriteOutcomeUnknownError, not ${String(err)}`);
+        assert.equal(err.unnamed, 1, label);
+        assert.equal(stored.length, 1, `${label}, setup: the row landed`);
+      }
+      assert.equal(err.cause, failure, label);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
   });
 
   it("resetHeadWindow's transition add that fails after storing it rejects with the error naming it, and the head window isn't reset", async () => {
