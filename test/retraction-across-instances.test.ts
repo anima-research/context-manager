@@ -30,7 +30,7 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, KnowledgeStrategy, PassthroughStrategy } from '../src/index.js';
 import type { MessageId, SummaryEntry } from '../src/index.js';
 
 const BASE = './test-retraction-across-instances';
@@ -1044,4 +1044,87 @@ describe('a retraction through another instance sharing the store', () => {
     });
   }
 
+  // Wave 6, finding 8: the check above ran before the call's exact
+  // adoption only at entry. After the call, an exact L1 found in the store
+  // was adopted before the check, and a compression that waited on another
+  // instance's call over the chunk adopted its L1 with no check.
+  it('an L1 whose call returns after a row of its span was taken out, with an L1 over the span written meanwhile and not let go of, adopts nothing', async () => {
+    const { store, strategy: A, cm: a, calls } = await instanceA();
+    let c: ContextManager | undefined;
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const span = work.chunk.messages.map((m) => m.id);
+      const row = span[1]!;
+      // Another instance's L1 over the span lands, as its own compression's
+      // would, and a manager whose strategy folds nothing takes the row out,
+      // so nothing lets go of that L1.
+      store.appendToStateJson(SUMMARIES, {
+        id: 'L1-zz', level: 1, content: 'zz', tokens: 5, sourceLevel: 0, sourceIds: span,
+        sourceRange: { first: span[0], last: span.at(-1) }, created: 1,
+      });
+      c = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      c.retractRows([row], { undone: true });
+      const lines = await linesDuring(async () => {
+        calls[0]!.release();
+        await ticking;
+      });
+      assert.ok(internals(A).summaries.every((s) => !s.sourceIds.includes(row)), `the instance adopted nothing over the row: ${lines.join('\n')}`);
+      assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'and let go of the L1 over it in the store');
+      assert.ok(lines.some((line) => line.includes('discarding L1') && line.includes(row)), lines.join('\n'));
+    } finally {
+      for (const call of calls) call.release();
+      c?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  it("a compression that waited on another instance's call over the same chunk adopts nothing over a row taken out before it resumed", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    const B = strategyFor();
+    const b = await ContextManager.open({ store, strategy: B, membrane });
+    let c: ContextManager | undefined;
+    const realEdit = store.editStateItem.bind(store);
+    try {
+      const producing = a.tick();
+      await waitFor(() => calls.length === 1);
+      const work = internals(A).pendingCompressionWork;
+      assert.ok(work && 'chunk' in work, 'premise: an L1 is in flight');
+      const row = work.chunk.messages[1]!.id;
+      const waiting = b.tick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(calls.length, 1, 'premise: the other instance waits on this call');
+      c = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      // As the producer marks its record, past its own checks, a manager
+      // whose strategy folds nothing takes the row out: the producer's L1
+      // is written, and nothing lets go of it.
+      let taken = false;
+      (store as unknown as { editStateItem: typeof realEdit }).editStateItem = (id: string, index: number, payload: Buffer) => {
+        const out = realEdit(id, index, payload);
+        if (id === CHUNKS && !taken) {
+          taken = true;
+          c!.retractRows([row], { undone: true });
+        }
+        return out;
+      };
+      const lines = await linesDuring(async () => {
+        calls[0]!.release();
+        await producing;
+        await waiting;
+      });
+      assert.ok(taken, `premise: the producer marked its record: ${lines.join('\n')}`);
+      assert.ok(internals(B).summaries.every((s) => !s.sourceIds.includes(row)), `the waiter adopted nothing over the row: ${lines.join('\n')}`);
+      assert.ok(lines.some((line) => line.includes(row) && line.includes('left the window')), lines.join('\n'));
+    } finally {
+      (store as unknown as { editStateItem: typeof realEdit }).editStateItem = realEdit;
+      for (const call of calls) call.release();
+      c?.close();
+      b.close();
+      a.close();
+      store.close();
+    }
+  });
 });

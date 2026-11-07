@@ -6170,11 +6170,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * went (`when`), and take it up. A
    * record changed in the store: this instance takes up the store's state,
    * and the rebuild from its records queues the record again over the rows
-   * it keeps. A row out of the window the record still holds, or with no
+   * it keeps (or, where another instance compressed it instead, takes the
+   * record as compressed with that instance's L1). A row out of the window
+   * the record still holds, or with no
    * record kept, or one presented again since (rowsMovedInWindow): the
    * instance lets go of the row as its own onRetracted would have
    * (letGoOfRowsOutOfWindow), and the rebuild chunks a row presented again
-   * where the window now holds it. Returns whether it did either.
+   * where the window now holds it. With no `sources`, only the window is
+   * asked. Returns whether it did either.
    */
   private takeUpSpanLetGoElsewhere(
     chunk: Chunk,
@@ -6187,7 +6190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.chunkRecordChangedInStore(chunk.recordId, sources)) {
       this.diag.warn(
         `[autobiographical] ${discarding}: its chunk record ${chunk.recordId} changed in the store ${when} ` +
-          '(another instance sharing the store let go of a row of its span)',
+          '(another instance sharing the store let go of a row of its span, or compressed it)',
       );
       this.takeUpStoreState();
       this.rebuildChunks(ctx.messageStore);
@@ -11673,6 +11676,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // presentation in flight stays as it is (#166).
       this.takeUpStoreState();
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      // A row of the span left the window, or left and was presented again,
+      // while this waited, through a manager whose strategy didn't let go of
+      // the producer's L1 (another instance's, whose let-go failed or hasn't
+      // come; or one that folds nothing): adopted, that L1 would cover the
+      // row. The window says so (takeUpSpanLetGoElsewhere, asked of the
+      // window alone: the take-up above made this instance's records the
+      // store's, and the producer marks the record it compressed, so the
+      // record's change says nothing here). The rows are let go of, with
+      // what covers them, and nothing is adopted.
+      if (this.takeUpSpanLetGoElsewhere(chunk, undefined, ctx, spanOrdinals, 'not adopting the L1 of the compression it waited on', 'while it waited')) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
         // The producer shares this namespace (the in-flight key says so), and
@@ -13147,6 +13160,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // Another instance sharing the store let go of a row of the span
+      // while the request was in flight: the row left that instance's
+      // window, which gave the row up from the chunk's record or removed it
+      // (onRetracted), and this instance didn't hear it, so its own mark
+      // (_spanLeftWindow) isn't set. The summary would cover a row that
+      // window no longer holds. Discard it and take it up
+      // (takeUpSpanLetGoElsewhere): the store's changed record, or, where
+      // the record doesn't say so (a strategy keeping none, or that
+      // instance's writes after the window's tombstone failed), the row
+      // out of the window, let go of here. Asked before the exact adoption
+      // below, as before the call: an L1 over the span the store holds can
+      // be one written before the row left that nothing has let go of (that
+      // instance's let-go failed, or hasn't come), and adopted it would
+      // cover the row. Where another instance compressed the record
+      // instead, the take-up brings its L1 and the marked record in, which
+      // the rebuild adopts. Nothing between these reads and the writes
+      // below awaits.
+      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'discarding L1')) return;
+
       // Re-check the dedup guard AFTER the await: summary state may have
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
@@ -13160,19 +13192,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         await this.clearQuarantineForCompressedChunk(chunk);
         return;
       }
-
-      // Another instance sharing the store let go of a row of the span
-      // while the request was in flight: the row left that instance's
-      // window, which gave the row up from the chunk's record or removed it
-      // (onRetracted), and this instance didn't hear it, so its own mark
-      // (_spanLeftWindow) isn't set. The summary would cover a row that
-      // window no longer holds. Discard it and take it up
-      // (takeUpSpanLetGoElsewhere): the store's changed record, or, where
-      // the record doesn't say so (a strategy keeping none, or that
-      // instance's writes after the window's tombstone failed), the row
-      // out of the window, let go of here. Nothing between these reads and
-      // the writes below awaits.
-      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'discarding L1')) return;
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
