@@ -1001,4 +1001,47 @@ describe('a retraction through another instance sharing the store', () => {
     }
   });
 
+  // Wave 6, finding 1: another manager's retraction tells only its own
+  // strategy, so this instance went on rendering the L1 over the row, from
+  // its own summaries and chunk records, until its own next let-go, work
+  // over the span, or open.
+  for (const next of ['compile', 'presentation'] as const) {
+    it(`this instance's next ${next} after the other instance took out a row it folds lets go of what covers the row`, async () => {
+      const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+      let b: ContextManager | undefined;
+      try {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === 1);
+        calls[0]!.release();
+        await ticking;
+        const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+        const row = l1.sourceIds[0]!;
+        const rowText = (a.getMessage(row)!.content[0] as { text: string }).text;
+        b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+        await linesDuring(async () => { b!.retractRows([row], { undone: true }); });
+        assert.ok(!stored(store, SUMMARIES).some((s) => s.id === l1.id), 'premise: the other instance dropped the L1 in the store');
+        assert.ok(internals(A).summaries.some((s) => s.id === l1.id), 'premise: this instance, which did not hear it, still holds it');
+
+        let sent = '';
+        const lines = await linesDuring(async () => {
+          if (next === 'compile') sent = JSON.stringify((await a.compile()).messages);
+          else a.presentRows([a.addMessage('User', [{ type: 'text', text: 'zz after' }])]);
+        });
+        if (next === 'compile') {
+          assert.ok(!sent.includes(l1.content), `the compile doesn't send the L1 over the row: ${sent.slice(0, 400)}`);
+          assert.ok(!sent.includes(JSON.stringify(rowText)), "nor the row's text");
+        }
+        assert.ok(!internals(A).summaries.some((s) => s.sourceIds.includes(row)), `no summary this instance holds covers the row: ${lines.join('\n')}`);
+        assert.ok(!internals(A).chunkRecords.some((r) => r.sourceIds.includes(row)), 'nor does a record');
+        assert.ok(lines.some((line) => line.includes('still folded by this instance') && line.includes(row)), lines.join('\n'));
+        assert.ok(stored(store, SUMMARIES).every((s) => !s.sourceIds.includes(row)), 'nothing is written back over the row');
+      } finally {
+        for (const call of calls) call.release();
+        b?.close();
+        a.close();
+        store.close();
+      }
+    });
+  }
+
 });

@@ -2,6 +2,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
 import { registerStateIfAbsent } from '../state-registration.js';
+import { describeThrown } from '../describe-thrown.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -2229,6 +2230,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private warnedQuarantineSkips = new Set<string>();
   /** The context initialize was given; its `tools` getter follows the host's declarations. */
   private hostContext: StrategyContext | null = null;
+  /**
+   * The window's length (WindowIndexView.length) when this instance last
+   * looked for rows out of the window that it still folds
+   * (letGoOfRowsLeftUnheard). Every tombstone and presentation takes an
+   * ordinal, so while the length stands no row has left the window since.
+   */
+  private windowLengthLooked: number | undefined;
   protected _compressionCount = 0;
   /**
    * Monotonic counter of queue items consumed by tick(): compression, merges,
@@ -3146,6 +3154,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.reportImageLimitsWarningOnce();
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
+    this.windowLengthLooked = undefined;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -8235,7 +8244,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * instance holds them, it first takes them up (takeUpStoreState), and
    * lets go, beside the rows it is told of, of each row out of the window
    * that what it took up still folds: the other instance's let-go stands,
-   * and this one writes back nothing it dropped.
+   * and this one writes back nothing it dropped. Nor does it wait for a
+   * let-go of its own to take the other's up: before a live select, and as
+   * rows enter the window, it lets go of each row out of the window that it
+   * still folds (letGoOfRowsLeftUnheard), so it doesn't render the summary
+   * over a row the other manager took out.
    *
    * `undone` and `removed` change none of this: an undone row, a row taken
    * out and a removed row have each left. The manager doesn't call this for a removal
@@ -8378,6 +8391,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) folded.add(id);
     return folded;
+  }
+
+  /**
+   * Let go of each row out of the window (WindowIndexView.left) that this
+   * instance still folds: another manager sharing the window took it out
+   * (its retractRows, or a removal once a host presents), which told that
+   * manager's strategy (onRetracted), not this one, so this instance's
+   * summaries and chunk records would go on rendering the summary over a
+   * row the window no longer holds. It takes up the store, which holds the
+   * other strategy's let-go, and lets go of the rows as its own onRetracted
+   * would have (letGoOfRowsOutOfWindow), with a warning. Asked before a
+   * live select (with the context initialize was given, whose window is
+   * live) and as rows enter the window (windowGrew), once per change of the
+   * window's length: while it stands, the scan isn't made. Not in legacy
+   * mode, where no row leaves the window, nor in an audit-only instance,
+   * whose open leaves such rows under what covers them for inspection
+   * (releaseRowsThatLeft). A failure is logged, and the select or the
+   * notification goes ahead: what the let-go didn't write, the next one or
+   * the next open repairs, as after a failed onRetracted.
+   */
+  private letGoOfRowsLeftUnheard(ctx: StrategyContext | null, operation: string): void {
+    const window = ctx?.window;
+    if (!ctx || !window || this.config.auditOnly) return;
+    try {
+      const length = window.length();
+      if (length === this.windowLengthLooked) return;
+      this.windowLengthLooked = length;
+      const rows = [...this.foldedRowsOutOfWindow(ctx)];
+      if (rows.length === 0) return;
+      this.diag.warn(
+        `[autobiographical] row(s) [${rows.join(', ')}] are out of the window and still folded by this instance: ` +
+          `another manager sharing the window took them out, which this instance did not hear; taking up the store and ` +
+          `letting go of them before ${operation}`,
+      );
+      this.letGoOfRowsOutOfWindow(rows, ctx);
+    } catch (err) {
+      this.diag.warn(
+        `[autobiographical] looking for rows out of the window that this instance still folds, before ${operation}, ` +
+          `failed: ${describeThrown(err)}`,
+      );
+    }
   }
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
@@ -8640,6 +8694,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private windowGrew(operation: string, ctx: StrategyContext): void {
     this.requireLoadedBranch(operation);
+    this.letGoOfRowsLeftUnheard(ctx, operation);
     this.rebuildChunks(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
@@ -9398,6 +9453,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
+      this.letGoOfRowsLeftUnheard(this.hostContext, 'select');
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
