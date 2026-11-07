@@ -1210,16 +1210,23 @@ export class WindowIndex {
    * legacy mode it writes nothing: the window is the record, and a row
    * removed from the record has left it already. Returns the rows taken
    * out, with the ordinals they held, in window order; `cutShort` is as
-   * retract's.
+   * retract's. `leaving`, when given, hears the rows the write is about to
+   * take out, in window order, once the writes waiting to be settled have
+   * been (settled), whose hooks can take a row out first, and before the
+   * write, which can throw.
    */
-  retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
+  retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void, leaving?: (left: LeftRow[]) => void): LeftRow[] {
     const { state, branch } = this.settled('retractRemoved');
-    if (!inEffect(state)) return [];
+    if (!inEffect(state)) {
+      leaving?.([]);
+      return [];
+    }
     const left: LeftRow[] = [];
     for (const id of new Set(ids)) {
       const ordinal = state.ordinals.get(id);
       if (ordinal !== undefined) left.push({ id, ordinal, by: state.by[ordinal] });
     }
+    leaving?.(inWindowOrder(left));
     this.writeLeaving('retractRemoved', left.map((row): IndexItem => ({ retract: row.id })), left, branch, cutShort);
     return inWindowOrder(left);
   }

@@ -264,6 +264,58 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // CM #350 bot review, wave 6, finding 26: where the removal's own
+  // tombstones then fail to land, what it tells is what that write was
+  // taking out, read after the settlement, not before it.
+  it("a removal whose settlement's hook takes one of its rows out, and whose own tombstones fail, tells that row once", async () => {
+    let cm!: ContextManager;
+    let x!: MessageId;
+    /** Hearing, whose onPresented, once armed, takes x out by its id, then makes the next write to the index fail, writing nothing. */
+    class RetractsX extends Hearing {
+      armed = false;
+      async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+        this.log.push(`presented ${rows.map((m) => m.id).join(',')}`);
+        if (!this.armed) return;
+        this.armed = false;
+        cm.retractRemoved([x]);
+        const store = cm.getStore() as unknown as Record<string, unknown>;
+        const append = store.appendToStateJsonWithIdentity as (this: unknown, id: string, ...rest: unknown[]) => unknown;
+        store.appendToStateJsonWithIdentity = function (this: unknown, id: string, ...rest: unknown[]) {
+          if (id !== INDEX) return append.call(this, id, ...rest);
+          delete store.appendToStateJsonWithIdentity;
+          throw new Error('zz-tombstones-refused');
+        };
+      }
+    }
+    const strategy = new RetractsX();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    let y: MessageId;
+    [x, y] = ['x', 'y'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    const z = cm.addMessage('alice', [text('z')]);
+    cm.presentRows([x, y]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([z]), { operation: 'presentRows', entering: [z], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    strategy.log.length = 0;
+    strategy.armed = true;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      cm.removeMessages(x, y);
+    } finally {
+      console.error = error;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cm.ordinalOf(x), undefined, "setup: the hook's retractRemoved took x out");
+    assert.notEqual(cm.ordinalOf(y), undefined, "setup: the removal's own tombstone for y didn't land");
+    assert.deepEqual(strategy.log, [`presented ${z}`, `retracted ${x}`, `retracted ${y}`], 'x is told once, by the hook\'s call, and y by the removal');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 45: what waits for a later write
   // holds the rows the write named, not the call's record.
   it("a write whose outcome is unknown doesn't keep the record its call read while its telling waits", async () => {
