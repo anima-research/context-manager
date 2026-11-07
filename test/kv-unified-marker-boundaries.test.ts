@@ -448,6 +448,24 @@ describe("a caller that places its own cache markers outside the messages (kvUni
     }
   });
 
+  it("a later call that takes the count check in place of a compile's own request is held to the declared count too", async () => {
+    const c = CASES['everything in the recent window: only the last message is marked']!;
+    const o = await open(conversation(c), { ...c.config, ...withCallerMarkers(1) });
+    try {
+      const compiled = await o.compile();
+      assert.equal(breakpointsOf(compiled.messages).length, 1, 'premise: kv-unified marks one message');
+      o.strategy.reportKvUnifiedFailed(o.begin());
+      o.accept(o.begin(), 2);
+      assert.ok(receipts(o.strategy).cache, "after a failed own request, a later call carrying kv-unified's marker and the declared one sets the reference");
+      await o.compile();
+      o.strategy.reportKvUnifiedFailed(o.begin());
+      o.accept(o.begin(), 1);
+      assert.equal(receipts(o.strategy).cache, null, "after a failed own request, a later call carrying kv-unified's marker alone sets none");
+    } finally {
+      await o.close();
+    }
+  });
+
   it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built, naming the value as given', () => {
     for (const [declared, shown] of [
       [4, '4'], [-1, '-1'], [1.5, '1.5'], [Number.NaN, 'NaN'], [Number.POSITIVE_INFINITY, 'Infinity'],
