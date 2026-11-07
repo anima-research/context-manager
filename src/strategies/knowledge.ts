@@ -91,9 +91,10 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     // removed (a consolidation removes its system changes), a chunk could run
     // into or across a summary's span; the overlap guard refuses to compress
     // such a chunk for good, and its messages go out raw beside the summary
-    // that already covers some of them. Where the chunks already match the
-    // summaries, the walk closes there anyway. An L2's sources are summaries,
-    // not messages.
+    // that already covers some of them, unless the hierarchical select leaves
+    // that summary out for costing more than its messages, which then go out
+    // raw in its place. Where the chunks already match the summaries, the
+    // walk closes there anyway. An L2's sources are summaries, not messages.
     const coveredBy = new Map<string, string>();
     for (const s of this.summaries) {
       if (s.level === 1) for (const id of s.sourceIds) coveredBy.set(id, s.id);

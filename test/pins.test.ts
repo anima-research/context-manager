@@ -86,9 +86,10 @@ describe('AutobiographicalStrategy — pins / documents (gap #3)', () => {
       strategy,
     });
 
-    const m1 = manager.addMessage('user', textBlock('alpha'));
+    const said = 'words of the turn as it was first said '.repeat(8);
+    const m1 = manager.addMessage('user', textBlock(`alpha ${said}`));
     const m2 = manager.addMessage('user', textBlock('PINNED-DOCUMENT-CONTENT'));
-    const m3 = manager.addMessage('user', textBlock('gamma'));
+    const m3 = manager.addMessage('user', textBlock(`gamma ${said}`));
     manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
 
     // Seed summaries that cover m1 and m3 (NOT m2 — m2 is pinned).

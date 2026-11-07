@@ -32,6 +32,8 @@ function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
 
+const covered = (marker: string): ContentBlock[] => textBlock(`${marker} ` + 'words of the turn as it was first said '.repeat(8));
+
 /** A summary entry of any shape, for the persistence boundary. */
 function rawSummary(id: string, level: number, sourceIds: unknown, sourceRange: unknown) {
   return { id, level, content: `text of ${id}`, tokens: 3, sourceLevel: level - 1, sourceIds, sourceRange, created: 1 };
@@ -745,7 +747,7 @@ describe('AutobiographicalStrategy — persistence', () => {
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
       // The parent covers A and C, which are next to each other; B and D come after them.
       const markers = ['PTR-A', 'PTR-C', 'PTR-B', 'PTR-D'];
-      const l1s = markers.map((marker) => strategy.seedL1(marker, [manager.addMessage('User', textBlock(marker))]));
+      const l1s = markers.map((marker) => strategy.seedL1(marker, [manager.addMessage('User', covered(marker))]));
       markers.forEach((marker, i) => { ids[marker] = l1s[i]!.id; });
       const parent = strategy.seedL2([ids['PTR-A']!, ids['PTR-C']!], 'PTR-A PTR-C');
       parentId = parent.id;
@@ -800,6 +802,7 @@ describe('AutobiographicalStrategy — persistence', () => {
         }
         const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
         const rendered = JSON.stringify(compiled.messages.map((message) => message.content));
+        assert.ok(!rendered.includes('as it was first said'), 'the premise: the summaries render, not the messages they cover');
         for (const marker of ['PTR-A', 'PTR-B', 'PTR-C', 'PTR-D']) assert.equal(rendered.split(marker).length - 1, 1, rendered);
       } finally { manager.close(); }
     }
@@ -1436,7 +1439,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const id = manager.addMessage('User', textBlock('DUP-A'));
+      const id = manager.addMessage('User', covered('DUP-A'));
       const child = strategy.seedL1('DUP-A', [id]);
       const plain = { ...child };
       const parent = strategy.seedL2([child.id], 'DUP-A');
@@ -1457,6 +1460,7 @@ describe('AutobiographicalStrategy — persistence', () => {
       for (const dryRun of [false, true]) {
         const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun });
         const rendered = JSON.stringify(compiled.messages.map(message => message.content));
+        assert.ok(!rendered.includes('as it was first said'), 'the premise: the summaries render, not the messages they cover');
         assert.equal(rendered.split('DUP-A').length - 1, 1, rendered);
       }
     } finally { manager.close(); }
@@ -1526,7 +1530,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const ids = ['GONE-A', 'GONE-B'].map(text => manager.addMessage('User', textBlock(text)));
+      const ids = ['GONE-A', 'GONE-B'].map(text => manager.addMessage('User', covered(text)));
       const [lost, survivor] = ids.map((id, i) => strategy.seedL1(['GONE-A', 'GONE-B'][i], [id]));
       const parent = strategy.seedL2([lost.id, survivor.id], 'GONE-A GONE-B');
       const grandparent = strategy.seedParent(3, [parent.id], 'GONE-A GONE-B');
@@ -1555,6 +1559,7 @@ describe('AutobiographicalStrategy — persistence', () => {
         if (open === 1) assert.ok(!warnings.some(line => line.includes('repaired summary state')), warnings.join('\n'));
         const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
         const rendered = JSON.stringify(compiled.messages.map(message => message.content));
+        assert.ok(!rendered.includes('GONE-B words'), "the premise: the survivor renders, not the message it covers");
         for (const marker of ['GONE-A', 'GONE-B']) assert.equal(rendered.split(marker).length - 1, 1, rendered);
       } finally { manager.close(); }
     }
@@ -1571,7 +1576,7 @@ describe('AutobiographicalStrategy — persistence', () => {
       {
         const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
         const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-        const ids = markers.map(text => manager.addMessage('User', textBlock(text)));
+        const ids = markers.map(text => manager.addMessage('User', covered(text)));
         const children = ids.map((id, i) => strategy.seedL1(markers[i], [id]));
         childIds = children.map(child => child.id);
         const parent = strategy.seedL2(childIds.slice(0, 2), markers.slice(0, 2).join(' '));
@@ -1620,6 +1625,9 @@ describe('AutobiographicalStrategy — persistence', () => {
         for (const dryRun of [false, true]) {
           const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun });
           const rendered = JSON.stringify(compiled.messages.map(message => message.content));
+          for (const marker of defect === 'empty-child' ? markers.slice(1) : markers) {
+            assert.ok(!rendered.includes(`${marker} words`), `the premise: a kept summary renders ${marker}, not its message`);
+          }
           for (const marker of markers) assert.equal(rendered.split(marker).length - 1, 1, rendered);
         }
       } finally { manager.close(); }
