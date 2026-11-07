@@ -1,8 +1,8 @@
 - A sharded `addMessage` keeps a body's shards together, as one body:
   - It refuses a `chunkIngressMessage` decision whose `bodyGroupId` is empty
-    or not a string, before any shard is stored. Such shards didn't read as
-    one body, so a write that failed partway removed only the first of them
-    and threw as if none stayed.
+    or not a string, before any shard is stored. With an empty id, such shards
+    didn't read as one body, so a write that failed partway removed only the
+    first of them and threw as if none stayed.
   - An `addMessage` on the same manager made while a sharded `addMessage` of
     its stores its shards (from an `onMessage` listener of a shard's add, or
     a strategy hook that listener runs by presenting a shard) is refused (one
@@ -35,19 +35,21 @@
     failed looked for the first shard there.
   - A `removeMessage` or `removeMessages` on the same manager made while a
     sharded `addMessage` of its stores its shards (from an `onMessage`
-    listener of a shard's add) is refused (one through another manager
-    sharing the slot isn't: `onMessage`'s contract rules it out), with an
-    error that says a removal then could split the body or
-    move the rows the write removes if it fails. Before, it was taken: the
-    body's later shards stayed with no first shard, and a write that then
-    failed left them stored and threw as if none stayed.
+    listener of a shard's add) is refused (one through another manager sharing
+    the slot isn't: `onMessage`'s contract rules it out), with an error that
+    says a removal then could split the body or move the rows the write
+    removes if it fails. Before, a `removeMessages` over the shards stored so
+    far was taken: the body's later shards stayed with no first shard, and a
+    write that then failed left them stored and threw as if none stayed. A
+    `removeMessage` naming a shard was already refused in 0.24.2, with the
+    store's error that a shard isn't removed alone.
   - A `branchAt` or `branchSequenceOf` on the same manager made then (from
     such a listener, after it presents a shard) is refused too, with an error
-    that says the cut would come before the body's later shards. Before, the
-    cut was taken over the shards stored so far, so the new branch's record
-    held part of the body, though `branchAt` promises the whole body. So are
-    a `fork` and a `derive` on the same manager made then, before either
+    that says the cut would come before the body's later shards. Before, a
+    `branchAt` was taken, at the named message's own sequence, so the new
+    branch's record held the body only up to that message. A `fork` and a
+    `derive` on the same manager made then are refused too, before either
     makes a branch: each cuts at the head, which holds only the shards stored
     so far. Before, a fork moved the store, so the body's later shards landed
-    on the new branch and the branch the write started on kept only the
-    first, and a derive's child held part of the body.
+    on the new branch and the branch the write started on kept only the first,
+    and a derive's child held part of the body.

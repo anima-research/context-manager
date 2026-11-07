@@ -26,26 +26,27 @@
   the row landed throws too), the
   strategy isn't told the row entered, and an add listener registered
   after the manager's doesn't hear it.
-- A sharded `addMessage` that fails partway where the store then can't say
-  its branch removes nothing, as after a branch move, and logs the failed
-  read: it throws `WriteLandedError` naming the shards stored, on the branch
-  the write started on (`WriteOutcomeUnknownError`, with `unnamed` 1, where
-  a shard's append threw). In legacy mode the strategy hears those shards
-  once the store reads again. In 0.24.2 the branch wasn't read: the add
-  removed what the current branch's tail held of the body group and threw
-  the write's own error, which says none of the message was stored.
+- A sharded `addMessage` that fails partway where the store then can't say its
+  branch removes nothing, as after a branch move, and logs the failed read: it
+  throws `WriteLandedError` naming the shards stored, on the branch the write
+  started on (`WriteOutcomeUnknownError`, with `unnamed` 1, where a shard's
+  append threw). In legacy mode the strategy hears those shards once the store
+  reads again. In 0.24.2 the add's removal tried to read the branch, the read
+  failed, and it removed nothing; the add logged that removing what it wrote
+  threw, then threw the write's own error, which says none of the message was
+  stored.
 - `unnamed` is 1 only where a shard's append threw: a sharded `addMessage`
   that fails once every shard is stored (in legacy mode, the manager's own
   work telling the strategy of the body) and whose removal of them fails
   names every shard, with `WriteLandedError`.
-- A sharded `addMessage` whose removal of the shards it stored fails after
-  the strategy's `onCompressionHoldsReleased` hook, which that removal runs
-  for a held shard, moved the store's branch throws
-  `WriteOutcomeUnknownError`, naming every shard the write stored as
-  `unknown`: which of them stayed is a question for the branch the write
-  started on, which the store no longer reads. In 0.24.2 the add removed
-  what the current branch's tail held of the body group (nothing of this
-  write, after a move) and threw the write's own error.
+- A sharded `addMessage` whose removal of the shards it stored fails after the
+  strategy's `onCompressionHoldsReleased` hook, which that removal runs for a
+  held shard, moved the store's branch throws `WriteOutcomeUnknownError`,
+  naming every shard the write stored as `unknown`: which of them stayed is a
+  question for the branch the write started on, which the store no longer
+  reads. In 0.24.2 the removal took the write's shards out of the branch the
+  write started on, before the removal's event ran the hook, and the add threw
+  the write's own error.
 - An `addMessage` of a message stored as one row whose append throws after
   a listener of its add moved the store's branch, or where the store then
   can't say its branch, throws `WriteOutcomeUnknownError` with `unnamed` 1:
