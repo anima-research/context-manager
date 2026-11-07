@@ -13,7 +13,8 @@
  * as `{ anchor, ordinal, v: 2 }`
  * when it is made (an anchor of 0, the start, isn't written, since it
  * converts to the whole window whenever it is converted; a write that
- * fails is made again at the next read: see presentedAnchor), keeping the
+ * fails is made again by the next compile that isn't a dryRun, or
+ * getAnchorOrdinal() (getAnchor() doesn't): see presentedAnchor), keeping the
  * sequence for a release that reads it alone,
  * so a reload reads the ordinal back rather than converting again. From
  * then on a row stored before the anchor's sequence and presented later is
@@ -384,6 +385,65 @@ describe('windowed passthrough: a move retried after its write threw', () => {
     assert.equal(slot(cm), null, 'setup: still unwritten');
     strategy.setAnchorOrdinal(ordinal);
     assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal, v: 2, moved: true }, 'the retry that lands writes the move');
+    cm.close();
+  });
+});
+
+describe('windowed passthrough: a move whose lookup in the window throws', () => {
+  // Wave 6, finding 5: each setter set one field of the move before the
+  // window's lookup that gives the other, which can throw (the index can't
+  // be read), so a retry with the same value read as the move made and
+  // returned, converting and writing nothing.
+  function failLookup(strategy: WindowedPassthroughStrategy, name: 'ordinalFrom' | 'sequenceFrom'): () => void {
+    const window = (strategy as unknown as { window: Record<string, (n: number) => number | undefined> }).window;
+    const lookup = window[name]!;
+    window[name] = () => { throw new Error('zz-index-unreadable'); };
+    return () => { window[name] = lookup; };
+  }
+
+  it('setAnchor keeps nothing of the move, so a retry with the same sequence makes it and writes it', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'setup: the whole window');
+    const start = sequenceOf(cm, ids[1]!);
+    const restore = failLookup(strategy, 'ordinalFrom');
+    try {
+      assert.throws(() => strategy.setAnchor(start), /zz-index-unreadable/);
+    } finally {
+      restore();
+    }
+    strategy.setAnchor(start);
+    assert.deepEqual(slot(cm), { anchor: start, ordinal: cm.ordinalOf(ids[1]!), v: 2 }, 'the retry wrote the move');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'and the window follows it');
+    cm.close();
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'across a reopen');
+    cm.close();
+  });
+
+  it('setAnchorOrdinal keeps nothing of the move, so a retry with the same ordinal makes it and writes it', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    cm.presentRows([]);
+    const ids = ['a', 'b', 'c'].map((t) => cm.addMessage('u', text(t)));
+    cm.presentRows(ids);
+    assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'setup: the whole window');
+    const ordinal = cm.ordinalOf(ids[1]!)!;
+    const restore = failLookup(strategy, 'sequenceFrom');
+    try {
+      assert.throws(() => strategy.setAnchorOrdinal(ordinal), /zz-index-unreadable/);
+    } finally {
+      restore();
+    }
+    strategy.setAnchorOrdinal(ordinal);
+    assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[1]!), ordinal, v: 2, moved: true }, 'the retry wrote the move');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'and the window follows it');
+    cm.close();
+    ({ cm, strategy } = await open(path));
+    assert.deepEqual(texts(await cm.compile(BIG)), ['b', 'c'], 'across a reopen');
     cm.close();
   });
 });
@@ -772,6 +832,32 @@ describe('windowed passthrough: a slot of another version', () => {
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c']);
     strategy.setAnchor(sequenceOf(cm, ids[2]!));
     assert.deepEqual(slot(cm), { anchor: sequenceOf(cm, ids[2]!) });
+    cm.close();
+  });
+});
+
+describe('windowed passthrough: a format-2 slot on a branch whose window is the record', () => {
+  // Wave 6, finding 18: a branch with no window index reads a format-2
+  // slot by its sequence and leaves its ordinal (loadBranchState), and no
+  // test reached that: both derived-context tests inherit the index.
+  it('is read by its sequence, and the first presentation converts that sequence, not the slot\'s ordinal', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    const ids = ['a', 'b', 'c', 'd'].map((t) => cm.addMessage('u', text(t)));
+    // An ordinal that would start the window at b once rows are presented.
+    cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, ids[2]!), ordinal: 1, v: 2 });
+    cm.close();
+
+    ({ cm, strategy } = await open(path));
+    assert.equal(cm.windowMode(), 'legacy', 'setup: no window index on the branch');
+    assert.equal(strategy.getAnchor(), sequenceOf(cm, ids[2]!), 'the sequence is read');
+    assert.equal(strategy.getAnchorOrdinal(), undefined, 'and the ordinal left');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['c', 'd'], 'the window starts at the sequence');
+
+    cm.presentRows([]);
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[2]!), 'the first presentation converts the sequence');
+    assert.notEqual(cm.ordinalOf(ids[2]!), 1, "premise: c's ordinal isn't the slot's");
+    assert.deepEqual(texts(await cm.compile(BIG)), ['c', 'd'], 'and the window is the one the sequence gave');
     cm.close();
   });
 });

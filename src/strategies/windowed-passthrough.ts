@@ -47,7 +47,9 @@ export interface WindowedPassthroughOptions {
    * anchor never moves, so compiled output between re-anchors is a
    * byte-stable prefix plus pure appends, apart from a row taken out of the
    * window once a host presents rows (retractRows, or a removal), which
-   * changes the prefix from that row on, and an image the live-image
+   * changes the prefix from that row on, a message edited
+   * (ContextManager.editMessage), which changes the bytes at its place,
+   * and an image the live-image
    * policy strips once it is past its limits (`maxLiveImages`,
    * `imageStripDepthTokens`, `maxLiveImageBytes`, below), which changes
    * the bytes at that image's place — and the strategy
@@ -352,8 +354,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // No-op: the window is recomputed on select(), whether a row entered
     // the agent's window (ContextManager.presentRows) at its add or at its
     // presentation. There is deliberately no onPresented beside it, so a
-    // subclass that overrides this still hears each row
-    // (ContextStrategy.onNewMessage).
+    // subclass that overrides this still hears each row of this manager's
+    // slot (a row of an auxiliary slot is heard only when a host presents
+    // it: ContextStrategy.onNewMessage).
   }
 
   /**
@@ -426,8 +429,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       if (this.anchorUnwritten) this.persistAnchor();
       return;
     }
+    // Looked up before any field is set: a lookup that throws (the index
+    // can't be read) leaves the anchor as it was, so a retry of the move
+    // isn't taken for the move made.
+    const ordinal = this.window?.ordinalFrom(sequence) ?? null;
     this.anchor = sequence;
-    this.anchorOrdinal = this.window?.ordinalFrom(sequence) ?? null;
+    this.anchorOrdinal = ordinal;
     this.anchorMoved = false;
     this.persistAnchor();
   }
@@ -468,8 +475,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       if (this.anchorUnwritten) this.persistAnchor();
       return;
     }
+    // As in setAnchor, looked up before either field is set.
+    const anchor = window.sequenceFrom(ordinal) ?? this.store!.currentSequence();
     this.anchorOrdinal = ordinal;
-    this.anchor = window.sequenceFrom(ordinal) ?? this.store!.currentSequence();
+    this.anchor = anchor;
     this.anchorMoved = true;
     this.persistAnchor();
   }

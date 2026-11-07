@@ -2,6 +2,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
 import { registerStateIfAbsent } from '../state-registration.js';
+import { describeThrown } from '../describe-thrown.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -1139,7 +1140,7 @@ interface CompressionRefusalNormalizedConfig {
 
 type CompressionAttemptOutcome =
   | 'refusal'
-  /** The merge group is not contiguous in store order; refused before any model call. */
+  /** The merge group is not contiguous in store order (the strategy's view: the window's order once a host presents); refused before any model call. */
   | 'topology_violation'
   | 'unusable_empty'
   | 'provider_error'
@@ -2229,6 +2230,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private warnedQuarantineSkips = new Set<string>();
   /** The context initialize was given; its `tools` getter follows the host's declarations. */
   private hostContext: StrategyContext | null = null;
+  /**
+   * The window's length (WindowIndexView.length) when this instance last
+   * looked for rows out of the window that it still folds
+   * (letGoOfRowsLeftUnheard). Every tombstone and presentation takes an
+   * ordinal, so while the length stands no row has left the window since.
+   */
+  private windowLengthLooked: number | undefined;
   protected _compressionCount = 0;
   /**
    * Monotonic counter of queue items consumed by tick(): compression, merges,
@@ -2254,6 +2262,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * updated by ID when its L1 lands.
    */
   protected chunkRecords: ChunkRecord[] = [];
+  /**
+   * The revision of the summaries' state, and of the chunk records', on the
+   * store's branch (stateHeadOffset) as of the last read or write after
+   * which this instance held it as the store did: its load, a write of its
+   * own made while it still held it so, or a compare that found the two
+   * alike (storeWrittenElsewhere). Every write of the state moves the
+   * revision, another instance's included. A write of this instance's made
+   * over a revision another writer moved, a write that throws, and a change
+   * to memory the store didn't take keep none, so the next compare reads
+   * the state; so does a store that gives no revision (a chronicle without
+   * stateHeadOffset), at every compare.
+   */
+  private readonly heldAsStoredAt = new Map<string, number | null>();
   /** The chunk owning each position of the listing the last rebuild saw. */
   private _chunkByPosition: { listing: readonly StoredMessage[]; chunks: (Chunk | undefined)[] } | null = null;
   /** Record-derived chunks of the last rebuild: reused while the listing only
@@ -3133,6 +3154,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.reportImageLimitsWarningOnce();
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
+    this.windowLengthLooked = undefined;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -3306,6 +3328,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._demandedL1Chunks.clear();
     this.chunkRecords = [];
     this.chunkIdCounter = 0;
+    this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
     this._orphanWarned = false;
     this._overlapBlocked.clear();
@@ -3417,7 +3440,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected appendChunkRecord(record: ChunkRecord): void {
     this.requireBranchMutation('appendChunkRecord');
     this.chunkRecords.push(record);
-    this.store?.appendToStateJson(this.chunksStateId, record);
+    this.writeHeldState(this.chunksStateId, () => this.store?.appendToStateJson(this.chunksStateId, record));
   }
 
   /**
@@ -3433,18 +3456,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     rec.compressed = true;
     rec.summaryId = summaryId;
     if (!this.store) return;
-    const stored = this.store.getStateJson(this.chunksStateId);
-    if (!Array.isArray(stored)) return;
+    const store = this.store;
+    const stored = store.getStateJson(this.chunksStateId);
+    if (!Array.isArray(stored)) {
+      this.heldAsStoredAt.delete(this.chunksStateId);
+      return;
+    }
     const payload = storedJson(rec);
     let found = false;
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as ChunkRecord | null;
       if (item && item.id === recordId) {
-        this.store.editStateItem(this.chunksStateId, i, payload);
+        this.writeHeldState(this.chunksStateId, () => store.editStateItem(this.chunksStateId, i, payload));
         found = true;
       }
     }
     if (!found) {
+      this.heldAsStoredAt.delete(this.chunksStateId);
       this.diag.warn(
         `[autobiographical] markChunkRecordCompressed: ${recordId} not found in persisted chunk log`,
       );
@@ -3567,6 +3595,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // halt and its warning stay as they are: rebuildChunks recomputes the
     // halt, and an open clears both (clearBranchMirrors).
     this._overlapBlocked.clear();
+    this.heldAsStoredAt.clear();
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -3627,6 +3656,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.warn(`[autobiographical] ${releasedRecordsLine(released)}`);
       }
     }
+    // Memory now holds the summaries and chunk records as the store does,
+    // a record the load leaves out apart (storeWrittenElsewhere compares
+    // what the load keeps).
+    this.heldAsStored(this.summariesStateId);
+    if (this.chunkPersistenceEnabled) this.heldAsStored(this.chunksStateId);
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
@@ -4277,7 +4311,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       entry.sourceRange = { first: ids[0]!, last: ids[ids.length - 1]! };
     }
     this.summaries.push(entry);
-    this.store?.appendToStateJson(this.summariesStateId, entry);
+    this.writeHeldState(this.summariesStateId, () => this.store?.appendToStateJson(this.summariesStateId, entry));
   }
 
   /**
@@ -6136,11 +6170,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * went (`when`), and take it up. A
    * record changed in the store: this instance takes up the store's state,
    * and the rebuild from its records queues the record again over the rows
-   * it keeps. A row out of the window the record still holds, or with no
+   * it keeps (or, where another instance compressed it instead, takes the
+   * record as compressed with that instance's L1). A row out of the window
+   * the record still holds, or with no
    * record kept, or one presented again since (rowsMovedInWindow): the
    * instance lets go of the row as its own onRetracted would have
    * (letGoOfRowsOutOfWindow), and the rebuild chunks a row presented again
-   * where the window now holds it. Returns whether it did either.
+   * where the window now holds it. With no `sources`, only the window is
+   * asked. Returns whether it did either.
    */
   private takeUpSpanLetGoElsewhere(
     chunk: Chunk,
@@ -6153,7 +6190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.chunkRecordChangedInStore(chunk.recordId, sources)) {
       this.diag.warn(
         `[autobiographical] ${discarding}: its chunk record ${chunk.recordId} changed in the store ${when} ` +
-          '(another instance sharing the store let go of a row of its span)',
+          '(another instance sharing the store let go of a row of its span, or compressed it)',
       );
       this.takeUpStoreState();
       this.rebuildChunks(ctx.messageStore);
@@ -7003,18 +7040,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // clobbering them (4 summaries lost in the 2026-07 Lena incident, leaving
     // duplicate-id copies with diverging mergedInto). Update every stored
     // copy with this id so past duplicates converge too.
-    const stored = this.store.getStateJson(this.summariesStateId);
-    if (!Array.isArray(stored)) return;
+    const store = this.store;
+    const stored = store.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) {
+      this.heldAsStoredAt.delete(this.summariesStateId);
+      return;
+    }
     let found = false;
     const payload = storedJson(entry);
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as SummaryEntry | null;
       if (item && item.id === entry.id) {
-        this.store.editStateItem(this.summariesStateId, i, payload);
+        this.writeHeldState(this.summariesStateId, () => store.editStateItem(this.summariesStateId, i, payload));
         found = true;
       }
     }
     if (!found) {
+      this.heldAsStoredAt.delete(this.summariesStateId);
       this.diag.warn(
         `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
       );
@@ -7496,7 +7538,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * this strategy never heard go, stands at the end of their run, where
    * releaseRowsThatLeft doesn't see it (it is in the window again). Such an
    * L1 is dropped and its record compressed again over the run in window
-   * order, and such a record holds its run in window order.
+   * order, and such a record holds its run in window order. So is a
+   * summary above L1 whose leaves, read through its L1s in the order it
+   * holds them, the window holds in another order, though each L1 is in
+   * order and the leaves stand together (one L1's row presented again
+   * after a later L1's rows): it is dropped alone, with every summary
+   * above it, and its L1s and their records stay.
    *
    * The audit's index places only rows a chunk or an L1 owns, so a row
    * presented again after a row no chunk owns (one in the recent window,
@@ -7561,13 +7608,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((summary) => summary.level === 1 && live.has(summary.id) && !named.has(summary.id) &&
           (outOfOrder(summary.sourceIds) || windowRuns(summary.sourceIds, position).length > windowRuns(summary.sourceIds, owned).length))
         .map((summary) => summary.id);
-      if (violations.length === 0 && reordered.length === 0 && split.size === 0) return;
+      // A summary above L1 whose L1s are each in order, and whose leaves
+      // stand together, can still hold them out of order: one L1's row
+      // presented again after a later L1's rows. The audit asks only for
+      // holes, and the test above reads each L1 alone, so its leaves are read
+      // through its L1s, in the order it holds them (leafRowsOf). It goes on
+      // its own, with every summary above it, and its L1s, which the window
+      // holds whole, stay and render on their own: no record changes. One
+      // over a summary that goes anyway goes with it (unfold), unnamed.
+      const above = this.summaries.filter(
+        (summary) => summary.level > 1 && !named.has(summary.id) && outOfOrder(this.leafRowsOf([summary])),
+      );
+      const going = new Set([...named, ...reordered, ...above.map((summary) => summary.id)]);
+      const goesWith = (summary: SummaryEntry, seen = new Set<string>()): boolean => summary.sourceIds.some((id) => {
+        if (going.has(id)) return true;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        const child = this.summaryById(id);
+        return child !== undefined && child.level > 1 && goesWith(child, seen);
+      });
+      const reorderedAbove = above.filter((summary) => !goesWith(summary)).map((summary) => summary.id);
+      if (violations.length === 0 && reordered.length === 0 && reorderedAbove.length === 0 && split.size === 0) return;
       const l1s = new Set([...violations.filter((v) => v.level === 1).map((v) => v.id), ...reordered]);
       const released: MessageId[] = [];
       const trimmed: string[] = [];
       const releasedUncompressed: MessageId[] = [];
       const place = ctx.window.ordinals() ?? position;
-      const unfolded = this.unfold(new Set([...named, ...reordered]), (record) => {
+      const unfolded = this.unfold(new Set([...named, ...reordered, ...reorderedAbove]), (record) => {
         const demoted = record.summaryId !== undefined && l1s.has(record.summaryId);
         if (!demoted && !split.has(record.id)) return undefined;
         const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
@@ -7580,12 +7647,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!demoted) trimmed.push(record.id);
         return windowOrdered(record.sourceIds.filter((id) => kept.has(id)), place);
       });
-      const demoted = violations.length + reordered.length;
+      const demoted = violations.length + reordered.length + reorderedAbove.length;
       if (demoted > 0) {
         const refolded = unfolded.refolded.filter((id) => !split.has(id));
+        const outOfOrderIds = [...reordered, ...reorderedAbove];
         this.diag.warn(
           `[autobiographical] the window holds the leaves of ${demoted} summar${demoted === 1 ? 'y' : 'ies'} apart` +
-            `${reordered.length > 0 ? ` or out of order [${reordered.join(', ')}]` : ''} ` +
+            `${outOfOrderIds.length > 0 ? ` or out of order [${outOfOrderIds.join(', ')}]` : ''} ` +
             `(a row that left the window and was presented again before this strategy heard it go, or crossed ownership ` +
             `the store held already): dropped ` +
             `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
@@ -8194,10 +8262,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * compressed again). Should this strategy never hear a row go (the
    * process stopped between the window's tombstone and these writes, or a
    * manager whose strategy has no onRetracted took it out), the next open
-   * in presented mode repairs it: it lets go of what covers a row still
-   * out of the window, as this does (releaseRowsThatLeft), and demotes the
-   * summary the new place of a row presented again leaves non-contiguous
-   * (demoteSplitSummaries).
+   * in presented mode repairs it, where that open isn't audit-only: it
+   * lets go of what covers a row still out of the window, as this does
+   * (releaseRowsThatLeft, whatever the topology policy), and, under
+   * 'reject', demotes the summary the new place of a row presented again
+   * leaves non-contiguous (demoteSplitSummaries).
    *
    * Another instance sharing the store doesn't hear the rows that leave
    * this one's window, nor this one its, and each writes the summaries and
@@ -8205,7 +8274,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * instance holds them, it first takes them up (takeUpStoreState), and
    * lets go, beside the rows it is told of, of each row out of the window
    * that what it took up still folds: the other instance's let-go stands,
-   * and this one writes back nothing it dropped.
+   * and this one writes back nothing it dropped. Nor does it wait for a
+   * let-go of its own to take the other's up: before a live select, and as
+   * rows enter the window, it lets go of each row out of the window that it
+   * still folds (letGoOfRowsLeftUnheard), so it doesn't render the summary
+   * over a row the other manager took out.
    *
    * `undone` and `removed` change none of this: an undone row, a row taken
    * out and a removed row have each left. The manager doesn't call this for a removal
@@ -8245,18 +8318,72 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * instance's threw, and memory went ahead of what the store may hold
    * (writeUnfolded, where the read back threw too; pushSummary). Where the
    * store can't be read, nothing is known to differ.
+   *
+   * A state whose revision is still the one at which this instance last
+   * held it as the store did (heldAsStoredAt) is alike, and isn't read:
+   * nothing has written it since. Only a state some other write moved, or
+   * one whose revision this instance doesn't know, is read and compared,
+   * and one found alike keeps its revision for the next compare. The chunk
+   * records are compared as the load keeps them (loadedChunkRecords), so a
+   * stored record the load leaves out, with no id or no rows, which no
+   * write of this instance's puts back, doesn't read as another writer's.
    */
   private storeWrittenElsewhere(): boolean {
     const store = this.store;
     if (!store) return false;
     try {
-      const differs = (stateId: string, mirror: unknown): boolean =>
-        canonicalJson(store.getStateJson(stateId) ?? []) !== storedCanonicalJson(mirror);
-      return differs(this.summariesStateId, this.summaries) ||
-        (this.chunkPersistenceEnabled && differs(this.chunksStateId, this.chunkRecords));
+      const differs = (stateId: string, mirror: unknown, asLoaded: (stored: unknown) => unknown): boolean => {
+        if (this.stillHeldAsStored(stateId)) return false;
+        const revision = this.stateRevision(stateId);
+        const apart = canonicalJson(asLoaded(store.getStateJson(stateId))) !== storedCanonicalJson(mirror);
+        if (!apart && revision !== undefined) this.heldAsStoredAt.set(stateId, revision);
+        return apart;
+      };
+      return differs(this.summariesStateId, this.summaries, (stored) => stored ?? []) ||
+        (this.chunkPersistenceEnabled &&
+          differs(this.chunksStateId, this.chunkRecords, (stored) => loadedChunkRecords<ChunkRecord>(stored)));
     } catch {
       return false;
     }
+  }
+
+  /** The state's revision on the store's branch (stateHeadOffset), or undefined where the store gives none or can't say. */
+  private stateRevision(stateId: string): number | null | undefined {
+    const store = this.store as { stateHeadOffset?: (id: string) => number | null } | null;
+    if (typeof store?.stateHeadOffset !== 'function') return undefined;
+    try {
+      return store.stateHeadOffset(stateId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** This instance holds the state as the store does, as of now (heldAsStoredAt). */
+  private heldAsStored(stateId: string): void {
+    const revision = this.stateRevision(stateId);
+    if (revision === undefined) this.heldAsStoredAt.delete(stateId);
+    else this.heldAsStoredAt.set(stateId, revision);
+  }
+
+  /** Whether nothing has written the state since this instance last held it as the store did (heldAsStoredAt). */
+  private stillHeldAsStored(stateId: string): boolean {
+    if (!this.heldAsStoredAt.has(stateId)) return false;
+    const revision = this.stateRevision(stateId);
+    return revision !== undefined && revision === this.heldAsStoredAt.get(stateId);
+  }
+
+  /**
+   * One of this instance's writes of its summaries or chunk records, which
+   * memory has taken already, or takes as it returns (`write`). Where this
+   * instance still held the state as the store did before the write, it
+   * holds it so after it; where another write had moved it since, or the
+   * write throws, the next compare reads the state (heldAsStoredAt).
+   */
+  private writeHeldState(stateId: string, write: () => void): void {
+    const held = this.stillHeldAsStored(stateId);
+    this.heldAsStoredAt.delete(stateId);
+    write();
+    if (held) this.heldAsStored(stateId);
   }
 
   /**
@@ -8294,6 +8421,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (const record of this.chunkRecords) for (const id of record.sourceIds) if (left.has(id)) folded.add(id);
     return folded;
+  }
+
+  /**
+   * Let go of each row out of the window (WindowIndexView.left) that this
+   * instance still folds: another manager sharing the window took it out
+   * (its retractRows, or a removal once a host presents), which told that
+   * manager's strategy (onRetracted), not this one, so this instance's
+   * summaries and chunk records would go on rendering the summary over a
+   * row the window no longer holds. It takes up the store, which holds the
+   * other strategy's let-go, and lets go of the rows as its own onRetracted
+   * would have (letGoOfRowsOutOfWindow), with a warning. Asked before a
+   * live select (with the context initialize was given, whose window is
+   * live) and as rows enter the window (windowGrew), once per change of the
+   * window's length: while it stands, the scan isn't made. Not in legacy
+   * mode, where no row leaves the window, nor in an audit-only instance,
+   * whose open leaves such rows under what covers them for inspection
+   * (releaseRowsThatLeft). A failure is logged, and the select or the
+   * notification goes ahead: what the let-go didn't write, the next one or
+   * the next open repairs, as after a failed onRetracted.
+   */
+  private letGoOfRowsLeftUnheard(ctx: StrategyContext | null, operation: string): void {
+    const window = ctx?.window;
+    if (!ctx || !window || this.config.auditOnly) return;
+    try {
+      const length = window.length();
+      if (length === this.windowLengthLooked) return;
+      this.windowLengthLooked = length;
+      const rows = [...this.foldedRowsOutOfWindow(ctx)];
+      if (rows.length === 0) return;
+      this.diag.warn(
+        `[autobiographical] row(s) [${rows.join(', ')}] are out of the window and still folded by this instance: ` +
+          `another manager sharing the window took them out, which this instance did not hear; taking up the store and ` +
+          `letting go of them before ${operation}`,
+      );
+      this.letGoOfRowsOutOfWindow(rows, ctx);
+    } catch (err) {
+      this.diag.warn(
+        `[autobiographical] looking for rows out of the window that this instance still folds, before ${operation}, ` +
+          `failed: ${describeThrown(err)}`,
+      );
+    }
   }
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
@@ -8540,7 +8708,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private writeUnfolded(stateId: string, value: unknown, take: () => void): void {
     try {
-      this.store?.setStateJson(stateId, value);
+      this.writeHeldState(stateId, () => this.store?.setStateJson(stateId, value));
     } catch (error) {
       let landed = true;
       try {
@@ -8556,6 +8724,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private windowGrew(operation: string, ctx: StrategyContext): void {
     this.requireLoadedBranch(operation);
+    this.letGoOfRowsLeftUnheard(ctx, operation);
     this.rebuildChunks(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
@@ -9314,6 +9483,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
+      this.letGoOfRowsLeftUnheard(this.hostContext, 'select');
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
@@ -11533,6 +11703,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // presentation in flight stays as it is (#166).
       this.takeUpStoreState();
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      // A row of the span left the window, or left and was presented again,
+      // while this waited, through a manager whose strategy didn't let go of
+      // the producer's L1 (another instance's, whose let-go failed or hasn't
+      // come; or one that folds nothing): adopted, that L1 would cover the
+      // row. The window says so (takeUpSpanLetGoElsewhere, asked of the
+      // window alone: the take-up above made this instance's records the
+      // store's, and the producer marks the record it compressed, so the
+      // record's change says nothing here). The rows are let go of, with
+      // what covers them, and nothing is adopted.
+      if (this.takeUpSpanLetGoElsewhere(chunk, undefined, ctx, spanOrdinals, 'not adopting the L1 of the compression it waited on', 'while it waited')) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
         // The producer shares this namespace (the in-flight key says so), and
@@ -13007,6 +13187,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // Another instance sharing the store let go of a row of the span
+      // while the request was in flight: the row left that instance's
+      // window, which gave the row up from the chunk's record or removed it
+      // (onRetracted), and this instance didn't hear it, so its own mark
+      // (_spanLeftWindow) isn't set. The summary would cover a row that
+      // window no longer holds. Discard it and take it up
+      // (takeUpSpanLetGoElsewhere): the store's changed record, or, where
+      // the record doesn't say so (a strategy keeping none, or that
+      // instance's writes after the window's tombstone failed), the row
+      // out of the window, let go of here. Asked before the exact adoption
+      // below, as before the call: an L1 over the span the store holds can
+      // be one written before the row left that nothing has let go of (that
+      // instance's let-go failed, or hasn't come), and adopted it would
+      // cover the row. Where another instance compressed the record
+      // instead, the take-up brings its L1 and the marked record in, which
+      // the rebuild adopts. Nothing between these reads and the writes
+      // below awaits.
+      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'discarding L1')) return;
+
       // Re-check the dedup guard AFTER the await: summary state may have
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
@@ -13020,19 +13219,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         await this.clearQuarantineForCompressedChunk(chunk);
         return;
       }
-
-      // Another instance sharing the store let go of a row of the span
-      // while the request was in flight: the row left that instance's
-      // window, which gave the row up from the chunk's record or removed it
-      // (onRetracted), and this instance didn't hear it, so its own mark
-      // (_spanLeftWindow) isn't set. The summary would cover a row that
-      // window no longer holds. Discard it and take it up
-      // (takeUpSpanLetGoElsewhere): the store's changed record, or, where
-      // the record doesn't say so (a strategy keeping none, or that
-      // instance's writes after the window's tombstone failed), the row
-      // out of the window, let go of here. Nothing between these reads and
-      // the writes below awaits.
-      if (this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, 'discarding L1')) return;
 
       const messageIds = chunk.messages.map(m => m.id);
       const entry: SummaryEntry = {
@@ -13630,7 +13816,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Last line of defence: a crossed node is never minted. Whatever enqueued
     // this group (threshold pass, demand path, a persisted queue from an older
     // grammar, an operator), the sources must be one level below the target
-    // and strictly adjacent in store order, with no listed message between
+    // and strictly adjacent in store order (the strategy's view: the
+    // window's order once a host presents), with no listed message between
     // them (mergePositionIndex).
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {

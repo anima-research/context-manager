@@ -31,6 +31,11 @@
  * there, and the L1 was kept. The runs are now parted at such a row where
  * the window holds it between two owned rows and the record doesn't; an
  * L1 minted across it, which both hold between its leaves, stays.
+ *
+ * The demote's order check read L1s and records only, so a summary above
+ * L1 whose L1s a stop left out of order, each L1 in order and the leaves
+ * together, was kept (wave 6, finding 2). It is now dropped alone, and its
+ * L1s and their records stay.
  */
 
 import { describe, it, after } from 'node:test';
@@ -305,6 +310,62 @@ describe("the open's demote, where a row no chunk owns stands between an L1's le
     assert.ok(!lines.some((line) => line.includes('the window holds the')), lines.join('\n'));
     assert.ok(internals(strategy).summaries.some((s) => s.id === 'L1-zz'), 'the L1 stays');
     assert.deepEqual(internals(strategy).chunkRecords.find((r) => r.id === 'c-zz')?.sourceIds, [a, c], 'and its record');
+    cm.close();
+  });
+});
+
+describe("the open's demote, where a summary above L1 holds its L1s out of order", () => {
+  // Wave 6, finding 2: the reorder check read L1s and records only, and the
+  // audit asks only for holes, so an L2 over two one-row L1s whose rows a
+  // stop left out of order (the first L1's row presented again after the
+  // second's, before any strategy heard it go) was kept, and rendered the
+  // first row's text before the second's over a window that holds the
+  // second first.
+  it('drops that summary alone, and keeps the L1s and their records', async () => {
+    const path = freshPath();
+    const seed = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    seed.presentRows([]);
+    const [a, b] = ['TAG0', 'TAG1'].map((tag) => {
+      const row = seed.addMessage('User', [text(`${tag} ` + 'word '.repeat(60))]);
+      seed.presentRows([row]);
+      return row;
+    }) as [MessageId, MessageId];
+    seed.retractRows([a], { undone: true });
+    seed.presentRows([a]);
+    assert.deepEqual(seed.getPresentedMessages().map((m) => m.id), [b, a], 'premise: the window holds B, then A');
+    const l1 = (id: string, row: MessageId): SummaryEntry => ({
+      id, level: 1, content: `s ${id}`, tokens: 50, sourceLevel: 0, sourceIds: [row],
+      sourceRange: { first: row, last: row }, created: 1, mergedInto: 'L2-zz',
+    } as SummaryEntry);
+    const l2 = {
+      id: 'L2-zz', level: 2, content: 's L2-zz', tokens: 50, sourceLevel: 1, sourceIds: ['L1-a', 'L1-b'],
+      sourceRange: { first: a, last: b }, created: 2,
+    } as SummaryEntry;
+    const store = seed.getStore();
+    store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+    store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+    store.setStateJson('agent/autobio:summaries', [l1('L1-a', a), l1('L1-b', b), l2]);
+    store.setStateJson('agent/autobio:chunks', [
+      { id: 'c-a', sourceIds: [a], compressed: true, summaryId: 'L1-a' },
+      { id: 'c-b', sourceIds: [b], compressed: true, summaryId: 'L1-b' },
+    ]);
+    seed.close();
+
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    let cm!: ContextManager;
+    const lines = await linesDuring(async () => {
+      cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of 1 summary apart or out of order [L2-zz]')), lines.join('\n'));
+    assert.deepEqual(internals(strategy).summaries.map((s) => s.id).sort(), ['L1-a', 'L1-b'], 'the L2 is dropped, and the L1s stay');
+    assert.ok(internals(strategy).summaries.every((s) => (s as { mergedInto?: string }).mergedInto === undefined), 'with no parent');
+    assert.deepEqual(
+      internals(strategy).chunkRecords.map((r) => [r.id, r.sourceIds, r.compressed, r.summaryId]).sort(),
+      [['c-a', [a], true, 'L1-a'], ['c-b', [b], true, 'L1-b']],
+      'their records stay as they were',
+    );
+    const kept = cm.getStore().getStateJson('agent/autobio:summaries') as Array<{ id: string }>;
+    assert.deepEqual(kept.map((s) => s.id).sort(), ['L1-a', 'L1-b'], 'as the store holds them');
     cm.close();
   });
 });

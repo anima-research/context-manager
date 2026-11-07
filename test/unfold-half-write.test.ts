@@ -2,8 +2,10 @@
  * A half-written unfold is repaired by the next open (CM #350 bot review,
  * finding 2), where that open demotes: under `topologyPolicy` 'reject', the
  * default, in an open that isn't audit-only. 'report', and an audit-only
- * open under 'reject', each leave the record as they find it, as the last
- * case shows (wave 4, finding 45; wave 5, finding 5).
+ * open under 'reject', each leave the record's rows as they find them (the
+ * open still releases the record to raw, releaseUnsummarizedRecords, as
+ * every open does), as the last case shows (wave 4, finding 45; wave 5,
+ * finding 5; wave 6, finding 44).
  *
  * The autobiographical strategy writes what it lets go of (unfold) as three
  * states, one after another: the summaries, then the chunk records, then
@@ -535,7 +537,7 @@ describe('a half-written unfold', () => {
   // finding 5): 'report' in an open that isn't audit-only, and an
   // audit-only open under the default 'reject'. With both set, as this case
   // was, the auditOnly term went untested.
-  it("under 'report' and in an audit-only open, the record is left as it was found", async () => {
+  it("under 'report' and in an audit-only open, the record's rows are left as they were found (the open still releases the record to raw)", async () => {
     for (const config of [{ topologyPolicy: 'report' as const }, { auditOnly: true }]) {
       const path = freshPath();
       const strategy = new AutobiographicalStrategy(FOLDING);
@@ -566,7 +568,9 @@ describe('a half-written unfold', () => {
         open = await ContextManager.open({ path, namespace: 'agent', strategy: inspected, membrane: mockMembrane() });
       });
       assert.ok(!lines.some((line) => line.includes('uncompressed chunk record')), `${JSON.stringify(config)}: ${lines.join('\n')}`);
-      assert.equal(splitRecords(open, inspected).length, 1, `${JSON.stringify(config)}: the record is left as it was found`);
+      assert.equal(splitRecords(open, inspected).length, 1, `${JSON.stringify(config)}: the record's rows are left as they were found`);
+      const split = internals(inspected).chunkRecords.find((record) => splitRecords(open, inspected)[0]!.startsWith(`${record.id}[`))!;
+      assert.ok(!split.compressed && split.summaryId === undefined, `${JSON.stringify(config)}: the open released the record to raw, as every open does: ${JSON.stringify(split)}`);
       open.close();
     }
   });
