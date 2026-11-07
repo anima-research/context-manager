@@ -12,10 +12,12 @@
  *   before a row lands throws its own error, unwrapped, and so does a
  *   sharded write once it has removed the shards it stored.
  *
- * A host's onMessage listener can't fail a write (its throw is logged), so
- * the failure after a row landed is the manager's own: its listener runs
- * inside each append. These make it fail by wrapping that listener, or, in
- * legacy mode, the context it builds for the strategy there.
+ * A host's onMessage listener's throw is logged and doesn't fail the write,
+ * unless that log throws too (see onMessage), so the failure after a row
+ * landed is the manager's own: its listener runs inside each append. These
+ * make it fail by wrapping that listener, or, in legacy mode, the context
+ * it builds for the strategy there; one adds a listener of its own to the
+ * manager's slot, after the host's.
  */
 
 import { describe, it, after } from 'node:test';
@@ -488,6 +490,53 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     cm.close();
   });
 
+  // CM #350 bot review, wave 6, finding 25: where the failing shard's
+  // landing can't be read, its row has no id here, and the removal of the
+  // run takes it all the same; the rows the removal takes are read from
+  // the slot, so a shard a host's listener presented leaves the window
+  // with the rest and is told.
+  it("a rollback that can't read whether the failing shard landed takes that shard out of the window with the run, and the strategy hears it leave", async () => {
+    const strategy = new ShardingHears();
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    cm.presentRows([]);
+    // The host presents the body by its first shard's id as the second
+    // shard's add is heard, which presents both.
+    let first: MessageId | undefined;
+    cm.onMessage((event) => {
+      if (event.type !== 'add') return;
+      if (event.message.shardIndex === 0) first = event.message.id;
+      if (event.message.shardIndex === 1) cm.presentRows([first!]);
+    });
+    // Then the second shard's append throws, after its row landed and its
+    // listeners ran (a listener on the slot after the host's), and the read
+    // of whether it landed fails once.
+    const failure = new Error('zz-after-listeners');
+    const messages = internals(cm).messageStore;
+    messages.addListener((event) => {
+      if (event.type === 'add' && event.message.shardIndex === 1) throw failure;
+    });
+    const getTail = messages.getTail.bind(messages);
+    let tailFails = 1;
+    messages.getTail = (count) => {
+      if (tailFails > 0) {
+        tailFails--;
+        throw new Error('store unreadable');
+      }
+      return getTail(count);
+    };
+    const { result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')])));
+    assert.equal(err, failure, 'unwrapped: the store holds none of the message');
+    assert.equal(tailFails, 0, "setup: the read of whether the second shard landed failed");
+    assert.deepEqual(cm.getAllMessages(), [], 'the removal took both shards');
+    const shards = strategy.presented.at(-1)!;
+    assert.equal(shards.length, 2, 'setup: the listener presented both shards');
+    assert.deepEqual(shards.map((id) => cm.ordinalOf(id)), [undefined, undefined], 'both left the window as they were removed');
+    assert.deepEqual(strategy.retracted, [{ ids: shards, rows: shards, removed: true }], 'the strategy heard both leave, with the rows as they were, removed');
+    assert.deepEqual(cm.retractAbsentRows(), [], 'nothing is left for a repair to take out');
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
+
   it("a removal that took the shards out and then failed leaves none, so the write's own error is thrown", async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new Sharding() });
     cm.addMessage('bob', [text('before')]);
@@ -683,6 +732,49 @@ describe('WriteLandedError and WriteOutcomeUnknownError: what an add that fails 
     assert.deepEqual(strategy.presented.at(-1), stored.slice(1).map((m) => m.id), 'the strategy hears both shards the legacy window holds, in one call');
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
+  });
+
+  // CM #350 bot review, wave 6, finding 7: the lines a failed add logs on
+  // its way to the error that says what the store holds can throw (a
+  // console.error that throws); the error is built all the same, so a host
+  // isn't told the store holds none of a message it holds.
+  it('a log that throws on the way to the error leaves the error to say what the store holds', async () => {
+    const cases = [
+      ['a message stored as one row whose landing can\'t be read', 1, false, false],
+      ["a sharded write's first shard whose landing can't be read", 1, true, false],
+      ['a sharded write whose removal of what it stored fails', 2, true, true],
+    ] as const;
+    for (const [label, nth, sharded, removalFails] of cases) {
+      const cm = await ContextManager.open({ path: freshPath(), strategy: sharded ? new Sharding() : new PassthroughStrategy() });
+      cm.addMessage('bob', [text('before')]);
+      const failure = new Error('propagation failed');
+      failOwnListenerAfterAdd(cm, nth, failure);
+      const readable = removalFails ? () => {} : failTailRead(cm);
+      if (removalFails) failRemoval(cm);
+      const error = console.error;
+      console.error = () => {
+        throw new Error('zz-log-failed');
+      };
+      let err: unknown;
+      try {
+        err = thrownBy(() => cm.addMessage('alice', sharded ? [text('one '), text('two '), text('three')] : [text('one')]));
+      } finally {
+        console.error = error;
+        readable();
+      }
+      const stored = cm.getAllMessages().slice(1).map((m) => m.id);
+      if (removalFails) {
+        assert.ok(err instanceof WriteLandedError, `${label}: a WriteLandedError, not ${String(err)}`);
+        assert.deepEqual(err.landed, stored, `${label}: naming the shards that stayed`);
+      } else {
+        assert.ok(err instanceof WriteOutcomeUnknownError, `${label}: a WriteOutcomeUnknownError, not ${String(err)}`);
+        assert.equal(err.unnamed, 1, label);
+        assert.equal(stored.length, 1, `${label}, setup: the row landed`);
+      }
+      assert.equal(err.cause, failure, label);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
   });
 
   it("resetHeadWindow's transition add that fails after storing it rejects with the error naming it, and the head window isn't reset", async () => {
@@ -1233,6 +1325,68 @@ describe("a sharded addMessage's shards land together, as one body", () => {
     assert.deepEqual(strategy.presented.at(-1), err.landed, 'the strategy hears both shards the legacy window holds, in one call');
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
+  });
+
+  // CM #350 bot review, wave 6, finding 9: a shard that stayed without
+  // reaching the manager's listener, whose row then can't be read from the
+  // slot either, waits by its id, as do the shards the read-back names on
+  // the exits that can't say which stayed; the delivery tells those the
+  // legacy window's listing holds.
+  it("in legacy mode a shard that stayed without reaching the manager's listener, and can't be read, waits by its id and is heard with the others", async () => {
+    for (const fails of ['get', 'read-back'] as const) {
+      const strategy = new ShardingHears();
+      const cm = await ContextManager.open({ path: freshPath(), strategy });
+      cm.addMessage('bob', [text('before')]);
+      // As above: the second shard's read of the window's mode throws in the
+      // manager's listener, after its row landed.
+      const index = (cm as unknown as { windowIndex: { mode: () => string } }).windowIndex;
+      const mode = index.mode;
+      let reads = 0;
+      index.mode = function (this: unknown) {
+        if (++reads === 2) throw new Error('zz-mode-unreadable');
+        return mode.call(this);
+      };
+      // The removal fails, and then the next read of the slot fails once:
+      // the read of the shard the listener didn't keep (get), or the
+      // read-back of which shards stayed (sequenceOf).
+      const messages = internals(cm).messageStore;
+      const read = fails === 'get' ? 'get' : 'sequenceOf';
+      const real = (messages[read] as (id: MessageId) => unknown).bind(messages);
+      let removalTried = false;
+      messages.removeBodyGroup = () => {
+        removalTried = true;
+        throw new Error('removal failed');
+      };
+      (messages as unknown as Record<string, unknown>)[read] = (id: MessageId) => {
+        if (removalTried) {
+          removalTried = false;
+          throw new Error('zz-slot-unreadable');
+        }
+        return real(id);
+      };
+      let err: unknown;
+      try {
+        ({ result: err } = errorsDuring(() => thrownBy(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]))));
+      } finally {
+        delete (index as { mode?: unknown }).mode;
+        delete (messages as unknown as Record<string, unknown>)[read];
+      }
+      const stored = cm.getAllMessages();
+      assert.deepEqual(stored.map(textOf), ['before', 'one ', 'two '], `${fails}, setup: the second shard landed, and the removal failed`);
+      const shards = stored.slice(1).map((m) => m.id);
+      if (fails === 'get') {
+        assert.ok(err instanceof WriteLandedError, `${fails}: a WriteLandedError, not ${String(err)}`);
+        assert.deepEqual(err.landed, shards);
+      } else {
+        assert.ok(err instanceof WriteOutcomeUnknownError, `${fails}: a WriteOutcomeUnknownError, not ${String(err)}`);
+        assert.deepEqual(err.unknown, shards, 'the read-back names both, as unknown');
+      }
+      assert.deepEqual(strategy.presented.at(-1), shards, `${fails}: the strategy hears both shards the legacy window holds, in one call`);
+      const after = cm.addMessage('bob', [text('after')]);
+      assert.deepEqual(strategy.presented.slice(-2), [shards, [after]], `${fails}: and not again`);
+      await new Promise((resolve) => setImmediate(resolve));
+      cm.close();
+    }
   });
 
   // CM #350 bot review, wave 3, finding 22: once every shard is stored, no

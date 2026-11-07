@@ -53,6 +53,21 @@ const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Resolves once `ready()` holds, checked each macrotask; rejects after a
+ * second. A check that something didn't happen while a strategy's
+ * initialize runs waits for the initialize to be entered first (CM #350
+ * bot review, wave 6, finding 32), so a manager that put the entry off
+ * past the check would fail it.
+ */
+async function waitFor(ready: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 /** console.error's calls while `fn` runs. */
 async function errorsDuring(fn: () => Promise<void>): Promise<unknown[][]> {
   const errors: unknown[][] = [];
@@ -113,7 +128,9 @@ class ShardingRecords extends Records {
 /** Records whose initialize waits for `gate`, once one is set. */
 class GatedRecords extends Records {
   gate: Promise<void> | undefined;
+  entered = false;
   async initialize(_ctx: StrategyContext): Promise<void> {
+    this.entered = true;
     await this.gate;
   }
 }
@@ -121,11 +138,13 @@ class GatedRecords extends Records {
 /** A strategy with neither onPresented nor onNewMessage, whose initialize waits for `gate`, once one is set. */
 class Unhooked extends PassthroughStrategy {
   gate: Promise<void> | undefined;
+  entered = false;
   constructor() {
     super();
     (this as { onNewMessage?: unknown }).onNewMessage = undefined;
   }
   async initialize(_ctx: StrategyContext): Promise<void> {
+    this.entered = true;
     await this.gate;
   }
 }
@@ -388,6 +407,7 @@ describe('onPresented in presented mode', () => {
       // The first initialization's completion, where an early delivery
       // would be made, has run (CM #350 bot review, wave 5, finding 26).
       await superseded;
+      await waitFor(() => replacement.entered, "the replacement's initialize");
       assert.equal(replacement.heard.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;
@@ -736,6 +756,72 @@ describe('onPresented in presented mode', () => {
     cm.close();
   });
 
+  // The verifier's D15 at cfba31f: where the store can't say its branch
+  // before the retried calls, a move can't be seen, so the notification's
+  // own call waits too, and is made where the record of the branch the
+  // store is on holds its rows. In legacy mode nothing else checks that
+  // (in presented mode the rows' ordinals are read again).
+  it("in legacy mode a notification that can't read the store's branch before a retried call's hook moves it to a branch lacking its row doesn't tell that row", async () => {
+    const store = (await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() })).getStore();
+    const start = store.currentBranch().name;
+    class Moves extends ShardingRecords {
+      moves = true;
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (this.moves && rows.length > 1) {
+          this.moves = false;
+          store.switchBranch('zz-b');
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ store, namespace: 'zz-agent', strategy });
+    // As above: the shards that stayed wait for the strategy's next notification.
+    const own = cm as unknown as { createStrategyContext: () => unknown; hookScope: () => unknown; messageStore: { removeBodyGroup: () => void } };
+    const build = own.createStrategyContext.bind(cm);
+    let failures = 0;
+    own.createStrategyContext = () => {
+      if (failures < 2) {
+        failures++;
+        throw new Error('zz-context-failed');
+      }
+      return build();
+    };
+    const removeBodyGroup = own.messageStore.removeBodyGroup;
+    own.messageStore.removeBodyGroup = () => { throw new Error('zz-removal-failed'); };
+    await errorsDuring(async () => {
+      assert.throws(() => cm.addMessage('alice', [text('one'), text('two')]));
+    });
+    own.messageStore.removeBodyGroup = removeBodyGroup;
+    assert.equal(failures, 2, 'setup: both failed');
+    // A branch of the record as it stands, with the shards and without x.
+    store.createBranchAt('zz-b', start, store.currentSequence());
+    // x's notification's read of the store's branch, before it tries the
+    // waiting call again, throws once.
+    const scope = own.hookScope;
+    let unreadable = true;
+    own.hookScope = function (this: unknown) {
+      if (unreadable) {
+        unreadable = false;
+        throw new Error('zz-branch-unreadable');
+      }
+      return scope.call(this);
+    };
+    let x: MessageId;
+    try {
+      x = cm.addMessage('bob', [text('x')]);
+    } finally {
+      delete (own as { hookScope?: unknown }).hookScope;
+    }
+    assert.equal(unreadable, false, 'setup: the branch read failed');
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.equal(store.currentBranch().name, 'zz-b', "setup: the retried call's hook moved the store");
+    assert.equal(strategy.heard[0]?.rows.length, 2, 'setup: the shards were heard');
+    assert.deepEqual(strategy.heard.flatMap((h) => h.rows).filter((id) => id === x), [], "x isn't heard on a branch whose record lacks it");
+    await settle();
+    cm.close();
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.
@@ -804,10 +890,12 @@ class Reacts extends PassthroughStrategy {
   heard: MessageId[] = [];
   detached = 0;
   gate: Promise<void> | undefined;
+  entered = false;
   constructor(public onFirst?: () => void) {
     super();
   }
   async initialize(_ctx: StrategyContext): Promise<void> {
+    this.entered = true;
     await this.gate;
   }
   detach(): void {
@@ -1437,6 +1525,54 @@ describe('resetHeadWindow once a host presents', () => {
     }
   });
 
+  // CM #350 bot review, wave 6, finding 27: where the store can't say
+  // whether it still holds the transition, the refusal says what the call
+  // last knew, as where it can't say its branch.
+  it("a refusal where the store can't say whether it still holds the transition says what the call last knew", async () => {
+    let cm!: ContextManager;
+    class Resettable extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        const transition = rows.find((m) => m.participant === 'Context Manager');
+        if (transition) {
+          cm.removeMessage(transition.id);
+          cm.close();
+          // The refusal's read of the store then fails, once.
+          const messages = (cm as unknown as { messageStore: Record<string, unknown> }).messageStore;
+          messages.sequenceOf = () => {
+            delete messages.sequenceOf;
+            throw new Error('zz-store-unreadable');
+          };
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Resettable();
+    // An app-owned store, which stays open after close().
+    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+    cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = strategy.heard.flatMap((h) => h.rows).at(-1)!;
+    assert.equal(owner.getMessage(transition), null, 'setup: the hook removed the transition');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${transition} is stored`), `not stated as what holds now: ${err.message}`);
+    assert.ok(
+      err.message.includes(
+        `message ${transition} was stored and presented on the branch it was added on, as the call last knew, and the store can't say now whether it still holds it`,
+      ),
+      err.message,
+    );
+    await settle();
+    owner.close();
+  });
+
   // CM #350 bot review, wave 5, finding 36: a listener of a sharded
   // transition's first shard can present it before the rest is stored, so
   // a refusal then judges the body whole, as the presentation does.
@@ -1639,7 +1775,10 @@ describe('onPresented in legacy mode', () => {
       assert.deepEqual(first.heard, [shards[0]], 'the strategy the hook replaced heard only the first shard');
       // CM #350 bot review, wave 3, finding 30: nothing reaches the
       // replacement while its initialize is held.
-      if (next instanceof Reacts) assert.deepEqual(next.heard, [], 'probe: the replacement hears nothing before its initialize');
+      if (next instanceof Reacts) {
+        await waitFor(() => next.entered, "the replacement's initialize");
+        assert.deepEqual(next.heard, [], 'probe: the replacement hears nothing while its initialize runs');
+      }
       open();
       await replaced;
       const heard = next instanceof Reacts ? next.heard : next.heard.map((h) => h.id);

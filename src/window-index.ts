@@ -78,7 +78,11 @@
  * whatever the failure left. Where that read throws too, whether the write
  * landed is unknown: the call throws WindowWriteOutcomeUnknownError, and
  * the next write through the index settles what the write did, once the
- * index reads.
+ * index reads, except where the store can't say its branch before the
+ * write or after it: then nothing waits, and the strategy reads the window
+ * at its next select (see WindowWriteOutcomeUnknownError). A later write
+ * made while the store can't say its branch, and such a settlement waits,
+ * throws, writing nothing (settled).
  * A batch is one presentation point: every item of it carries the same `at`,
  * and chronicle cuts a branch only between records, so a cut at a row a
  * batch presented keeps every row of the batch, and a cut before it drops
@@ -102,6 +106,12 @@
  * out and writes the whole record again, in record order). A body such an
  * index holds in part is completed, or put back whole, by present. Such an
  * index is read as one written in batches is; this version writes none.
+ * The first builds of this branch (before fa8bd05) wrote the header first.
+ * An index they wrote reads as complete, a write-down they cut short
+ * included, and its rows as presented after the header: a branch cut takes
+ * them at their items, not at their own sequences (presentedByWriteDown is
+ * false for each). No release wrote one, and no reader for such an index
+ * is kept.
  *
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header
@@ -173,14 +183,19 @@ export interface LeftRow {
  * retractRows as not in it. For retractRemoved and retractAbsentRows,
  * whose rows the store no longer holds, windowStatusOf reads 'absent'
  * either way: ordinalOf tells (undefined for a row taken out), and calling
- * either again takes out only what is still there. A write-down (the
+ * either again takes out only what is still there. So it does for a row a
+ * retractRows takes out by its id once another manager removed it, which
+ * windowStatusOf reads as 'absent' too. A write-down (the
  * first presentRows or retractRows on a branch in legacy mode, which
  * writes the window down before any work of its own) puts no row in the
  * window and takes none out: `entering` and `leaving` are both empty,
  * windowMode tells whether it landed, and the strategy has nothing to
  * hear of it. The strategy hears what the write did (onPresented,
  * onRetracted) at the next write to the window on the branch it was made
- * on, once the index reads there, before that call's own work:
+ * on, once the index reads there, before that call's own work (where the
+ * manager's own work around the strategy's call fails, such as the context
+ * it builds, that is logged and the rows wait for the strategy's next
+ * notification):
  * presentRows (presentRows([]) among them), retractRows, retractRemoved,
  * retractAbsentRows or a removal. Of a write the store didn't keep it
  * hears nothing. A hook of that hearing that moves the store's branch
@@ -218,9 +233,13 @@ export class WindowWriteOutcomeUnknownError extends Error {
     // The rows of the repairs are ones the store no longer holds, which
     // windowStatusOf reads as absent whether or not the write landed.
     const repair = operation === 'retractRemoved' || operation === 'retractAbsentRows';
+    // So is a row a retractRows takes out by its id once another manager
+    // removed it.
     const which = repair
       ? `ordinalOf tells which once the index reads (undefined for a row taken out), and calling ${operation} again takes out only what is still there`
-      : 'windowStatusOf tells which once the index reads';
+      : operation === 'retractRows'
+        ? 'windowStatusOf tells which once the index reads (ordinalOf for a row the store no longer holds: undefined once taken out)'
+        : 'windowStatusOf tells which once the index reads';
     const hears = waiting
       ? 'the strategy hears what it did at the next write to the window'
       : 'nothing waits to tell the strategy what it did, so it reads the window at its next select';
@@ -484,6 +503,17 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
   return false;
 }
 
+/**
+ * Whether apply reads `item` as one of this format's: a presentation, a
+ * tombstone or this format's header. Another format's header, and an item
+ * apply can't read, aren't (readOn reads the state whole for them).
+ */
+function isOwnItem(item: unknown): boolean {
+  if (typeof item !== 'object' || item === null) return false;
+  const fields = item as { id?: unknown; retract?: unknown; v?: unknown };
+  return typeof fields.id === 'string' || typeof fields.retract === 'string' || fields.v === INDEX_FORMAT;
+}
+
 /** Positions of each id in a listing, built once per listing (a listing is never changed in place). */
 const positionsByListing = new WeakMap<readonly StoredMessage[], Map<MessageId, number>>();
 
@@ -595,7 +625,10 @@ function leavingSettlement(left: readonly LeftRow[], cutShort: (left: LeftRow[])
  * The window index of one manager namespace, read through one store handle
  * on whatever branch that handle is on. It reads the state again whenever
  * the state's revision there has moved since it last read it, so another
- * handle's write, a branch switch and a restart all reach it.
+ * handle's write, a branch switch and a restart all reach it: only the
+ * items appended since, where its last reading is a prefix of the state
+ * (readOn), so two handles that take turns writing don't each read the
+ * whole index at every turn, and the state whole otherwise.
  */
 export class WindowIndex {
   readonly stateId: string;
@@ -638,13 +671,70 @@ export class WindowIndex {
       : this.store.currentBranch().id;
   }
 
-  /** The index as it stands on the handle's branch. */
+  /**
+   * The index as it stands on the handle's branch. Where the revision has
+   * moved since the last reading, the items appended since are applied to
+   * that reading (readOn), so another handle's write costs what it wrote;
+   * otherwise, and wherever that can't be told, the state is read whole.
+   */
   private current(): IndexState {
     const revision = this.revision();
     const branchId = this.branchKey();
     const state = this.state;
     if (state && state.revision === revision && state.branchId === branchId) return state;
+    if (state && revision !== null && state.branchId === branchId && this.readOn(state, revision)) return state;
     return (this.state = this.read(branchId, revision));
+  }
+
+  /**
+   * Bring `state`, a reading of this branch's index or of another's, up to
+   * `revision` by applying only the items after it, in place: true where
+   * that was done, false where the state has to be read whole (read).
+   *
+   * The index is append-only: this package only appends to it, so where
+   * the state's chain still holds the record that wrote the reading's last
+   * item, at that item's ordinal, the reading is a prefix of the state, and
+   * the items after it are what was appended since. That record's identity
+   * (the item's `by` stamp) is unique in the store, and a branch shares a
+   * record with the one it was made from only up to the branch point, so
+   * the check holds across a branch switch too: a branch made after that
+   * item continues the reading, and any other holds another item there.
+   * The store's own snapshots move the revision and append nothing. It is
+   * one slice read (getStateSlice) from the reading's last item on, which
+   * the store answers from its per-item cache. Read whole instead: a
+   * reading with no item or no stamp on its last, or of a state another
+   * format keeps or with items this version can't read (so the warnings
+   * read gives are given), a slice that holds any item this version would
+   * read as another format's or can't read, a store without the slice
+   * read, and a slice read that throws. A state another writer edited in
+   * place, before that last item, would read as its appends: nothing here
+   * writes one so.
+   */
+  private readOn(state: IndexState, revision: number): boolean {
+    const last = state.rows.length - 1;
+    const stamp = last >= 0 ? state.by[last] : undefined;
+    if (stamp === undefined || state.found !== null || state.otherFormat !== null || state.unreadable > 0) return false;
+    const store = this.store as { getStateSlice?: (id: string, offset: number, limit: number) => Buffer | null };
+    if (typeof store.getStateSlice !== 'function') return false;
+    let items: unknown;
+    try {
+      const slice = store.getStateSlice(this.stateId, last, 2 ** 31 - 1);
+      items = slice === null ? null : JSON.parse(slice.toString('utf8'));
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(items) || items.length === 0) return false;
+    const boundary = items[0] as { by?: unknown } | null;
+    if (typeof boundary !== 'object' || boundary === null || boundary.by !== stamp) return false;
+    const added = items.slice(1) as Array<{ at?: unknown; by?: unknown } | null>;
+    if (!added.every(isOwnItem)) return false;
+    added.forEach((item, i) => {
+      apply(state, item, last + 1 + i, typeof item?.at === 'number' ? item.at : undefined, typeof item?.by === 'string' ? item.by : undefined);
+    });
+    state.revision = revision;
+    state.version = ++versions;
+    state.presented = null;
+    return true;
   }
 
   /**
@@ -663,8 +753,12 @@ export class WindowIndex {
    * `operation`, which throws, writing nothing: the call was given the
    * record of the branch it was made on, and would write it into the
    * window of the one the store is on now, or take out of that window
-   * every row the record lacks. The writes it heard of stay settled, and a
-   * call made again works on the branch the store is on.
+   * every row the record lacks. The writes heard of up to that hook stay
+   * settled, and those after it aren't heard on the branch the store
+   * moved to: they wait for the next write on the branch they were made
+   * on, as do they where the store can't say its branch after a hook (its
+   * error is thrown). A call made again works on the branch the store is
+   * on.
    *
    * Returns the reading with the id of the branch it is of, which the
    * call's own write waits on if its outcome is unknown (afterThrow): read
@@ -693,23 +787,41 @@ export class WindowIndex {
     const due = this.unsettled.filter((write) => write.branch === branch.id);
     if (due.length === 0) return { state, branch: branch.id };
     this.unsettled = this.unsettled.filter((write) => write.branch !== branch.id);
-    for (const write of due) {
-      try {
-        write.settle(state.ordinals);
-      } catch (error) {
-        logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
+    // One at a time, with the branch read after each: a hook that moved the
+    // store stops the rest, which wait for the next write on this branch,
+    // ahead of any write a hook made meanwhile, and so do they where the
+    // branch can't be read after one.
+    let next = 0;
+    try {
+      while (next < due.length) {
+        const write = due[next++]!;
+        try {
+          write.settle(state.ordinals);
+        } catch (error) {
+          logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
+        }
+        const now = this.store.currentBranch();
+        if (now.id !== branch.id) {
+          throw new Error(
+            `ContextManager.${operation}: a strategy hook that heard what an earlier write to the window did moved the ` +
+              `store's branch from ${branch.name} to ${now.name}, and this call was given the record of ${branch.name}, ` +
+              `so it writes nothing; call it again on the branch the store is on`,
+          );
+        }
       }
-    }
-    const now = this.store.currentBranch();
-    if (now.id !== branch.id) {
-      throw new Error(
-        `ContextManager.${operation}: a strategy hook that heard what an earlier write to the window did moved the ` +
-          `store's branch from ${branch.name} to ${now.name}, and this call was given the record of ${branch.name}, ` +
-          `so it writes nothing; call it again on the branch the store is on`,
-      );
+    } finally {
+      if (next < due.length) this.unsettled = [...due.slice(next), ...this.unsettled];
     }
     // A hook may have written to the index since.
     return { state: this.current(), branch: branch.id };
+  }
+
+  /**
+   * Let go of the writes waiting to be settled: the manager closed, and
+   * nothing it settles would reach a strategy.
+   */
+  dropUnsettled(): void {
+    this.unsettled = [];
   }
 
   /**
@@ -822,7 +934,9 @@ export class WindowIndex {
    * put back since, undone or not, from one reading of the index: rows a
    * host took out, and rows removed from the record once taken out by
    * their ids. Null in legacy mode. A row removed in legacy mode, before
-   * the write-down, was never in the window, and isn't one, even where a
+   * the write-down, was never in the written-down window (in legacy mode
+   * the window is the record, so a strategy may have folded it; what
+   * folded it stays, as it always has there), and isn't one, even where a
    * write-down cut short wrote it and the one that finished it took it out
    * (its tombstones come before the header); neither is a
    * row removed through another manager that no retract has taken out
@@ -903,7 +1017,9 @@ export class WindowIndex {
    * was in the window from its own write, as every row is in legacy mode,
    * and the rows before it there were the rows stored before it, since the
    * write-down follows record order. A row taken out since and presented
-   * again holds a later ordinal and is not one. False in legacy mode.
+   * again holds a later ordinal and is not one. False in legacy mode, and
+   * for every row of an index written header-first (see the module
+   * comment).
    */
   presentedByWriteDown(id: MessageId): boolean {
     const state = this.current();
@@ -1006,7 +1122,10 @@ export class WindowIndex {
    * first such row of `source` (which is in record order) by a binary
    * search, so the walk is over those rows alone. A cut inside a body reads
    * the body's shards before it to say whether the body is partly in the
-   * window.
+   * window, and leaves out the shards it lacks before the cut, so a host
+   * that presents these rows by id names the body's first shard there,
+   * which present takes as naming the rest: it refuses a later shard named
+   * alone.
    */
   unpresented(source: readonly StoredMessage[], afterSequence?: number): StoredMessage[] {
     const state = this.current();
@@ -1196,16 +1315,23 @@ export class WindowIndex {
    * legacy mode it writes nothing: the window is the record, and a row
    * removed from the record has left it already. Returns the rows taken
    * out, with the ordinals they held, in window order; `cutShort` is as
-   * retract's.
+   * retract's. `leaving`, when given, hears the rows the write is about to
+   * take out, in window order, once the writes waiting to be settled have
+   * been (settled), whose hooks can take a row out first, and before the
+   * write, which can throw.
    */
-  retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void): LeftRow[] {
+  retractRemoved(ids: readonly MessageId[], cutShort?: (left: LeftRow[]) => void, leaving?: (left: LeftRow[]) => void): LeftRow[] {
     const { state, branch } = this.settled('retractRemoved');
-    if (!inEffect(state)) return [];
+    if (!inEffect(state)) {
+      leaving?.([]);
+      return [];
+    }
     const left: LeftRow[] = [];
     for (const id of new Set(ids)) {
       const ordinal = state.ordinals.get(id);
       if (ordinal !== undefined) left.push({ id, ordinal, by: state.by[ordinal] });
     }
+    leaving?.(inWindowOrder(left));
     this.writeLeaving('retractRemoved', left.map((row): IndexItem => ({ retract: row.id })), left, branch, cutShort);
     return inWindowOrder(left);
   }

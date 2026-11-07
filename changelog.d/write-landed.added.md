@@ -13,8 +13,9 @@
   message.
   - `WriteLandedError` is thrown when a row stays: a message stored as one
     row, whose append failed after the row landed (the manager's own store
-    listener failing inside it; a host's `onMessage` listener can't fail a
-    write), or the shards of a sharded write that failed partway and whose
+    listener failing inside it; a host's `onMessage` listener's throw is
+    logged and doesn't fail the write, unless that log throws too: see
+    `onMessage`), or the shards of a sharded write that failed partway and whose
     removal of what it stored failed too, a body short of its `shardCount`.
   - `WriteOutcomeUnknownError` names what the manager knows: `landed`, the
     rows it knows are stored, possibly none; `unknown`, rows the write
@@ -41,13 +42,14 @@
     write's shards before the failing one were heard as each was stored, so a
     listener that presents rows as they are added may have presented them.
     Once a host presents rows, present the first row of `landed` that
-    `windowStatusOf` doesn't read `'in'` on the branch the write started on
-    (where a listener moved the store's branch, switch back first: the
-    shards are there, and a `WriteLandedError`'s `cause` names that branch),
-    if any, which `presentRows` takes as
-    naming the rest of the body: it refuses a row already in the window, and a
-    later shard whose earlier shards aren't all in it (where a listener took a
-    presented shard out again, say). A `holdCompression` hold the add placed
+    `windowStatusOf` doesn't read `'in'` on the branch the store was on when
+    `addMessage` was called (read `currentBranch()` before the call; where a
+    listener's move stopped the write, switch back first, since the shards
+    are there, and a `WriteLandedError`'s `cause` names it too), if any,
+    which `presentRows` takes as naming the rest of the body: it refuses a
+    row already in the window, and a later shard whose earlier shards
+    aren't all in it (where a listener took a presented shard out again,
+    say). A `holdCompression` hold the add placed
     on them stays until `releaseCompression(landed)`. `resetHeadWindow`
     rejects with either error when its transition's add fails so, without
     resetting the head window.

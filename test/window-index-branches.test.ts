@@ -406,6 +406,101 @@ describe('fork and the window', () => {
   });
 });
 
+// CM #350 bot review, wave 6, finding 28: a handle reads only the items
+// another handle appended since its last reading, where that reading is a
+// prefix of the state, and the state whole where it isn't.
+describe("another handle's writes to the window", () => {
+  /** Counts whole reads of the index (getStateJson) on `store`; returns the count and the undo. */
+  function countWholeReads(store: JsStore): { reads: () => number; restore: () => void } {
+    const handle = store as unknown as Record<string, (id: string) => unknown>;
+    const real = handle.getStateJson!;
+    let reads = 0;
+    handle.getStateJson = function (this: unknown, id: string) {
+      if (id === INDEX) reads++;
+      return real.call(this, id);
+    };
+    return { reads: () => reads, restore: () => { delete handle.getStateJson; } };
+  }
+
+  it('two handles taking turns presenting read only what the other appended, and read the same window', async () => {
+    const a = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = a.getStore();
+    const b = await ContextManager.open({ store, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    a.presentRows([]);
+    const rows = Array.from({ length: 8 }, (_, i) => a.addMessage('alice', [text(`r${i}`)]));
+    a.presentRows(rows.slice(0, 2));
+    b.retractRows([rows[0]!]);
+    assert.equal(a.windowStatusOf(rows[0]!), 'out', 'setup: each reads the other');
+    const counted = countWholeReads(store);
+    try {
+      rows.slice(2).forEach((id, i) => {
+        (i % 2 === 0 ? b : a).presentRows([id]);
+        assert.equal((i % 2 === 0 ? a : b).ordinalOf(id), (i % 2 === 0 ? b : a).ordinalOf(id), `row ${i + 2}: both read its ordinal`);
+      });
+      b.retractRows([rows[3]!], { undone: true });
+      assert.equal(a.windowStatusOf(rows[3]!), 'undone', "a reads b's tombstone");
+      assert.deepEqual(ids(a.getPresentedMessages()), ids(b.getPresentedMessages()));
+      assert.equal(counted.reads(), 0, 'no handle read the index whole');
+    } finally {
+      counted.restore();
+    }
+    const fresh = await ContextManager.open({ store, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    assert.deepEqual(ids(a.getPresentedMessages()), ids(fresh.getPresentedMessages()), 'a reading made whole says the same');
+    assert.deepEqual(rows.map((id) => a.ordinalOf(id)), rows.map((id) => fresh.ordinalOf(id)));
+    fresh.close();
+    b.close();
+    a.close();
+  });
+
+  it("a handle whose store moves to a branch made before its reading's last item reads that branch's index whole", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = cm.getStore();
+    const other = await ContextManager.open({ store, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const main = cm.currentBranch().name;
+    // Made at the write-down: its index holds the header alone.
+    const side = store.createBranchAt('zz-side', main, store.currentSequence()).name;
+    const [p, q] = ['p', 'q'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([p]);
+    cm.presentRows([q]);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [p, q], "setup: cm's reading is main's");
+    // The store moves under cm, and the other handle presents three rows
+    // there, one record each: that index is longer than cm's reading, and
+    // holds other items where cm's reading ends.
+    store.switchBranch(side);
+    const [r, s, t] = ['r', 's', 't'].map((x) => other.addMessage('alice', [text(x)])) as [MessageId, MessageId, MessageId];
+    for (const id of [r, s, t]) other.presentRows([id]);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [r, s, t], "cm reads the side branch's window");
+    assert.deepEqual([r, s, t].map((id) => cm.ordinalOf(id)), [r, s, t].map((id) => other.ordinalOf(id)));
+    assert.equal(cm.ordinalOf(p), undefined);
+    other.close();
+    cm.close();
+  });
+
+  it("a handle whose store moves to a branch made after its reading's last item reads only what that branch appended", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = cm.getStore();
+    const other = await ContextManager.open({ store, namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const [p, q] = ['p', 'q'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    cm.presentRows([p, q]);
+    assert.deepEqual(ids(cm.getPresentedMessages()), [p, q], "setup: cm's reading is main's");
+    const later = store.createBranchAt('zz-later', cm.currentBranch().name, store.currentSequence()).name;
+    store.switchBranch(later);
+    const u = other.addMessage('alice', [text('u')]);
+    other.presentRows([u]);
+    const counted = countWholeReads(store);
+    try {
+      assert.deepEqual(ids(cm.getPresentedMessages()), [p, q, u], "cm reads the later branch's window");
+      assert.equal(counted.reads(), 0, 'without reading the index whole');
+    } finally {
+      counted.restore();
+    }
+    other.close();
+    cm.close();
+  });
+});
+
 describe('branchAt and the window', () => {
   /**
    * a and c stored by the agent and presented in one call, b stored between

@@ -130,8 +130,10 @@ export interface WindowIndexView {
    * from one reading of the index: rows a host took out (retractRows), and
    * rows removed from the record once they were taken out, by a removal
    * through the manager or by their ids. Null in legacy mode. A row
-   * removed before the window was written down was never in it, and isn't
-   * one. A strategy that folds rows reads it at its open to let go of what
+   * removed before the window was written down was never in the
+   * written-down window (in legacy mode the window is the record, so a
+   * strategy may have folded it; what folded it stays, as it always has
+   * there), and isn't one. A strategy that folds rows reads it at its open to let go of what
    * covers a row that left while no strategy of its kind heard it go
    * (onRetracted). Optional: a view a caller builds by hand may not have
    * it, which a strategy reads as no row having left.
@@ -498,9 +500,9 @@ export interface ContextStrategy {
    * when the call is made, as for onPresented's) holds at the ordinal it
    * left, in its window and its record (a branch made before it left), is
    * left out, as is a row a branch made before it was presented presented
-   * on its own (that branch's index never gave it the ordinal it left in
-   * the record that did, even where it gave it the same ordinal in a
-   * record of its own),
+   * on its own, whether or not it took it out again since (that branch's
+   * index never gave it the ordinal it left in the record that did, even
+   * where it gave it the same ordinal in a record of its own),
    * and every row while that branch is in legacy mode, and a call left
    * with no row isn't made. They wait for the manager's strategy,
    * not for this instance, as onPresented's do.
@@ -2002,8 +2004,9 @@ export interface AutobiographicalConfig {
    * (2026-07-12 contiguity fix) used to break a merge run when the positional
    * gap between consecutive unmerged candidates exceeded this many messages,
    * bridging smaller holes. Every grouping decision now requires exact
-   * adjacency in store order, with no listed message between two sources,
-   * whatever this is set to. Configurations that set it still type-check.
+   * adjacency in store order (the strategy's view: the window's order once a
+   * host presents), with no listed message between two sources, whatever
+   * this is set to. Configurations that set it still type-check.
    *
    * @deprecated Not read: grouping requires exact adjacency.
    */

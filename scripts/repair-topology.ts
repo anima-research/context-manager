@@ -50,7 +50,10 @@
  * planned; the summary-id counter is raised past every stored id first, as
  * the loader raises it.
  * --rebuild-since <messageId|ISO date> rebuilds only crossed summaries whose
- * span starts at or after that message and compacts the older ones; strays
+ * span starts at or after that message, in the plan's order (window order
+ * once a host presents: a date names the first row in that order dated at
+ * or after it, so a row presented again after it counts as after it), and
+ * compacts the older ones; strays
  * and released messages before it get no partner, and no tower that starts
  * before it is dissolved to partner one (a crossed summary rebuilt after it
  * still takes its ancestors with it). The L1 split still releases a crossed
@@ -191,7 +194,7 @@ else {
   for (const r of plan.rehomed) console.log(`  re-home ${r.id} (${r.leaves} leaves) from ${r.from} into ${r.into}`);
   for (const s of plan.splitL1) console.log(`  split L1 ${s.id}: keep ${s.kept}, release ${s.released.join(',')}`);
   for (const d of plan.dissolved) console.log(`  dissolve L${d.level} ${d.id} (single source ${d.child})`);
-  if (plan.rebuildSince) console.log(`  rebuild-since: message ${plan.rebuildSince.id} (store position ${plan.rebuildSince.position}) — ${plan.rebuildSince.rebuilt} crossed rebuilt, ${plan.rebuildSince.compacted} older ones compacted`);
+  if (plan.rebuildSince) console.log(`  rebuild-since: message ${plan.rebuildSince.id} (position ${plan.rebuildSince.position}) — ${plan.rebuildSince.rebuilt} crossed rebuilt, ${plan.rebuildSince.compacted} older ones compacted`);
   if (plan.dissolvedForRebuild.length) {
     const byLevel: Record<string, number> = {};
     for (const d of plan.dissolvedForRebuild) byLevel[`L${d.level}`] = (byLevel[`L${d.level}`] ?? 0) + 1;

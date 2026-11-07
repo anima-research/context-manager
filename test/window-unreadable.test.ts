@@ -7,7 +7,10 @@
  *   `cause` and the rows the write would have moved. What the write did is
  *   settled at the next write through the index, on the branch it was made
  *   on: the strategy then hears the rows that entered or left, once, before
- *   that call's own work, and hears nothing of a write the store refused.
+ *   that call's own work (where the manager's own work around the
+ *   strategy's call fails, such as the context it builds, that is logged
+ *   and the rows wait for the strategy's next notification), and hears
+ *   nothing of a write the store refused.
  *   Where the store can't say its branch before the write or after it,
  *   nothing waits, the error and a warning say so, and the strategy reads
  *   the window at its next select (the nothing-waits case below); a write
@@ -264,6 +267,58 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // CM #350 bot review, wave 6, finding 26: where the removal's own
+  // tombstones then fail to land, what it tells is what that write was
+  // taking out, read after the settlement, not before it.
+  it("a removal whose settlement's hook takes one of its rows out, and whose own tombstones fail, tells that row once", async () => {
+    let cm!: ContextManager;
+    let x!: MessageId;
+    /** Hearing, whose onPresented, once armed, takes x out by its id, then makes the next write to the index fail, writing nothing. */
+    class RetractsX extends Hearing {
+      armed = false;
+      async onPresented(rows: readonly StoredMessage[]): Promise<void> {
+        this.log.push(`presented ${rows.map((m) => m.id).join(',')}`);
+        if (!this.armed) return;
+        this.armed = false;
+        cm.retractRemoved([x]);
+        const store = cm.getStore() as unknown as Record<string, unknown>;
+        const append = store.appendToStateJsonWithIdentity as (this: unknown, id: string, ...rest: unknown[]) => unknown;
+        store.appendToStateJsonWithIdentity = function (this: unknown, id: string, ...rest: unknown[]) {
+          if (id !== INDEX) return append.call(this, id, ...rest);
+          delete store.appendToStateJsonWithIdentity;
+          throw new Error('zz-tombstones-refused');
+        };
+      }
+    }
+    const strategy = new RetractsX();
+    cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    let y: MessageId;
+    [x, y] = ['x', 'y'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    const z = cm.addMessage('alice', [text('z')]);
+    cm.presentRows([x, y]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([z]), { operation: 'presentRows', entering: [z], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    strategy.log.length = 0;
+    strategy.armed = true;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      cm.removeMessages(x, y);
+    } finally {
+      console.error = error;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cm.ordinalOf(x), undefined, "setup: the hook's retractRemoved took x out");
+    assert.notEqual(cm.ordinalOf(y), undefined, "setup: the removal's own tombstone for y didn't land");
+    assert.deepEqual(strategy.log, [`presented ${z}`, `retracted ${x}`, `retracted ${y}`], 'x is told once, by the hook\'s call, and y by the removal');
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 45: what waits for a later write
   // holds the rows the write named, not the call's record.
   it("a write whose outcome is unknown doesn't keep the record its call read while its telling waits", async () => {
@@ -420,6 +475,92 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // The verifier's D12 at cfba31f, the removal's own reading: where its
+  // tombstones' write refuses before it settles anything (the store can't
+  // say its branch while a settlement waits), the removal tells the rows
+  // the window held as it read them before, each with the identity of the
+  // record that presented it there, which tells a branch that presented
+  // the row on its own apart once the call is made there.
+  it("a removal whose tombstones' write refuses before settling tells its rows with the records that presented them, so a branch that presented them on its own isn't told", async () => {
+    /** Hearing, whose initialize waits for `gate`, once one is set. */
+    class GatedHearing extends Hearing {
+      gate: Promise<void> | undefined;
+      async initialize(): Promise<void> {
+        await this.gate;
+      }
+    }
+    const strategy = new GatedHearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const [a, x] = ['a', 'x'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    // Made once a is stored and before it is presented.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    // A write whose outcome is unknown waits to be settled on this branch.
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    // The removal's settlement can't read the store's branch, so its
+    // tombstones' write refuses; and the context for the strategy's call
+    // fails once, so the call waits.
+    type Settled = (operation: string) => unknown;
+    const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+    const raw = store as unknown as Record<string, unknown>;
+    const currentBranch = raw.currentBranch as (this: unknown) => unknown;
+    const settled = index.settled;
+    let settling = false;
+    index.settled = function (this: unknown, operation: string) {
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
+    };
+    raw.currentBranch = function (this: unknown) {
+      if (settling) throw new Error('zz-branch-read-failed');
+      return currentBranch.call(this);
+    };
+    const own = cm as unknown as { createStrategyContext: () => unknown };
+    const build = own.createStrategyContext.bind(cm);
+    own.createStrategyContext = () => {
+      own.createStrategyContext = build;
+      throw new Error('zz-context-failed');
+    };
+    strategy.log.length = 0;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      cm.removeMessage(a);
+    } finally {
+      console.error = error;
+      delete (index as { settled?: unknown }).settled;
+      delete raw.currentBranch;
+    }
+    assert.equal(own.createStrategyContext, build, 'setup: telling the strategy failed');
+    assert.notEqual(cm.ordinalOf(a), undefined, "setup: the tombstones' write refused, so a keeps its ordinal");
+    assert.equal(strategy.log.length, 0, 'setup: the call waits');
+    let open!: () => void;
+    strategy.gate = new Promise<void>((resolve) => { open = resolve; });
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, at the ordinal it took on the other
+    // branch, then takes it out and presents it again, before the strategy
+    // initializes there.
+    cm.presentRows([a]);
+    assert.equal(cm.ordinalOf(a), left, 'setup: the branch presented a at the same ordinal');
+    cm.retractRows([a]);
+    cm.presentRows([a]);
+    open();
+    await switched;
+    assert.deepEqual(strategy.log.filter((line) => line.startsWith('retracted')), [`retracted ${a}`], "only the branch's own retraction of a is told");
+    cm.close();
+  });
+
   // CM #350 bot review, wave 4, finding 13: where the store can't say its
   // branch before the write or after it, nothing waits, and the error says so.
   it("a write whose outcome is unknown, where the store can't say its branch before the write either, says nothing waits to tell the strategy", async () => {
@@ -549,6 +690,34 @@ describe('a write the store threw on, where the index then can\'t be read', () =
       assert.deepEqual(repair === 'retractRemoved' ? cm.retractRemoved([rows[0]!]) : cm.retractAbsentRows(), [], `${repair}: a second call takes out nothing more`);
       cm.close();
     }
+  });
+
+  // CM #350 bot review, wave 6, finding 6: retractRows takes out a row the
+  // store no longer holds by its id, and windowStatusOf reads 'absent' for
+  // it whether or not the write landed, so the error names ordinalOf.
+  it("retractRows of a row another manager removed, the outcome unknown: the error says ordinalOf tells which for such a row", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Hearing() });
+    cm.presentRows([]);
+    const rows = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+    cm.presentRows(rows);
+    const other = await ContextManager.open({ store: cm.getStore(), namespace: 'zz-other', strategy: new PassthroughStrategy() });
+    other.removeMessage(rows[0]!);
+    other.close();
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.retractRows([rows[0]!]), {
+        operation: 'retractRows',
+        entering: [],
+        leaving: [rows[0]!],
+        cause: 'zz-index-kept-then-failed',
+        says: /windowStatusOf tells which once the index reads \(ordinalOf for a row the store no longer holds: undefined once taken out\)/,
+      });
+    } finally {
+      restore();
+    }
+    assert.equal(cm.windowStatusOf(rows[0]!), 'absent', "windowStatusOf can't tell");
+    assert.equal(cm.ordinalOf(rows[0]!), undefined, 'setup: the store kept the write, which ordinalOf tells');
+    cm.close();
   });
 
   it('retractRows, the write kept: throws outcome-unknown; the next write tells the strategy the rows left', async () => {
@@ -805,6 +974,77 @@ describe("a hook that hears what an unknown write did, and moves the store's bra
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
+
+  // CM #350 bot review, wave 6, finding 22: two writes can wait on one
+  // branch (a hook that heard an earlier one made a write whose outcome was
+  // unknown, and so did the call that settled it). Where the first one's
+  // hook moves the store, the second isn't settled on the other branch: it
+  // waits for the next write on its own.
+  it("of two writes waiting on a branch, the one after a hook that moved the store waits for the next write on that branch", async () => {
+    /** Hearing, which runs the reaction set for a row, once, when it hears that row enter, after logging it. */
+    class Reacts extends Hearing {
+      on = new Map<MessageId, () => void>();
+      override onPresented(rows: readonly StoredMessage[]): Promise<void> {
+        const heard = super.onPresented(rows);
+        for (const row of rows) {
+          const react = this.on.get(row.id);
+          this.on.delete(row.id);
+          react?.();
+        }
+        return heard;
+      }
+    }
+    const strategy = new Reacts();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const home = cm.currentBranch().name;
+    const side = store.createBranchAt('zz-side', home, store.currentSequence()).name;
+    const [x, y, w] = ['x', 'y', 'w'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    // Each of the next `n` appends to the index is kept and then throws,
+    // and the read of the index after it throws once.
+    const failing = { appends: 0, reads: 0 };
+    const raw = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originals = new Map(['appendToStateJsonWithIdentity', 'stateHeadOffset'].map((name) => [name, raw[name]!] as const));
+    raw.appendToStateJsonWithIdentity = function (this: unknown, id: unknown, ...rest: unknown[]) {
+      const record = originals.get('appendToStateJsonWithIdentity')!.call(this, id, ...rest);
+      if (id !== INDEX || failing.appends === 0) return record;
+      failing.appends--;
+      failing.reads++;
+      throw new Error('zz-index-kept-then-failed');
+    };
+    raw.stateHeadOffset = function (this: unknown, id: unknown) {
+      if (id === INDEX && failing.reads > 0) {
+        failing.reads--;
+        throw new Error('zz-index-read-failed');
+      }
+      return originals.get('stateHeadOffset')!.call(this, id);
+    };
+    try {
+      failing.appends = 1;
+      assert.throws(() => cm.presentRows([x]), WindowWriteOutcomeUnknownError);
+      // Hearing x, the hook presents y, whose write's outcome is unknown too;
+      // then the call that settled x presents w, likewise.
+      strategy.on.set(x, () => {
+        assert.throws(() => cm.presentRows([y]), WindowWriteOutcomeUnknownError);
+      });
+      failing.appends = 2;
+      assert.throws(() => cm.presentRows([w]), WindowWriteOutcomeUnknownError);
+      assert.deepEqual(strategy.log, [`presented ${x}`], 'setup: x is settled, and y and w wait on the branch');
+      // Hearing y, the hook moves the store itself.
+      strategy.on.set(y, () => store.switchBranch(side));
+      assert.throws(() => cm.presentRows([]), /^Error: ContextManager\.presentRows: .*moved the store's branch from main to zz-side/);
+      assert.equal(cm.currentBranch().name, side, 'setup: the hook moved the store');
+      assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`], "w isn't told on the branch the hook moved to");
+      store.switchBranch(home);
+      cm.presentRows([]);
+      assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`, `presented ${w}`], 'the next write on the branch it was made on settles it, once');
+    } finally {
+      for (const [name, fn] of originals) raw[name] = fn;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
 });
 
 describe('a window state that holds no index this version reads', () => {
@@ -889,23 +1129,25 @@ describe('a window state that holds no index this version reads', () => {
     const b = other.addMessage('alice', [text('b')]);
     other.presentRows([b]);
     other.close();
-    // The index moved under cm, which reads it again at its next read.
-    const store = cm.getStore() as unknown as { getStateJson: (id: string) => unknown };
-    const read = store.getStateJson;
-    let fail = true;
-    store.getStateJson = function (this: unknown, id: string) {
-      if (id === INDEX && fail) {
-        fail = false;
-        throw new Error('zz-io-failed');
-      }
-      return read.call(this, id);
-    };
+    // The index moved under cm, which reads it again at its next read: the
+    // items appended since its reading (getStateSlice), or, where that read
+    // fails, the index whole (getStateJson), which fails too, once each.
+    const store = cm.getStore() as unknown as Record<string, (this: unknown, id: string, ...rest: unknown[]) => unknown>;
+    const reads = { getStateJson: store.getStateJson!, getStateSlice: store.getStateSlice! };
+    const failing = new Set(Object.keys(reads));
+    for (const [name, read] of Object.entries(reads)) {
+      store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (id === INDEX && failing.delete(name)) throw new Error('zz-io-failed');
+        return read.call(this, id, ...rest);
+      };
+    }
     try {
       assert.throws(() => cm.windowMode(), /zz-io-failed/);
+      assert.equal(failing.size, 0, 'setup: both reads failed');
       assert.equal(cm.windowMode(), 'presented');
       assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b]);
     } finally {
-      store.getStateJson = read;
+      for (const [name, read] of Object.entries(reads)) store[name] = read;
     }
     cm.close();
   });
