@@ -817,6 +817,14 @@ export class WindowIndex {
   }
 
   /**
+   * Let go of the writes waiting to be settled: the manager closed, and
+   * nothing it settles would reach a strategy.
+   */
+  dropUnsettled(): void {
+    this.unsettled = [];
+  }
+
+  /**
    * After a write that threw: read the index again and give `tell` the
    * ordinals as the store holds them, then return the write's own error to
    * throw on. Where the index can't be read, the outcome is unknown: `tell`

@@ -5405,6 +5405,13 @@ export class ContextManager {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Nothing reaches the strategy after close(), so what waits for it is
+    // let go: the calls waiting for its initialization, and the window
+    // writes waiting to be settled. A write a close() from a listener
+    // interrupted can queue a few again as it finishes; nothing reads them.
+    this.presentedUnheard.clear();
+    this.retractedUnheard = [];
+    this.windowIndex.dropUnsettled();
     this.detachStrategy(this.strategy);
     if (this.ownsStore) {
       // From a listener inside a write: the write finishes on the open
