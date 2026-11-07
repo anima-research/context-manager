@@ -808,6 +808,32 @@ describe('the raw pins add is spent from the recall budget', () => {
     cm.close();
   });
 
+  it('a message the compression quarantine holds in an opened chunk inside the head window is neither shown nor charged', async () => {
+    const { cm, internals, ids, textOf, requests } = await forest('budget-head-held');
+    const opened = l1Holding(internals, ids[1]);
+    const held = opened.sourceIds.find((id) => id !== ids[1])!;
+    const shown = opened.sourceIds.filter((id) => id !== held);
+    const shownTokens = shown.reduce((sum, id) => sum + internals.estimateTokens([{ type: 'text', text: textOf.get(id)! }]), 0);
+    internals.config.headWindowTokens = 400;
+    internals.config.compressionRecallBudgetTokens = shownTokens;
+    (internals as unknown as { quarantinedMessageIds(): Set<string> }).quarantinedMessageIds = () => new Set([held]);
+    const view = (cm as unknown as { strategyMessageView(): unknown }).strategyMessageView();
+    const headStart = internals.getHeadWindowStartIndex(view);
+    const headEnd = internals.getHeadWindowEnd(view);
+    for (const id of opened.sourceIds) {
+      const at = ids.indexOf(id);
+      assert.ok(at >= headStart && at < headEnd, `setup: the opened chunk's message ${at} is in the head window [${headStart}, ${headEnd})`);
+    }
+    cm.pinRange(ids[1], ids[1], { name: 'in-head-held' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    const texts = textsOf(request);
+    assert.ok(!texts.includes(textOf.get(held)!), 'the held message is left out of the head');
+    for (const id of shown) assert.ok(texts.includes(textOf.get(id)!), `the opened chunk's message ${id} is raw in the head`);
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin fits in what the shown messages take: ${JSON.stringify(warnings)}`);
+    cm.close();
+  });
+
   it('pins that would take the complete request past compressionContextBudgetTokens are recalled; a request without pins still goes', async () => {
     const { cm, internals, ids, textOf, requests } = await forest('context-budget');
     // Far below any canonical request: only a request with pins is gated by it.
