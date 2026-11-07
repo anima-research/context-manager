@@ -31,8 +31,8 @@
   read: it throws `WriteLandedError` naming the shards stored, on the branch
   the write started on (`WriteOutcomeUnknownError`, with `unnamed` 1, where
   a shard's append threw). In legacy mode the strategy hears those shards
-  once the store reads again. Before, the branch read's own error was thrown,
-  which says none of the message was stored.
+  once the store reads again. 0.24.x read no branch, and threw the write's
+  own error.
 - `unnamed` is 1 only where a shard's append threw: a sharded `addMessage`
   that fails once every shard is stored (in legacy mode, the manager's own
   work telling the strategy of the body) and whose removal of them fails
@@ -42,14 +42,12 @@
   for a held shard, moved the store's branch throws
   `WriteOutcomeUnknownError`, naming every shard the write stored as
   `unknown`: which of them stayed is a question for the branch the write
-  started on, which the store no longer reads. Before, it read the other
-  branch, and threw `WriteLandedError` naming the shards that branch holds,
-  or the write's own error where it holds none.
+  started on, which the store no longer reads. 0.24.x threw the write's own
+  error.
 - An `addMessage` of a message stored as one row whose append throws after
   a listener of its add moved the store's branch, or where the store then
   can't say its branch, throws `WriteOutcomeUnknownError` with `unnamed` 1:
   the row landed on the branch the add started on, if it did, which the
   store no longer reads, or may not. A host listener's throw is caught and
-  logged, so this takes a log that throws too. Before, it read the other
-  branch, and threw `WriteLandedError` naming that branch's row at the
-  place the row would take, or the write's own error where it has none.
+  logged, so this takes a log that throws too. 0.24.x threw the append's own
+  error.
