@@ -2,9 +2,13 @@
  * General-purpose repair planner for crossed summary ownership.
  *
  * A summary is crossed when its leaves are not contiguous among owned
- * messages (chunk-record members ∪ chunk-linked L1 sources) in store order:
+ * messages (chunk-record members ∪ chunk-linked L1 sources) in the order of
+ * the strategy's view (record order in legacy mode, window order once a
+ * host presents rows):
  * another live representation sits inside its span. The load-time audit
- * (`topologyPolicy`) refuses such a store. Known causes: issue #122 (the head
+ * (`topologyPolicy`) refuses such a store under 'reject' (once a host
+ * presents, an open that isn't audit-only first demotes what the audit
+ * names; see `topologyPolicy`). Known causes: issue #122 (the head
  * ratchet minted late L1s over opening messages that merged with the
  * frontier by chunk-record order), issue #95 (demand-path merges folded across
  * an unlanded neighbour), restore/branch interleavings, hand surgery.
@@ -61,7 +65,7 @@ export interface RepairRecord {
 export interface RepairInputs {
   summaries: RepairSummary[];
   records: RepairRecord[];
-  /** Store listing in store order (ids; timestamps only for a date cutoff). */
+  /** The listing in the order of the strategy's view: record order in legacy mode, window order once a host presents rows (ids; timestamps only for a date cutoff). */
   messages: ReadonlyArray<{ id: string; timestamp?: number | string | Date }>;
   resolutions?: Record<string, number> | null;
   /**

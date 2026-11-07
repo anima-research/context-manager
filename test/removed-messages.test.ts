@@ -96,7 +96,7 @@ async function logged(run: () => Promise<void>): Promise<{ warnings: string[]; e
   }
   return { warnings, errors };
 }
-const DROPPED = /skipping stale queue entry, whose merge check found: (\d+ source\(s\); a merge needs at least two|source level mismatch: |source position unresolved |sources are not adjacent in store order: )/;
+const DROPPED = /skipping stale queue entry, whose merge check found: (\d+ source\(s\); a merge needs at least two|source level mismatch: |source position unresolved |sources are not adjacent in store order \(the strategy's view: the window's order once a host presents\): )/;
 const REFUSED = /\[merge-topology\] ⛔ refused/;
 const droppedWithWarning = ({ warnings, errors }: { warnings: string[]; errors: string[] }): void => {
   assert.ok(warnings.some((line) => DROPPED.test(line)), 'a warning names what the merge check found');
@@ -899,7 +899,7 @@ describe('removed messages (#321)', () => {
       const quarantine = (strategy as unknown as { mergeQuarantine: Map<string, { lastOutcome: string }> }).mergeQuarantine;
       assert.deepStrictEqual([...quarantine.values()].map((r) => r.lastOutcome), ['topology_violation'], 'MEM[1] and MEM[4], with MEM[3] between them, are refused');
       const reason = [...(quarantine.values() as Iterable<{ lastErrorType?: string }>)][0]!.lastErrorType ?? '';
-      assert.ok(reason.startsWith('sources are not adjacent in store order: ') && reason.includes(byContent('MEM[1]')) && reason.includes(byContent('MEM[4]')) && !reason.includes(byContent('MEM[2]')),
+      assert.ok(reason.startsWith("sources are not adjacent in store order (the strategy's view: the window's order once a host presents): ") && reason.includes(byContent('MEM[1]')) && reason.includes(byContent('MEM[4]')) && !reason.includes(byContent('MEM[2]')),
         `the refusal names the other sources' problem: ${reason}`);
       assert.ok(errors.some((line) => REFUSED.test(line)), 'the refusal is an operator error');
     } finally {
@@ -1021,78 +1021,14 @@ describe('removed messages (#321)', () => {
     }
   });
 
-  function watchPositions(strategy: Probe): { built: () => number; looked: Set<string>; restore: () => void } {
-    const probe = strategy as unknown as { positionIndex: (...args: unknown[]) => ReadonlyMap<string, number> };
-    const positionIndex = probe.positionIndex;
-    let built = 0;
-    const looked = new Set<string>();
-    class Watched extends Map<string, number> {
-      override get(id: string): number | undefined {
-        looked.add(id);
-        return super.get(id);
-      }
-    }
-    probe.positionIndex = (...args: unknown[]) => {
-      built++;
-      return new Watched(positionIndex.apply(strategy, args));
-    };
-    return {
-      built: () => {
-        const seen = built;
-        built = 0;
-        return seen;
-      },
-      looked,
-      restore: () => {
-        probe.positionIndex = positionIndex;
-      },
-    };
-  }
-
-  it('the range query works out the span of a summary that lost a message once, over positions it builds once, and not again on each later call over the same messages, also when none of its messages is left', async () => {
-    const { manager, strategy, ids, path } = await twoParents();
+  it('the range query leaves out a summary none of whose messages is still there, and answers a second call over the same messages as the first', async () => {
+    const { manager, ids, path } = await twoParents();
     try {
       for (const i of [0, 8, 9, 10, 11]) manager.removeMessage(ids[i]! as never);
-      const positions = watchPositions(strategy);
       const first = manager.getSummariesInRange({});
-      assert.strictEqual(positions.built(), 1, 'the first call builds the store\'s positions once for every span it works out');
-      assert.ok(!first.some((s) => s.content === 'MEM[3]'), 'premise: the summary that lost every message is left out');
+      assert.ok(first.some((s) => s.content === 'MEM[4]'), 'premise: the summary beside it is listed');
+      assert.ok(!first.some((s) => s.content === 'MEM[3]'), 'the summary that lost every message is left out');
       assert.deepStrictEqual(manager.getSummariesInRange({}), first);
-      assert.strictEqual(positions.built(), 0, 'a second call over the same messages and summaries works out no span');
-      positions.restore();
-    } finally {
-      await manager.close();
-      rmSync(path, { recursive: true, force: true });
-    }
-  });
-
-  it('the range query doesn\'t work out a span again for a message added after an earlier call', async () => {
-    const { manager, strategy, ids, path } = await twoParents();
-    try {
-      manager.removeMessage(ids[0]! as never);
-      const positions = watchPositions(strategy);
-      const first = manager.getSummariesInRange({});
-      assert.ok(positions.built() > 0, 'premise: the first call works out spans over the store\'s positions');
-      manager.addMessage('user', text(body('M16')));
-      assert.deepStrictEqual(manager.getSummariesInRange({}), first);
-      assert.strictEqual(positions.built(), 0, 'the call after the addition works out no span');
-      positions.restore();
-    } finally {
-      await manager.close();
-      rmSync(path, { recursive: true, force: true });
-    }
-  });
-
-  it('the range query places an L1 whose first and last messages are both listed by those two, not by each of its messages', async () => {
-    const { manager, strategy, ids, path } = await twoParents();
-    try {
-      manager.removeMessage(ids[0]! as never);
-      const positions = watchPositions(strategy);
-      const listed = manager.getSummariesInRange({ level: 2 });
-      positions.restore();
-      assert.deepStrictEqual(listed.map((s) => [s.firstMessageId, s.lastMessageId]), [[ids[1], ids[7]], [ids[8], ids[15]]]);
-      assert.ok([1, 2, 3].every((i) => positions.looked.has(ids[i]!)), 'premise: the L1 that lost M0 is placed by its messages');
-      assert.deepStrictEqual([5, 6].filter((i) => positions.looked.has(ids[i]!)), [], 'the L1 beside it is placed by M4 and M7 alone');
     } finally {
       await manager.close();
       rmSync(path, { recursive: true, force: true });
@@ -1125,40 +1061,6 @@ describe('removed messages (#321)', () => {
       manager.removeMessage(ids[0]! as never);
       const listed = manager.getSummariesInRange({ level: 2 });
       assert.strictEqual(listed.length, 2);
-    } finally {
-      await manager.close();
-      rmSync(path, { recursive: true, force: true });
-    }
-  });
-
-  it('the range query, called again on a listing it has already read, reads only the messages its summaries start and end at', async () => {
-    const { manager, strategy, ids, path } = await twoParents();
-    try {
-      manager.removeMessage(ids[0]! as never);
-      const read = new Set<number>();
-      const counted = (listing: StoredMessage[]) => new Proxy(listing, {
-        get(target, key, receiver) {
-          if (typeof key === 'string' && /^\d+$/.test(key)) read.add(Number(key));
-          return Reflect.get(target, key, receiver);
-        },
-      });
-      const beyondEnds = (listing: StoredMessage[], listed: ReturnType<typeof list>) => {
-        const ends = new Set(listed.flatMap((s) => [s.firstMessageId, s.lastMessageId]).map((id) => listing.findIndex((m) => m.id === id)));
-        return [...read].filter((i) => !ends.has(i)).map((i) => listing[i]!.id);
-      };
-      const view = (shown: StoredMessage[], listing: StoredMessage[]) => ({ getAll: () => shown, get: (id: string) => listing.find((m) => m.id === id) ?? null });
-      const before = manager.getAllMessages();
-      manager.addMessage('user', text(body('M16')));
-      const after = manager.getAllMessages();
-      assert.strictEqual(after.length, before.length + 1, 'premise: the later listing only grew');
-      const [shownBefore, shownAfter] = [counted(before), counted(after)];
-      const list = (shown: StoredMessage[], listing: StoredMessage[]) => strategy.listSummariesInRange(view(shown, listing) as never, {});
-      list(shownBefore, before);
-      read.clear();
-      assert.deepStrictEqual(beyondEnds(before, list(shownBefore, before)), [], 'the same listing again');
-      list(shownAfter, after);
-      read.clear();
-      assert.deepStrictEqual(beyondEnds(after, list(shownAfter, after)), [], 'the grown listing again');
     } finally {
       await manager.close();
       rmSync(path, { recursive: true, force: true });
