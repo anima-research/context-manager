@@ -692,6 +692,39 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // CM #350 bot review, wave 6, finding 12: where that branch took its own
+  // presentation out again, the row is out of its window too, so the
+  // presentation the call left is asked for there as well.
+  it('a call waiting on an initialization of a branch that presented the row on its own and took it out again is not made there', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    cm.presentRows([]);
+    const store = cm.getStore();
+    const a = cm.addMessage('alice', [text('a')]);
+    // Made once a is stored and before it is presented: its record holds a, and its window doesn't.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    const { gate, open } = gated();
+    const strategy = new Gated();
+    strategy.gate = gate;
+    const initialized = cm.setStrategy(strategy);
+    cm.retractRows([a]);
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, at the ordinal it took on the other
+    // branch, and takes it out again, before the strategy initializes there.
+    cm.presentRows([a]);
+    assert.equal(cm.ordinalOf(a), left, 'setup: the branch presented a at the same ordinal');
+    cm.retractRows([a]);
+    open();
+    await assert.rejects(initialized, /supersed/i);
+    await switched;
+    assert.equal(cm.currentBranch().name, diverged);
+    assert.equal(cm.ordinalOf(a), undefined, 'setup: the branch took a out');
+    assert.deepEqual(strategy.log, ['retracted a'], "the branch's own retraction of a is told, once, and the other branch's isn't");
+    await settle();
+    cm.close();
+  });
+
   // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
   // store no longer holds is told by its id, removed, as retractRows tells it.
   it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {

@@ -5133,15 +5133,18 @@ export class ContextManager {
   /**
    * The calls of onRetracted made while the strategy wasn't initialized,
    * in the order they came. A row is given when it left the window of the
-   * branch the strategy initialized on: that branch's index took it out,
-   * or holds it at another ordinal and once issued it the call's, in the
-   * record that issued it there where the call left it (presented again
-   * since), or the branch's record no longer holds it (a removal whose
-   * tombstone failed). A branch made before it left holds it there, in its
-   * window and its record, a branch made before it was presented never
-   * held it, or presented it on its own, in records of its own, whatever
-   * ordinal they gave it (WindowIndex.issuedBy), and a branch in
-   * legacy mode holds every row of its record, so none of them is told. A
+   * branch the strategy initialized on, as the call left it: that branch's
+   * index once issued it the call's ordinal, in the record that issued it
+   * there where the call left it, and has taken it out, or holds it at
+   * another ordinal (presented again since); or the branch holds it and
+   * its record no longer does (a removal whose tombstone failed). A call
+   * with no ordinal (the index couldn't be read when it was made) gives a
+   * row the branch's index took out. A branch made before it left holds
+   * it there, in its window and its record, a branch made before it was
+   * presented never held it, or presented it on its own, in records of its
+   * own, whatever ordinal they gave it (WindowIndex.issuedBy), whether or
+   * not it took it out again since, and a branch in legacy mode holds
+   * every row of its record, so none of them is told. A
    * call left with no row isn't made. A row the call didn't keep is read
    * then, from the record of that branch, and given where it holds it; one
    * it no longer holds is told by its id alone, with `removed`, in a call
@@ -5164,24 +5167,24 @@ export class ContextManager {
           const presented = this.windowIndex.mode() === 'presented';
           const merged = presented ? this.mergedMessageView() : null;
           const tookOut = presented ? this.windowIndex.left() : null;
-          // A row out of this window left it where this branch's index took
-          // it out; one it never held (a branch made before the row was
-          // presented) didn't. A row the window holds left where it holds it
-          // at another ordinal than the call's, and this branch's own index
-          // issued the call's ordinal to it, in the record that presented it
-          // where the call left it (presented again since), or where the
-          // record no longer holds it (a removal whose tombstone failed,
-          // told with no ordinal where the index couldn't be read then). A
-          // branch made before the row was presented, which presented it on
-          // its own, issued it the call's ordinal in a record of its own, if
-          // at all, so isn't told.
+          // A row left this window where this branch's own index issued the
+          // call's ordinal to it, in the record that presented it where the
+          // call left it (sharedPresentation), and has taken it out, or holds
+          // it at another ordinal (presented again since); or where the
+          // window holds it and the record no longer does (a removal whose
+          // tombstone failed). A call with no ordinal (the index couldn't be
+          // read when it was made) is told where this branch's index took
+          // the row out. A branch made before the row was presented never
+          // held it, or presented it on its own and issued it the call's
+          // ordinal in a record of its own, if at all, so isn't told, even
+          // where it took that presentation out again.
           const leftHere = ({ id, ordinal, by }: RetractedRow) => {
             const here = this.windowIndex.ordinalOf(id);
-            if (here === undefined) return tookOut?.has(id) === true;
             const sharedPresentation =
               ordinal !== undefined &&
               this.windowIndex.issuedTo(ordinal) === id &&
               (by === undefined || this.windowIndex.issuedBy(ordinal) === by);
+            if (here === undefined) return tookOut?.has(id) === true && (ordinal === undefined || sharedPresentation);
             return (ordinal !== undefined && here !== ordinal && sharedPresentation) || !holdsRow(merged!, id);
           };
           const withRow = (l: RetractedRow): RetractedRow => {
