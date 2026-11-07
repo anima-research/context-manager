@@ -352,8 +352,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // No-op: the window is recomputed on select(), whether a row entered
     // the agent's window (ContextManager.presentRows) at its add or at its
     // presentation. There is deliberately no onPresented beside it, so a
-    // subclass that overrides this still hears each row
-    // (ContextStrategy.onNewMessage).
+    // subclass that overrides this still hears each row of this manager's
+    // slot (a row of an auxiliary slot is heard only when a host presents
+    // it: ContextStrategy.onNewMessage).
   }
 
   /**
