@@ -836,6 +836,32 @@ describe('windowed passthrough: a slot of another version', () => {
   });
 });
 
+describe('windowed passthrough: a format-2 slot on a branch whose window is the record', () => {
+  // Wave 6, finding 18: a branch with no window index reads a format-2
+  // slot by its sequence and leaves its ordinal (loadBranchState), and no
+  // test reached that: both derived-context tests inherit the index.
+  it('is read by its sequence, and the first presentation converts that sequence, not the slot\'s ordinal', async () => {
+    const path = freshPath();
+    let { cm, strategy } = await open(path);
+    const ids = ['a', 'b', 'c', 'd'].map((t) => cm.addMessage('u', text(t)));
+    // An ordinal that would start the window at b once rows are presented.
+    cm.getStore().setStateJson(ANCHOR, { anchor: sequenceOf(cm, ids[2]!), ordinal: 1, v: 2 });
+    cm.close();
+
+    ({ cm, strategy } = await open(path));
+    assert.equal(cm.windowMode(), 'legacy', 'setup: no window index on the branch');
+    assert.equal(strategy.getAnchor(), sequenceOf(cm, ids[2]!), 'the sequence is read');
+    assert.equal(strategy.getAnchorOrdinal(), undefined, 'and the ordinal left');
+    assert.deepEqual(texts(await cm.compile(BIG)), ['c', 'd'], 'the window starts at the sequence');
+
+    cm.presentRows([]);
+    assert.equal(strategy.getAnchorOrdinal(), cm.ordinalOf(ids[2]!), 'the first presentation converts the sequence');
+    assert.notEqual(cm.ordinalOf(ids[2]!), 1, "premise: c's ordinal isn't the slot's");
+    assert.deepEqual(texts(await cm.compile(BIG)), ['c', 'd'], 'and the window is the one the sequence gave');
+    cm.close();
+  });
+});
+
 describe('windowed passthrough: a derived context', () => {
   const supported = typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function';
   const skip = supported ? false : 'installed @animalabs/chronicle has no JsStore.view (branch-bound handles)';
