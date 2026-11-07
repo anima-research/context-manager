@@ -93,7 +93,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { isOpaqueCarrier, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -21800,7 +21800,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let tokens = 0;
     for (const block of content) {
       if (block.type === 'text') {
-        tokens += defaultTokenEstimator(block.text);
+        // Mirrors MessageStore.computeBlockTokensRaw: a zero-width carrier is priced as its item.
+        tokens += isOpaqueCarrier(block) ? MessageStore.opaqueCarrierTokens(block) : defaultTokenEstimator(block.text);
       } else if (block.type === 'thinking') {
         // Mirrors MessageStore.computeBlockTokensRaw: a stamped estimate
         // wins; a signed block is a full hidden chain of thought priced by
