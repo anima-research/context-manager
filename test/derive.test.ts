@@ -920,6 +920,26 @@ describe('MessageStore coherence across handles on one branch', () => {
   });
 });
 
+describe('MessageStore.deriveOnto from a seed', () => {
+  it("a store its parent seeds starts at its parent's calibration multiplier", { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-derive-seeded-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const parent = new MessageStore(root);
+      parent.append('user', [{ type: 'text', text: 'before the fork' }]);
+      parent.setTokenCalibration(1.3);
+      root.createBranchAt('seeded-child', root.currentBranch().name, root.currentSequence());
+      const derived = parent.deriveOnto((root as ViewStore).view('seeded-child'));
+      assert.equal(derived.getAll()[0], parent.getAll()[0], 'premise: the parent seeded the child, which shares its message object');
+      assert.equal(derived.getTokenCalibration(), 1.3);
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('MessageStore message views', () => {
   it('an append converts only the new message; an edit replaces only the edited one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cm-views-'));
