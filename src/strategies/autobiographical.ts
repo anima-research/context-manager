@@ -1140,7 +1140,7 @@ interface CompressionRefusalNormalizedConfig {
 
 type CompressionAttemptOutcome =
   | 'refusal'
-  /** The merge group is not contiguous in store order; refused before any model call. */
+  /** The merge group is not contiguous in store order (the strategy's view: the window's order once a host presents); refused before any model call. */
   | 'topology_violation'
   | 'unusable_empty'
   | 'provider_error'
@@ -13815,7 +13815,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Last line of defence: a crossed node is never minted. Whatever enqueued
     // this group (threshold pass, demand path, a persisted queue from an older
     // grammar, an operator), the sources must be one level below the target
-    // and strictly adjacent in store order, with no listed message between
+    // and strictly adjacent in store order (the strategy's view: the
+    // window's order once a host presents), with no listed message between
     // them (mergePositionIndex).
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
