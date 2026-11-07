@@ -680,7 +680,7 @@ describe("a removal through the manager where the window can't be read", () => {
     }
     assert.deepEqual(ids(cm.getAllMessages()), [c], 'the removal stands');
     assert.ok(
-      logged.some((line) => line.includes(`reading the rows before removing messages ${a} to ${b} failed`) && line.includes('keep their ordinals')),
+      logged.some((line) => line.includes(`reading the rows before removing messages ${a} to ${b} failed`) && line.includes('keep their ordinals, untold, until retractAbsentRows() takes them out and tells the strategy by id')),
       logged.join('\n'),
     );
     assert.deepEqual(ordinals(cm, [a, b]).map((o) => o !== undefined), [true, true], 'both keep their ordinals');

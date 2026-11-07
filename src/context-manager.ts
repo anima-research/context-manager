@@ -1770,7 +1770,9 @@ export class ContextManager {
       // A format string, since the error follows it: a '%' in an id is doubled.
       const message =
         `[context-manager] reading the rows before removing ${what} failed; ` +
-        (ids ? `the removal goes ahead, and the window's rows of it leave by their ids:` : `the removal goes ahead, and the window's rows of it keep their ordinals:`);
+        (ids
+          ? `the removal goes ahead, and the window's rows of it leave by their ids:`
+          : `the removal goes ahead, and the window's rows of it keep their ordinals, untold, until retractAbsentRows() takes them out and tells the strategy by id:`);
       logThrown(message.replaceAll('%', '%%'), err, this.diag);
       return ids ? { ids, rows: [] } : null;
     }
