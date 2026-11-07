@@ -99,6 +99,16 @@ describe('calibration and compaction items', () => {
     cm.close();
   });
 
+  it("leaves a sample to the compile that armed it, whatever a dry select between them holds", async () => {
+    const { cm, strategy, internals } = await openManager('dry-select');
+    await cm.compile(BUDGET);
+    cm.addMessage('Claude', [COMPACTION, { type: 'text', text: 'a later answer' }]);
+    await cm.compile(BUDGET, undefined, { dryRun: true });
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
+    assert.ok(Math.abs(internals._calibration - 1.2) < 1e-9, `the live compile held no compaction item: got ${internals._calibration}`);
+    cm.close();
+  });
+
   it('learns from a compile holding any other carrier, as from any other', async () => {
     const { cm, strategy, internals } = await openManager('hosted-call', HOSTED_CALL);
     await cm.compile(BUDGET);
