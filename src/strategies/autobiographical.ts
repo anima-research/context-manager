@@ -3222,7 +3222,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       if (abortIfStale()) return;
       this.releaseRowsThatLeft(ctx);
       if (abortIfStale()) return;
@@ -6215,7 +6215,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           '(another instance sharing the store let go of a row of its span, or compressed it)',
       );
       this.takeUpStoreState();
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       return true;
     }
     const ids = chunk.messages.map((m) => m.id);
@@ -7217,6 +7217,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The listing `_storeOrder` was built from (append-only refreshes extend
    *  it), or NO_LISTING until one is seen. */
   private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = NO_LISTING;
+  /** Calls of refreshStoreOrder so far, so rechunk can tell whether a
+   *  rebuild refreshed the order itself. */
+  private _storeOrderRefreshes = 0;
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
 
@@ -7248,6 +7251,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
+    this._storeOrderRefreshes++;
     const prev = this._storeOrderSource;
     if (messages === prev) return;
     // A listing that keeps every earlier element (same object, so same id
@@ -7700,7 +7704,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `to their longest run in the window, releasing [${releasedUncompressed.join(', ')}] to be chunked where the window holds them`,
         );
       }
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
     }
   }
 
@@ -8524,7 +8528,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // those chunks again, as after a load.
       this._overlapBlocked.clear();
     } finally {
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
     }
     if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
       // A merge-quarantine record naming a dropped summary no longer stands.
@@ -8565,7 +8569,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
         `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
     );
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
   }
 
   /**
@@ -8756,7 +8760,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private windowGrew(operation: string, ctx: StrategyContext): void {
     this.requireLoadedBranch(operation);
     this.letGoOfRowsLeftUnheard(ctx, operation);
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
     // each tick completes, if the queue still has work AND preflight
@@ -9020,7 +9024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const sources = chunk.recordId === undefined ? undefined : this.chunkRecords.find((record) => record.id === chunk.recordId)?.sourceIds;
         const ordinals = this.windowOrdinalsOf(chunk.messages.map((m) => m.id), ctx);
         if (!this.takeUpSpanLetGoElsewhere(chunk, sources, ctx, ordinals, `not compressing chunk ${chunk.recordId ?? `#${chunk.index}`}`, 'before its compression began')) {
-          this.rebuildChunks(ctx.messageStore);
+          this.rechunk(ctx.messageStore);
         }
         return;
       }
@@ -9175,7 +9179,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.checkMergeThreshold();
       }
       if (!chunk.compressed && (carriedMessageLeft || chunk.messages.some((m) => this.hasLeftView(m.id, ctx.messageStore)))) {
-        this.rebuildChunks(ctx.messageStore);
+        this.rechunk(ctx.messageStore);
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
@@ -9439,7 +9443,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `${tookUpStore ? ' of another instance sharing the store' : ''} ` +
           `(${droppedSince.map((source) => source.id).join(', ')}); ${outcome}`,
       );
-      if (tookUpStore) this.rebuildChunks(ctx.messageStore);
+      if (tookUpStore) this.rechunk(ctx.messageStore);
       return true;
     }
     const leafRowsSince = this.leafRowsOf(sources);
@@ -9539,7 +9543,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
       this.letGoOfRowsLeftUnheard(this.hostContext, 'select');
-      this.rebuildChunks(store);
+      this.rechunk(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
       // A select refused after it placed its markers (assertMiddleCoverage,
@@ -9602,7 +9606,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
     this.selectPricing = pricing;
     try {
-      this.rebuildChunks(store);
+      this.rechunk(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
@@ -13865,7 +13869,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `sharing it, or a write of this one's that failed) (${droppedBefore.map((source) => source.id).join(', ')}); ` +
           'skipping stale queue entry',
       );
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       return false;
     }
     // A row under a source is out of the window though the store's
@@ -19605,6 +19609,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Rebuild the chunks over `store`, then refresh the store order merge
+   * placement reads (mergePositionIndex) to the store's listing if the
+   * rebuild didn't, whatever a subclass's rebuildChunks does. Placement takes
+   * a summary's range end that the last listing doesn't hold for one that
+   * left the view (placeRangeEnds), which holds only while no chunk, and so
+   * no L1, is newer than that listing: a rebuildChunks that doesn't refresh
+   * it (KnowledgeStrategy's) would leave every L1 written since unplaceable,
+   * and never merged. The base rebuildChunks refreshes the order from the
+   * listing it chunks, so it lists the store no more than before. Every
+   * rebuild goes through here.
+   */
+  private rechunk(store: MessageStoreView): void {
+    const refreshes = this._storeOrderRefreshes;
+    this.rebuildChunks(store);
+    if (this._storeOrderRefreshes === refreshes) this.refreshStoreOrder(store.getAll());
+  }
+
+  /**
    * Rebuild the chunk list: persisted records own the past; the running-sum
    * chunker only extends at the frontier, and a chunk is only ever created
    * once it CLOSES (reaches targetChunkTokens). The trailing partial chunk
@@ -21028,7 +21050,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   onCompressionHoldsReleased(ctx: StrategyContext): void {
     this.requireLoadedBranch('onCompressionHoldsReleased');
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
     if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
       this.driveSpeculativeDrain(ctx);
     }

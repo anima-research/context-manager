@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy, StoreTopologyError } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, StoreTopologyError } from '../src/index.js';
 import type { StoredMessage, SummaryEntry } from '../src/types/index.js';
 import type { StrategyContext } from '../src/types/strategy.js';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
@@ -1565,5 +1565,53 @@ describe('removed messages (#321)', () => {
       }
     });
   });
+
+  // KnowledgeStrategy's rebuildChunks doesn't refresh the store order merge
+  // placement reads. Before every rebuild went through rechunk(), every L1
+  // written after the first listing had range ends that listing didn't hold,
+  // which placement took for ends that left the view, so a long task of tool
+  // rounds sent no merge at all.
+  for (const kind of ['knowledge', 'autobiographical'] as const) {
+    it(`${kind}: a long task of tool rounds, with nothing removed, has its L1s merged`, async () => {
+      const path = freshPath();
+      const membrane = {
+        complete: async () => ({ stopReason: 'end_turn', content: text(`Summary ${'z'.repeat(40)}`) }),
+      } as never;
+      const options = { targetChunkTokens: 150, recentWindowTokens: 200, compressionModel: 'test-model', l1HoldbackChunks: 0 };
+      const strategy = kind === 'knowledge' ? new KnowledgeStrategy(options) : new AutobiographicalStrategy(options);
+      const manager = await ContextManager.open({ path, strategy, membrane });
+      const settle = async (): Promise<void> => {
+        for (let i = 0; i < 300 && !manager.isReady(); i++) await manager.tick();
+      };
+      try {
+        manager.setToolDefinitions([{ name: 'search', description: 'Search.', inputSchema: { type: 'object' } }]);
+        manager.addMessage('user', text(`Task: ${'t'.repeat(300)}`));
+        for (let round = 1; round <= 30; round++) {
+          manager.addMessage('assistant', [
+            { type: 'text', text: `Step ${round} ${'s'.repeat(200)}` },
+            { type: 'tool_use', id: `call-${round}`, name: 'search', input: { round } } as unknown as ContentBlock,
+          ]);
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: `call-${round}`, content: [{ type: 'text', text: `Result ${round} ${'r'.repeat(400)}` }] } as unknown as ContentBlock]);
+          await manager.compile();
+          await settle();
+        }
+        const all = (strategy as unknown as { summaries: SummaryEntry[] }).summaries;
+        const l1s = all.filter((s) => s.level === 1).length;
+        assert.ok(l1s >= 6, `premise: enough L1s for a merge (${l1s})`);
+        assert.ok(all.some((s) => s.level === 2), `an L2 was written over ${l1s} L1s`);
+        // A rebuild refreshes the store order once: the base's from the
+        // listing it chunks, and otherwise rechunk's after the rebuild.
+        const internal = strategy as unknown as { refreshStoreOrder(messages: unknown): void; rechunk(store: unknown): void };
+        const refresh = internal.refreshStoreOrder.bind(strategy);
+        let refreshes = 0;
+        internal.refreshStoreOrder = (messages) => { refreshes++; refresh(messages); };
+        internal.rechunk(context(manager).messageStore);
+        assert.equal(refreshes, 1, 'a rebuild refreshes the store order once');
+      } finally {
+        await manager.close();
+        rmSync(path, { recursive: true, force: true });
+      }
+    });
+  }
 
 });
