@@ -1692,6 +1692,18 @@ export interface KvUnifiedConfig {
    * merge it would otherwise demand.
    */
   latentDemandMode?: 'individual' | 'joint';
+  /**
+   * The cache markers the caller's own request carries outside the messages,
+   * on its tools or system prompt, such as a membrane `beforeRequest` hook's
+   * under `cacheMarkers: 'cm-owned'`: an integer from 0 to 3, 0 when unset,
+   * read when the strategy is built; a preview's overrides don't change it,
+   * since it describes the caller's request. kv-unified places at most 4
+   * minus this many markers of its own, so the request stays within
+   * Anthropic's four, and sets a compile's cache reference only when its
+   * first accepted call's wire receipt counts kv-unified's markers plus this
+   * many.
+   */
+  callerCacheMarkers?: number;
 }
 
 export interface AutobiographicalConfig {

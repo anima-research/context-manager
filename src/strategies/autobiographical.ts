@@ -2547,6 +2547,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** foldingStrategy as resolved at construction — the drift baseline for
    *  [picker-config-drift]. */
   private _constructedFoldingStrategy: AutobiographicalConfig['foldingStrategy'];
+  private readonly kvUnifiedCallerMarkers: number;
 
   /** A future usable window the KV-stable controller is preparing while the
    * caller keeps compiling against its current hard window. */
@@ -2600,6 +2601,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.config = resolved.effective as unknown as AutobiographicalConfig;
     this.configProvenance = resolved.provenance;
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
+    const callerMarkers = this.config.kvUnified?.callerCacheMarkers ?? 0;
+    if (!Number.isInteger(callerMarkers) || callerMarkers < 0 || callerMarkers > 3) {
+      const shown =
+        typeof callerMarkers === 'string' || typeof callerMarkers === 'object'
+          ? JSON.stringify(callerMarkers)
+          : String(callerMarkers);
+      throw new RangeError(
+        `kvUnified.callerCacheMarkers is ${shown}; it must be an integer from 0 to 3, the cache markers the ` +
+          `caller's request carries outside the messages. kv-unified places at most 4 minus that many of its own, ` +
+          `and needs at least one.`,
+      );
+    }
+    this.kvUnifiedCallerMarkers = callerMarkers;
     // The solver committed to at construction. buildPicker compares the live
     // config against this on every compile: a runtime mutation (e.g. an
     // override merge carrying `foldingStrategy: undefined`) silently swaps
@@ -16442,7 +16456,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       args.wireReceipt &&
       this.kvUnifiedPendingLayout &&
       this.kvUnifiedPendingImmutablePrefixHash &&
-      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length
+      args.wireReceipt.markers.length === this.kvUnifiedPendingMarkerUnitIndices.length + this.kvUnifiedCallerMarkers
     ) {
       cache = {
         immutablePrefixHash: this.kvUnifiedPendingImmutablePrefixHash,
@@ -16465,10 +16479,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       !this.kvUnifiedMarkerMismatchReported
     ) {
       // The request carried markers, but not one for each layout boundary its
-      // compile reconciled them to, which reconcileKvUnifiedMarkerIndices'
-      // contract rules out. A request with none (prompt caching off) has
-      // nothing to match. Logged once the chain has taken the accept: one it
-      // refuses as a duplicate keeps the chain's reference as it was.
+      // compile reconciled them to plus the caller's declared ones. A request
+      // with none (prompt caching off) has nothing to match. Logged once the
+      // chain has taken the accept: one it refuses as a duplicate keeps the
+      // chain's reference as it was.
       mismatched = true;
     }
     const { duplicate } = this.kvUnifiedReceipts.accept(
@@ -16483,6 +16497,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.diag.error(
         `[kv-unified] submission ${args.submissionId}: the request carried ${args.wireReceipt!.markers.length} ` +
           `cache markers where its compile marked ${boundaries} layout boundar${boundaries === 1 ? 'y' : 'ies'}, ` +
+          `plus the ${this.kvUnifiedCallerMarkers} kvUnified.callerCacheMarkers says the caller places outside the ` +
+          'messages, ' +
           `so this presentation keeps no cache reference and the next compile weighs no cache costs ` +
           `(logged once per strategy)`,
       );
@@ -17006,11 +17022,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Place message-level `cache_control` breakpoints across the final ordered
-   * entries. `kv-unified` owns all four provider slots and uses rendered-token
-   * thirds of non-tail history plus the tail end. Other strategies retain the
-   * legacy three-slot contract: first slot, measured stable-prefix boundary,
-   * and end. Their first slot is the end of the deep band (`deepBandEnd`)
-   * when the compile emitted one, else the last head message.
+   * entries. `kv-unified` owns the four provider slots less the caller's own
+   * (`kvUnified.callerCacheMarkers`), puts its history markers on the legal
+   * boundaries nearest to evenly spaced fractions of non-tail history's
+   * rendered tokens, and marks the tail end. Other
+   * strategies retain the legacy three-slot contract: first slot, measured
+   * stable-prefix boundary, and end. Their first slot is the end of the deep
+   * band (`deepBandEnd`) when the compile emitted one, else the last head
+   * message.
    *
    * The trade on membrane's native formatter: native puts a cache marker on
    * the system block only when ZERO message markers arrive. So there the
@@ -17048,7 +17067,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Slot contract with membrane (the request compiler's side of it):
    * Anthropic allows 4 cache_control blocks per request INCLUDING any on
    * tools/system. The split is: **this strategy holds first claim, up to 3
-   * message-level markers; membrane is residual claimant on whatever
+   * message-level markers (kv-unified up to 4, less those
+   * `kvUnified.callerCacheMarkers` declares); membrane is residual claimant on whatever
    * remains**, spending it end-position-only — a tools+system fallback when
    * zero message markers arrive, and a floating marker on the newest
    * message when the native tool loop rebuilds the request between tool
@@ -17057,7 +17077,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * suffix at full input price — the qa-ops 2026-08-20 8M-token incident).
    *
    * kv-unified, which hosts send with membrane's `cacheMarkers: 'cm-owned'`,
-   * holds all four slots on a compile's own request. On the native tool
+   * holds the four slots of a compile's own request, less those
+   * `kvUnified.callerCacheMarkers` declares. On the native tool
    * loop's later calls, membrane may float markers of its own, which can
    * take these slots; membrane's `floatingCacheMarker` says when and where
    * (antra-tess/membrane#239 brings it to `cm-owned`; context-manager#168).
@@ -17124,12 +17145,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const historyEnd = firstTail - 1; // last non-tail entry
 
     if (this.config.foldingStrategy === 'kv-unified') {
-      // CM owns all four slots of a compile's own request in kv-unified
-      // mode. Place three history
-      // breakpoints at the nearest legal rendered-token boundaries to
-      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
-      // no separate early/system marker: every history prefix already
-      // includes tools, system, and the raw head on the provider wire.
+      // CM owns the four slots of a compile's own request in kv-unified mode,
+      // less the caller's own. There is deliberately no separate early/system
+      // marker of its own: every history prefix already includes tools,
+      // system, and the raw head on the provider wire.
       //
       // A marker can go only where an entry ends a solved layout unit, since
       // reconcileKvUnifiedMarkerIndices records it as that unit's boundary.
@@ -17152,6 +17171,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const last = lastSourceOf(entry);
         return !(last !== undefined && headMessageIds.has(last) && index < lastHeadEntry);
       };
+      const markerBudget = 4 - this.kvUnifiedCallerMarkers;
+      const historyMarkers = markerBudget - 1;
       const marks = new Set<number>();
       if (historyEnd >= 0) {
         const cumulative: number[] = [0];
@@ -17176,9 +17197,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           return best;
         };
         if (legalBoundaries.length > 0) {
-          marks.add(nearestBoundary(1 / 3));
-          marks.add(nearestBoundary(2 / 3));
-          marks.add(legalBoundaries.at(-1)!);
+          for (let i = 1; i < historyMarkers; i++) marks.add(nearestBoundary(i / historyMarkers));
+          if (historyMarkers > 0) marks.add(legalBoundaries.at(-1)!);
         }
       }
       let tailEnd = -1;
@@ -17190,9 +17210,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (tailEnd >= 0) marks.add(tailEnd);
-      if (marks.size > 4) {
+      if (marks.size > markerBudget) {
         throw new Error(
-          `placeCacheMarkers: ${marks.size} caller-owned markers exceed Anthropic's limit of 4`,
+          `placeCacheMarkers: ${marks.size} caller-owned markers exceed the ${markerBudget} of Anthropic's 4 ` +
+            'that kvUnified.callerCacheMarkers leaves',
         );
       }
       for (const idx of marks) entries[idx]!.cacheMarker = true;
@@ -17282,7 +17303,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * body on its last shard): a head message maps to the single synthetic head
    * unit, which placeCacheMarkers marks only on the entry that ends the head,
    * and any other message to its own unit, or a recent one without one to the
-   * opaque tail block. Every wire marker must reconcile exactly. */
+   * opaque tail block. Every marked entry must reconcile exactly. */
   protected reconcileKvUnifiedMarkerIndices(
     entries: readonly ContextEntry[],
     layout: RenderLayout,
@@ -17320,9 +17341,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  compile emits: for each marked entry, in order, its identity and the hash
    *  of every entry up to it. Reconcile refuses a marked entry with no
    *  identity, and acceptance keeps a reference only when the wire carried one
-   *  marker per reconciled unit, while it carries one per marked entry. So an
-   *  accepted reference's prefixes run parallel to its markers, and the check
-   *  credits one whose don't as it is. */
+   *  marker per reconciled unit beside the caller's declared ones, while the
+   *  record carries one per marked entry. So an accepted reference's prefixes
+   *  run parallel to its markers, and the check credits one whose don't as it
+   *  is. */
   private kvUnifiedRenderRecord(
     entries: readonly ContextEntry[],
     layout: RenderLayout,
