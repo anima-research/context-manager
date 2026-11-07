@@ -695,8 +695,14 @@ export class MessageStore {
     // Single atomic op: chronicle peeks the next record id+sequence under its
     // write lock, splices them into the payload as `id` and `sequence`, and
     // writes one record. The reconstructed state sees a fully-populated
-    // StoredMessageInternal, and `branchAt(messageId)` forks at this
-    // message's own sequence — exactly the post-fork-visible point.
+    // StoredMessageInternal, and a branch cut at this message's own
+    // sequence holds it: exactly the post-fork-visible point. That is where
+    // `branchAt(messageId)` forks in legacy mode and for a row the window
+    // doesn't hold. Once a host presents rows, it forks at the write that
+    // presented a row the window holds, and at the last shard of a body the
+    // write-down entered, and never before its body's last shard's own
+    // sequence, so the new branch's record holds the whole body (see
+    // ContextManager.branchAt).
     //
     // Whether this instance's caches reflected every write to the slot
     // BEFORE this append, including writes made through other handles to

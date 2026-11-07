@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Picker } from '../../src/adaptive/picker.js';
+import { Picker, UncoveredDropError } from '../../src/adaptive/picker.js';
 import { namespaceDiagnostics } from '../../src/diagnostics.js';
 import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
 import type { SummaryEntry } from '../../src/types/strategy.js';
 import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.js';
 import { OldestFirstStrategy } from '../../src/adaptive/strategies/oldest-first.js';
-import type { FoldingBudget } from '../../src/adaptive/folding-strategy.js';
+import type { FoldingBudget, FoldingSolution, FoldingSolver } from '../../src/adaptive/folding-strategy.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 
@@ -1030,4 +1030,91 @@ test('picker: its lines name the namespace its owner gives it', () => {
   const unrealizable = lines.filter((l) => l.startsWith('[picker-unrealizable]'));
   assert.equal(unrealizable.length, 1, lines.join('\n'));
   assert.match(unrealizable[0]!, / ns=agents\/tern$/);
+});
+
+const chainInputs = (chronicle: MockChronicle): PickerInputs => ({
+  chunks: chronicle.chunks,
+  summaries: chronicle.summaries,
+  recallPairTokens: chronicle.recallPairTokens,
+  ...chronicle.computeHeadTail({ headTokens: 0, tailTokens: 0 }),
+});
+
+const stubSolver = (frontier: Map<string, number>, extra: Partial<FoldingSolution> = {}): FoldingSolver => ({
+  name: 'stub',
+  solve: () => ({ frontier, produced: [], ...extra }),
+});
+
+test('picker: a chunk the solver frontier does not name applies at level 0', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  const result = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(100_000));
+  for (const c of chronicle.chunks) assert.equal(result.levelAt(c.sequence, c.id), 0, c.id);
+  assert.equal(result.finalTokens, 1200);
+});
+
+test('picker: a solver that leaves exhausted unset is exhausted when nothing is produced and the applied tokens are above the soft target', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  const over = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(1250));
+  assert.equal(over.finalTokens, 1200);
+  assert.ok(over.finalTokens > BUDGET(1250).targetBudget && over.finalTokens <= BUDGET(1250).totalBudget, 'the premise: above the soft target, within the hard budget');
+  assert.equal(over.exhausted, true);
+  const under = new Picker(stubSolver(new Map())).run(chainInputs(chronicle), BUDGET(100_000));
+  assert.equal(under.exhausted, false);
+  const request = { level: 2, range: { firstChunkId: 'c-0000', lastChunkId: 'c-0011' } };
+  const producing = new Picker(stubSolver(new Map(), { produced: [request] })).run(chainInputs(chronicle), BUDGET(1250));
+  assert.equal(producing.finalTokens, 1200);
+  assert.equal(producing.exhausted, false);
+});
+
+test('picker: a pinned chunk is accounted raw whatever level the solver gives it', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  chronicle.chunks[2]!.pinned = true;
+  const allAtOne = new Map(chronicle.chunks.slice(0, 11).map((c) => [c.id, 1] as [string, number]));
+  const result = new Picker(stubSolver(allAtOne)).run(chainInputs(chronicle), BUDGET(100_000));
+  assert.equal(result.finalTokens, 100 + 200 + 100 + 200);
+});
+
+test('picker: a level that is not finite, or is below 0, applies as 0', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  const [a, b, c] = chronicle.chunks;
+  const frontier = new Map([[a!.id, Number.NaN], [b!.id, Number.POSITIVE_INFINITY], [c!.id, -1]]);
+  const result = new Picker(stubSolver(frontier)).run(chainInputs(chronicle), BUDGET(100_000));
+  for (const chunk of [a!, b!, c!]) assert.equal(result.levelAt(chunk.sequence, chunk.id), 0, chunk.id);
+  assert.equal(result.unrealizable, 0);
+});
+
+test('picker: moves counts chunks whose level was lowered as well as raised', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  for (const c of chronicle.chunks.slice(0, 6)) c.currentResolution = 1;
+  const raised = new Map(chronicle.chunks.slice(6, 11).map((c) => [c.id, 1] as [string, number]));
+  const result = new Picker(stubSolver(raised)).run(chainInputs(chronicle), BUDGET(100_000));
+  assert.equal(result.moves, 6 + 5);
+});
+
+test('flat-profile: a solve that asks for a summary it lacks is not exhausted', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100, produceChain: false });
+  const result = new Picker(new FlatProfileStrategy()).run(chainInputs(chronicle), BUDGET(700));
+  assert.ok(result.produced.length > 0, 'premise: the solve asks for a summary');
+  assert.ok(result.finalTokens > 700 * 0.9, 'premise: the plan is above the soft target');
+  assert.equal(result.exhausted, false);
+});
+
+test('flat-profile: a solve that ends between the soft target and the hard budget with nothing left to fold or produce is exhausted', () => {
+  const chronicle = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 100 });
+  for (const c of chronicle.chunks) c.pinned = true;
+  const result = new Picker(new FlatProfileStrategy()).run(chainInputs(chronicle), BUDGET(1300));
+  assert.deepEqual(result.produced, [], 'premise: nothing is left to produce');
+  assert.equal(result.finalTokens, 1200, 'premise: between the soft target and the hard budget');
+  assert.equal(result.exhausted, true);
+});
+
+test('UncoveredDropError carries every dropped id, and its message the count, the first three ids and how many more', () => {
+  const error = new UncoveredDropError({
+    droppedIds: ['m-1', 'm-2', 'm-3', 'm-4'],
+    site: 'test',
+    diagnostics: { budget: 100, totalTokens: 90 },
+  });
+  assert.deepEqual(error.droppedIds, ['m-1', 'm-2', 'm-3', 'm-4']);
+  assert.match(error.message, /Renderer dropped 4 middle message\(s\)/);
+  assert.match(error.message, /m-1, m-2, m-3, … \(\+1 more\)/);
+  assert.doesNotMatch(error.message, /m-4/);
 });

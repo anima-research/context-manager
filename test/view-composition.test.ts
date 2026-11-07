@@ -24,7 +24,7 @@ import {
   mergeMessageStoreViews,
   OverBudgetError,
 } from '../src/index.js';
-import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import type { ContextStrategy, MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 const BASE = './test-view-composition';
 let storeSeq = 0;
@@ -113,6 +113,15 @@ describe('mergeMessageStoreViews', () => {
   it('returns the primary view untouched when there is nothing to merge', () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
     assert.equal(mergeMessageStoreViews(primary, []), primary);
+  });
+
+  it("reports the primary view's calibration multiplier", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    primary.getTokenCalibration = () => 1.1;
+    const auxiliary = fakeView([{ id: 'x1', sequence: 2 }]);
+    auxiliary.getTokenCalibration = () => 1.3;
+    const merged = mergeMessageStoreViews(primary, [auxiliary]);
+    assert.equal(merged.getTokenCalibration?.(), 1.1);
   });
 
   it('serves one merged listing while every source listing is the same array', () => {
@@ -244,6 +253,26 @@ describe('ContextManager auxiliaryMessageViews', () => {
   });
 });
 
+describe('PassthroughStrategy', () => {
+  it('sends a stored image as stored when every message fits', async () => {
+    const manager = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const image = {
+      type: 'image',
+      source: { type: 'url', url: 'https://example.com/a.png' },
+      sourceUrl: 'https://example.com/a.png',
+      tokenEstimate: 1600,
+    } as ContentBlock;
+    const ids = [manager.addMessage('u', [...text('look'), image]), manager.addMessage('u', text('done'))];
+    const result = await manager.compile();
+    assert.deepStrictEqual(manager.getMessage(ids[0]!)!.content, [...text('look'), image]);
+    assert.deepStrictEqual(
+      result.messages.map((m) => m.content),
+      ids.map((id) => manager.getMessage(id)!.content),
+    );
+    await manager.close();
+  });
+});
+
 describe('WindowedPassthroughStrategy', () => {
   it('honors the anchor and stays byte-stable between compiles', async () => {
     const path = freshPath();
@@ -322,6 +351,15 @@ describe('WindowedPassthroughStrategy', () => {
     );
     await manager2.close();
   });
+
+  it('refuses a reAnchorFraction outside (0, 1], and takes 1', () => {
+    for (const reAnchorFraction of [-0.5, 0, 1.5, NaN]) {
+      assert.throws(() => new WindowedPassthroughStrategy({ reAnchorFraction }), {
+        message: `reAnchorFraction must be in (0, 1], got ${reAnchorFraction}`,
+      });
+    }
+    assert.doesNotThrow(() => new WindowedPassthroughStrategy({ reAnchorFraction: 1 }));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -380,6 +418,24 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
     // The reset is said, naming the strategy's namespace (#239).
     assert.ok(warned.some((w) => w.startsWith('[windowed-passthrough] persisted anchor 1000000 is past the branch head') && w.endsWith(' ns=agents/tern')), warned.join('\n'));
     assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
+    await manager2.close();
+  });
+
+  it('a persisted negative anchor, which names no position either, reads as 0 on load', async () => {
+    const path = freshPath();
+    const anchorStateId = 'test/windowed:anchor';
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ anchorStateId }),
+    });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    manager.getStore().setStateJson(anchorStateId, { anchor: -1 });
+    await manager.close();
+
+    const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
+    const manager2 = await ContextManager.open({ path, strategy: strategy2 });
+    assert.equal(strategy2.getAnchor(), 0);
     await manager2.close();
   });
 });
@@ -443,6 +499,11 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     assert.match(t, /\[truncated — original was 500 tokens\]$/);
     assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
     await manager.close();
+  });
+
+  it('surfaces maxMessageTokens as the strategy property the framework reads', () => {
+    const strategy: ContextStrategy = new WindowedPassthroughStrategy({ maxMessageTokens: 100 });
+    assert.equal(strategy.maxMessageTokens, 100);
   });
 
   it('a tool result past the message\'s cap keeps its pairing and says the cap ran out', async () => {
@@ -635,5 +696,47 @@ describe('WindowedPassthroughStrategy: cache markers', () => {
     assert.ok(strategy.getAnchor() > 0, 'anchor moved');
     assert.deepEqual(breakpoints(r), [r.messages.length - 1]);
     await manager.close();
+  });
+
+  it('after discardRenderingFrontier only the end is marked, as on a cold start', async () => {
+    const strategy = new WindowedPassthroughStrategy();
+    const manager = await ContextManager.open({ path: freshPath(), strategy });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    assert.deepEqual(breakpoints(await manager.compile()), [1]);
+    manager.addMessage('u', text('c'));
+    manager.addMessage('u', text('d'));
+    strategy.discardRenderingFrontier();
+    assert.deepEqual(breakpoints(await manager.compile()), [3]);
+    await manager.close();
+  });
+
+  it('takes over a frontier its own class exported, and ignores one the autobiographical strategy exported', async () => {
+    const path = freshPath();
+    const first = new WindowedPassthroughStrategy();
+    const manager = await ContextManager.open({ path, strategy: first });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    await manager.compile();
+    const own = first.exportRenderingFrontier();
+    await manager.close();
+
+    const autobiographical = new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000 });
+    const other = await ContextManager.open({ path: freshPath(), strategy: autobiographical });
+    other.addMessage('u', text('a'));
+    other.addMessage('u', text('b'));
+    await other.compile();
+    const foreign = autobiographical.exportRenderingFrontier();
+    await other.close();
+
+    const strategy = new WindowedPassthroughStrategy();
+    const reopened = await ContextManager.open({ path, strategy });
+    strategy.adoptRenderingFrontier(own);
+    reopened.addMessage('u', text('c'));
+    assert.deepEqual(breakpoints(await reopened.compile()), [1, 2], 'the adopted frontier names the previous endpoint');
+    strategy.adoptRenderingFrontier(foreign);
+    reopened.addMessage('u', text('d'));
+    assert.deepEqual(breakpoints(await reopened.compile()), [2, 3], 'its own previous compile is still the one named');
+    await reopened.close();
   });
 });

@@ -134,6 +134,34 @@ describe('removal and the chain-break guard', () => {
     await cm.close();
   });
 
+  it('a store whose rows are presented, reopened under a view filter hiding the messages of 5 of 8 chunk records, compresses later messages', async () => {
+    const path = freshPath();
+    let cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+    cm.presentRows([]);
+    const presented = (count: number): string[] => {
+      const ids = add(cm, count);
+      for (const id of ids) cm.presentRows([id]);
+      return ids;
+    };
+    for (let i = 0; i < 400 && records(cm).length < 8; i++) {
+      presented(1);
+      await cm.tick();
+    }
+    assert.strictEqual(records(cm).length, 8, 'grew to 8 chunk records');
+    await drain(cm);
+    const hidden = new Set(records(cm).slice(0, 5).flatMap((r) => r.sourceIds));
+    await cm.close();
+    const s = strategy();
+    cm = await ContextManager.open({ path, strategy: s, membrane, viewFilter: (m: StoredMessage) => !hidden.has(m.id) });
+    assert.strictEqual(cm.windowMode(), 'presented', 'premise: the reopened window is presented');
+    const later = presented(40);
+    await drain(cm);
+    const covered = l1Sources(cm);
+    assert.ok(later.some((id) => covered.has(id)), 'an L1 covers messages added after it');
+    assert.notStrictEqual(s.getCompressionDebt().state, 'critical', "the debt report isn't critical");
+    await cm.close();
+  });
+
   it('a store whose chunk records a removal emptied before it closed compresses later messages after it reopens', async () => {
     const path = freshPath();
     let cm = await ContextManager.open({ path, strategy: strategy(), membrane });
