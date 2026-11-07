@@ -78,7 +78,11 @@
  * whatever the failure left. Where that read throws too, whether the write
  * landed is unknown: the call throws WindowWriteOutcomeUnknownError, and
  * the next write through the index settles what the write did, once the
- * index reads.
+ * index reads, except where the store can't say its branch before the
+ * write or after it: then nothing waits, and the strategy reads the window
+ * at its next select (see WindowWriteOutcomeUnknownError). A later write
+ * made while the store can't say its branch, and such a settlement waits,
+ * throws, writing nothing (settled).
  * A batch is one presentation point: every item of it carries the same `at`,
  * and chronicle cuts a branch only between records, so a cut at a row a
  * batch presented keeps every row of the batch, and a cut before it drops
@@ -102,6 +106,12 @@
  * out and writes the whole record again, in record order). A body such an
  * index holds in part is completed, or put back whole, by present. Such an
  * index is read as one written in batches is; this version writes none.
+ * The first builds of this branch (before fa8bd05) wrote the header first.
+ * An index they wrote reads as complete, a write-down they cut short
+ * included, and its rows as presented after the header: a branch cut takes
+ * them at their items, not at their own sequences (presentedByWriteDown is
+ * false for each). No release wrote one, and no reader for such an index
+ * is kept.
  *
  * A header naming a format other than this version's is another version's
  * index, and so is a log with items this version can't read and no header
@@ -916,7 +926,9 @@ export class WindowIndex {
    * put back since, undone or not, from one reading of the index: rows a
    * host took out, and rows removed from the record once taken out by
    * their ids. Null in legacy mode. A row removed in legacy mode, before
-   * the write-down, was never in the window, and isn't one, even where a
+   * the write-down, was never in the written-down window (in legacy mode
+   * the window is the record, so a strategy may have folded it; what
+   * folded it stays, as it always has there), and isn't one, even where a
    * write-down cut short wrote it and the one that finished it took it out
    * (its tombstones come before the header); neither is a
    * row removed through another manager that no retract has taken out
@@ -997,7 +1009,9 @@ export class WindowIndex {
    * was in the window from its own write, as every row is in legacy mode,
    * and the rows before it there were the rows stored before it, since the
    * write-down follows record order. A row taken out since and presented
-   * again holds a later ordinal and is not one. False in legacy mode.
+   * again holds a later ordinal and is not one. False in legacy mode, and
+   * for every row of an index written header-first (see the module
+   * comment).
    */
   presentedByWriteDown(id: MessageId): boolean {
     const state = this.current();
@@ -1100,7 +1114,10 @@ export class WindowIndex {
    * first such row of `source` (which is in record order) by a binary
    * search, so the walk is over those rows alone. A cut inside a body reads
    * the body's shards before it to say whether the body is partly in the
-   * window.
+   * window, and leaves out the shards it lacks before the cut, so a host
+   * that presents these rows by id names the body's first shard there,
+   * which present takes as naming the rest: it refuses a later shard named
+   * alone.
    */
   unpresented(source: readonly StoredMessage[], afterSequence?: number): StoredMessage[] {
     const state = this.current();

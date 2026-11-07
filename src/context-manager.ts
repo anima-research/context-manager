@@ -2602,7 +2602,10 @@ export class ContextManager {
    * before the cut) and not the whole record; the listing itself is
    * built once per change of the record (with auxiliary slots, merged and
    * sorted), as a compile's reads are. A shard of a body stored across
-   * the cut is listed as the whole listing lists it. Throws a TypeError for
+   * the cut is listed as the whole listing lists it. A cut inside a body
+   * partly in the window leaves out the shards it lacks before the cut,
+   * and presentRows refuses a later shard named alone: name the body's
+   * first shard, which it takes as naming the rest. Throws a TypeError for
    * an `afterSequence` that isn't a number.
    */
   getUnpresentedMessages(options?: { afterSequence?: number }): StoredMessage[] {

@@ -6,7 +6,10 @@
  * taken out, and once a host presents rows a removal through the manager
  * takes a removed row out too (a removeMessages whose range's rows can't be
  * read before it goes leaves them their ordinals, untold, until
- * retractAbsentRows takes them out). Until this hook the strategy heard neither,
+ * retractAbsentRows takes them out; nor where a strategy hook the removal
+ * runs, onCompressionHoldsReleased or a settlement's, moves the store's
+ * branch: no strategy is told, and on the removal's branch the rows keep
+ * their ordinals until retractAbsentRows). Until this hook the strategy heard neither,
  * so the autobiographical strategy kept an undone row inside its summaries:
  * the compile went on showing it folded, and a redo, which presents the
  * rows again at the end of the window, rendered them twice, raw there and

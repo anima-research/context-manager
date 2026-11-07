@@ -4,7 +4,11 @@
  *
  * A removal through a manager takes the row out of that manager's window
  * (except a removeMessages whose range's rows can't be read before it
- * goes: those keep their ordinals, untold, until retractAbsentRows), but
+ * goes: those keep their ordinals, untold, until retractAbsentRows; nor
+ * where a strategy hook the removal runs, onCompressionHoldsReleased or a
+ * settlement's, moves the store's branch: no strategy is told, and on the
+ * removal's branch the rows keep their ordinals until retractAbsentRows),
+ * but
  * another manager whose window holds the row, on the same slot or
  * merging it as an auxiliary one, never hears it: the row leaves the
  * record and so its listing, while its ordinal stays issued (CM-T). A host
