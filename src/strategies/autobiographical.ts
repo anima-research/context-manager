@@ -8262,10 +8262,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * compressed again). Should this strategy never hear a row go (the
    * process stopped between the window's tombstone and these writes, or a
    * manager whose strategy has no onRetracted took it out), the next open
-   * in presented mode repairs it: it lets go of what covers a row still
-   * out of the window, as this does (releaseRowsThatLeft), and demotes the
-   * summary the new place of a row presented again leaves non-contiguous
-   * (demoteSplitSummaries).
+   * in presented mode repairs it, where that open isn't audit-only: it
+   * lets go of what covers a row still out of the window, as this does
+   * (releaseRowsThatLeft, whatever the topology policy), and, under
+   * 'reject', demotes the summary the new place of a row presented again
+   * leaves non-contiguous (demoteSplitSummaries).
    *
    * Another instance sharing the store doesn't hear the rows that leave
    * this one's window, nor this one its, and each writes the summaries and
