@@ -4024,11 +4024,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * List summaries whose source message span overlaps `[opts.fromMs, opts.toMs]`,
    * for a "browse my history" table-of-contents (agent-framework consumer) —
-   * read-only, generates nothing. A summary's span runs from its recorded
-   * first message to its recorded last while both are in the view, and
-   * otherwise from the first to the last of its messages still in the view
-   * (a message removed from the store, or hidden by the view's filter, no
-   * longer bounds it). A summary with none left isn't listed.
+   * read-only, generates nothing. A summary's span runs from the first to
+   * the last of its messages still in the view, in record order (a message
+   * removed from the store, or hidden by the view's filter, no longer
+   * bounds it). A summary with none left isn't listed.
    *
    * Deliberately channel-agnostic: `SummaryEntry` has no channel field — a
    * summary is a fold over whatever messages landed in a chunk, which can span

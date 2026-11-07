@@ -168,9 +168,12 @@ interface ContextManagerBaseConfig {
    * waits, and a summary written meanwhile leaves it out. If the message is
    * shown again, by the predicate or by a later open whose predicate hides
    * less, while the view still shows that summary's messages on both sides
-   * of it, `open` refuses the store under `topologyPolicy: 'reject'`. The
-   * store opens with `'report'`, and where no `auxiliaryMessageViews` are
-   * merged, `scripts/repair-topology.ts` plans a repair.
+   * of it, then in legacy mode `open` refuses the store under
+   * `topologyPolicy: 'reject'`; the store opens with `'report'`, and where
+   * no `auxiliaryMessageViews` are merged, `scripts/repair-topology.ts`
+   * plans a repair. In presented mode, an open under `'reject'` that isn't
+   * audit-only drops that summary instead, as it drops any summary the
+   * topology audit names (see `StoreTopologyError`), and opens.
    *
    * NOT retroactive, and NOT a confidentiality boundary. The filter governs
    * what the strategy sees from now on. Derived state a strategy persisted

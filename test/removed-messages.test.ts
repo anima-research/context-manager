@@ -626,6 +626,44 @@ describe('removed messages (#321)', () => {
         rmSync(path, { recursive: true, force: true });
       }
     });
+
+    it(`with a predicate whose answer an edit changes, which viewFilter's contract forbids, a message hidden while its chunk waits and shown again ${route}, in presented mode, leaves a store that an open under topologyPolicy 'reject' opens, dropping the summary that left it out, unless the open is audit-only`, async () => {
+      const viewFilter = (m: StoredMessage): boolean =>
+        !m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HIDE'));
+      const { manager, strategy, ids, requests, path } = await chunked(12, (call, ids, manager) => {
+        if (call === 1) manager.editMessage(ids[5]! as never, text(body('HIDE M5')));
+      }, { viewFilter });
+      manager.presentRows(ids as never);
+      const config = {
+        compressionModel: 'm', headWindowTokens: 1, recentWindowTokens: 0, l1HoldbackChunks: 0, targetChunkTokens: 60,
+        autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+      };
+      const membrane = { complete: async () => ({ stopReason: 'end_turn', content: text('MEM') }) };
+      const filter = route === 'by an edit' ? { viewFilter } : {};
+      let reopened: ContextManager | undefined;
+      try {
+        assert.strictEqual(manager.windowMode(), 'presented', 'premise: the host presented the rows');
+        await tickUntil(manager, () => requests.length >= 2 && strategy.all().length >= 2);
+        assert.deepStrictEqual(named(ids, strategy.all()[1]!.sourceIds), ['M4', 'M6', 'M7'], 'premise: the summary left M5 out');
+        if (route === 'by an edit') manager.editMessage(ids[5]! as never, text(body('M5')));
+        await manager.close();
+        await assert.rejects(
+          ContextManager.open({ path, strategy: new Probe({ ...config, topologyPolicy: 'reject', auditOnly: true } as never), membrane: membrane as never, ...filter } as never),
+          StoreTopologyError,
+        );
+        const again = new Probe({ ...config, topologyPolicy: 'reject' } as never);
+        const { warnings } = await logged(async () => {
+          reopened = await ContextManager.open({ path, strategy: again, membrane: membrane as never, ...filter } as never);
+        });
+        assert.deepStrictEqual(again.all().map((s) => named(ids, s.sourceIds).join(',')), ['M0,M1,M2,M3'], 'the summary that left M5 out is dropped');
+        assert.strictEqual(again.getTopologyViolations().length, 0);
+        assert.ok(warnings.some((line) => line.includes('the window holds the leaves of 1 summary apart')), 'the open says what it dropped');
+      } finally {
+        await manager.close();
+        await reopened?.close();
+        rmSync(path, { recursive: true, force: true });
+      }
+    });
   }
 
   async function fourSummaries(
