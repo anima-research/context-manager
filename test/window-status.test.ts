@@ -128,9 +128,11 @@ describe('windowStatusOf', () => {
     assert.equal(main.getStore().currentSequence(), head, 'a status read writes nothing');
 
     main.removeMessage(m2);
+    // CM #350 bot review, wave 6, finding 38: taken before the reads after
+    // the removal too, so one that writes is caught.
+    const afterRemoval = main.getStore().currentSequence();
     assert.equal(main.windowStatusOf(m2), 'absent');
     assert.equal(side.windowStatusOf(m2), 'absent');
-    const afterRemoval = main.getStore().currentSequence();
     statuses(side, [m1, m2, s1]);
     assert.equal(main.getStore().currentSequence(), afterRemoval, 'a status read writes nothing');
     assert.ok(afterRemoval > head);

@@ -2411,8 +2411,19 @@ describe('fold journal over a presented window', () => {
     const legacy = (await cm.compile(BUDGET)).provenance!;
     assert.equal(legacy.layout!.keyedBy, 'sequence');
     cm.presentRows([]);
-    assert.equal(cm.acceptRound({ provenance: legacy })?.kind, 'change', 'compared with the layout before it');
+    const legacyReceipt = cm.acceptRound({ provenance: legacy });
+    assert.equal(legacyReceipt?.kind, 'change', 'compared with the layout before it');
     assert.deepEqual(formats(cm.getStore()).map(([v]) => v), [3, 3, 3]);
+    // CM #350 bot review, wave 6, finding 19: the sequence-keyed compile,
+    // accepted again across the switch of format and across a reopen, is
+    // found among the records of either format, and writes nothing.
+    const acceptedAgain = (when: string) => {
+      const store = cm.getStore();
+      const [records, sequence] = [formats(store), store.currentSequence()];
+      assert.equal(cm.acceptRound({ provenance: legacy })?.id, legacyReceipt!.id, `${when}: the receipt it was accepted with`);
+      assert.deepEqual(formats(store), records, `${when}: nothing is written`);
+      assert.equal(store.currentSequence(), sequence, `${when}: nothing is written`);
+    };
 
     const warnings: string[] = [];
     const warn = console.warn;
@@ -2423,6 +2434,7 @@ describe('fold journal over a presented window', () => {
       assert.equal(rebased?.kind, 'baseline', 'the first layout by ordinal is compared with nothing');
       assert.equal(rebased?.historyBefore, 'unknown');
       assert.equal(await acceptCompile(cm), null, 'the next one is compared with it');
+      acceptedAgain('after the switch');
     } finally {
       console.warn = warn;
     }
@@ -2438,6 +2450,7 @@ describe('fold journal over a presented window', () => {
     // Exactly one baseline: a restart compares with the format-4 record.
     cm.close();
     ({ cm, strategy } = await open(strategy));
+    acceptedAgain('after a reopen');
     strategy.plan.set(ids[2]!, 'omit');
     assert.equal((await acceptCompile(cm))?.kind, 'change');
     assert.deepEqual(formats(cm.getStore()).map(([v]) => v), [3, 3, 3, 4, 4, 4]);

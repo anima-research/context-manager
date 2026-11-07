@@ -70,6 +70,21 @@ const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
 /** One macrotask turn: by then a rejection's handler has run, and an unhandled one would have been reported. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+/**
+ * Resolves once `ready()` holds, checked each macrotask; rejects after a
+ * second. A check that something didn't happen while a strategy's
+ * initialize runs waits for the initialize to be entered first (CM #350
+ * bot review, wave 6, finding 32), so a manager that put the entry off
+ * past the check would fail it.
+ */
+async function waitFor(ready: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 /** console.error's and console.warn's calls while `fn` runs. */
 async function linesDuring(fn: () => Promise<void>): Promise<string[]> {
   const lines: string[] = [];
@@ -143,7 +158,9 @@ function gated(): { gate: Promise<void>; open: () => void } {
 /** Records whose initialize waits for `gate`, once one is set. */
 class Gated extends Records {
   gate: Promise<void> | undefined;
+  entered = false;
   async initialize(_ctx: StrategyContext): Promise<void> {
+    this.entered = true;
     await this.gate;
   }
 }
@@ -151,11 +168,13 @@ class Gated extends Records {
 /** A strategy with no row hook (neither onPresented, onNewMessage nor onRetracted), whose initialize waits for `gate`, once one is set. */
 class Unhooked extends PassthroughStrategy {
   gate: Promise<void> | undefined;
+  entered = false;
   constructor() {
     super();
     (this as { onNewMessage?: unknown }).onNewMessage = undefined;
   }
   async initialize(_ctx: StrategyContext): Promise<void> {
+    this.entered = true;
     await this.gate;
   }
 }
@@ -474,6 +493,7 @@ describe('onRetracted', () => {
       // The first initialization's completion, where an early delivery
       // would be made, has run (CM #350 bot review, wave 5, finding 26).
       await superseded;
+      await waitFor(() => replacement.entered, "the replacement's initialize");
       assert.equal(replacement.retracted.length, 0, `${hooked ? 'control' : 'probe'}: nothing reaches the replacement while it initializes`);
       own.open();
       await second;

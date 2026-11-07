@@ -369,14 +369,25 @@ describe('writing the window down', () => {
   it('retractRows([]) writes nothing in either mode; any other retract in legacy mode writes the window down first', async () => {
     const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
     const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)]));
+    // CM #350 bot review, wave 6, finding 34: nor is any other state
+    // written or registered.
+    const store = cm.getStore();
+    const unchanged = (when: string) => {
+      const before = { states: store.listStates().length, sequence: store.currentSequence() };
+      return () => assert.deepEqual({ states: store.listStates().length, sequence: store.currentSequence() }, before, `${when}: no state is written or registered`);
+    };
+    let check = unchanged('retractRows([]) in legacy mode');
     cm.retractRows([]);
     cm.retractRows([], { undone: true });
+    check();
     assert.equal(cm.getStore().getStateJson(INDEX), null, 'nothing is written');
     assert.equal(indexRegistered(cm, 'zz-agent'), false, 'and no window state is registered');
     assert.equal(cm.windowMode(), 'legacy');
     const c = cm.addMessage('alice', [text('c')]);
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b', 'c'], 'a later write still reaches the window at once');
+    check = unchanged('a refused retractRows');
     assert.throws(() => cm.retractRows(['zz-no-such-row']), /no stored message has id zz-no-such-row, and the window holds none/);
+    check();
     assert.equal(cm.getStore().getStateJson(INDEX), null);
     assert.equal(indexRegistered(cm, 'zz-agent'), false);
 
@@ -390,7 +401,9 @@ describe('writing the window down', () => {
     assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'c'], 'a row stored now enters the window only when presented');
     assert.deepEqual(cm.getUnpresentedMessages().map((m) => m.id), [b, d]);
 
+    check = unchanged('retractRows([]) in presented mode');
     cm.retractRows([]);
+    check();
     assert.equal(indexItems(cm).length, 5, 'nor in presented mode');
     cm.close();
   });
@@ -422,6 +435,8 @@ describe('writing the window down', () => {
       const warned: string[] = [];
       const warn = console.warn;
       console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+      // CM #350 bot review, wave 6, finding 34: no other state is written or registered either.
+      const before = { states: store.listStates().length, sequence: store.currentSequence() };
       try {
         assert.equal(cm.windowMode(), 'legacy', label);
         assert.deepEqual(texts(await cm.compile(BIG)), ['a', 'b'], label);
@@ -440,6 +455,7 @@ describe('writing the window down', () => {
       assert.equal(lines.length, 1, `${label}: ${warned.join('\n')}`);
       assert.match(lines[0]!, says, label);
       assert.equal(store.getStateLen(INDEX), items.length, `nothing is written, ${label}`);
+      assert.deepEqual({ states: store.listStates().length, sequence: store.currentSequence() }, before, `no state is written or registered, ${label}`);
       cm.close();
     }
   });
@@ -894,5 +910,35 @@ describe('thinking binding over the window', () => {
     assert.deepEqual(keeps(after), [false, true, false, false]);
     side.close();
     main.close();
+  });
+});
+
+// CM #350 bot review, wave 6, finding 14: the per-row fixtures elsewhere
+// write through the writer's own field names (perItemIndexWrites), so a
+// rename of `at` or `by` in the writer and the reader together keeps them
+// green. These items are written straight to the index, one record each,
+// under the names pre-release builds stamped them with.
+describe('an index a pre-release build wrote, one record per item', () => {
+  it('reads as presented, and a branch cut takes a row presented after the header at its presentation', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const store = cm.getStore();
+    const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    store.registerState({ id: INDEX, strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+    for (const item of [{ id: a }, { id: b }, { v: 1 }]) store.appendToStateJsonWithIdentity(INDEX, item, 'by', 'at');
+    const c = cm.addMessage('alice', [text('c')]);
+    const presented = store.appendToStateJsonWithIdentity(INDEX, { id: c }, 'by', 'at');
+    const d = cm.addMessage('alice', [text('d')]);
+    assert.equal(cm.windowMode(), 'presented');
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b, c]);
+    assert.deepEqual([a, b, c].map((id) => cm.ordinalOf(id)), [0, 1, 3]);
+    assert.deepEqual(cm.getUnpresentedMessages().map((m) => m.id), [d]);
+    const index = (cm as unknown as { windowIndex: { issuedBy: (ordinal: number) => string | undefined } }).windowIndex;
+    assert.equal(index.issuedBy(3), presented.id, "c's presentation is read as the record that wrote it");
+    const branch = cm.branchAt(c, 'zz-at-c');
+    assert.equal(cm.listBranches().find((x) => x.name === branch)!.branchPoint, presented.sequence, "the cut is at c's presentation, not its own sequence");
+    await cm.switchBranch(branch);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b, c], "the branch's window holds c");
+    assert.deepEqual(cm.getAllMessages().map((m) => m.id), [a, b, c], 'and its record not d');
+    cm.close();
   });
 });
