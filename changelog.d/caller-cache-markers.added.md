@@ -6,7 +6,9 @@
   spread over the history's tokens, the tail end always marked), so the
   request stays within Anthropic's four, and sets a compile's cache
   reference only when its first accepted call's request carries as many
-  markers as it placed plus the declared ones. Before,
+  markers as it placed plus the declared ones. When the compile's own
+  request is never accepted and a later call takes the count check in its
+  place, that call is held to the same count. Before,
   such a hook's marker made every call's marker count differ from the
   compile's, so kv-unified kept no cache reference and weighed no cache
   costs, and once its own four were in use the hook's was a fifth, and

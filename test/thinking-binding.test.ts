@@ -269,6 +269,35 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
+  it('presented mode: a write between a stream\u2019s rounds, presented after them, leaves every reply its thinking', async () => {
+    // The sibling of the test above once a host presents rows (agent-framework
+    // #291): the other writer's row is stored between the rounds, as there,
+    // but enters the window at the next boundary, after the rounds the
+    // stream sent, so the reply after it keeps its thinking. The sibling of
+    // the auxiliary-slot test below is in window-index.test.ts.
+    cleanup();
+    const manager = await open();
+    manager.presentRows([]);
+    const u1 = manager.addMessage('User', [text('U1')]);
+    manager.presentRows([u1]);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const a1 = manager.addMessage('Claude', [thought(1), text('A1'), toolUse('t1')]);
+    manager.presentRows([a1]);
+    const other = manager.addMessage('Other', [text('zz-interleaved')]);
+    const r1 = manager.addMessage('User', [toolResult('t1', 'zz-result')]);
+    manager.presentRows([r1]);
+    note(manager, [a1, r1], identity());
+    const a2 = manager.addMessage('Claude', [thought(2), text('A2')]);
+    manager.presentRows([a2]);
+    note(manager, [a1, r1, a2], identity());
+    manager.presentRows([other]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, A1: true, tool_result: false, A2: true, 'zz-interleaved': false });
+    assert.deepEqual(next.messages.map((m) => (m.content.find((b) => b.type === 'text') as { text?: string } | undefined)?.text ?? 'tool_result'), ['U1', 'A1', 'tool_result', 'A2', 'zz-interleaved']);
+    assert.equal(next.thinkingStrip, undefined);
+    await manager.close();
+  });
+
   it('a write in an auxiliary slot between a stream\u2019s rounds leaves out the reply after it', async () => {
     cleanup();
     const main = await open();
