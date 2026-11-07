@@ -86,6 +86,10 @@ export function isOpaqueCarrier(block: ContentBlock): boolean {
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
+export function isCompactionCarrier(block: ContentBlock): boolean {
+  return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
+}
+
 function itemKey(block: ContentBlock): string | undefined {
   const raw = (block as RawFormCarrier).rawItem;
   // The Responses formatter emits only an object, deduplicated per message by

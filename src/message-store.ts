@@ -22,6 +22,7 @@ import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
+import { isOpaqueCarrier } from './raw-forms.js';
 
 /** Whether content, written or stored, holds a top-level block of `type`; content that isn't an array holds none. */
 function holdsBlock(content: unknown, type: string): boolean {
@@ -1414,6 +1415,50 @@ export class MessageStore {
    */
   static readonly ENCRYPTED_CARRIER_CHARS_PER_TOKEN = 6;
 
+  /**
+   * Billed-token rate for the `encrypted_content` of an Anthropic
+   * `web_search_tool_result`'s results. Measured 2026-11-07 with
+   * `count_tokens`: 47 results from 5 searches (a place, news, a
+   * reference article, code, a Japanese query), each result's tokens as the
+   * turn holding it alone less the turn with an empty list, its other fields
+   * at the JSON rate. On the tokenizer claude-opus-5-5, claude-sonnet-5-5 and
+   * claude-fable-5-1 share: median 2.78 chars/token, p10 2.35, p90 3.38, min
+   * 1.83, max 3.90; per search the medians run 2.48 to 3.52. claude-haiku-4-5
+   * counts the 47 results' ciphertext as 1.26x fewer tokens, as it counts
+   * prose and JSON (1.26x, 1.27x), so the calibration multiplier carries
+   * that, as it does for every rate.
+   */
+  static readonly WEB_SEARCH_RESULT_CIPHERTEXT_CHARS_PER_TOKEN = 2.8;
+
+  /**
+   * A zero-width carrier (raw-forms' isOpaqueCarrier) is sent as its raw
+   * item, so it is priced as that item: its JSON at the JSON rate, with the
+   * ciphertext of a compaction item at the encrypted carrier rate and that of
+   * a web search's results at their own. A route that leaves a carrier out
+   * (a Responses item on Anthropic) is over-counted by it. Any other block is 0.
+   */
+  static opaqueCarrierTokens(block: ContentBlock): number {
+    if (!isOpaqueCarrier(block)) return 0;
+    const item = (block as { rawItem: Record<string, unknown> }).rawItem;
+    if (item.type === 'compaction' && typeof item.encrypted_content === 'string') {
+      const { encrypted_content: ciphertext, ...rest } = item;
+      return jsonTokenEstimator(JSON.stringify(rest)) +
+        Math.round(ciphertext.length / MessageStore.ENCRYPTED_CARRIER_CHARS_PER_TOKEN);
+    }
+    if (item.type === 'web_search_tool_result' && Array.isArray(item.content)) {
+      let ciphertext = 0;
+      const results = item.content.map((result: unknown) => {
+        const { encrypted_content: enc, ...rest } = (result ?? {}) as Record<string, unknown>;
+        if (typeof enc !== 'string') return result;
+        ciphertext += enc.length;
+        return rest;
+      });
+      return jsonTokenEstimator(JSON.stringify({ ...item, content: results })) +
+        Math.round(ciphertext / MessageStore.WEB_SEARCH_RESULT_CIPHERTEXT_CHARS_PER_TOKEN);
+    }
+    return jsonTokenEstimator(JSON.stringify(item));
+  }
+
   /** Per-block cache of the raw (calibration-independent) estimate. */
   private _rawBlockTokens = new WeakMap<ContentBlock, number>();
 
@@ -1474,7 +1519,7 @@ export class MessageStore {
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
-        return this.tokenEstimator(block.text);
+        return isOpaqueCarrier(block) ? MessageStore.opaqueCarrierTokens(block) : this.tokenEstimator(block.text);
       case 'thinking': {
         // Stamped price wins. Otherwise a signed block is a FULL chain of
         // thought whatever its visible text says (empty under
