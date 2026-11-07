@@ -748,6 +748,64 @@ describe('onRetracted', () => {
     cm.close();
   });
 
+  // The verifier's D12 and F4 at cfba31f: the identity of the record that
+  // presented a row (`by`) is what tells a branch that presented it on its
+  // own apart, so it has to reach a waiting call from a removal's
+  // tombstones (WindowIndex.retractRemoved), and from a presentation
+  // written as a batch (the reading the write applies to, WindowIndex.write).
+  // The call waits here because telling it failed in the manager's own work.
+  it("a waiting call from a removal, or from a retraction of a row a batch presented, isn't made on a branch that presented the row on its own at the same ordinal", async () => {
+    for (const how of ['removal', 'batch'] as const) {
+      const strategy = new Gated();
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+      cm.presentRows([]);
+      const store = cm.getStore();
+      const [a, b] = ['a', 'b'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      // Made once a and b are stored and before they are presented.
+      const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+      // The batch case presents both in one record; the removal case one at a time.
+      if (how === 'batch') cm.presentRows([a, b]);
+      else {
+        cm.presentRows([a]);
+        cm.presentRows([b]);
+      }
+      const left = cm.ordinalOf(a);
+      // The context the manager builds for the strategy's call fails once, so the call waits.
+      const own = cm as unknown as { createStrategyContext: () => unknown };
+      const build = own.createStrategyContext.bind(cm);
+      own.createStrategyContext = () => {
+        own.createStrategyContext = build;
+        throw new Error('zz-context-failed');
+      };
+      await linesDuring(async () => {
+        if (how === 'removal') cm.removeMessage(a);
+        else cm.retractRows([a]);
+      });
+      assert.equal(own.createStrategyContext, build, `${how}, setup: telling the strategy failed`);
+      assert.equal(strategy.retracted.length, 0, `${how}, setup: the call waits`);
+      const { gate, open } = gated();
+      strategy.gate = gate;
+      const switched = cm.switchBranch(diverged);
+      // The branch presents a on its own, at the ordinal it took on the
+      // other branch (in a batch with b in the batch case, as there), then
+      // takes it out and presents it again, before the strategy initializes.
+      cm.presentRows(how === 'batch' ? [a, b] : [a]);
+      assert.equal(cm.ordinalOf(a), left, `${how}, setup: the branch presented a at the same ordinal`);
+      cm.retractRows([a]);
+      cm.presentRows([a]);
+      open();
+      await switched;
+      assert.equal(cm.currentBranch().name, diverged);
+      assert.deepEqual(
+        strategy.retracted.map((r) => ({ rows: r.rows, removed: r.info.removed })),
+        [{ rows: [a], removed: false }],
+        `${how}: only the branch's own retraction of a is told`,
+      );
+      await settle();
+      cm.close();
+    }
+  });
+
   // CM #350 bot review, wave 2, finding 36: a row of a waiting call that the
   // store no longer holds is told by its id, removed, as retractRows tells it.
   it('a waiting call whose row another manager removed before it was made tells that row by its id alone, with removed, in a call after the rows it holds', async () => {

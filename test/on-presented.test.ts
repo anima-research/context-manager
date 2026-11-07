@@ -756,6 +756,72 @@ describe('onPresented in presented mode', () => {
     cm.close();
   });
 
+  // The verifier's D15 at cfba31f: where the store can't say its branch
+  // before the retried calls, a move can't be seen, so the notification's
+  // own call waits too, and is made where the record of the branch the
+  // store is on holds its rows. In legacy mode nothing else checks that
+  // (in presented mode the rows' ordinals are read again).
+  it("in legacy mode a notification that can't read the store's branch before a retried call's hook moves it to a branch lacking its row doesn't tell that row", async () => {
+    const store = (await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() })).getStore();
+    const start = store.currentBranch().name;
+    class Moves extends ShardingRecords {
+      moves = true;
+      async onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        if (this.moves && rows.length > 1) {
+          this.moves = false;
+          store.switchBranch('zz-b');
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Moves();
+    const cm = await ContextManager.open({ store, namespace: 'zz-agent', strategy });
+    // As above: the shards that stayed wait for the strategy's next notification.
+    const own = cm as unknown as { createStrategyContext: () => unknown; hookScope: () => unknown; messageStore: { removeBodyGroup: () => void } };
+    const build = own.createStrategyContext.bind(cm);
+    let failures = 0;
+    own.createStrategyContext = () => {
+      if (failures < 2) {
+        failures++;
+        throw new Error('zz-context-failed');
+      }
+      return build();
+    };
+    const removeBodyGroup = own.messageStore.removeBodyGroup;
+    own.messageStore.removeBodyGroup = () => { throw new Error('zz-removal-failed'); };
+    await errorsDuring(async () => {
+      assert.throws(() => cm.addMessage('alice', [text('one'), text('two')]));
+    });
+    own.messageStore.removeBodyGroup = removeBodyGroup;
+    assert.equal(failures, 2, 'setup: both failed');
+    // A branch of the record as it stands, with the shards and without x.
+    store.createBranchAt('zz-b', start, store.currentSequence());
+    // x's notification's read of the store's branch, before it tries the
+    // waiting call again, throws once.
+    const scope = own.hookScope;
+    let unreadable = true;
+    own.hookScope = function (this: unknown) {
+      if (unreadable) {
+        unreadable = false;
+        throw new Error('zz-branch-unreadable');
+      }
+      return scope.call(this);
+    };
+    let x: MessageId;
+    try {
+      x = cm.addMessage('bob', [text('x')]);
+    } finally {
+      delete (own as { hookScope?: unknown }).hookScope;
+    }
+    assert.equal(unreadable, false, 'setup: the branch read failed');
+    assert.equal(cm.windowMode(), 'legacy', 'setup: legacy mode');
+    assert.equal(store.currentBranch().name, 'zz-b', "setup: the retried call's hook moved the store");
+    assert.equal(strategy.heard[0]?.rows.length, 2, 'setup: the shards were heard');
+    assert.deepEqual(strategy.heard.flatMap((h) => h.rows).filter((id) => id === x), [], "x isn't heard on a branch whose record lacks it");
+    await settle();
+    cm.close();
+  });
+
   // House review of #350, untested contract 3: a row the view filter leaves
   // out is given to onPresented all the same, and the context neither lists
   // it nor gives it a position.

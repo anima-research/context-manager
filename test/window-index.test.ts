@@ -42,6 +42,7 @@ import type {
   MessageStoreView,
   RequestIdentity,
   StoredMessage,
+  StrategyContext,
   ThinkingBinding,
   TokenBudget,
 } from '../src/index.js';
@@ -109,6 +110,31 @@ function indexRegistered(cm: ContextManager, namespace: string): boolean {
 }
 
 describe('the window in legacy mode', () => {
+  // The verifier's D2 at cfba31f: the strategy's window view answers
+  // sequenceFrom and ordinalFrom with undefined in legacy mode, as the index
+  // does, without listing the merged record for the index first (its
+  // argument), as 5b78bc5 made it for ordinalFrom.
+  it("the strategy's window view answers sequenceFrom and ordinalFrom without listing the record", async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+    const a = cm.addMessage('alice', [text('a')]);
+    const own = cm as unknown as { createStrategyContext: () => StrategyContext; mergedMessageView: () => unknown };
+    const window = own.createStrategyContext().window!;
+    const merged = own.mergedMessageView;
+    let listings = 0;
+    own.mergedMessageView = function (this: unknown) {
+      listings++;
+      return merged.call(this);
+    };
+    try {
+      assert.equal(window.sequenceFrom(0), undefined);
+      assert.equal(window.ordinalFrom(cm.getMessage(a)!.sequence), undefined);
+    } finally {
+      delete (own as { mergedMessageView?: unknown }).mergedMessageView;
+    }
+    assert.equal(listings, 0, 'no listing of the record');
+    cm.close();
+  });
+
   it('is the record itself, read live, and nothing is written until a host presents', async () => {
     const strategy = new Capturing();
     const path = freshPath();

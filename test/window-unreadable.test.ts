@@ -475,6 +475,92 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // The verifier's D12 at cfba31f, the removal's own reading: where its
+  // tombstones' write refuses before it settles anything (the store can't
+  // say its branch while a settlement waits), the removal tells the rows
+  // the window held as it read them before, each with the identity of the
+  // record that presented it there, which tells a branch that presented
+  // the row on its own apart once the call is made there.
+  it("a removal whose tombstones' write refuses before settling tells its rows with the records that presented them, so a branch that presented them on its own isn't told", async () => {
+    /** Hearing, whose initialize waits for `gate`, once one is set. */
+    class GatedHearing extends Hearing {
+      gate: Promise<void> | undefined;
+      async initialize(): Promise<void> {
+        await this.gate;
+      }
+    }
+    const strategy = new GatedHearing();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const [a, x] = ['a', 'x'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    // Made once a is stored and before it is presented.
+    const diverged = store.createBranchAt('zz-diverged', cm.currentBranch().name, store.currentSequence()).name;
+    cm.presentRows([a]);
+    const left = cm.ordinalOf(a);
+    // A write whose outcome is unknown waits to be settled on this branch.
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([x]), { operation: 'presentRows', entering: [x], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    // The removal's settlement can't read the store's branch, so its
+    // tombstones' write refuses; and the context for the strategy's call
+    // fails once, so the call waits.
+    type Settled = (operation: string) => unknown;
+    const index = (cm as unknown as { windowIndex: { settled: Settled } }).windowIndex;
+    const raw = store as unknown as Record<string, unknown>;
+    const currentBranch = raw.currentBranch as (this: unknown) => unknown;
+    const settled = index.settled;
+    let settling = false;
+    index.settled = function (this: unknown, operation: string) {
+      settling = true;
+      try {
+        return settled.call(this, operation);
+      } finally {
+        settling = false;
+      }
+    };
+    raw.currentBranch = function (this: unknown) {
+      if (settling) throw new Error('zz-branch-read-failed');
+      return currentBranch.call(this);
+    };
+    const own = cm as unknown as { createStrategyContext: () => unknown };
+    const build = own.createStrategyContext.bind(cm);
+    own.createStrategyContext = () => {
+      own.createStrategyContext = build;
+      throw new Error('zz-context-failed');
+    };
+    strategy.log.length = 0;
+    const error = console.error;
+    console.error = () => {};
+    try {
+      cm.removeMessage(a);
+    } finally {
+      console.error = error;
+      delete (index as { settled?: unknown }).settled;
+      delete raw.currentBranch;
+    }
+    assert.equal(own.createStrategyContext, build, 'setup: telling the strategy failed');
+    assert.notEqual(cm.ordinalOf(a), undefined, "setup: the tombstones' write refused, so a keeps its ordinal");
+    assert.equal(strategy.log.length, 0, 'setup: the call waits');
+    let open!: () => void;
+    strategy.gate = new Promise<void>((resolve) => { open = resolve; });
+    const switched = cm.switchBranch(diverged);
+    // The branch presents a on its own, at the ordinal it took on the other
+    // branch, then takes it out and presents it again, before the strategy
+    // initializes there.
+    cm.presentRows([a]);
+    assert.equal(cm.ordinalOf(a), left, 'setup: the branch presented a at the same ordinal');
+    cm.retractRows([a]);
+    cm.presentRows([a]);
+    open();
+    await switched;
+    assert.deepEqual(strategy.log.filter((line) => line.startsWith('retracted')), [`retracted ${a}`], "only the branch's own retraction of a is told");
+    cm.close();
+  });
+
   // CM #350 bot review, wave 4, finding 13: where the store can't say its
   // branch before the write or after it, nothing waits, and the error says so.
   it("a write whose outcome is unknown, where the store can't say its branch before the write either, says nothing waits to tell the strategy", async () => {
