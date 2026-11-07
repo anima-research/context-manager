@@ -67,16 +67,28 @@ async function linesDuring(fn: () => Promise<void>): Promise<string[]> {
   return lines;
 }
 
-/** A membrane that holds each call until the test releases it (or fails it), noting whether it asks for a merge. */
-function heldMembrane() {
-  const calls: Array<{ merge: boolean; release: () => void; fail: (error: Error) => void }> = [];
+/**
+ * A membrane that holds each call until the test releases it (or fails it),
+ * noting whether it asks for a merge and whether its request carries
+ * reasoning blocks. With `thinking`, each answer leads with a signed
+ * thinking block, which the L1 keeps (responseContent) and a merge's
+ * request carries.
+ */
+function heldMembrane(options: { thinking?: boolean } = {}) {
+  const calls: Array<{ merge: boolean; carriesReasoning: boolean; release: () => void; fail: (error: Error) => void }> = [];
   const membrane = {
-    complete: (request: { messages: Array<{ content: Array<{ text?: string }> }> }) => new Promise((resolve, reject) => {
+    complete: (request: { messages: Array<{ content: Array<{ type?: string; text?: string }> }> }) => new Promise((resolve, reject) => {
       const n = calls.length + 1;
-      const input = request.messages.flatMap((m) => m.content).map((b) => b.text ?? '').join('\n');
+      const blocks = request.messages.flatMap((m) => m.content);
+      const input = blocks.map((b) => b.text ?? '').join('\n');
+      const text = { type: 'text', text: `Summary #${n}` };
       calls.push({
         merge: input.includes('consolidate into a single L'),
-        release: () => resolve({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${n}` }] }),
+        carriesReasoning: blocks.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
+        release: () => resolve({
+          stopReason: 'end_turn',
+          content: options.thinking ? [{ type: 'thinking', thinking: `zz thought ${n}`, signature: `zz-sig-${n}` }, text] : [text],
+        }),
         fail: reject,
       });
     }),
@@ -161,7 +173,7 @@ interface Internals {
   summaries: SummaryEntry[];
   chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
   pendingCompressionWork: { chunk: { messages: Array<{ id: MessageId }>; recordId?: string } } | { sourceIds: readonly string[] } | null;
-  chunks: Array<{ messages: Array<{ id: MessageId }>; recordId?: string }>;
+  chunks: Array<{ messages: Array<{ id: MessageId }>; recordId?: string; compressed?: boolean; summaryId?: string }>;
   compressionQueue: number[];
   pushSummary(entry: SummaryEntry): void;
 }
@@ -200,10 +212,9 @@ function refusingWrites<T>(store: JsStore, ids: readonly string[], fn: () => T):
 }
 
 /** Instance A on a fresh store, its window holding 24 presented rows. */
-async function instanceA(make: () => AutobiographicalStrategy = strategyFor) {
+async function instanceA(make: () => AutobiographicalStrategy = strategyFor, held = heldMembrane()) {
   const path = freshPath();
   const store = JsStore.openOrCreate({ path });
-  const held = heldMembrane();
   const strategy = make();
   const cm = await ContextManager.open({ store, strategy, membrane: held.membrane });
   cm.presentRows([]);
@@ -254,6 +265,7 @@ describe('a retraction through another instance sharing the store', () => {
       assert.ok(work && 'sourceIds' in work && calls[2]!.merge, 'premise: a merge is in flight');
       const source = work.sourceIds[0]!;
       const row = internals(A).summaries.find((s) => s.id === source)!.sourceIds[0]!;
+      const sourceRecord = internals(A).chunkRecords.find((r) => r.summaryId === source)!.id;
 
       const B = strategyFor();
       b = await ContextManager.open({ store, strategy: B, membrane });
@@ -268,6 +280,16 @@ describe('a retraction through another instance sharing the store', () => {
       const after = stored(store, SUMMARIES);
       assert.ok(after.every((s) => !s.sourceIds.includes(source)), `no summary was written over ${source}: ${JSON.stringify(after.map((s) => s.id))}`);
       assert.ok(!internals(A).summaries.some((s) => s.id === source), 'the instance took up the store: it no longer holds the dropped source');
+      // The verifier's plant E5: the take-up rebuilds the chunks from the
+      // records it took up, so no chunk is still marked with the dropped
+      // source, and the record the other instance refolded is queued again
+      // over the rows it keeps, before any select rebuilds them.
+      const refolded = stored(store, CHUNKS).find((r) => r.id === sourceRecord && !r.compressed && !r.sourceIds.includes(row));
+      assert.ok(!internals(A).chunks.some((chunk) => chunk.summaryId === source), `no chunk is marked with the dropped source: ${JSON.stringify(internals(A).chunks.map((c) => [c.recordId, c.compressed, c.summaryId]))}`);
+      assert.ok(!internals(A).chunks.some((chunk) => chunk.messages.some((m) => m.id === row)), 'nor holds the row');
+      assert.ok(refolded, 'premise: the other instance refolded the record of the dropped source');
+      const chunk = internals(A).chunks.find((c) => c.recordId === refolded.id);
+      assert.ok(chunk && !chunk.compressed && internals(A).compressionQueue.includes(internals(A).chunks.indexOf(chunk)), `the refolded record is queued again: ${JSON.stringify(chunk)}`);
     } finally {
       for (const call of calls) call.release();
       b?.close();
@@ -1148,4 +1170,150 @@ describe('a retraction through another instance sharing the store', () => {
       store.close();
     }
   });
+
+  // The verifier's plants at cfba31f that the suite left green (E2, E4, E7;
+  // E5 is pinned in the first case above).
+  const unmerging = (extra: Record<string, unknown> = {}) => () => new AutobiographicalStrategy({
+    compressionModel: 'm',
+    targetChunkTokens: 50,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0,
+    l1HoldbackChunks: 0,
+    mergeThreshold: 10,
+    maxSpeculativeL1s: 1,
+    ...extra,
+  });
+
+  // E2: letGoOfRowsOutOfWindow takes up the store before it lets go, so the
+  // whole-state writes of its let-go carry the other instance's.
+  it("a let-go of a row found out of the window before a compression takes up the store first, writing back nothing another instance let go of", async () => {
+    const make = unmerging();
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA(make);
+    let b: ContextManager | undefined;
+    let c: ContextManager | undefined;
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await deadline(ticking);
+      }
+      const first = internals(A).summaries.find((s) => s.level === 1)!;
+      const z = first.sourceIds[0]!;
+      const queued = internals(A).chunks[internals(A).compressionQueue[0]!]!;
+      const y = queued.messages[1]!.id;
+      b = await ContextManager.open({ store, strategy: make(), membrane });
+      await linesDuring(async () => { b!.retractRows([z], { undone: true }); });
+      assert.ok(!stored(store, SUMMARIES).some((s) => s.id === first.id), "premise: the other instance's let-go dropped the L1");
+      assert.ok(internals(A).chunkRecords.some((r) => r.sourceIds.includes(z)), 'premise: this instance, which did not hear it, still holds the row in a record');
+      // Nothing lets go of y: a manager whose strategy folds nothing takes it out.
+      c = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      c.retractRows([y], { undone: true });
+
+      const before = calls.length;
+      const lines = await linesDuring(async () => { await releasingUntil(calls, a.tick()); });
+      assert.ok(lines.some((line) => line.includes(`not compressing chunk ${queued.recordId}`) && line.includes(y)), lines.join('\n'));
+      assert.equal(calls.length, before, 'no call is made');
+      const records = stored(store, CHUNKS);
+      assert.ok(records.every((r) => !r.sourceIds.includes(z)), `no record holds the row the other instance let go of: ${JSON.stringify(records)}`);
+      assert.ok(records.every((r) => !r.sourceIds.includes(y)), 'nor the row found out of the window');
+      assert.ok(!stored(store, SUMMARIES).some((s) => s.id === first.id), 'nor is the dropped L1 written back');
+    } finally {
+      for (const call of calls) call.release();
+      c?.close();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  // E4: storeWrittenElsewhere compares the chunk records too, so a let-go
+  // that changed only them (a row no L1 folds) is taken up.
+  it("a retraction through this instance, after the other instance gave a row up from a record no L1 folds, writes back nothing it gave up", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let b: ContextManager | undefined;
+    try {
+      const [r1, r2] = internals(A).chunkRecords.filter((r) => !r.compressed);
+      assert.ok(r1 && r2 && internals(A).summaries.length === 0, 'premise: two records, and no summary');
+      const y = r1.sourceIds[1]!;
+      const x = r2.sourceIds[1]!;
+      const summariesBefore = JSON.stringify(stored(store, SUMMARIES));
+      b = await ContextManager.open({ store, strategy: strategyFor(), membrane });
+      await linesDuring(async () => { b!.retractRows([y], { undone: true }); });
+      assert.equal(JSON.stringify(stored(store, SUMMARIES)), summariesBefore, "premise: the other instance's let-go left the summaries as they were");
+      assert.ok(!stored(store, CHUNKS).find((r) => r.id === r1.id)?.sourceIds.includes(y), 'premise: it gave the row up from its record');
+      assert.ok(internals(A).chunkRecords.find((r) => r.id === r1.id)?.sourceIds.includes(y), 'premise: this instance still holds it there');
+
+      const lines = await linesDuring(async () => { a.retractRows([x], { undone: true }); });
+      const records = stored(store, CHUNKS);
+      assert.ok(records.every((r) => !r.sourceIds.includes(y) && !r.sourceIds.includes(x)), `no record holds either row: ${JSON.stringify(records)}`);
+      assert.ok(lines.some((line) => line.includes("aren't as this instance holds them")), lines.join('\n'));
+    } finally {
+      for (const call of calls) call.release();
+      b?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  // E7: the rejection of the carrier fallback's retry is checked as the
+  // first call's is, before it is counted.
+  for (const limit of [5, 1] as const) {
+    it(`a merge whose carrier retry the provider rejects, after the other instance dropped a source during the retry, counts nothing and writes nothing (attempt limit ${limit})`, async () => {
+      const make = () => new AutobiographicalStrategy({
+        compressionModel: 'm',
+        targetChunkTokens: 50,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        autoTickOnNewMessage: false,
+        minChunkCharsForLLM: 0,
+        l1HoldbackChunks: 0,
+        mergeThreshold: 2,
+        maxSpeculativeL1s: 1,
+        mergeAttemptLimit: limit,
+      });
+      const { store, strategy: A, cm: a, calls, membrane } = await instanceA(make, heldMembrane({ thinking: true }));
+      let b: ContextManager | undefined;
+      try {
+        // Two L1s and their merge, then two more L1s: the second merge's
+        // request carries the reasoning of what precedes its sources.
+        for (let n = 1; n <= 5; n++) {
+          const ticking = a.tick();
+          await waitFor(() => calls.length === n);
+          calls[n - 1]!.release();
+          await deadline(ticking);
+        }
+        const merging = a.tick();
+        await waitFor(() => calls.length === 6);
+        const work = internals(A).pendingCompressionWork;
+        assert.ok(work && 'sourceIds' in work && calls[5]!.merge, 'premise: a merge is in flight');
+        assert.ok(calls[5]!.carriesReasoning, 'premise: its request carries reasoning blocks');
+        const source = work.sourceIds[0]!;
+        const row = internals(A).summaries.find((s) => s.id === source)!.sourceIds[0]!;
+        const naming = () => stored(store, QUEUE).filter((entry) => entry.sourceIds.includes(source));
+        const lines = await linesDuring(async () => {
+          // The transport refuses the carriers: the merge retries once, text-only.
+          calls[5]!.fail(Object.assign(new Error('zz invalid_request: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 }));
+          await waitFor(() => calls.length === 7);
+          assert.ok(calls[6]!.merge && !calls[6]!.carriesReasoning, 'premise: the retry is the merge, text-only');
+          b = await ContextManager.open({ store, strategy: make(), membrane });
+          b.retractRows([row], { undone: true });
+          assert.deepEqual(naming(), [], "premise: the other instance's let-go removed the queued merge from the store");
+          calls[6]!.fail(Object.assign(new Error('zz invalid_request failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 }));
+          await deadline(merging.catch(() => {}));
+        });
+        assert.ok(lines.some((line) => line.includes('transport rejected reasoning carriers')), `premise: the carrier fallback ran: ${lines.join('\n')}`);
+        assert.deepEqual(naming(), [], `the store's queue doesn't hold the merge again: ${lines.join('\n')}`);
+        assert.equal(A.getMergeQuarantineStatus().count, 0, `nothing is quarantined: ${lines.join('\n')}`);
+        assert.ok(lines.some((line) => line.includes("merge's call was out") && line.includes('its rejection is not counted')), lines.join('\n'));
+      } finally {
+        for (const call of calls) call.release();
+        b?.close();
+        a.close();
+        store.close();
+      }
+    });
+  }
 });
