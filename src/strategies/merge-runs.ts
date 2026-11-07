@@ -42,6 +42,70 @@ export interface StoreRunsInput<S extends RunSummary> {
   planning?: boolean;
 }
 
+export interface RangeSummary extends RunSummary {
+  sourceIds?: readonly string[];
+}
+
+export function placeRangeEnds<S extends RangeSummary>(
+  position: Map<string, number>,
+  listed: ReadonlyMap<string, number>,
+  l1s: Iterable<S>,
+  byId: ReadonlyMap<string, S>,
+  parentOf: (s: S) => string | null | undefined,
+  leavesOf: (s: S) => Iterable<string>,
+): void {
+  const place = (s: S, first: string | undefined, last: string | undefined, leaves: () => Iterable<string>): void => {
+    const range = s.sourceRange;
+    if (!range) return;
+    const { first: a, last: b } = range;
+    const startOwn = a === first && !listed.has(a);
+    const endOwn = b === last && !listed.has(b);
+    if (!startOwn && !endOwn) return;
+    const span = spanInStore(leaves(), listed);
+    for (const [own, end, at] of [[startOwn, a, span?.[0]], [endOwn, b, span?.[1]]] as const) {
+      if (!own) continue;
+      if (at !== undefined) position.set(end, at);
+      else position.delete(end);
+    }
+  };
+  const ancestors = new Map<string, S>();
+  for (const s of l1s) {
+    const ids = s.sourceIds ?? [];
+    place(s, ids[0], ids[ids.length - 1], () => ids);
+    for (let id = parentOf(s), p = id ? byId.get(id) : undefined; p && !ancestors.has(p.id); id = parentOf(p), p = id ? byId.get(id) : undefined) {
+      ancestors.set(p.id, p);
+    }
+  }
+  for (const s of [...ancestors.values()].sort((x, y) => (x.level ?? 1) - (y.level ?? 1))) {
+    place(s, ownRangeEnd(s, byId, false), ownRangeEnd(s, byId, true), () => leavesOf(s));
+  }
+}
+
+export function spanInStore(ids: Iterable<string>, position: ReadonlyMap<string, number>): [number, number] | undefined {
+  let first = Infinity;
+  let last = -Infinity;
+  for (const id of ids) {
+    const at = position.get(id);
+    if (at === undefined) continue;
+    if (at < first) first = at;
+    if (at > last) last = at;
+  }
+  return Number.isFinite(first) ? [first, last] : undefined;
+}
+
+export function ownRangeEnd<S extends RangeSummary>(s: S, byId: ReadonlyMap<string, S>, last: boolean): string | undefined {
+  const seen = new Set<string>();
+  for (let at: S | undefined = s; at && !seen.has(at.id);) {
+    seen.add(at.id);
+    const ids: readonly string[] = at.sourceIds ?? [];
+    const id: string | undefined = last ? ids[ids.length - 1] : ids[0];
+    const child: S | undefined = id === undefined ? undefined : byId.get(id);
+    if (!child) return id;
+    at = child;
+  }
+  return undefined;
+}
+
 export function placeOf(s: RunSummary, position: ReadonlyMap<string, number>): [number, number] | undefined {
   const range = s.sourceRange;
   if (!range) return undefined;
