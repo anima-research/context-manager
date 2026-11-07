@@ -4610,7 +4610,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and cache reads as disjoint counts wherever it knows the convention,
     // Gemini's included, so the prompt's total is their sum whatever the
     // provider, and a full cache hit is a zero input count beside a positive
-    // cache read. The usage comes from the host's instance (ctx.membrane),
+    // cache read. The usage comes from the host's instance (compressionMembraneFor),
     // which this package's range doesn't bind: a host on an older membrane
     // passes Gemini's counts raw, and before 0.5.81 OpenAI's too, with the
     // cached span inside the input count, so the sum counts that span twice
@@ -6351,10 +6351,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * model now. A pause observed on another membrane instance or model says
    * nothing about this one, so it is ignored and cleared.
    */
+  /**
+   * The membrane memory-writing calls go through: the host's
+   * compressionMembrane when it gave one (another provider or credential for
+   * compression), else the agent's own. Every compression, merge and
+   * transition-summary call, and the compression lane's pause, which is kept
+   * per membrane, read it here.
+   */
+  protected compressionMembraneFor(ctx: StrategyContext): Membrane | undefined {
+    return ctx.compressionMembrane ?? ctx.membrane;
+  }
+
   private activeCompressionPause(ctx: StrategyContext): CompressionLanePause | null {
     const pause = this.compressionPause;
     if (!pause) return null;
-    if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
+    if (pause.membrane !== this.compressionMembraneFor(ctx) || pause.model !== this.config.compressionModel) {
       this.compressionPause = null;
       return null;
     }
@@ -6428,7 +6439,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const model = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined)
       ?? this.config.compressionModel;
     const previous = this.compressionPause &&
-      this.compressionPause.membrane === ctx.membrane &&
+      this.compressionPause.membrane === this.compressionMembraneFor(ctx) &&
       this.compressionPause.model === model
       ? this.compressionPause
       : null;
@@ -6461,7 +6472,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       const pause: CompressionLanePause = previous
         ? { ...previous }
-        : { backoffUntil: 0, statedUntil: null, statedBy: null, failures: 0, membrane: ctx.membrane, model, reason: '' };
+        : { backoffUntil: 0, statedUntil: null, statedBy: null, failures: 0, membrane: this.compressionMembraneFor(ctx), model, reason: '' };
       if (!(pause.statedBy === 'provider' && pause.statedUntil !== null && pause.statedUntil > recheckAt)) {
         pause.statedUntil = recheckAt;
         pause.statedBy = 'admission';
@@ -6517,7 +6528,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : statedUntil,
       statedBy,
       failures,
-      membrane: ctx.membrane,
+      membrane: this.compressionMembraneFor(ctx),
       model,
       reason,
       latest: { subject, failureClass: compressionFailureClass(error) },
@@ -6846,7 +6857,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  pin or a lock keeps what they cover in the floor another way. Merges the
    *  queue doesn't hold yet aren't counted. */
   protected queuedReliefTokens(): number {
-    if (!this.config.compressionModel || !this.hostContext?.membrane) return 0;
+    if (!this.config.compressionModel || !(this.hostContext && this.compressionMembraneFor(this.hostContext))) return 0;
     const store = this.hostContext?.messageStore;
     const tools = this.hostContext?.tools;
     const quarantined = this.quarantinedChunkSources();
@@ -8901,7 +8912,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       this.diag.warn('AutobiographicalStrategy: No membrane instance for compression');
       return;
     }
@@ -9159,7 +9171,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // executeMerge builds its request before its first await, so this is
       // the model the call names.
       const mergeModel = this.config.compressionModel;
-      const mergeMembrane = ctx.membrane;
+      const mergeMembrane = compressionMembrane;
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
       let mergeToolsDeferred = false;
       const merging = this.executeMerge(merge.level, merge.sourceIds, ctx, () => {
@@ -9290,8 +9302,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const streak = nextFailureStreak(
               this.mergeFailureRuns.get(mergeFailureKey(merge)),
               sha256Json({ level: merge.level, sourceIds: merge.sourceIds }),
-              compressionDomain(ctx.membrane, dispatched),
-              domainLanded(ctx.membrane, dispatched),
+              compressionDomain(compressionMembrane, dispatched),
+              domainLanded(compressionMembrane, dispatched),
             );
             if (streak.failures >= AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES) {
               this.mergeFailureOrder.delete(mergeFailureKey(merge));
@@ -10875,7 +10887,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for compression');
     }
     // The chunk's record as this instance holds it as the compression
@@ -11686,7 +11699,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // room), so no provider stated a wait for this lane to take.
         if (
           compressionFailureKind(result.error) === 'transient' && !isNoCallDeferral(result.error) &&
-          result.membrane === ctx.membrane
+          result.membrane === compressionMembrane
         ) {
           this.pauseCompressionLane(
             sourceBranch, ctx, result.error, 'l1',
@@ -11907,9 +11920,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          response = await this.callProvider(ctx.membrane!, attemptRequest);
+          response = await this.callProvider(compressionMembrane, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
-          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
+          this.resumeCompressionLane(compressionMembrane, this.compressionRequestModel(attemptRequest));
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
@@ -11955,7 +11968,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           try {
-            response = await this.callProvider(ctx.membrane!, acceptedRequest);
+            response = await this.callProvider(compressionMembrane, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
@@ -11964,7 +11977,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             throw retryError;
           }
           if (response && typeof response === 'object') countedStripped.add(response);
-          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
+          this.resumeCompressionLane(compressionMembrane, this.compressionRequestModel(acceptedRequest));
         }
         // An answer ends the run of failures of the rung that gave it.
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
@@ -12170,7 +12183,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
             this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash),
-            compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched),
+            compressionDomain(compressionMembrane, dispatched), domainLanded(compressionMembrane, dispatched),
           );
           // The decision is the rung's outcome, which ends its run (noteOutcome).
           if (run.failures >= AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES) {
@@ -13293,7 +13306,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The L1 is pushed and its chunk record marked: it has landed, on the
       // branch that compressed it (noted before the await below, which a
       // branch switch may cross).
-      this.noteCompressionLanded(ctx.membrane, model);
+      this.noteCompressionLanded(compressionMembrane, model);
       // Success pays off quarantine debt recorded against this chunk under
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
@@ -13357,7 +13370,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw error;
     } finally {
       settleInFlight({
-        ...(inFlightError !== undefined ? { error: inFlightError, membrane: ctx.membrane } : {}),
+        ...(inFlightError !== undefined ? { error: inFlightError, membrane: compressionMembrane } : {}),
         ...(inFlightError === undefined && this.compressionBranchGeneration !== sourceBranch.strategyGeneration
           ? { discarded: true }
           : {}),
@@ -13711,7 +13724,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     onToolsDeferred?: () => void,
   ): Promise<boolean> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for merge');
     }
 
@@ -14349,7 +14363,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       let response: NormalizedResponse;
       try {
-        response = await this.callProvider(ctx.membrane, dispatchRequest);
+        response = await this.callProvider(compressionMembrane, dispatchRequest);
       } catch (error) {
         noteDispatchedModel(error, dispatchRequest);
         // An error on work that lost its currency is discarded as its result
@@ -14386,7 +14400,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
         try {
-          response = await this.callProvider(ctx.membrane, acceptedRequest);
+          response = await this.callProvider(compressionMembrane, acceptedRequest);
         } catch (retryError) {
           noteDispatchedModel(retryError, acceptedRequest);
           if (stale(retryError)) return false;
@@ -14397,7 +14411,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Any answer from the provider ends its route's pause and backoff,
       // whatever the disposition gate below makes of it (a refusal included),
       // and on whatever branch: the pause is the route's, not the branch's.
-      this.resumeCompressionLane(ctx.membrane, this.compressionRequestModel(acceptedRequest));
+      this.resumeCompressionLane(compressionMembrane, this.compressionRequestModel(acceptedRequest));
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
       // the request that authored it: sha256 of the accepted request's JSON,
@@ -19292,7 +19306,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
     const sourceBranch = this.requireLoadedBranch('generateTransitionSummary');
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for transition summary generation');
     }
 
@@ -19370,7 +19385,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.isCompressionBranchCurrent(sourceBranch)) throw crossed();
     let response: NormalizedResponse;
     try {
-      response = await this.callProvider(ctx.membrane, prepared);
+      response = await this.callProvider(compressionMembrane, prepared);
     } catch (error) {
       // An error on work that lost its currency while the call was out says
       // so, as its result would below. A host's withdrawal
