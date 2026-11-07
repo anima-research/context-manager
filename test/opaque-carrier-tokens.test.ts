@@ -25,6 +25,11 @@ class Unbound extends AutobiographicalStrategy {
   price(content: ContentBlock[]): number { return this.estimateTokens(content); }
 }
 
+class Compressing extends AutobiographicalStrategy {
+  sent(content: ContentBlock[], ctx: never): number { return this.sentTokensOf(content, ctx); }
+  prepared(content: ContentBlock[], ctx: never): number { return this.preparedTokensOf(content, ctx); }
+}
+
 const PATHS: Array<{ name: string; open(store: JsStore): Estimate }> = [
   {
     name: 'MessageStore.estimateTokens',
@@ -152,5 +157,15 @@ describe('zero-width carriers in a stored message', () => {
       messages.estimateTokens({ content: [carrier(COMPACTION), answer, nested] } as never),
       without + COMPACTION_PRICE + jsonTokenEstimator(JSON.stringify(HOSTED_CALL)),
     );
+  });
+
+  it('prices a compression request without the carriers it never sends', () => {
+    const strategy = new Compressing({ targetChunkTokens: 5_000, recentWindowTokens: 50_000, compressionModel: 'mock' });
+    const ctx = { messageStore: messages } as never;
+    const answer: ContentBlock = { type: 'text', text: 'word '.repeat(200) };
+    for (const item of [COMPACTION, SEARCH_RESULT, HOSTED_CALL]) {
+      assert.strictEqual(strategy.sent([carrier(item), answer], ctx), strategy.sent([answer], ctx), `sentTokensOf, ${String(item.type)}`);
+      assert.strictEqual(strategy.prepared([carrier(item), answer], ctx), strategy.prepared([answer], ctx), `preparedTokensOf, ${String(item.type)}`);
+    }
   });
 });

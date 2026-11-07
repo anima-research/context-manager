@@ -19085,13 +19085,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * A message's content priced as the store prices a message, with its
-   * serialized media replaced on a copy, as runAttempt prepares a request
-   * before it is sent. So a data URL is priced as its marker, not its
-   * payload.
+   * A message's content priced as the store prices a message, without the
+   * opaque carriers no compression request sends and with its serialized
+   * media replaced on a copy, as runAttempt prepares a request before it is
+   * sent. So a data URL is priced as its marker, not its payload.
    */
   protected preparedTokensOf(content: ContentBlock[], ctx: StrategyContext): number {
-    const copy = { content: [...content] };
+    const copy = { content: content.filter((block) => !isOpaqueCarrier(block)) };
     this.stripSerializedCompressionMedia([copy]);
     return ctx.messageStore.estimateTokens({ content: copy.content } as unknown as StoredMessage);
   }
