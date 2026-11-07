@@ -303,7 +303,6 @@ export class ContextLog {
   private estimateBlockTokens(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
-        // Mirrors MessageStore.computeBlockTokensRaw: a zero-width carrier is priced as its item.
         return isOpaqueCarrier(block) ? MessageStore.opaqueCarrierTokens(block) : this.tokenEstimator(block.text);
       case 'thinking': {
         // Mirrors MessageStore.computeBlockTokensRaw: stamped price wins;

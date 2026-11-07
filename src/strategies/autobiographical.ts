@@ -16153,13 +16153,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _lastCompileEstimate = 0;
   private _lastCompileInjected = 0;
-  /** Whether the last committed compile holds a Responses compaction item.
-   *  OpenAI may count a request holding one from the item onward, so its
-   *  usage no longer measures the window this strategy priced, and no
-   *  calibration sample is learned from it (reportRealInputTokens). */
   private _lastCompileHeldCompaction = false;
-  /** Whether calibration has stopped for compaction items, so the change is
-   *  logged once each way rather than at every sample. */
   private _calibrationPausedForCompaction = false;
   private _storeView: MessageStoreView | null = null;
 
@@ -21826,7 +21820,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let tokens = 0;
     for (const block of content) {
       if (block.type === 'text') {
-        // Mirrors MessageStore.computeBlockTokensRaw: a zero-width carrier is priced as its item.
         tokens += isOpaqueCarrier(block) ? MessageStore.opaqueCarrierTokens(block) : defaultTokenEstimator(block.text);
       } else if (block.type === 'thinking') {
         // Mirrors MessageStore.computeBlockTokensRaw: a stamped estimate

@@ -86,7 +86,6 @@ export function isOpaqueCarrier(block: ContentBlock): boolean {
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
-/** An opaque carrier whose item is a Responses compaction item. */
 export function isCompactionCarrier(block: ContentBlock): boolean {
   return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
 }

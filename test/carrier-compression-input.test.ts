@@ -1,13 +1,3 @@
-/**
- * A compression request still carries no zero-width carrier, now that the
- * live window prices one as its item.
- *
- * Compression input drops carriers with the other empty text
- * (stripEmptyTextBlocks): a summarizer can't read an encrypted compaction
- * item or a server tool's opaque block, and a compression request is priced
- * by what it sends. Pricing a carrier in the live window changes neither.
- */
-
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';

@@ -1,19 +1,3 @@
-/**
- * Calibration learns nothing from a compile that holds a Responses compaction
- * item.
- *
- * OpenAI may count a request that carries a compaction item from the item
- * onward, so the request's usage no longer measures the window the compile
- * priced. A sample from such a compile would teach the multiplier that every
- * window costs less than it does. The change is logged once when skipping
- * begins, and once when a compile without one lets calibration learn again,
- * not at every sample. Other carriers stay ordinary samples, and a multiplier
- * learned before carriers were priced still loads: agent-framework releases
- * from 0.6.5 on, before the one that carries
- * anima-research/agent-framework#988, leave carriers out of a turn's first
- * request, the one a sample is taken from.
- */
-
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -43,7 +27,7 @@ async function openManager(name: string, carrier?: ContentBlock) {
     targetChunkTokens: 5_000,
     recentWindowTokens: 50_000,
     compressionModel: 'mock',
-    adaptiveResolution: true, // the calibration sample is armed on the adaptive (folding) path only
+    adaptiveResolution: true,
   });
   const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane });
   let carrierAt: string | undefined;
@@ -55,7 +39,6 @@ async function openManager(name: string, carrier?: ContentBlock) {
   return { cm, strategy, internals: strategy as unknown as Internals, carrierAt: carrierAt! };
 }
 
-/** The `[estimator-calibration]` lines logged while `fn` runs. */
 async function calibrationLines(fn: () => Promise<void> | void): Promise<string[]> {
   const lines: string[] = [];
   const { warn, error } = console;
@@ -72,8 +55,6 @@ async function calibrationLines(fn: () => Promise<void> | void): Promise<string[
 describe('calibration and compaction items', () => {
   it('learns nothing from a compile holding a compaction item, says so once, and learns again once a compile holds none', async () => {
     const { cm, strategy, internals, carrierAt } = await openManager('compaction', COMPACTION);
-    // A fresh store's provisional 1 is replaced outright by the first sample
-    // the band accepts, so a learned sample would read 1.2 at once.
     const first = await calibrationLines(async () => {
       await cm.compile(BUDGET);
       strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);

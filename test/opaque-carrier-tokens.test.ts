@@ -1,15 +1,3 @@
-/**
- * A zero-width carrier is priced as the provider item it is sent as.
- *
- * membrane carries a provider item it has no block for (a Responses
- * compaction item or hosted tool call, an Anthropic server-tool block such as
- * a web search's results) as `{ type: 'text', text: '', rawItem }`, and the
- * formatters send the item in its place. Priced as its empty text, a window
- * holding such items cost less than the request that carries them. The
- * store's estimator, the context log's, and the strategy's own before a store
- * view is bound each price one the same way, so every case runs on all three.
- */
-
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -58,11 +46,9 @@ const PATHS: Array<{ name: string; open(store: JsStore): Estimate }> = [
 
 const carrier = (rawItem: Record<string, unknown>): ContentBlock => ({ type: 'text', text: '', rawItem }) as unknown as ContentBlock;
 
-// A Responses compaction item: its ciphertext at the encrypted carrier rate.
 const COMPACTION = { type: 'compaction', id: 'cmp_1', encrypted_content: 'E'.repeat(6_000) };
 const COMPACTION_PRICE = jsonTokenEstimator(JSON.stringify({ type: 'compaction', id: 'cmp_1' })) + 1_000;
 
-// An Anthropic web search's results: their ciphertext at its measured rate, the rest as JSON.
 const SEARCH_RESULT = {
   type: 'web_search_tool_result',
   tool_use_id: 'srvtoolu_1',
@@ -80,7 +66,6 @@ const SEARCH_RESULT_PRICE = jsonTokenEstimator(JSON.stringify({
   ],
 })) + 1_500;
 
-// Items with no ciphertext of their own: their JSON at the JSON rate.
 const SERVER_TOOL_USE = { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'okaukuejo waterhole' } };
 const SEARCH_ERROR = { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_2', content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' } };
 const HOSTED_CALL = { type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'etosha' } };
