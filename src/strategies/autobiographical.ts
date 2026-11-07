@@ -7538,7 +7538,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * this strategy never heard go, stands at the end of their run, where
    * releaseRowsThatLeft doesn't see it (it is in the window again). Such an
    * L1 is dropped and its record compressed again over the run in window
-   * order, and such a record holds its run in window order.
+   * order, and such a record holds its run in window order. So is a
+   * summary above L1 whose leaves, read through its L1s in the order it
+   * holds them, the window holds in another order, though each L1 is in
+   * order and the leaves stand together (one L1's row presented again
+   * after a later L1's rows): it is dropped alone, with every summary
+   * above it, and its L1s and their records stay.
    *
    * The audit's index places only rows a chunk or an L1 owns, so a row
    * presented again after a row no chunk owns (one in the recent window,
@@ -7603,13 +7608,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((summary) => summary.level === 1 && live.has(summary.id) && !named.has(summary.id) &&
           (outOfOrder(summary.sourceIds) || windowRuns(summary.sourceIds, position).length > windowRuns(summary.sourceIds, owned).length))
         .map((summary) => summary.id);
-      if (violations.length === 0 && reordered.length === 0 && split.size === 0) return;
+      // A summary above L1 whose L1s are each in order, and whose leaves
+      // stand together, can still hold them out of order: one L1's row
+      // presented again after a later L1's rows. The audit asks only for
+      // holes, and the test above reads each L1 alone, so its leaves are read
+      // through its L1s, in the order it holds them (leafRowsOf). It goes on
+      // its own, with every summary above it, and its L1s, which the window
+      // holds whole, stay and render on their own: no record changes. One
+      // over a summary that goes anyway goes with it (unfold), unnamed.
+      const above = this.summaries.filter(
+        (summary) => summary.level > 1 && !named.has(summary.id) && outOfOrder(this.leafRowsOf([summary])),
+      );
+      const going = new Set([...named, ...reordered, ...above.map((summary) => summary.id)]);
+      const goesWith = (summary: SummaryEntry, seen = new Set<string>()): boolean => summary.sourceIds.some((id) => {
+        if (going.has(id)) return true;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        const child = this.summaryById(id);
+        return child !== undefined && child.level > 1 && goesWith(child, seen);
+      });
+      const reorderedAbove = above.filter((summary) => !goesWith(summary)).map((summary) => summary.id);
+      if (violations.length === 0 && reordered.length === 0 && reorderedAbove.length === 0 && split.size === 0) return;
       const l1s = new Set([...violations.filter((v) => v.level === 1).map((v) => v.id), ...reordered]);
       const released: MessageId[] = [];
       const trimmed: string[] = [];
       const releasedUncompressed: MessageId[] = [];
       const place = ctx.window.ordinals() ?? position;
-      const unfolded = this.unfold(new Set([...named, ...reordered]), (record) => {
+      const unfolded = this.unfold(new Set([...named, ...reordered, ...reorderedAbove]), (record) => {
         const demoted = record.summaryId !== undefined && l1s.has(record.summaryId);
         if (!demoted && !split.has(record.id)) return undefined;
         const longest = windowRuns(record.sourceIds, position).reduce<MessageId[]>((best, run) => (run.length > best.length ? run : best), []);
@@ -7622,12 +7647,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!demoted) trimmed.push(record.id);
         return windowOrdered(record.sourceIds.filter((id) => kept.has(id)), place);
       });
-      const demoted = violations.length + reordered.length;
+      const demoted = violations.length + reordered.length + reorderedAbove.length;
       if (demoted > 0) {
         const refolded = unfolded.refolded.filter((id) => !split.has(id));
+        const outOfOrderIds = [...reordered, ...reorderedAbove];
         this.diag.warn(
           `[autobiographical] the window holds the leaves of ${demoted} summar${demoted === 1 ? 'y' : 'ies'} apart` +
-            `${reordered.length > 0 ? ` or out of order [${reordered.join(', ')}]` : ''} ` +
+            `${outOfOrderIds.length > 0 ? ` or out of order [${outOfOrderIds.join(', ')}]` : ''} ` +
             `(a row that left the window and was presented again before this strategy heard it go, or crossed ownership ` +
             `the store held already): dropped ` +
             `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
