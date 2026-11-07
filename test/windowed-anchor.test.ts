@@ -13,7 +13,8 @@
  * as `{ anchor, ordinal, v: 2 }`
  * when it is made (an anchor of 0, the start, isn't written, since it
  * converts to the whole window whenever it is converted; a write that
- * fails is made again at the next read: see presentedAnchor), keeping the
+ * fails is made again by the next compile that isn't a dryRun, or
+ * getAnchorOrdinal() (getAnchor() doesn't): see presentedAnchor), keeping the
  * sequence for a release that reads it alone,
  * so a reload reads the ordinal back rather than converting again. From
  * then on a row stored before the anchor's sequence and presented later is

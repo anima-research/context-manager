@@ -532,7 +532,9 @@ describe('a retraction through another instance sharing the store', () => {
 
   // Wave 3 (finding 2, the verifier's pin): a merge's entry check finds a
   // row under its sources that left and was presented again before it
-  // began, by the order the window now holds them in, and makes no call.
+  // began, by the order the window now holds them in, and makes no call
+  // (here the first row under them; the last, or one before a row the
+  // window doesn't hold, isn't found at entry: see the merge-entry comment).
   it("a merge over a row the other instance took out and presented again before it began, whose own writes then failed, makes no call", async () => {
     const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
     let b: ContextManager | undefined;
