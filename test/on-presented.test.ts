@@ -1437,6 +1437,54 @@ describe('resetHeadWindow once a host presents', () => {
     }
   });
 
+  // CM #350 bot review, wave 6, finding 27: where the store can't say
+  // whether it still holds the transition, the refusal says what the call
+  // last knew, as where it can't say its branch.
+  it("a refusal where the store can't say whether it still holds the transition says what the call last knew", async () => {
+    let cm!: ContextManager;
+    class Resettable extends Records {
+      resets: MessageId[] = [];
+      resetHeadWindow(fromMessageId: MessageId): void {
+        this.resets.push(fromMessageId);
+      }
+      async generateTransitionSummary(): Promise<string> {
+        return 'summary';
+      }
+      onPresented(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void> {
+        const transition = rows.find((m) => m.participant === 'Context Manager');
+        if (transition) {
+          cm.removeMessage(transition.id);
+          cm.close();
+          // The refusal's read of the store then fails, once.
+          const messages = (cm as unknown as { messageStore: Record<string, unknown> }).messageStore;
+          messages.sequenceOf = () => {
+            delete messages.sequenceOf;
+            throw new Error('zz-store-unreadable');
+          };
+        }
+        return super.onPresented(rows, ctx);
+      }
+    }
+    const strategy = new Resettable();
+    // An app-owned store, which stays open after close().
+    const owner = await ContextManager.open({ path: freshPath(), namespace: 'zz-owner', strategy: new PassthroughStrategy() });
+    cm = await ContextManager.open({ store: owner.getStore(), namespace: 'zz-agent', strategy });
+    cm.presentRows([]);
+    const err = await cm.resetHeadWindow('zz-transition').then(() => assert.fail('expected a rejection'), (e: unknown) => e as Error);
+    const transition = strategy.heard.flatMap((h) => h.rows).at(-1)!;
+    assert.equal(owner.getMessage(transition), null, 'setup: the hook removed the transition');
+    assert.deepEqual(strategy.resets, [], "the head window wasn't reset");
+    assert.ok(!err.message.includes(`message ${transition} is stored`), `not stated as what holds now: ${err.message}`);
+    assert.ok(
+      err.message.includes(
+        `message ${transition} was stored and presented on the branch it was added on, as the call last knew, and the store can't say now whether it still holds it`,
+      ),
+      err.message,
+    );
+    await settle();
+    owner.close();
+  });
+
   // CM #350 bot review, wave 5, finding 36: a listener of a sharded
   // transition's first shard can present it before the rest is stored, so
   // a refusal then judges the body whole, as the presentation does.

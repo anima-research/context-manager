@@ -4187,7 +4187,8 @@ export class ContextManager {
    * the shards stored by then), stored and out of the window, or, in
    * legacy mode, where the window is the record, stored. Where they can't
    * tell (the store is on another branch than the one the transition was
-   * added on, or can't say its branch), it says what the call last knew of
+   * added on, can't say its branch, or can't say whether it still holds
+   * the transition), it says what the call last knew of
    * that branch, such as stored, or stored and maybe presented, and, once a
    * host presents, that it is what the call last knew (in legacy mode it
    * says stored, as before).
@@ -4265,7 +4266,8 @@ export class ContextManager {
     // window, which judges the body whole, each read guarded. `known` is
     // what the call last knew, given where the reads can't tell: the store
     // is on another branch than the one the add stored it on, or can't say
-    // its branch; once a host presents, the words say so, and in legacy
+    // its branch, or can't say whether it holds the transition; once a host
+    // presents, the words say so, and in legacy
     // mode, where only the refusal after the add can be reached, they are
     // main's ("stored"). `out` is where the window lacks it and the store
     // holds it: once a host presents, stored and out of the window, and in
@@ -4282,7 +4284,10 @@ export class ContextManager {
       try {
         if (this.messageStore.sequenceOf(msgId) === undefined) return 'is no longer stored (a listener of its add, or a hook its presentation ran, removed it)';
       } catch {
-        // The store can't say: it was stored.
+        // The store can't say whether a listener or a hook removed it, so
+        // the window, which a removal through another manager doesn't
+        // reach, can't say either.
+        return lastKnown("the store can't say now whether it still holds it");
       }
       let held: 'all' | 'some' | 'none' | undefined;
       let presented: boolean | undefined;
