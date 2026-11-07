@@ -47,7 +47,9 @@ export interface WindowedPassthroughOptions {
    * anchor never moves, so compiled output between re-anchors is a
    * byte-stable prefix plus pure appends, apart from a row taken out of the
    * window once a host presents rows (retractRows, or a removal), which
-   * changes the prefix from that row on, and an image the live-image
+   * changes the prefix from that row on, a message edited
+   * (ContextManager.editMessage), which changes the bytes at its place,
+   * and an image the live-image
    * policy strips once it is past its limits (`maxLiveImages`,
    * `imageStripDepthTokens`, `maxLiveImageBytes`, below), which changes
    * the bytes at that image's place — and the strategy
