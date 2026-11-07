@@ -663,8 +663,12 @@ export class WindowIndex {
    * `operation`, which throws, writing nothing: the call was given the
    * record of the branch it was made on, and would write it into the
    * window of the one the store is on now, or take out of that window
-   * every row the record lacks. The writes it heard of stay settled, and a
-   * call made again works on the branch the store is on.
+   * every row the record lacks. The writes heard of up to that hook stay
+   * settled, and those after it aren't heard on the branch the store
+   * moved to: they wait for the next write on the branch they were made
+   * on, as do they where the store can't say its branch after a hook (its
+   * error is thrown). A call made again works on the branch the store is
+   * on.
    *
    * Returns the reading with the id of the branch it is of, which the
    * call's own write waits on if its outcome is unknown (afterThrow): read
@@ -693,20 +697,30 @@ export class WindowIndex {
     const due = this.unsettled.filter((write) => write.branch === branch.id);
     if (due.length === 0) return { state, branch: branch.id };
     this.unsettled = this.unsettled.filter((write) => write.branch !== branch.id);
-    for (const write of due) {
-      try {
-        write.settle(state.ordinals);
-      } catch (error) {
-        logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
+    // One at a time, with the branch read after each: a hook that moved the
+    // store stops the rest, which wait for the next write on this branch,
+    // ahead of any write a hook made meanwhile, and so do they where the
+    // branch can't be read after one.
+    let next = 0;
+    try {
+      while (next < due.length) {
+        const write = due[next++]!;
+        try {
+          write.settle(state.ordinals);
+        } catch (error) {
+          logThrown('[context-manager] telling the strategy what a window write whose outcome was unknown did failed:', error, this.diag);
+        }
+        const now = this.store.currentBranch();
+        if (now.id !== branch.id) {
+          throw new Error(
+            `ContextManager.${operation}: a strategy hook that heard what an earlier write to the window did moved the ` +
+              `store's branch from ${branch.name} to ${now.name}, and this call was given the record of ${branch.name}, ` +
+              `so it writes nothing; call it again on the branch the store is on`,
+          );
+        }
       }
-    }
-    const now = this.store.currentBranch();
-    if (now.id !== branch.id) {
-      throw new Error(
-        `ContextManager.${operation}: a strategy hook that heard what an earlier write to the window did moved the ` +
-          `store's branch from ${branch.name} to ${now.name}, and this call was given the record of ${branch.name}, ` +
-          `so it writes nothing; call it again on the branch the store is on`,
-      );
+    } finally {
+      if (next < due.length) this.unsettled = [...due.slice(next), ...this.unsettled];
     }
     // A hook may have written to the index since.
     return { state: this.current(), branch: branch.id };

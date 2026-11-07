@@ -805,6 +805,77 @@ describe("a hook that hears what an unknown write did, and moves the store's bra
     await new Promise((resolve) => setImmediate(resolve));
     cm.close();
   });
+
+  // CM #350 bot review, wave 6, finding 22: two writes can wait on one
+  // branch (a hook that heard an earlier one made a write whose outcome was
+  // unknown, and so did the call that settled it). Where the first one's
+  // hook moves the store, the second isn't settled on the other branch: it
+  // waits for the next write on its own.
+  it("of two writes waiting on a branch, the one after a hook that moved the store waits for the next write on that branch", async () => {
+    /** Hearing, which runs the reaction set for a row, once, when it hears that row enter, after logging it. */
+    class Reacts extends Hearing {
+      on = new Map<MessageId, () => void>();
+      override onPresented(rows: readonly StoredMessage[]): Promise<void> {
+        const heard = super.onPresented(rows);
+        for (const row of rows) {
+          const react = this.on.get(row.id);
+          this.on.delete(row.id);
+          react?.();
+        }
+        return heard;
+      }
+    }
+    const strategy = new Reacts();
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy });
+    const store = cm.getStore();
+    cm.presentRows([]);
+    const home = cm.currentBranch().name;
+    const side = store.createBranchAt('zz-side', home, store.currentSequence()).name;
+    const [x, y, w] = ['x', 'y', 'w'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId, MessageId];
+    // Each of the next `n` appends to the index is kept and then throws,
+    // and the read of the index after it throws once.
+    const failing = { appends: 0, reads: 0 };
+    const raw = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originals = new Map(['appendToStateJsonWithIdentity', 'stateHeadOffset'].map((name) => [name, raw[name]!] as const));
+    raw.appendToStateJsonWithIdentity = function (this: unknown, id: unknown, ...rest: unknown[]) {
+      const record = originals.get('appendToStateJsonWithIdentity')!.call(this, id, ...rest);
+      if (id !== INDEX || failing.appends === 0) return record;
+      failing.appends--;
+      failing.reads++;
+      throw new Error('zz-index-kept-then-failed');
+    };
+    raw.stateHeadOffset = function (this: unknown, id: unknown) {
+      if (id === INDEX && failing.reads > 0) {
+        failing.reads--;
+        throw new Error('zz-index-read-failed');
+      }
+      return originals.get('stateHeadOffset')!.call(this, id);
+    };
+    try {
+      failing.appends = 1;
+      assert.throws(() => cm.presentRows([x]), WindowWriteOutcomeUnknownError);
+      // Hearing x, the hook presents y, whose write's outcome is unknown too;
+      // then the call that settled x presents w, likewise.
+      strategy.on.set(x, () => {
+        assert.throws(() => cm.presentRows([y]), WindowWriteOutcomeUnknownError);
+      });
+      failing.appends = 2;
+      assert.throws(() => cm.presentRows([w]), WindowWriteOutcomeUnknownError);
+      assert.deepEqual(strategy.log, [`presented ${x}`], 'setup: x is settled, and y and w wait on the branch');
+      // Hearing y, the hook moves the store itself.
+      strategy.on.set(y, () => store.switchBranch(side));
+      assert.throws(() => cm.presentRows([]), /^Error: ContextManager\.presentRows: .*moved the store's branch from main to zz-side/);
+      assert.equal(cm.currentBranch().name, side, 'setup: the hook moved the store');
+      assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`], "w isn't told on the branch the hook moved to");
+      store.switchBranch(home);
+      cm.presentRows([]);
+      assert.deepEqual(strategy.log, [`presented ${x}`, `presented ${y}`, `presented ${w}`], 'the next write on the branch it was made on settles it, once');
+    } finally {
+      for (const [name, fn] of originals) raw[name] = fn;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    cm.close();
+  });
 });
 
 describe('a window state that holds no index this version reads', () => {
