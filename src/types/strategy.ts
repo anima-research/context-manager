@@ -28,6 +28,15 @@ export interface MessageStoreView {
    */
   sequenceOf?(id: MessageId): number | undefined;
   /**
+   * Whether the store has ever held a message under this id, on any of its
+   * branches: true for a message in the view, one a view filter hides, and
+   * one removed since; false for an id it never gave a message (optional —
+   * MessageStore provides it). A filtered view answers for the messages it hides, a
+   * merged view for every source when each source can, and the window a
+   * ContextManager presents (presentedMessageView) as the view under it does.
+   */
+  held?(id: MessageId): boolean;
+  /**
    * A message's position in `getAll()`, undefined when the listing doesn't
    * hold it, without reading the message where the view can (optional).
    * The window a ContextManager gives its strategy and its compile answers

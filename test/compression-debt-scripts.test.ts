@@ -366,3 +366,27 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     assert.doesNotMatch(r.stdout, /Cause:|Effect:|Fix:/);
   });
 });
+
+describe('the drain on a store whose chain-break guard holds', () => {
+  it('stops before any tick and fails, saying a drain run again stops too', async () => {
+    const path = join(dir, 'guard');
+    const seed = await ContextManager.open({
+      path, namespace: 'probe', strategy: new AutobiographicalStrategy({ autoTickOnNewMessage: false } as never),
+      membrane: { complete: async () => { throw new Error('no provider call while seeding (test)'); } } as never,
+    });
+    for (let c = 0; c < 4; c++) {
+      seed.getStore().appendToStateJson('probe/autobio:chunks', { id: `c-${c}`, sourceIds: [`ghost-${c}`], compressed: true, summaryId: `L1-${c}` });
+    }
+    seed.sync();
+    await seed.close();
+    const r = run(DRAIN, drainArgs(path));
+    assert.equal(r.status, 1, r.stderr);
+    const seen = events(r.stdout);
+    assert.deepEqual(seen.map((e) => e.event), ['start', 'finish'], 'no step');
+    const finish = seen.at(-1)!;
+    assert.deepEqual([finish.completed, finish.stopped, finish.debtFailure], [false, 'chunk-records', 'chunk-records']);
+    assert.match(String(finish.debtError), /chunk records name message ids its store can't show it ever held/);
+    assert.match(r.stderr, /not drained \(chunk-records\): the chain-break guard holds, and a drain run again stops here too\. Its debt report says:\nCompression of new conversation has stopped\./);
+    assert.doesNotMatch(r.stderr, /run the drain again/);
+  });
+});

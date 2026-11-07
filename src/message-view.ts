@@ -22,7 +22,8 @@ import type { MessageStoreView, StoredMessage, MessageId } from './types/index.j
  * Wrap a view so that only messages passing `keep` are visible.
  * All read methods (including `get` by id) see the filtered world — note
  * that `getFrom(index)` therefore indexes the FILTERED sequence of
- * messages, not raw-store positions.
+ * messages, not raw-store positions — but for `held`, which answers for the
+ * store beneath, hidden messages included.
  */
 const filteredListings = new WeakMap<
   readonly StoredMessage[],
@@ -58,6 +59,7 @@ export function filterMessageStoreView(
       const msg = view.get(id);
       return msg && keep(msg) ? msg : null;
     },
+    held: view.held ? (id: MessageId) => view.held!(id) : undefined,
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {
       const messages = all();
@@ -147,6 +149,9 @@ export function mergeMessageStoreViews(
       }
       return undefined;
     },
+    held: [primary, ...auxiliary].every((view) => view.held)
+      ? (id: MessageId) => [primary, ...auxiliary].some((view) => view.held!(id))
+      : undefined,
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {
       const messages = all();
