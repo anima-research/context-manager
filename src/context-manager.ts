@@ -1339,15 +1339,29 @@ export class ContextManager {
           // A host's listener of the add may have presented a shard, so the
           // removal takes the window's shards out with it, and the strategy
           // is told, as removeMessages tells it: the rows are read first,
-          // for the store's event (handleMessageStoreEvent).
+          // for the store's event (handleMessageStoreEvent). Where the
+          // failing shard's landing couldn't be read (`unnamed`), its row,
+          // if it landed, has no id here, and the removal takes it with the
+          // run all the same: the run is read from the slot then, as the
+          // removal finds it (bodyRunOf), so the rows named are the rows it
+          // takes. Where that read fails, the shards the write named are
+          // read by their ids, as otherwise.
           const removingBefore = this.removing;
           try {
-            this.removing = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, wrote, () =>
-              wrote.flatMap((id) => {
-                const row = this.messageStore.get(id);
-                return row ? [row] : [];
-              }),
-            );
+            const named = this.rowsBeforeRemoval(`body group ${decision.bodyGroupId} (first shard ${wrote[0]})`, wrote, () => {
+              const byId = () =>
+                wrote.flatMap((id) => {
+                  const row = this.messageStore.get(id);
+                  return row ? [row] : [];
+                });
+              if (unnamed === 0) return byId();
+              try {
+                return this.bodyRunOf(wrote[0]!) ?? byId();
+              } catch {
+                return byId();
+              }
+            });
+            this.removing = named && { ids: [...new Set([...named.ids, ...named.rows.map((m) => m.id)])], rows: named.rows };
             this.messageStore.removeBodyGroup(wrote[0]!);
           } catch (removal) {
             this.diag.error(
@@ -1440,6 +1454,20 @@ export class ContextManager {
     if (length <= index) return null;
     const row = this.messageStore.getTail(length - index)[0];
     return row !== undefined && row.bodyGroupId === bodyGroupId ? row.id : null;
+  }
+
+  /**
+   * The body the slot holds `id` in, in store order, as
+   * MessageStore.removeBodyGroup finds it: the run of shards around it
+   * (body-runs.ts). Null where the slot doesn't hold `id`. A read that
+   * fails throws.
+   */
+  private bodyRunOf(id: MessageId): StoredMessage[] | null {
+    const all = this.messageStore.getAll();
+    const at = all.findIndex((m) => m.id === id);
+    if (at === -1) return null;
+    const { from, to } = bodyBoundsIn(all, at);
+    return all.slice(from, to + 1);
   }
 
   /**
