@@ -484,6 +484,17 @@ function apply(state: IndexState, item: unknown, ordinal: number, at: number | u
   return false;
 }
 
+/**
+ * Whether apply reads `item` as one of this format's: a presentation, a
+ * tombstone or this format's header. Another format's header, and an item
+ * apply can't read, aren't (readOn reads the state whole for them).
+ */
+function isOwnItem(item: unknown): boolean {
+  if (typeof item !== 'object' || item === null) return false;
+  const fields = item as { id?: unknown; retract?: unknown; v?: unknown };
+  return typeof fields.id === 'string' || typeof fields.retract === 'string' || fields.v === INDEX_FORMAT;
+}
+
 /** Positions of each id in a listing, built once per listing (a listing is never changed in place). */
 const positionsByListing = new WeakMap<readonly StoredMessage[], Map<MessageId, number>>();
 
@@ -595,7 +606,10 @@ function leavingSettlement(left: readonly LeftRow[], cutShort: (left: LeftRow[])
  * The window index of one manager namespace, read through one store handle
  * on whatever branch that handle is on. It reads the state again whenever
  * the state's revision there has moved since it last read it, so another
- * handle's write, a branch switch and a restart all reach it.
+ * handle's write, a branch switch and a restart all reach it: only the
+ * items appended since, where its last reading is a prefix of the state
+ * (readOn), so two handles that take turns writing don't each read the
+ * whole index at every turn, and the state whole otherwise.
  */
 export class WindowIndex {
   readonly stateId: string;
@@ -638,13 +652,70 @@ export class WindowIndex {
       : this.store.currentBranch().id;
   }
 
-  /** The index as it stands on the handle's branch. */
+  /**
+   * The index as it stands on the handle's branch. Where the revision has
+   * moved since the last reading, the items appended since are applied to
+   * that reading (readOn), so another handle's write costs what it wrote;
+   * otherwise, and wherever that can't be told, the state is read whole.
+   */
   private current(): IndexState {
     const revision = this.revision();
     const branchId = this.branchKey();
     const state = this.state;
     if (state && state.revision === revision && state.branchId === branchId) return state;
+    if (state && revision !== null && state.branchId === branchId && this.readOn(state, revision)) return state;
     return (this.state = this.read(branchId, revision));
+  }
+
+  /**
+   * Bring `state`, a reading of this branch's index or of another's, up to
+   * `revision` by applying only the items after it, in place: true where
+   * that was done, false where the state has to be read whole (read).
+   *
+   * The index is append-only: this package only appends to it, so where
+   * the state's chain still holds the record that wrote the reading's last
+   * item, at that item's ordinal, the reading is a prefix of the state, and
+   * the items after it are what was appended since. That record's identity
+   * (the item's `by` stamp) is unique in the store, and a branch shares a
+   * record with the one it was made from only up to the branch point, so
+   * the check holds across a branch switch too: a branch made after that
+   * item continues the reading, and any other holds another item there.
+   * The store's own snapshots move the revision and append nothing. It is
+   * one slice read (getStateSlice) from the reading's last item on, which
+   * the store answers from its per-item cache. Read whole instead: a
+   * reading with no item or no stamp on its last, or of a state another
+   * format keeps or with items this version can't read (so the warnings
+   * read gives are given), a slice that holds any item this version would
+   * read as another format's or can't read, a store without the slice
+   * read, and a slice read that throws. A state another writer edited in
+   * place, before that last item, would read as its appends: nothing here
+   * writes one so.
+   */
+  private readOn(state: IndexState, revision: number): boolean {
+    const last = state.rows.length - 1;
+    const stamp = last >= 0 ? state.by[last] : undefined;
+    if (stamp === undefined || state.found !== null || state.otherFormat !== null || state.unreadable > 0) return false;
+    const store = this.store as { getStateSlice?: (id: string, offset: number, limit: number) => Buffer | null };
+    if (typeof store.getStateSlice !== 'function') return false;
+    let items: unknown;
+    try {
+      const slice = store.getStateSlice(this.stateId, last, 2 ** 31 - 1);
+      items = slice === null ? null : JSON.parse(slice.toString('utf8'));
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(items) || items.length === 0) return false;
+    const boundary = items[0] as { by?: unknown } | null;
+    if (typeof boundary !== 'object' || boundary === null || boundary.by !== stamp) return false;
+    const added = items.slice(1) as Array<{ at?: unknown; by?: unknown } | null>;
+    if (!added.every(isOwnItem)) return false;
+    added.forEach((item, i) => {
+      apply(state, item, last + 1 + i, typeof item?.at === 'number' ? item.at : undefined, typeof item?.by === 'string' ? item.by : undefined);
+    });
+    state.revision = revision;
+    state.version = ++versions;
+    state.presented = null;
+    return true;
   }
 
   /**

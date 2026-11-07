@@ -1012,23 +1012,25 @@ describe('a window state that holds no index this version reads', () => {
     const b = other.addMessage('alice', [text('b')]);
     other.presentRows([b]);
     other.close();
-    // The index moved under cm, which reads it again at its next read.
-    const store = cm.getStore() as unknown as { getStateJson: (id: string) => unknown };
-    const read = store.getStateJson;
-    let fail = true;
-    store.getStateJson = function (this: unknown, id: string) {
-      if (id === INDEX && fail) {
-        fail = false;
-        throw new Error('zz-io-failed');
-      }
-      return read.call(this, id);
-    };
+    // The index moved under cm, which reads it again at its next read: the
+    // items appended since its reading (getStateSlice), or, where that read
+    // fails, the index whole (getStateJson), which fails too, once each.
+    const store = cm.getStore() as unknown as Record<string, (this: unknown, id: string, ...rest: unknown[]) => unknown>;
+    const reads = { getStateJson: store.getStateJson!, getStateSlice: store.getStateSlice! };
+    const failing = new Set(Object.keys(reads));
+    for (const [name, read] of Object.entries(reads)) {
+      store[name] = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (id === INDEX && failing.delete(name)) throw new Error('zz-io-failed');
+        return read.call(this, id, ...rest);
+      };
+    }
     try {
       assert.throws(() => cm.windowMode(), /zz-io-failed/);
+      assert.equal(failing.size, 0, 'setup: both reads failed');
       assert.equal(cm.windowMode(), 'presented');
       assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [a, b]);
     } finally {
-      store.getStateJson = read;
+      for (const [name, read] of Object.entries(reads)) store[name] = read;
     }
     cm.close();
   });
