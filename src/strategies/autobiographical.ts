@@ -2254,6 +2254,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * updated by ID when its L1 lands.
    */
   protected chunkRecords: ChunkRecord[] = [];
+  /**
+   * The revision of the summaries' state, and of the chunk records', on the
+   * store's branch (stateHeadOffset) as of the last read or write after
+   * which this instance held it as the store did: its load, a write of its
+   * own made while it still held it so, or a compare that found the two
+   * alike (storeWrittenElsewhere). Every write of the state moves the
+   * revision, another instance's included. A write of this instance's made
+   * over a revision another writer moved, a write that throws, and a change
+   * to memory the store didn't take keep none, so the next compare reads
+   * the state; so does a store that gives no revision (a chronicle without
+   * stateHeadOffset), at every compare.
+   */
+  private readonly heldAsStoredAt = new Map<string, number | null>();
   /** The chunk owning each position of the listing the last rebuild saw. */
   private _chunkByPosition: { listing: readonly StoredMessage[]; chunks: (Chunk | undefined)[] } | null = null;
   /** Record-derived chunks of the last rebuild: reused while the listing only
@@ -3306,6 +3319,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._demandedL1Chunks.clear();
     this.chunkRecords = [];
     this.chunkIdCounter = 0;
+    this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
     this._orphanWarned = false;
     this._overlapBlocked.clear();
@@ -3417,7 +3431,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected appendChunkRecord(record: ChunkRecord): void {
     this.requireBranchMutation('appendChunkRecord');
     this.chunkRecords.push(record);
-    this.store?.appendToStateJson(this.chunksStateId, record);
+    this.writeHeldState(this.chunksStateId, () => this.store?.appendToStateJson(this.chunksStateId, record));
   }
 
   /**
@@ -3433,18 +3447,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     rec.compressed = true;
     rec.summaryId = summaryId;
     if (!this.store) return;
-    const stored = this.store.getStateJson(this.chunksStateId);
-    if (!Array.isArray(stored)) return;
+    const store = this.store;
+    const stored = store.getStateJson(this.chunksStateId);
+    if (!Array.isArray(stored)) {
+      this.heldAsStoredAt.delete(this.chunksStateId);
+      return;
+    }
     const payload = storedJson(rec);
     let found = false;
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as ChunkRecord | null;
       if (item && item.id === recordId) {
-        this.store.editStateItem(this.chunksStateId, i, payload);
+        this.writeHeldState(this.chunksStateId, () => store.editStateItem(this.chunksStateId, i, payload));
         found = true;
       }
     }
     if (!found) {
+      this.heldAsStoredAt.delete(this.chunksStateId);
       this.diag.warn(
         `[autobiographical] markChunkRecordCompressed: ${recordId} not found in persisted chunk log`,
       );
@@ -3567,6 +3586,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // halt and its warning stay as they are: rebuildChunks recomputes the
     // halt, and an open clears both (clearBranchMirrors).
     this._overlapBlocked.clear();
+    this.heldAsStoredAt.clear();
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -3627,6 +3647,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.warn(`[autobiographical] ${releasedRecordsLine(released)}`);
       }
     }
+    // Memory now holds the summaries and chunk records as the store does,
+    // a record the load leaves out apart (storeWrittenElsewhere compares
+    // what the load keeps).
+    this.heldAsStored(this.summariesStateId);
+    if (this.chunkPersistenceEnabled) this.heldAsStored(this.chunksStateId);
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
@@ -4277,7 +4302,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       entry.sourceRange = { first: ids[0]!, last: ids[ids.length - 1]! };
     }
     this.summaries.push(entry);
-    this.store?.appendToStateJson(this.summariesStateId, entry);
+    this.writeHeldState(this.summariesStateId, () => this.store?.appendToStateJson(this.summariesStateId, entry));
   }
 
   /**
@@ -7003,18 +7028,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // clobbering them (4 summaries lost in the 2026-07 Lena incident, leaving
     // duplicate-id copies with diverging mergedInto). Update every stored
     // copy with this id so past duplicates converge too.
-    const stored = this.store.getStateJson(this.summariesStateId);
-    if (!Array.isArray(stored)) return;
+    const store = this.store;
+    const stored = store.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) {
+      this.heldAsStoredAt.delete(this.summariesStateId);
+      return;
+    }
     let found = false;
     const payload = storedJson(entry);
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as SummaryEntry | null;
       if (item && item.id === entry.id) {
-        this.store.editStateItem(this.summariesStateId, i, payload);
+        this.writeHeldState(this.summariesStateId, () => store.editStateItem(this.summariesStateId, i, payload));
         found = true;
       }
     }
     if (!found) {
+      this.heldAsStoredAt.delete(this.summariesStateId);
       this.diag.warn(
         `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
       );
@@ -8245,18 +8275,72 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * instance's threw, and memory went ahead of what the store may hold
    * (writeUnfolded, where the read back threw too; pushSummary). Where the
    * store can't be read, nothing is known to differ.
+   *
+   * A state whose revision is still the one at which this instance last
+   * held it as the store did (heldAsStoredAt) is alike, and isn't read:
+   * nothing has written it since. Only a state some other write moved, or
+   * one whose revision this instance doesn't know, is read and compared,
+   * and one found alike keeps its revision for the next compare. The chunk
+   * records are compared as the load keeps them (loadedChunkRecords), so a
+   * stored record the load leaves out, with no id or no rows, which no
+   * write of this instance's puts back, doesn't read as another writer's.
    */
   private storeWrittenElsewhere(): boolean {
     const store = this.store;
     if (!store) return false;
     try {
-      const differs = (stateId: string, mirror: unknown): boolean =>
-        canonicalJson(store.getStateJson(stateId) ?? []) !== storedCanonicalJson(mirror);
-      return differs(this.summariesStateId, this.summaries) ||
-        (this.chunkPersistenceEnabled && differs(this.chunksStateId, this.chunkRecords));
+      const differs = (stateId: string, mirror: unknown, asLoaded: (stored: unknown) => unknown): boolean => {
+        if (this.stillHeldAsStored(stateId)) return false;
+        const revision = this.stateRevision(stateId);
+        const apart = canonicalJson(asLoaded(store.getStateJson(stateId))) !== storedCanonicalJson(mirror);
+        if (!apart && revision !== undefined) this.heldAsStoredAt.set(stateId, revision);
+        return apart;
+      };
+      return differs(this.summariesStateId, this.summaries, (stored) => stored ?? []) ||
+        (this.chunkPersistenceEnabled &&
+          differs(this.chunksStateId, this.chunkRecords, (stored) => loadedChunkRecords<ChunkRecord>(stored)));
     } catch {
       return false;
     }
+  }
+
+  /** The state's revision on the store's branch (stateHeadOffset), or undefined where the store gives none or can't say. */
+  private stateRevision(stateId: string): number | null | undefined {
+    const store = this.store as { stateHeadOffset?: (id: string) => number | null } | null;
+    if (typeof store?.stateHeadOffset !== 'function') return undefined;
+    try {
+      return store.stateHeadOffset(stateId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** This instance holds the state as the store does, as of now (heldAsStoredAt). */
+  private heldAsStored(stateId: string): void {
+    const revision = this.stateRevision(stateId);
+    if (revision === undefined) this.heldAsStoredAt.delete(stateId);
+    else this.heldAsStoredAt.set(stateId, revision);
+  }
+
+  /** Whether nothing has written the state since this instance last held it as the store did (heldAsStoredAt). */
+  private stillHeldAsStored(stateId: string): boolean {
+    if (!this.heldAsStoredAt.has(stateId)) return false;
+    const revision = this.stateRevision(stateId);
+    return revision !== undefined && revision === this.heldAsStoredAt.get(stateId);
+  }
+
+  /**
+   * One of this instance's writes of its summaries or chunk records, which
+   * memory has taken already, or takes as it returns (`write`). Where this
+   * instance still held the state as the store did before the write, it
+   * holds it so after it; where another write had moved it since, or the
+   * write throws, the next compare reads the state (heldAsStoredAt).
+   */
+  private writeHeldState(stateId: string, write: () => void): void {
+    const held = this.stillHeldAsStored(stateId);
+    this.heldAsStoredAt.delete(stateId);
+    write();
+    if (held) this.heldAsStored(stateId);
   }
 
   /**
@@ -8540,7 +8624,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private writeUnfolded(stateId: string, value: unknown, take: () => void): void {
     try {
-      this.store?.setStateJson(stateId, value);
+      this.writeHeldState(stateId, () => this.store?.setStateJson(stateId, value));
     } catch (error) {
       let landed = true;
       try {

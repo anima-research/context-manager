@@ -195,6 +195,25 @@ async function instanceA(make: () => AutobiographicalStrategy = strategyFor) {
   return { store, strategy, cm, ...held };
 }
 
+/**
+ * The states among `ids` the store reads (getStateJson) while `fn` runs,
+ * one entry a read, in order.
+ */
+function readsDuring(store: JsStore, ids: readonly string[], fn: () => void): string[] {
+  const reads: string[] = [];
+  const real = store.getStateJson.bind(store);
+  (store as unknown as { getStateJson: typeof real }).getStateJson = (id: string) => {
+    if (ids.includes(id)) reads.push(id);
+    return real(id);
+  };
+  try {
+    fn();
+  } finally {
+    (store as unknown as { getStateJson: typeof real }).getStateJson = real;
+  }
+  return reads;
+}
+
 /** The list a state of the store holds (none written yet is an empty one). */
 const stored = (store: JsStore, id: string) =>
   ((store.getStateJson(id) as Array<{ id: string; level?: number; sourceIds: string[]; compressed?: boolean; summaryId?: string }> | null) ?? []);
@@ -920,4 +939,66 @@ describe('a retraction through another instance sharing the store', () => {
       store.close();
     }
   });
+
+  // Wave 6, finding 29 (a regression of wave 5's 4eb1aa6): the check above
+  // read both states whole and serialized each side twice at every
+  // retraction, a row nothing folds included, and a chunk record the load
+  // leaves out (no id, or no rows), which stays in the store, made it find
+  // the store apart at every retraction.
+  it("a retraction reads neither the summaries nor the chunk records while nothing else has written them, its own let-go's writes included", async () => {
+    const { store, strategy: A, cm: a, calls } = await instanceA();
+    try {
+      for (let n = 1; n <= 2; n++) {
+        const ticking = a.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1]!.release();
+        await ticking;
+      }
+      const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+      // Rows past the last closed chunk, which no record holds yet.
+      for (let i = 24; i < 26; i++) a.presentRows([a.addMessage('User', [{ type: 'text', text: `${i} zz` }])]);
+      const folded = new Set([
+        ...internals(A).summaries.flatMap((s) => s.sourceIds),
+        ...internals(A).chunkRecords.flatMap((r) => r.sourceIds),
+      ]);
+      const window = a.getPresentedMessages().map((m) => m.id);
+      const loose = window.filter((id) => !folded.has(id));
+      assert.ok(loose.length >= 2, `premise: rows nothing folds: ${JSON.stringify(internals(A).chunkRecords)}`);
+      const reads: string[][] = [];
+      const lines = await linesDuring(async () => {
+        reads.push(readsDuring(store, [SUMMARIES, CHUNKS], () => a.retractRows([loose.at(-1)!], { undone: true })));
+        // A let-go of a row an L1 folds writes both states whole.
+        reads.push(readsDuring(store, [SUMMARIES, CHUNKS], () => a.retractRows([l1.sourceIds[0]!], { undone: true })));
+        reads.push(readsDuring(store, [SUMMARIES, CHUNKS], () => a.retractRows([loose.at(-2)!], { undone: true })));
+      });
+      assert.ok(!stored(store, SUMMARIES).some((s) => s.id === l1.id), 'premise: the let-go dropped the L1 in the store');
+      assert.deepEqual(reads, [[], [], []], `no retraction read either state: ${lines.join('\n')}`);
+      assert.ok(!lines.some((line) => line.includes("aren't as this instance holds them")), lines.join('\n'));
+    } finally {
+      for (const call of calls) call.release();
+      a.close();
+      store.close();
+    }
+  });
+
+  it("a chunk record the load leaves out, written to the store, is read once and doesn't read as another instance's write", async () => {
+    const { store, cm: a, calls } = await instanceA();
+    try {
+      const window = a.getPresentedMessages().map((m) => m.id);
+      // A record with no rows, which loadedChunkRecords leaves out and no write of the strategy's puts back.
+      store.appendToStateJson(CHUNKS, { id: 'c-zz', sourceIds: [] });
+      const reads: string[][] = [];
+      const lines = await linesDuring(async () => {
+        reads.push(readsDuring(store, [SUMMARIES, CHUNKS], () => a.retractRows([window.at(-1)!], { undone: true })));
+        reads.push(readsDuring(store, [SUMMARIES, CHUNKS], () => a.retractRows([window.at(-2)!], { undone: true })));
+      });
+      assert.ok(!lines.some((line) => line.includes("aren't as this instance holds them")), `nothing was taken up: ${lines.join('\n')}`);
+      assert.deepEqual(reads, [[CHUNKS], []], 'the chunk records, which another write moved, were read once, and the summaries not at all');
+    } finally {
+      for (const call of calls) call.release();
+      a.close();
+      store.close();
+    }
+  });
+
 });
