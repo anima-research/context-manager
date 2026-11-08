@@ -690,11 +690,7 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
  * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
-  type Waiting = { toolName: string; call: AnsweredCall };
-  // The latest call with each id while no result has answered it, and the
-  // call each id's latest first answer went to.
-  const waiting = new Map<string, Waiting>();
-  const answeredLast = new Map<string, AnsweredCall>();
+  const latest = new Map<string, { toolName: string; call: AnsweredCall }>();
   const byTool = new Map<string, AnsweredCall[]>();
   let place = 0;
   for (let at = 0; at < messages.length; at++) {
@@ -702,22 +698,17 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        waiting.set(block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } });
+        latest.set(block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } });
       } else if (block.type === 'tool_result') {
-        const first = waiting.get(block.toolUseId);
-        let call: AnsweredCall | undefined;
-        if (first) {
-          waiting.delete(block.toolUseId);
-          call = first.call;
-          call.place = place;
-          answeredLast.set(block.toolUseId, call);
-          let answered = byTool.get(first.toolName);
-          if (!answered) byTool.set(first.toolName, (answered = []));
-          answered.push(call);
-        } else {
-          call = answeredLast.get(block.toolUseId);
+        const nearest = latest.get(block.toolUseId);
+        if (!nearest) continue;
+        if (nearest.call.results.length === 0) {
+          nearest.call.place = place;
+          let answered = byTool.get(nearest.toolName);
+          if (!answered) byTool.set(nearest.toolName, (answered = []));
+          answered.push(nearest.call);
         }
-        call?.results.push({ message: m.id, index: i });
+        nearest.call.results.push({ message: m.id, index: i });
       }
     }
   }
