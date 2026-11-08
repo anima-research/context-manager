@@ -3903,6 +3903,65 @@ export class ContextManager {
   }
 
   /**
+   * Note the stored replies whose thinking the provider set aside, under the
+   * drop control (`ThinkingBinding.dropBlock`), in a request of a stream
+   * built from this branch's last committing compile with `binds`. Call it on
+   * the branch that compile was on, with `compileId`, that compile's
+   * `provenance.compileId`. Each id is a body's head as the compile's
+   * provenance names it (`RawBodySource.messageId`), the id `addMessage`
+   * returned; an id that names no stored body's head, such as a missing id
+   * or a later shard, changes no compile while it names none (a later shard
+   * is its body's head once the shards before it are removed). From the next
+   * compile on, each goes without its thinking, as a reply the record's own
+   * compile sent without it does, so a block the provider can't take goes
+   * out only in the requests of the stream it was set aside in, not in every
+   * later compile's. The replies after it keep their thinking while it is
+   * otherwise as the record's compile sent it, for the provider to judge: a
+   * note follows a block the provider set aside under the drop control, so a
+   * later block it can't take is set aside in turn, and can be noted the
+   * same way, never refused. A note naming some but not all of a
+   * compiled message's bodies leaves that message differing from the record,
+   * so it and the replies after it go without their thinking, and its bodies
+   * the note didn't name, other than those the record's compile sent without
+   * their thinking, are reported in `thinkingStrip`.
+   *
+   * A noted reply isn't reported in a later compile's `thinkingStrip`, since
+   * the provider's report of the request it was set aside in told the host,
+   * unless a committing compile with `binds` came between that didn't leave
+   * its thinking out: as `ThinkingStrip.newly` says, it can then be reported
+   * again.
+   * Returns true when `compileId` is the compile that wrote the
+   * branch's record, and false, writing nothing, when it isn't or the branch
+   * has no record, as `noteRequestSent` does. It writes only when an id it's
+   * given isn't already noted, so a repeated note writes nothing. A
+   * record it can't read or write is logged, and it returns false.
+   * Throws, writing nothing, for ids that aren't an array of strings, or a
+   * `compileId` that isn't a string.
+   */
+  noteThinkingDropped(messageIds: readonly MessageId[], compileId: string): boolean {
+    this.requireInitialized('noteThinkingDropped');
+    if (!Array.isArray(messageIds)) throw new TypeError(`noteThinkingDropped: \`messageIds\` must be an array, got ${typeof messageIds}`);
+    for (let i = 0; i < messageIds.length; i++) {
+      const id: unknown = messageIds[i];
+      if (typeof id !== 'string') throw new TypeError(`noteThinkingDropped: id ${i} must be a message id, got ${JSON.stringify(id) ?? typeof id}`);
+    }
+    if (typeof compileId !== 'string') {
+      throw new TypeError(
+        `noteThinkingDropped: \`compileId\` must be a string, the provenance.compileId of the compile the stream was built from; got ${typeof compileId}`,
+      );
+    }
+    const record = this.readBindingRecordFor('this note writes nothing, and the provider sets these replies\' thinking aside again until a note writes');
+    if (record === null || record.compileId !== compileId) return false;
+    const known = new Set(record.dropped ?? []);
+    const added = [...new Set(messageIds)].filter((id) => !known.has(id));
+    if (added.length === 0) return true;
+    return this.writeBindingRecordFor(
+      { ...record, dropped: [...(record.dropped ?? []), ...added] },
+      'this note is lost: the provider sets these replies\' thinking aside again until a note writes',
+    );
+  }
+
+  /**
    * The branch's binding record. One this version doesn't read, or that the
    * store can't give, is logged, with what follows from it, and read as
    * none; a committing compile with `binds` then writes its own in its place.

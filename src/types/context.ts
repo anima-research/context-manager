@@ -237,7 +237,9 @@ export interface CompileResult {
 
   /**
    * Set on a compile with `thinkingBinding.binds` that newly leaves out a
-   * stored reply's thinking: what, and why (see
+   * stored reply's thinking, other than one a host noted, after the compile
+   * that wrote the branch's record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`): what, and why (see
    * `SelectOptions.thinkingBinding`).
    */
   thinkingStrip?: ThinkingStrip;
@@ -265,7 +267,10 @@ export interface ThinkingStrip {
    * that compile sent them with their thinking, they were stored since, or
    * it didn't send them as stored replies at all. A record is written by a
    * committing compile with `binds`, so a compile without it is passed
-   * over.
+   * over. A reply a host noted, after the compile that wrote the branch's
+   * record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`) is never among them: the
+   * provider's report of that request already told the host.
    * So a reply can be reported again: one whose thinking went, that a later
    * compile didn't send, and that renders again. A host that tells each
    * loss once keeps its own set of what it has told.
