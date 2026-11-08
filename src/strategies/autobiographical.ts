@@ -2155,6 +2155,7 @@ type SelectPricing = {
   allowanceTokens?: number;
   limitBound?: boolean;
   stubTokens?: number;
+  stubReserve?: number;
 };
 
 /**
@@ -2822,7 +2823,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           finalTokens: err.actual,
           budgetTokens: err.budget,
           fits: false,
-          exhausted: this.requestLimitRefusals.has(err) ? partial?.exhausted ?? false : true,
+          exhausted: this.stubRefusals.has(err) ? partial?.exhausted ?? true : true,
           clearedBy: err.clearedBy,
           headTokens: err.diagnostics.headTokens,
           tailTokens: err.diagnostics.tailTokens,
@@ -9591,7 +9592,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const allowance = Math.floor((limit - budget.reserveForResponse) * scale - overhead - injected);
     if (allowance <= 0) {
       pricing.limitBound = true;
-      const error = noRoomUnderRequestLimit({
+      throw noRoomUnderRequestLimit({
         limit,
         reserve: budget.reserveForResponse,
         overhead: Math.ceil(overhead / scale),
@@ -9599,13 +9600,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         allowance,
         ...(atCeiling ? { ceiling: CALIBRATION_CEILING } : {}),
       });
-      this.requestLimitRefusals.add(error);
-      throw error;
     }
     pricing.allowance = allowance;
-    if (allowance < target || allowance < bound) pricing.allowanceTokens = allowance;
-    if (allowance < bound) pricing.limitBound = true;
-    return { maxTokens: Math.min(target, allowance), rejectionBudget: Math.min(bound, allowance) };
+    const room = allowance - (pricing.stubReserve ?? 0);
+    if (room < target || room < bound) pricing.allowanceTokens = room;
+    if (room < bound) pricing.limitBound = true;
+    return { maxTokens: Math.min(target, room), rejectionBudget: Math.min(bound, room) };
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -9616,7 +9616,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.adaptiveResolution) {
       const adaptive = (dry: boolean): ContextEntry[] => this.selectAdaptive(store, budget, dry === dryRun ? opts : { ...opts, dryRun: dry });
       try {
-        return this.selectByWindowRule(store, adaptive, dryRun);
+        return this.withRoomForStubs(() => this.selectByWindowRule(store, adaptive, dryRun));
       } catch (err) {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
@@ -9628,12 +9628,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // recorded mustn't stand in for a retry that refuses before recording
         // its own (previewContext reads _lastPreview).
         this._lastPreview = undefined;
-        return this.selectByWindowRule(store, adaptive, dryRun);
+        return this.withRoomForStubs(() => this.selectByWindowRule(store, adaptive, dryRun));
       }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
-    return this.selectByWindowRule(store, () => this.selectHierarchical(store, budget), dryRun);
+    return this.withRoomForStubs(() => this.selectByWindowRule(store, () => this.selectHierarchical(store, budget), dryRun));
+  }
+
+  private withRoomForStubs(select: () => ContextEntry[]): ContextEntry[] {
+    const pricing = this.selectPricing;
+    if (pricing) {
+      pricing.stubReserve = undefined;
+      pricing.stubTokens = undefined;
+    }
+    try {
+      return select();
+    } catch (err) {
+      const stubs = pricing?.stubTokens;
+      if (!(err instanceof OverBudgetError) || !this.stubRefusals.has(err) || pricing?.allowance === undefined
+        || stubs === undefined || stubs >= pricing.allowance) throw err;
+      pricing.stubReserve = stubs;
+      pricing.stubTokens = undefined;
+      this._lastPreview = undefined;
+      return select();
+    }
   }
 
   private acrossMode: 'ask' | 'leave' | 'take' = 'take';
@@ -21317,11 +21336,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
     error.message = `The tool-result stubs the pairing repair added, ${stubTokens} tokens, take the window of ${window} ` +
       `past the ${pricing.allowance} the request limit of ${pricing.limitTokens} leaves it`;
-    this.requestLimitRefusals.add(error);
+    this.stubRefusals.add(error);
     throw error;
   }
 
-  private readonly requestLimitRefusals = new WeakSet<OverBudgetError>();
+  private readonly stubRefusals = new WeakSet<OverBudgetError>();
 
   /**
    * Remove trailing entries that contain tool_use without a following tool_result.

@@ -893,7 +893,8 @@ export interface PreviewResult {
   requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
-  /** True when the picker could not fold any further. */
+  /** True when the picker could not fold any further, and when the request
+   *  limit leaves the window no room at any fold. */
   exhausted: boolean;
   /**
    * When the layout doesn't fit: what clears that refusal besides a larger
