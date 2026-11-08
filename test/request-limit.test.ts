@@ -490,4 +490,21 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     assert.ok(requestTokens(room.renderStats!) + price <= top, `the request with them, ${requestTokens(room.renderStats!) + price}, is within ${top}`);
     cm.close();
   });
+
+  it('refuses a select that trims the newest turn for that turn, not for stubs the limit leaves no room for (adaptive)', async () => {
+    const { cm } = await seededAt('newest-trimmed', 1, {}, 60, true);
+    const open = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true });
+    const top = requestTokens(open.renderStats!);
+    const allowance = top - BUDGET.reserveForResponse - open.renderStats!.request!.overheadTokens - open.renderStats!.request!.injectedTokens;
+    const room = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true });
+    assert.ok(room.renderStats!.request!.allowanceTokens! < allowance, 'premise: at this limit the stubs take the first select past it');
+    cm.addMessage('Claude', [{ type: 'text', text: 'One more look.' }, { type: 'tool_use', id: 'n1', name: 'look', input: { at: 'the newest' } }] as ContentBlock[]);
+    await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true }), { message: /^Structural repair did not retain the newest turn/ },
+      'premise: without a limit, the trimmed newest turn refuses the compile');
+    await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true }), (e: Error) => {
+      assert.match(e.message, /^Structural repair did not retain the newest turn/, 'the refusal names the trimmed turn, not the stubs');
+      return true;
+    });
+    cm.close();
+  });
 });
