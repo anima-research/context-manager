@@ -19701,7 +19701,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `records name message ids this store can't show it ever held (messages chain break / store ` +
             `reconciliation signature). Chunk compression halted to prevent duplicate ` +
             `memory formation — reconcile the store before resuming.`
-          : `[autobiographical] FAIL-CLOSED: ${orphaned + emptiedHeld.length}/${n} chunk ` +
+          : `[autobiographical] FAIL-CLOSED: ${orphaned + emptiedHeld.length + unreadCount}/${n} chunk ` +
             `records name no message in the view, and the oldest or newest of those a removal or a filter ` +
             `emptied names messages this branch's messages chain doesn't hold (a chain broken under ` +
             `chronicle before 0.5.0, or a view with held and without onBranch). ` +

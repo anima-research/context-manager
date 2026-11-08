@@ -567,6 +567,40 @@ describe('the chain-break guard when held messages empty most chunk records', ()
     });
   }
 
+  it('the off-chain FAIL-CLOSED line counts an unread record between readable ends that helped pass the threshold', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const path = freshPath();
+    let cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+    await growTo(cm, 5);
+    const main = cm.currentBranch().name;
+    await cm.fork('sibling-writes');
+    const sibling = add(cm, 3);
+    await cm.switchBranch(main);
+    for (const id of records(cm).slice(0, 2).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    await cm.close();
+    {
+      // written with no autobiographical strategy open, so nothing holds the records in memory
+      const writer = await ContextManager.open({ path, strategy: new PassthroughStrategy(), membrane });
+      writer.getStore().appendToStateJson(CHUNKS, { id: 'sib-0', sourceIds: sibling, compressed: true, summaryId: 'L1-sib-0' });
+      writer.sync();
+      await writer.close();
+    }
+    const s = strategy();
+    cm = await ContextManager.open({ path, strategy: s, membrane });
+    assert.strictEqual(records(cm).length, 6, 'setup: 5 records and the sibling\'s');
+    assert.notStrictEqual(s.getCompressionDebt().state, 'critical', 'setup: 3 of 6 emptied, exactly half, so the guard holds back');
+    const third = records(cm)[2]!.sourceIds;
+    for (const id of third) cm.removeMessage(id);
+    failReadsOf(cm, third);
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView());
+    assert.match(s.getCompressionDebt().error ?? '', /oldest or newest of those a removal or a filter emptied names messages its messages chain doesn't hold/, 'the unread third record carries 4 of 6, and the sibling\'s end is off the chain');
+    const lines = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0]!, /FAIL-CLOSED: 4\/6 chunk records name no message in the view/, 'the line counts the unread record');
+    await cm.close();
+  });
+
   it('a record whose read fails, where it could make a never-held majority, halts the rebuild with its error as the cause', async (t) => {
     mock.method(console, 'error', () => {});
     t.after(() => mock.restoreAll());
