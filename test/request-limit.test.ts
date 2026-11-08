@@ -448,12 +448,21 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       const stubPrice = jsonTokenEstimator((stubs[0] as { content: string }).content);
       const top = requestTokens(open.renderStats!);
       await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true }), (e: Error) => {
-        assert.ok(e.name === 'OverBudgetError' || e.name === 'UncoveredDropError', `${e.name}: ${e.message}`);
-        assert.ok(!e.message.startsWith('The compiled request would hold'), `the select refused it itself: ${e.message}`);
+        assert.equal(e.name, 'OverBudgetError', e.message);
+        assert.ok(e.message.startsWith('The tool-result stubs the pairing repair added'), `the select refused it for the stubs: ${e.message}`);
+        const d = (e as Error & { diagnostics: { requestLimitTokens?: number } }).diagnostics;
+        assert.equal(d.requestLimitTokens, top);
         return true;
       }, `the window at ${top} leaves no room for the stub's ${stubPrice}, and this store can't fold to make it`);
       const fits = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice, dryRun: true });
       assert.equal(fits.renderStats!.request!.stubTokens, stubPrice, 'the stub is priced as the store prices its block');
+      if (label === 'adaptive') {
+        const refused = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
+        const planned = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice })!;
+        assert.equal(refused.fits, false, 'a preview the stubs refused doesn\'t fit');
+        assert.equal(refused.exhausted, planned.exhausted, 'and reports the picker as its plan found it');
+        assert.equal(refused.requestLimitTokens, top, 'and the limit');
+      }
       assert.ok(requestTokens(fits.renderStats!) + stubPrice <= top + stubPrice, 'and the request with it is within the limit');
       cm.close();
     });
