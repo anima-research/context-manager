@@ -1890,6 +1890,19 @@ function isCarrierTransportRejection(error: unknown): boolean {
   return badRequest && (msg.includes('thinking') || msg.includes('reasoning'));
 }
 
+/**
+ * The provider's refusal of a carrier signed in another request, from a model
+ * that binds its thinking on an account that enforces it. A recall pair's
+ * carrier is always replayed after a conversation other than the one it was
+ * signed in, so that model's later summarizer requests would be refused the
+ * same way while they carry carriers.
+ */
+function isCarrierBindingRefusal(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null)?.message;
+  return compressionErrorType(error) === 'invalid_request' &&
+    typeof message === 'string' && message.includes('bound to a different conversation');
+}
+
 function requestCarriesReasoning(request: NormalizedRequest): boolean {
   return request.messages.some(m =>
     m.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking'),
@@ -11901,8 +11914,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // identity: a resumed ladder goes straight to the stripped request.
         const carrierLabel = `${curveLabel}:carrier-rejected`;
         const attemptHash = sha256Json(attemptRequest);
-        const carrierKnownRejected = knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
+        const attemptModel = this.compressionRequestModel(attemptRequest);
+        const carriersRefused = attemptModel !== undefined && this.carriersRefusedFor.has(attemptModel) &&
           requestCarriesReasoning(attemptRequest);
+        const carrierKnownRejected = carriersRefused || (knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
+          requestCarriesReasoning(attemptRequest));
         try {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
@@ -11937,20 +11953,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               outcome: 'provider_error',
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
+            if (attemptModel !== undefined && isCarrierBindingRefusal(error)) this.carriersRefusedFor.add(attemptModel);
           }
           // The rejection answers the request with its carriers, whose
           // failures ran under the rung's own label: it ends that run, whether
           // it came now or is reused from progress.
           this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
-          this.diag.error(
-            `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
-              `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
-          );
-          logCompressionCall({
-            event: 'compression:carrier-transport-fallback',
-            operation: 'compress_l1',
-            metadata: { curveLabel, error: String(error).slice(0, 300) },
-          }, this.ns);
+          if (!carriersRefused) {
+            this.diag.error(
+              `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
+                `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
+            );
+            logCompressionCall({
+              event: 'compression:carrier-transport-fallback',
+              operation: 'compress_l1',
+              metadata: { curveLabel, error: String(error).slice(0, 300) },
+            }, this.ns);
+          }
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
@@ -14346,12 +14365,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // attempt checks it: a generation ended there makes no call.
     if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
+    const mergeModel = this.compressionRequestModel(dispatchRequest);
+    if (mergeModel !== undefined && this.carriersRefusedFor.has(mergeModel) && requestCarriesReasoning(dispatchRequest)) {
+      acceptedRequest = stripReasoningFromRequest(dispatchRequest);
+    }
+
     try {
       let response: NormalizedResponse;
       try {
-        response = await this.callProvider(ctx.membrane, dispatchRequest);
+        response = await this.callProvider(ctx.membrane, acceptedRequest);
       } catch (error) {
-        noteDispatchedModel(error, dispatchRequest);
+        noteDispatchedModel(error, acceptedRequest);
         // An error on work that lost its currency is discarded as its result
         // would be, before the carrier fallback: no second call follows.
         if (stale(error)) return false;
@@ -14371,8 +14395,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (
           compressionFailureKind(error) !== 'rejection' ||
           !isCarrierTransportRejection(error) ||
-          !requestCarriesReasoning(dispatchRequest)
+          !requestCarriesReasoning(acceptedRequest)
         ) throw error;
+        if (mergeModel !== undefined && isCarrierBindingRefusal(error)) this.carriersRefusedFor.add(mergeModel);
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -16171,6 +16196,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  them in the live window, and the live window renders and prices them as
    *  under `carrierPolicy: 'live-strip'`. */
   private thinkingBound = false;
+
+  /** Compression models the provider has refused a recall carrier for
+   *  (isCarrierBindingRefusal): their summarizer requests are sent without
+   *  carriers, as the carrier fallback's retry is, for this instance's life. */
+  private readonly carriersRefusedFor = new Set<string>();
 
   /** The carrier policy the live window renders and prices under: the
    *  configured one, or `'live-strip'` while thinking is bound. */

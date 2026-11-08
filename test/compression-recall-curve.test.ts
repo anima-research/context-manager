@@ -5040,3 +5040,120 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     fx.manager.close();
   });
 });
+
+describe('a binding refusal of recall carriers', () => {
+  after(cleanup);
+  const bindingRefusal = () => Object.assign(
+    new Error('400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation."}}'),
+    { type: 'invalid_request', httpStatus: 400, retryable: false },
+  );
+  const otherThinkingRejection = () => Object.assign(
+    new Error('invalid_request_error: thinking blocks in this position cannot be modified'),
+    { type: 'invalid_request', httpStatus: 400, retryable: false },
+  );
+  const carries = (call: RecordedCall) => JSON.stringify(call.request).includes('private-');
+
+  function withCarriers(fx: Fixture): void {
+    for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+    fx.strategy.flushSummaries();
+  }
+
+  function chunkOf(fx: Fixture, from: number, to: number, index: number): Chunk {
+    const ids = fx.ids.slice(from, to);
+    return {
+      index,
+      startIndex: from,
+      endIndex: to,
+      messages: managerContext(fx.manager).messageStore.getAll().filter((message) => ids.includes(message.id)),
+      tokens: 100,
+      compressed: false,
+    };
+  }
+
+  async function logged<T>(run: () => Promise<T>, logs: string[]): Promise<T> {
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+    try {
+      return await run();
+    } finally {
+      console.error = original;
+    }
+  }
+
+  it('teaches the strategy: the model\u2019s later summarizer requests go without carriers, sent once, logging no error', async () => {
+    const mock = flexibleMembrane([
+      { error: bindingRefusal() },
+      { stop: 'end_turn', text: 'memory of the first chunk' },
+      { stop: 'end_turn', text: 'memory of the second chunk' },
+    ]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    withCarriers(fx);
+    const logs: string[] = [];
+    const first = chunkOf(fx, 8, 10, 998);
+    await logged(() => fx.strategy.run(first, managerContext(fx.manager)), logs);
+    assert.equal(mock.calls.length, 2, 'premise: refused, then retried without carriers');
+    assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the retry was stripped');
+    await logged(() => fx.strategy.run(fx.target, managerContext(fx.manager)), logs);
+    assert.equal(mock.calls.length, 3, 'the second chunk is sent once');
+    assert.equal(carries(mock.calls[2]!), false, 'without carriers');
+    assert.equal(fx.target.compressed, true);
+    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 1, 'one error line, for the refusal that taught it');
+    fx.manager.close();
+  });
+
+  it('another invalid request about thinking keeps the one-shot fallback and teaches nothing', async () => {
+    const mock = flexibleMembrane([
+      { error: otherThinkingRejection() },
+      { stop: 'end_turn', text: 'memory of the first chunk' },
+      { error: otherThinkingRejection() },
+      { stop: 'end_turn', text: 'memory of the second chunk' },
+    ]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+    withCarriers(fx);
+    const logs: string[] = [];
+    await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), logs);
+    await logged(() => fx.strategy.run(fx.target, managerContext(fx.manager)), logs);
+    assert.equal(mock.calls.length, 4);
+    assert.deepEqual(mock.calls.map(carries), [true, false, true, false], 'each chunk is tried with carriers first');
+    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 2);
+    fx.manager.close();
+  });
+
+  it('a chunk quarantined after the strategy learned is found by key at the next instance\u2019s first attempt', async () => {
+    const path = freshPath();
+    const mock = flexibleMembrane([
+      { error: bindingRefusal() },
+      { stop: 'end_turn', text: 'memory of the first chunk' },
+      { stop: 'refusal' },
+    ]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 }, path);
+    withCarriers(fx);
+    await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []);
+    const before = mock.calls.length;
+    await logged(() => fx.strategy.run(fx.target, managerContext(fx.manager)), []);
+    assert.ok(mock.calls.length > before, 'premise: the second chunk was tried');
+    assert.ok(mock.calls.slice(before).every((call) => !carries(call)), 'premise: tried without carriers, as learned');
+    assert.equal(fx.target.compressed, false);
+    assert.ok(quarantineEvents(fx.manager).some((event) => event.kind === 'exhausted'), 'premise: quarantined');
+    const targetIds = fx.target.messages.map((message) => message.id);
+    fx.manager.close();
+
+    const restartMock = scriptedMembrane(['refusal']);
+    const restarted = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 2,
+    });
+    const manager = await ContextManager.open({ path, strategy: restarted, membrane: restartMock.membrane });
+    const ctx = managerContext(manager);
+    const messages = targetIds.map((id) => ctx.messageStore.get(id)).filter(Boolean) as StoredMessage[];
+    await logged(() => restarted.run({ index: 999, startIndex: 10, endIndex: 12, messages, tokens: 100, compressed: false }, ctx), []);
+    assert.equal(restartMock.calls.length, 0, 'the quarantine is found by key');
+    manager.close();
+  });
+});

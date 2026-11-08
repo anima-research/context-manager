@@ -1884,12 +1884,14 @@ export interface AutobiographicalConfig {
    *    exactly as they have since the 2026-07-15 round-trip landed. Output is
    *    byte-identical to the pre-knob render on both surfaces.
    *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
-   *    and merge requests still recall them verbatim.
+   *    and merge requests still recall them verbatim, unless the provider has
+   *    refused one for a binding mismatch (see MINT-REQUEST RECALL).
    *
    * A select for a model that binds thinking (`SelectOptions.thinkingBinding`)
    * renders and prices the live window as under `'live-strip'` whatever this
    * says: a carrier was minted in its summarizer's request, so such a model
-   * never takes it there. Mint and merge requests are unchanged.
+   * never takes it there. The select doesn't change mint and merge requests;
+   * a binding refusal can (see MINT-REQUEST RECALL).
    *
    * TWO SURFACES, ONE STORE. A captured carrier is the ARCHIVIST'S cognition:
    * the thinking of writing the memory, not the thinking of living the span it
@@ -1902,7 +1904,13 @@ export interface AutobiographicalConfig {
    *    pairs carried their summaries' signed reasoning, where the text-only
    *    arm refused. `'live-strip'` does not touch this path, and no value of
    *    this option does: the anti-refusal duty stands until a measurement
-   *    retires it.
+   *    retires it. Where the duty can't be served, the provider says so: a
+   *    model that binds its thinking, on an account that enforces it, refuses
+   *    a request whose carrier is bound to a different conversation, which a
+   *    recall pair's carrier always is. After such a refusal, the strategy
+   *    sends that model's summarizer requests without carriers for the rest
+   *    of its life, as the one-shot fallback's retry is sent, without a
+   *    refused request first.
    *  - LIVE-WINDOW RENDER — what the agent whose memory it is reads back.
    *    Thinking blocks are not read there, they are INHABITED, and a carrier
    *    sits at the memory's chronological slot: the instance re-enters the
