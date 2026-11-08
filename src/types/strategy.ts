@@ -768,7 +768,8 @@ export interface SelectOptions {
    * stored reply answered which request. A noted reply sent without its
    * thinking doesn't count as differing where the record holds it as sent
    * with its thinking, so the replies after it keep their thinking, for the
-   * provider to judge. A reply whose stored body went
+   * provider to judge; a compiled message that also holds a body the note
+   * didn't name still differs. A reply whose stored body went
    * without its thinking goes without it again, since what came after it
    * was minted without it. A message whose participant isn't
    * `participant`, or that has no stored body (a summary's recall answer,
@@ -789,8 +790,9 @@ export interface SelectOptions {
    * Under `dropBlock`, a reply whose thinking the provider set aside goes
    * without it from the compile after the host notes so
    * (`ContextManager.noteThinkingDropped`), and the replies after it keep
-   * theirs. A host that doesn't note it sends the block again at every
-   * request, for the provider to set aside again.
+   * theirs. A host that doesn't note it keeps sending the block, for the
+   * provider to set aside again, until something else leaves its thinking
+   * out.
    *
    * So once a branch has a record, a reply keeps its thinking at the compile
    * after it's stored only if the host has noted it: each later round of a

@@ -3917,14 +3917,18 @@ export class ContextManager {
    * compile's. The replies after it keep their thinking, for the provider to
    * judge: a note follows a block the provider set aside under the drop
    * control, so a later block it can't take is set aside in turn, and can be
-   * noted the same way, never refused.
+   * noted the same way, never refused. A note naming some but not all of a
+   * compiled message's bodies leaves that message differing from the record,
+   * so it and the replies after it go without their thinking, and its bodies
+   * the note didn't name, other than those the record's compile sent without
+   * their thinking, are reported in `thinkingStrip`.
    *
    * A noted reply isn't reported again in a later compile's `thinkingStrip`:
    * the provider's report of the request it was set aside in already told
    * the host. Returns true when `compileId` is the compile that wrote the
    * branch's record, and false, writing nothing, when it isn't or the branch
    * has no record, as `noteRequestSent` does. It writes only when an id it's
-   * given isn't already in the record, so a repeated note writes nothing. A
+   * given isn't already noted, so a repeated note writes nothing. A
    * record it can't read or write is logged, and it returns false.
    * Throws, writing nothing, for ids that aren't an array of strings, or a
    * `compileId` that isn't a string.
@@ -3932,9 +3936,10 @@ export class ContextManager {
   noteThinkingDropped(messageIds: readonly MessageId[], compileId: string): boolean {
     this.requireInitialized('noteThinkingDropped');
     if (!Array.isArray(messageIds)) throw new TypeError(`noteThinkingDropped: \`messageIds\` must be an array, got ${typeof messageIds}`);
-    messageIds.forEach((id: unknown, i) => {
+    for (let i = 0; i < messageIds.length; i++) {
+      const id: unknown = messageIds[i];
       if (typeof id !== 'string') throw new TypeError(`noteThinkingDropped: id ${i} must be a message id, got ${JSON.stringify(id) ?? typeof id}`);
-    });
+    }
     if (typeof compileId !== 'string') {
       throw new TypeError(
         `noteThinkingDropped: \`compileId\` must be a string, the provenance.compileId of the compile the stream was built from; got ${typeof compileId}`,
@@ -3942,11 +3947,11 @@ export class ContextManager {
     }
     const record = this.readBindingRecordFor('this note writes nothing, and the provider sets these replies\' thinking aside again until a note writes');
     if (record === null || record.compileId !== compileId) return false;
-    const known = new Set(record.without);
+    const known = new Set(record.dropped ?? []);
     const added = [...new Set(messageIds)].filter((id) => !known.has(id));
     if (added.length === 0) return true;
     return this.writeBindingRecordFor(
-      { ...record, without: [...record.without, ...added] },
+      { ...record, dropped: [...(record.dropped ?? []), ...added] },
       'this note is lost: the provider sets these replies\' thinking aside again until a note writes',
     );
   }

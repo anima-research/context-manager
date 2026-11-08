@@ -86,9 +86,9 @@ export interface BindingRecord {
    *  `UNVOUCHED` for a row the next compile can't reproduce. Empty until a
    *  note. */
   continued: string[];
-  /** The stored bodies that compile sent without their thinking, and those a
-   *  host noted since the provider set aside (`noteThinkingDropped`). */
+  /** The stored bodies that compile sent without their thinking. */
   without: MessageId[];
+  dropped?: MessageId[];
   /** The head digests that compile sent. */
   identity: RequestIdentity;
   /** The branch's sequence (`JsStore.currentSequence`) when the record
@@ -171,6 +171,7 @@ function isBindingRecord(value: unknown): value is BindingRecord {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   if (!isStringArray(v.sent) || !isStringArray(v.continued) || !isStringArray(v.without)) return false;
+  if (v.dropped !== undefined && !isStringArray(v.dropped)) return false;
   if (!isSequence(v.recordedAfter) || typeof v.compileId !== 'string') return false;
   if (typeof v.identity !== 'object' || v.identity === null || Array.isArray(v.identity)) return false;
   const identity = v.identity as Record<string, unknown>;
@@ -261,13 +262,15 @@ function rawBodies(source: CompiledMessageSources | undefined): RawBodySource[] 
  * `SelectOptions.thinkingBinding`), and the record that compile leaves.
  *
  * A message keeps its thinking only when it is the participant's own, from a
- * stored body; none of its bodies is in the record's `without`, sent without
- * thinking by the record's compile or noted as set aside by the provider; it
- * was stored after the record began, unless the request carries the drop
- * control; and, where there is a record, nothing up to it differs from the
- * record, which it is within. A noted reply sent now without its thinking
- * still matches the record's whole form of it, so the replies after it keep
- * theirs. With no record, only the drop control keeps a reply's thinking.
+ * stored body; none of its bodies was sent without thinking by the record's
+ * compile or noted as set aside by the provider; it was stored after the
+ * record began, unless the request carries the drop control; and, where
+ * there is a record, nothing up to it differs from the record, which it is
+ * within. A message whose every body was noted, sent now without its
+ * thinking, still matches the record's whole form of it, so the replies
+ * after it keep theirs. One whose bodies were noted only in part differs,
+ * and its bodies neither noted nor left out before are newly left out. With
+ * no record, only the drop control keeps a reply's thinking.
  * Any other message's thinking (another participant's, a summary's recall,
  * an injection) was never minted in this agent's requests, and is always
  * left out.
@@ -278,7 +281,8 @@ export function bindThinking(input: BindInput): BindOutcome {
   const recorded = record ? [...record.sent, ...record.continued] : [];
   const changed = record ? IDENTITY_KEYS.filter((key) => identity[key] !== record.identity[key]) : [];
   let diverged = changed.length > 0;
-  const wasWithout = new Set(record?.without ?? []);
+  const wasDropped = new Set(record?.dropped ?? []);
+  const wasWithout = new Set([...(record?.without ?? []), ...wasDropped]);
   const messages: NormalizedMessage[] = [];
   const sent: string[] = [];
   const without = new Set<MessageId>();
@@ -303,11 +307,8 @@ export function bindThinking(input: BindInput): BindOutcome {
     }
     let out = thinking && !keep ? stripped(message) : message;
     let digest = messageDigest(out);
-    // A noted reply's record entry may still be the form sent with its
-    // thinking. Its thinking going isn't a difference, so the replies after
-    // it keep theirs, for the provider to judge.
     const noted = (): boolean =>
-      thinking && bodies.length > 0 && bodies.every((body) => wasWithout.has(body.messageId)) && messageDigest(message) === recorded[i];
+      thinking && bodies.length > 0 && bodies.every((body) => wasDropped.has(body.messageId)) && messageDigest(message) === recorded[i];
     // Past the record's end, nothing was vouched for.
     if (!diverged && record !== null) diverged = i >= recorded.length || (digest !== recorded[i] && !noted());
     if (diverged && keep) {
@@ -319,6 +320,9 @@ export function bindThinking(input: BindInput): BindOutcome {
     if (thinking && !keep && bodies.length > 0) {
       for (const block of message.content) if (isThinkingBlock(block)) leftOut.push(block);
       for (const body of bodies) without.add(body.messageId);
+      if (message.participant === participant && bodies.some((body) => wasDropped.has(body.messageId))) {
+        for (const body of bodies) if (!wasWithout.has(body.messageId)) newly.add(body.messageId);
+      }
     }
     messages.push(out);
     sent.push(digest);

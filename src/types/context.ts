@@ -266,7 +266,8 @@ export interface ThinkingStrip {
    * that compile sent them with their thinking, they were stored since, or
    * it didn't send them as stored replies at all. A record is written by a
    * committing compile with `binds`, so a compile without it is passed
-   * over. A reply a host noted since as set aside by the provider
+   * over. A reply a host noted, after the compile that wrote the branch's
+   * record, as set aside by the provider
    * (`ContextManager.noteThinkingDropped`) is never among them: the
    * provider's report of that request already told the host.
    * So a reply can be reported again: one whose thinking went, that a later
