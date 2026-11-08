@@ -267,11 +267,12 @@ function rawBodies(source: CompiledMessageSources | undefined): RawBodySource[] 
  * compile or noted as set aside by the provider; it was stored after the
  * record began, unless the request carries the drop control; and, where
  * there is a record, nothing up to it differs from the record, which it is
- * within. A message whose every body was noted, sent now without its
- * thinking, still matches the record's whole form of it, so the replies
- * after it keep theirs. One whose bodies were noted only in part differs,
- * and its bodies neither noted nor left out before are newly left out. With
- * no record, only the drop control keeps a reply's thinking.
+ * within. A message whose every body was noted, and which is otherwise as
+ * the record's compile sent it, still matches the record's whole form of it
+ * when sent now without its thinking, so the replies after it keep theirs.
+ * One whose bodies were noted only in part differs, and its bodies neither
+ * noted nor left out before are newly left out. With no record, only the
+ * drop control keeps a reply's thinking.
  * Any other message's thinking (another participant's, a summary's recall,
  * an injection) was never minted in this agent's requests, and is always
  * left out.

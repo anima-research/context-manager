@@ -1383,6 +1383,20 @@ describe('thinking binding: noteThinkingDropped', () => {
     await manager.close();
   });
 
+  it('a noted reply edited since it was sent differs from the record: the replies after it go without their thinking', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const first = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(first), { U1: false, A1: true, U2: false, A2: true }, 'setup');
+    assert.equal(dropped(manager, [a1]), true);
+    manager.editMessage(a1, [thought(1), text('A1 edited')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, 'A1 edited': false, U2: false, A2: false });
+    assert.deepEqual(next.thinkingStrip, { newly: [a2], cause: 'messages' });
+    await manager.close();
+  });
+
   it('a noted reply that a committing compile in between didn\u2019t send is reported again when it renders', async () => {
     cleanup();
     let hidden: MessageId | undefined;

@@ -790,9 +790,9 @@ export interface SelectOptions {
    * Under `dropBlock`, a reply whose thinking the provider set aside goes
    * without it from the compile after the host notes so
    * (`ContextManager.noteThinkingDropped`), and the replies after it keep
-   * theirs. A host that doesn't note it keeps sending the block, for the
-   * provider to set aside again, until something else leaves its thinking
-   * out.
+   * theirs while it is otherwise as it was sent. A host that doesn't note it
+   * keeps sending the block, for the provider to set aside again, until
+   * something else leaves its thinking out.
    *
    * So once a branch has a record, a reply keeps its thinking at the compile
    * after it's stored only if the host has noted it: each later round of a
