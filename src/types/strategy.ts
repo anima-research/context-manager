@@ -829,16 +829,30 @@ export interface SelectOptions {
    * ContextManager.compile fills it from its injections; `system` ones go
    * into the caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
-  /** The overhead of the request the compile is for: the system prompt and
-   * tool definitions it sends besides the window and its message-position
-   * injections. Its system prompt is the one the request sends, with the
+  /** The overhead of the request the compile is for: the system prompt, the
+   * tool definitions and any other messages it sends besides the window and
+   * its message-position injections. Its system prompt is the one the request sends, with the
    * system-position injections passed to this compile appended: the compile
    * hands those back unchanged (`systemInjections`) and prices none of them.
    * AutobiographicalStrategy prices it, and the message injections, for
-   * `RenderStats.request`, and selects exactly as it would without it. An
-   * overhead whose tool definitions can't be serialised as JSON is refused
-   * before anything is selected. */
+   * `RenderStats.request`, and selects exactly as it would without it,
+   * unless `requestLimitTokens` is given. An overhead whose tool definitions
+   * can't be serialised as JSON is refused before anything is selected. */
   requestOverhead?: RequestOverhead;
+  /** The most the whole request may hold, in tokens, as the provider limits
+   * it: the selected window, the message injections, `requestOverhead` and
+   * the budget's `reserveForResponse` together. Given, the select keeps that
+   * sum within it, in the window's units at the compile's multiplier (for a
+   * strategy that doesn't calibrate, such as the passthrough strategies, as
+   * the store's estimator prices it), the strategy's over-budget grace
+   * included; while an AutobiographicalStrategy's
+   * multiplier is provisional, it keeps the sum within it priced at the
+   * calibration's ceiling. A select whose sum would still pass it, or whose
+   * limit leaves the window no room, refuses with an `OverBudgetError`.
+   * It needs `requestOverhead`: one given without it, or one that isn't a
+   * positive finite number, is refused with a `TypeError` before anything is
+   * selected. */
+  requestLimitTokens?: number;
 }
 
 /**
@@ -1256,6 +1270,11 @@ export interface RequestOverhead {
   system?: string;
   /** The tool definitions the request sends. */
   tools?: ReadonlyArray<ToolDefinition>;
+  /** The content of each message the request sends besides the compiled
+   * window and the message injections, such as tool results a caller adds to
+   * the request after the compile. Each is priced as the window prices the
+   * same blocks sent whole. */
+  messages?: ReadonlyArray<ContentBlock[]>;
 }
 
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
@@ -1352,14 +1371,20 @@ export interface RenderStats {
    * (`SelectOptions.messageInjections`), 0 when it has none. Present only when
    * the select was given an overhead, so a compile without one has no price
    * here rather than a price of 0. The overhead's price is the store's
-   * estimate of the system prompt and of the tool definitions as JSON
-   * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * estimate of the system prompt, of the tool definitions as JSON
+   * (`JSON.stringify`) and of its messages' blocks as the window prices them
+   * sent whole, not the provider's count of what its formatter sends.
    * System-position injections are priced only as part of that system
    * prompt: the compile hands the ones it was passed back unchanged
    * (`systemInjections`) for the caller to append, so the overhead's system
-   * prompt is the one sent, with them appended.
+   * prompt is the one sent, with them appended. With
+   * `SelectOptions.requestLimitTokens`, `limitTokens` is that limit, and
+   * `allowanceTokens`, present only when the limit lowered the select's
+   * target or its hard bound, is what it left the window: the limit less
+   * `reserveForResponse`, the injections and the overhead, at the price the
+   * select kept it at.
    */
-  request?: { overheadTokens: number; injectedTokens: number };
+  request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's

@@ -67,6 +67,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { noRoomUnderRequestLimit, requestOverheadContent } from '../request-limit.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
@@ -2146,14 +2147,14 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
-type SelectPricing = { overhead: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
-
-function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
-  const content: ContentBlock[] = [];
-  if (overhead.system) content.push({ type: 'text', text: overhead.system });
-  if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
-  return content;
-}
+type SelectPricing = {
+  overhead: ContentBlock[];
+  injections?: ReadonlyArray<ContentBlock[]>;
+  limitTokens?: number;
+  allowance?: number;
+  allowanceTokens?: number;
+  limitBound?: boolean;
+};
 
 /**
  * A summary getStrandedSummaries lists: alone in a run at its level that is
@@ -9562,7 +9563,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private selectPricing: SelectPricing | null = null;
 
   private selectPricingOf(opts: SelectOptions | undefined): SelectPricing | null {
-    return opts?.requestOverhead ? { overhead: requestOverheadContent(opts.requestOverhead), injections: opts.messageInjections } : null;
+    if (!opts?.requestOverhead) return null;
+    return {
+      overhead: requestOverheadContent(opts.requestOverhead),
+      injections: opts.messageInjections,
+      ...(opts.requestLimitTokens !== undefined ? { limitTokens: opts.requestLimitTokens } : {}),
+    };
+  }
+
+  /** Call it once the select path has loaded its multiplier. */
+  private boundsUnderRequestLimit(
+    budget: TokenBudget,
+    target: number,
+    bound: number,
+    adaptive: boolean,
+  ): { maxTokens: number; rejectionBudget: number } {
+    const pricing = this.selectPricing;
+    const limit = pricing?.limitTokens;
+    if (pricing === null || limit === undefined) return { maxTokens: target, rejectionBudget: bound };
+    const overhead = this.priceContent(pricing.overhead);
+    const injected = this.priceMessageInjections(pricing.injections);
+    const atCeiling = adaptive && this._calibrationProvisional !== null;
+    const scale = atCeiling ? this._calibration / CALIBRATION_CEILING : 1;
+    const allowance = Math.floor((limit - budget.reserveForResponse) * scale - overhead - injected);
+    if (allowance <= 0) {
+      pricing.limitBound = true;
+      throw noRoomUnderRequestLimit({
+        limit,
+        reserve: budget.reserveForResponse,
+        overhead: Math.ceil(overhead / scale),
+        injected: Math.ceil(injected / scale),
+        allowance,
+        ...(atCeiling ? { ceiling: CALIBRATION_CEILING } : {}),
+      });
+    }
+    pricing.allowance = allowance;
+    if (allowance < target || allowance < bound) pricing.allowanceTokens = allowance;
+    if (allowance < bound) pricing.limitBound = true;
+    return { maxTokens: Math.min(target, allowance), rejectionBudget: Math.min(bound, allowance) };
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -10643,6 +10681,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       r.request = {
         overheadTokens: this.priceContent(pricing.overhead),
         injectedTokens: this.priceMessageInjections(pricing.injections),
+        ...(pricing.limitTokens !== undefined ? { limitTokens: pricing.limitTokens } : {}),
+        ...(pricing.allowanceTokens !== undefined ? { allowanceTokens: pricing.allowanceTokens } : {}),
       };
     }
     this._lastRenderStats = r;
@@ -15046,6 +15086,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         configuredBudget: budget.maxTokens,
         reserveForResponse: budget.reserveForResponse,
         inputBudget: budget.maxTokens - budget.reserveForResponse,
+        ...(this.selectPricing?.limitTokens !== undefined ? { requestLimitTokens: this.selectPricing.limitTokens } : {}),
+        ...(this.selectPricing?.allowanceTokens !== undefined ? { requestAllowanceTokens: this.selectPricing.allowanceTokens } : {}),
       },
     });
   }
@@ -15126,14 +15168,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
-    const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
-    const rejectionBudget = Math.floor(maxTokens * (1 + overBudgetGraceRatio));
     // Closed-loop calibration: apply the persisted multiplier BEFORE any
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store, { dryRun });
+    const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
+    const room = budget.maxTokens - budget.reserveForResponse;
+    const { maxTokens, rejectionBudget } = this.boundsUnderRequestLimit(
+      budget, room, Math.floor(room * (1 + overBudgetGraceRatio)), true);
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -15664,7 +15707,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         // With the line a compile at prodBudget refuses above, as the live
         // pick has its own, so the solver plans as that compile would.
-        const prodLine = Math.floor(prodBudget * (1 + overBudgetGraceRatio));
+        const prodLine = Math.min(Math.floor(prodBudget * (1 + overBudgetGraceRatio)), rejectionBudget);
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
           targetBudget: prodBudget * (1 - slack),
@@ -16183,7 +16226,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * for a request built from the latest compile (fresh + cache_read +
    * cache_creation, as the provider reports it), and what the request sent
    * besides the window and the compile's message-position injections: its
-   * system prompt and tool definitions (#323). The injections are priced at
+   * system prompt and tool definitions (#323), and any other messages it
+   * sent beside the window. The injections are priced at
    * the compile (SelectOptions.messageInjections) and the overhead here, as
    * the store prices the window, and both are added to the estimate, so the
    * sample compares the whole request with the whole request; left out, the
@@ -16346,7 +16390,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** The store's price of what a request sent besides the window: its system
    *  prompt and its tool definitions as sent, priced as a compression request
-   *  prices its own (priceRequest in the compression path), at the current
+   *  prices its own (priceRequest in the compression path), and its other
+   *  messages' blocks as the window prices them sent whole, at the current
    *  multiplier, so it adds to the window estimate in the same units. */
   private priceRequestOverhead(overhead: RequestOverhead): number {
     return this.priceContent(requestOverheadContent(overhead));
@@ -16895,10 +16940,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  persists it, a dry one keeps it to itself (select() puts it back).
    *  Returns false when there is nothing to drop: no provisional multiplier,
    *  or one at or below 1, where raising estimates can't help, so the refusal
-   *  stands. The 1 stays provisional: the first sample sets it. */
+   *  stands. Also false when a request limit set the hard bound or left no
+   *  room: that bound scales with the multiplier as the window's price does,
+   *  so a lower one can't make the window fit. The 1 stays provisional: the
+   *  first sample sets it. */
   protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
     const provisional = this._calibrationProvisional;
-    if (!provisional || this._calibration <= 1) return false;
+    if (!provisional || this._calibration <= 1 || this.selectPricing?.limitBound) return false;
     const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const discarded = this._calibration;
     const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
@@ -18344,17 +18392,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const room = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
     const msgCap = this.config.maxMessageTokens;
     // Emission grace (coverage invariant, 76e95a0): selection below still
     // TARGETS maxTokens, but emission never silently drops content to fit —
     // it may overshoot up to the grace window, and beyond that the select
     // refuses the turn (OverBudgetError) rather than losing history.
-    // enforceBudget=false disables the ceiling entirely (legacy behavior).
-    const graceLimit = this.config.enforceBudget === false
-      ? Number.POSITIVE_INFINITY
-      : Math.floor(maxTokens * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0)));
+    // enforceBudget=false disables the ceiling entirely (legacy behavior),
+    // apart from a request limit's.
+    const { maxTokens, rejectionBudget: graceLimit } = this.boundsUnderRequestLimit(budget, room,
+      this.config.enforceBudget === false
+        ? Number.POSITIVE_INFINITY
+        : Math.floor(room * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0))),
+      false);
 
     let totalTokens = 0;
 
@@ -19229,13 +19280,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * True if `projectedTotal` exceeds `max` AND the strategy is configured
-   * to enforce budget. When `enforceBudget: false`, always returns false
-   * — the rendering pipeline emits the full ideal context regardless of
-   * budget overage. Caller's API will reject if it exceeds the model's
-   * context window; the philosophy is "surface overage, don't hide it."
+   * to enforce budget. When `enforceBudget: false`, false unless a request
+   * limit (`SelectOptions.requestLimitTokens`) applies, and then true only
+   * past what that limit leaves the window — the rendering pipeline emits
+   * the full ideal context regardless of budget overage, within the limit.
+   * Caller's API will reject if it exceeds the model's context window; the
+   * philosophy is "surface overage, don't hide it."
    */
   protected isOverBudget(projectedTotal: number, max: number): boolean {
-    if (this.config.enforceBudget === false) return false;
+    if (this.config.enforceBudget === false) {
+      const allowance = this.selectPricing?.allowance;
+      return allowance !== undefined && projectedTotal > allowance;
+    }
     return projectedTotal > max;
   }
 
