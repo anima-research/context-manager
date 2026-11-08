@@ -2154,6 +2154,7 @@ type SelectPricing = {
   allowance?: number;
   allowanceTokens?: number;
   limitBound?: boolean;
+  stubTokens?: number;
 };
 
 /**
@@ -2821,13 +2822,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           finalTokens: err.actual,
           budgetTokens: err.budget,
           fits: false,
-          exhausted: true,
+          exhausted: this.requestLimitRefusals.has(err) ? partial?.exhausted ?? false : true,
           clearedBy: err.clearedBy,
           headTokens: err.diagnostics.headTokens,
           tailTokens: err.diagnostics.tailTokens,
           middleTokens: err.diagnostics.middleTokens,
           middleChunkCount: err.diagnostics.middleChunkCount,
           deepestLevel: err.diagnostics.deepestLevel,
+          ...(err.diagnostics.requestLimitTokens !== undefined ? { requestLimitTokens: err.diagnostics.requestLimitTokens } : {}),
+          ...(err.diagnostics.requestAllowanceTokens !== undefined ? { requestAllowanceTokens: err.diagnostics.requestAllowanceTokens } : {}),
           // An early throw means no fold plan was computed at all; a late one
           // means we have it.
           resolutions: partial?.resolutions ?? {},
@@ -9588,7 +9591,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const allowance = Math.floor((limit - budget.reserveForResponse) * scale - overhead - injected);
     if (allowance <= 0) {
       pricing.limitBound = true;
-      throw noRoomUnderRequestLimit({
+      const error = noRoomUnderRequestLimit({
         limit,
         reserve: budget.reserveForResponse,
         overhead: Math.ceil(overhead / scale),
@@ -9596,6 +9599,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         allowance,
         ...(atCeiling ? { ceiling: CALIBRATION_CEILING } : {}),
       });
+      this.requestLimitRefusals.add(error);
+      throw error;
     }
     pricing.allowance = allowance;
     if (allowance < target || allowance < bound) pricing.allowanceTokens = allowance;
@@ -9616,7 +9621,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
-        // it (#179, the startup wedge). Any other refusal stands.
+        // it (#179, the startup wedge). Any other refusal stands, and so does
+        // one the request limit made (dropProvisionalCalibration).
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, dryRun)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
@@ -10594,6 +10600,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Commit the accumulated stats as the last-render snapshot, and return
    *  it; null when this pass recorded none. */
+  private rsTokens(r: RenderStats): number {
+    const s = r.summaries;
+    return r.head.tokens + r.tail.tokens + r.middleRaw.tokens + s.l1.tokens + s.l2.tokens + s.l3.tokens;
+  }
+
   protected rsEnd(): RenderStats | null {
     const r = this._rs;
     if (!r) return null;
@@ -10605,9 +10616,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const summaryMsgs = (s.l1.count + s.l2.count + s.l3.count) * 2; // Q/A pair each
     r.total = {
       messages: r.head.messages + r.tail.messages + r.middleRaw.messages + summaryMsgs,
-      tokens:
-        r.head.tokens + r.tail.tokens + r.middleRaw.tokens +
-        s.l1.tokens + s.l2.tokens + s.l3.tokens,
+      tokens: this.rsTokens(r),
     };
     // Planner vs emitter reconciliation. `planned` is what the picker
     // projected after folding; `actual` is what the emitter committed. They
@@ -10683,6 +10692,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         injectedTokens: this.priceMessageInjections(pricing.injections),
         ...(pricing.limitTokens !== undefined ? { limitTokens: pricing.limitTokens } : {}),
         ...(pricing.allowanceTokens !== undefined ? { allowanceTokens: pricing.allowanceTokens } : {}),
+        ...(pricing.stubTokens !== undefined ? { stubTokens: pricing.stubTokens } : {}),
       };
     }
     this._lastRenderStats = r;
@@ -16077,6 +16087,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       recentStart: effectiveRecentStart,
     });
     this.postProcessToolEntries(merged);
+    this.keepStubsUnderRequestLimit(merged, budget, 'picker-chunks');
     // Strip stale images BEFORE placing markers, so they describe the
     // post-strip context the agent actually receives. This selection budgets
     // by postStripEstimates, so the strip counts as they do (see
@@ -16652,7 +16663,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the clamp allows, and says nothing about this release's); otherwise it
    * is kept, but not re-stamped. A provisional multiplier above 1 that puts
    * the first compile over budget is dropped to 1 and the select runs again
-   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * (dropProvisionalCalibration), unless the request limit made the
+   * refusal: its bound, no room, or the stubs past what it left. The first
+   * sample the band accepts replaces
    * a provisional multiplier outright, instead of stepping the EMA toward it,
    * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
    * from is provisional too, so one sample sets it rather than about ten; it
@@ -16907,7 +16920,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
                   `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
-                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first, unless the request limit ` +
+                  `made the refusal. Stamped (epoch ` +
                   `${current}) once a sample confirms it.`,
               );
             }
@@ -16940,9 +16954,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  persists it, a dry one keeps it to itself (select() puts it back).
    *  Returns false when there is nothing to drop: no provisional multiplier,
    *  or one at or below 1, where raising estimates can't help, so the refusal
-   *  stands. Also false when a request limit set the hard bound or left no
-   *  room: that bound scales with the multiplier as the window's price does,
-   *  so a lower one can't make the window fit. The 1 stays provisional: the
+   *  stands. Also false when the request limit made the refusal: it set the
+   *  hard bound, left no room, or found the pairing repair's stubs past what
+   *  it left. Each such bound scales with the multiplier as the window's
+   *  price does, so a lower one can't make the window fit. The 1 stays provisional: the
    *  first sample sets it. */
   protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
     const provisional = this._calibrationProvisional;
@@ -19011,6 +19026,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
+    this.keepStubsUnderRequestLimit(entries, budget, 'selection-items');
     // Strip stale images (this path places no cache markers). Its emission
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
@@ -21268,6 +21284,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.trimOrphanedToolUse(entries);
     this.enforceToolPairing(entries);
   }
+
+  private keepStubsUnderRequestLimit(
+    entries: readonly ContextEntry[],
+    budget: TokenBudget,
+    middleCountUnit: 'picker-chunks' | 'selection-items',
+  ): void {
+    const pricing = this.selectPricing;
+    if (pricing?.allowance === undefined || pricing.limitTokens === undefined || !this._rs) return;
+    const stubs = entries.flatMap((entry) => entry.content.filter((block) => this.generatedToolResultStubs.has(block)));
+    if (stubs.length === 0) return;
+    const stubTokens = this.priceContent(stubs);
+    pricing.stubTokens = stubTokens;
+    const window = this.rsTokens(this._rs);
+    if (window + stubTokens <= pricing.allowance) return;
+    pricing.limitBound = true;
+    pricing.allowanceTokens = pricing.allowance;
+    const error = this.overBudgetError(budget, {
+      stage: 'Request limit',
+      budget: pricing.allowance,
+      actual: window + stubTokens,
+      clearedBy: [],
+      diagnostics: {
+        middleCountUnit,
+        deepestLevelKind: 'attempted',
+        headTokens: this._rs.head.tokens,
+        tailTokens: this._rs.tail.tokens,
+        middleTokens: window - this._rs.head.tokens - this._rs.tail.tokens,
+        middleChunkCount: 0,
+        deepestLevel: 0,
+      },
+    });
+    error.message = `The tool-result stubs the pairing repair added, ${stubTokens} tokens, take the window of ${window} ` +
+      `past the ${pricing.allowance} the request limit of ${pricing.limitTokens} leaves it`;
+    this.requestLimitRefusals.add(error);
+    throw error;
+  }
+
+  private readonly requestLimitRefusals = new WeakSet<OverBudgetError>();
 
   /**
    * Remove trailing entries that contain tool_use without a following tool_result.

@@ -50,7 +50,10 @@ export function overRequestLimit(parts: RequestBesidesWindow & { window: number 
     budget: parts.limit,
     actual: total,
     stage: 'Request limit',
-    diagnostics: { headTokens: 0, tailTokens: 0, middleTokens: parts.window, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned' },
+    diagnostics: {
+      headTokens: 0, tailTokens: 0, middleTokens: parts.window, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned',
+      requestLimitTokens: parts.limit, requestAllowanceTokens: parts.limit - parts.reserve - parts.overhead - parts.injected,
+    },
   });
   error.message = `The compiled request would hold ${total} tokens, over its limit of ${parts.limit}: the window ` +
     `${parts.window}, the message injections ${parts.injected}, the request overhead ${parts.overhead} and the ` +

@@ -3210,12 +3210,13 @@ export class ContextManager {
     const messageInjections = (injections ?? [])
       .filter((inj) => inj.position === 'beforeUser' || inj.position === 'afterUser')
       .map((inj) => inj.content);
-    const entries = this.strategy.select(
-      view,
-      this.contextLog.createView(),
-      effectiveBudget,
-      messageInjections.length > 0 ? { ...opts, messageInjections } : opts
-    );
+    let selectOpts = opts;
+    if (messageInjections.length > 0) selectOpts = { ...opts, messageInjections };
+    else if (opts?.messageInjections !== undefined) {
+      const { messageInjections: _callers, ...rest } = opts;
+      selectOpts = rest;
+    }
+    const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
     const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;

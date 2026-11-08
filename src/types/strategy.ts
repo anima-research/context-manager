@@ -826,8 +826,9 @@ export interface SelectOptions {
    * request carries and the select's window doesn't. A strategy whose
    * calibration compares the provider's input total with the compile prices
    * it there (AutobiographicalStrategy.reportRealInputTokens).
-   * ContextManager.compile fills it from its injections; `system` ones go
-   * into the caller's system prompt instead. */
+   * ContextManager.compile fills it from its injections, and passes none
+   * when it has none, whatever its caller gave; `system` ones go into the
+   * caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
   /** The overhead of the request the compile is for: the system prompt, the
    * tool definitions and any other messages it sends besides the window and
@@ -841,13 +842,18 @@ export interface SelectOptions {
   requestOverhead?: RequestOverhead;
   /** The most the whole request may hold, in tokens, as the provider limits
    * it: the selected window, the message injections, `requestOverhead` and
-   * the budget's `reserveForResponse` together. Given, the select keeps that
-   * sum within it, in the window's units at the compile's multiplier (for a
-   * strategy that doesn't calibrate, such as the passthrough strategies, as
-   * the store's estimator prices it), the strategy's over-budget grace
-   * included; while an AutobiographicalStrategy's
+   * the budget's `reserveForResponse` together, with any tool-result stubs
+   * an AutobiographicalStrategy's pairing repair adds to the window. Given,
+   * the select keeps that sum within it, in the window's units at the
+   * compile's multiplier (for a strategy that doesn't calibrate, such as the
+   * passthrough strategies, as the store's estimator prices it), the
+   * strategy's over-budget grace included; while an AutobiographicalStrategy's
    * multiplier is provisional, it keeps the sum within it priced at the
-   * calibration's ceiling. A select whose sum would still pass it, or whose
+   * calibration's ceiling, by scaling its price at the provisional
+   * multiplier. The store rounds each block's price at that multiplier, by
+   * up to half a token, so at a true rate up to the ceiling the request can
+   * pass the limit by up to half a token a block, scaled by the ceiling over
+   * the multiplier. A select whose sum would still pass it, or whose
    * limit leaves the window no room, refuses with an `OverBudgetError`.
    * It needs `requestOverhead`: one given without it, or one that isn't a
    * positive finite number, is refused with a `TypeError` before anything is
