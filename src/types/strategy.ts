@@ -34,6 +34,7 @@ export interface MessageStoreView {
    * MessageStore provides it). A filtered view answers for the messages it hides, a
    * merged view for every source when each source can, and the window a
    * ContextManager presents (presentedMessageView) as the view under it does.
+   * It throws where a read fails, rather than answering.
    */
   held?(id: MessageId): boolean;
   /**
@@ -45,7 +46,8 @@ export interface MessageStoreView {
    * for an id the store never gave a message (optional — MessageStore
    * provides it). Where `held` reads one record, this reads the messages
    * state as it stood at the message's append, which costs in proportion
-   * to that state. Views pass it on as they pass `held`.
+   * to that state, and throws where a read fails. Views pass it on as they
+   * pass `held`.
    */
   onBranch?(id: MessageId): boolean;
   /**

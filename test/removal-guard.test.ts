@@ -1,4 +1,4 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import {
@@ -260,6 +260,15 @@ describe('the chain-break guard when held messages empty most chunk records', ()
     const debt = s.getCompressionDebt();
     assert.strictEqual(debt.state, 'critical', `${label}: the debt report is critical`);
     assert.strictEqual(debt.failure, 'chunk-records', label);
+    assert.match(debt.error ?? '', /chunk records name no message in its view, and the oldest or newest of those a removal or a filter emptied names messages its messages chain doesn't hold/, `${label}: the off-chain cause`);
+  };
+  const heldOffBranch = (cm: ContextManager, ids: string[], label: string): void => {
+    const store = messageStoreOf(cm);
+    assert.ok(ids.length > 0, `${label}: setup has ids`);
+    for (const id of ids) {
+      assert.strictEqual(store.held(id), true, `${label}: ${id} is held`);
+      assert.strictEqual(store.onBranch(id), false, `${label}: ${id} is off this branch's chain`);
+    }
   };
 
   // A model of a messages chain that restarted, as chronicle before 0.5.0 restarted one when its
@@ -278,6 +287,7 @@ describe('the chain-break guard when held messages empty most chunk records', ()
     await cm.switchBranch('restarted');
     assert.strictEqual(cm.getAllMessages().length, 0, 'setup: the branch holds no messages');
     assert.strictEqual(records(cm).length, 6, 'setup: the branch carries the chunk records');
+    heldOffBranch(cm, records(cm).flatMap((r) => r.sourceIds), 'restarted chain');
     for (const m of lived) cm.addMessage(m.participant, m.content);
     await halts(cm, s, 'restarted chain');
     await cm.close();
@@ -309,6 +319,7 @@ describe('the chain-break guard when held messages empty most chunk records', ()
     await cm.switchBranch('restarted-then-removed');
     assert.strictEqual(records(cm).length, 8, 'setup: 6 carried records and 2 on the new chain');
     assert.strictEqual(cm.getAllMessages().length, 3, "setup: the new chain holds only new-0's messages");
+    heldOffBranch(cm, records(cm).slice(0, 6).flatMap((r) => r.sourceIds), 'restarted, then removed');
     await halts(cm, s, 'restarted, then removed');
     await cm.close();
   });
@@ -378,13 +389,13 @@ describe('the chain-break guard when held messages empty most chunk records', ()
       return count;
     };
 
-    const below = await ContextManager.open({ path: freshPath(), strategy: strategy(), membrane });
-    await growTo(below, 3);
+    const belowStrategy = strategy();
+    const below = await ContextManager.open({ path: freshPath(), strategy: belowStrategy, membrane });
+    await growTo(below, 4);
     const belowCount = counted(below);
-    for (const id of records(below)[0]!.sourceIds) below.removeMessage(id);
-    add(below, 40);
-    for (let i = 0; i < 20; i++) await below.tick();
-    assert.strictEqual(belowCount.calls, 0, '1 of 3 records emptied: no call');
+    for (const id of records(below).slice(0, 2).flatMap((r) => r.sourceIds)) below.removeMessage(id);
+    await laterMessagesCompress(below, belowStrategy, 'exactly half');
+    assert.strictEqual(belowCount.calls, 0, '2 of 4 records emptied, exactly half: no call');
     await below.close();
 
     const s = strategy();
@@ -408,6 +419,207 @@ describe('the chain-break guard when held messages empty most chunk records', ()
     (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(withoutOnBranch);
     assert.strictEqual(s.getCompressionDebt().state, 'critical');
     assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records');
+    assert.match(s.getCompressionDebt().error ?? '', /\nFix: [^\n]*give the strategy a view with `onBranch`/, 'its fix names the view');
+    await cm.close();
+  });
+
+  it('a read of the chain that fails halts the rebuild with its error as the cause, keeps no answer, and a later rebuild asks again', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    const store = (messageStoreOf(cm) as unknown as { store: { getStateJsonAt(id: string, at: number): unknown; getRecord(id: string): unknown; getStateUpdateJson(id: string): string | null } }).store;
+    const messagesState = MessageStore.registrationFor().id;
+    const read = store.getStateJsonAt.bind(store);
+    let failing = true;
+    store.getStateJsonAt = (id, at) => {
+      if (failing && id === messagesState) throw new Error('a read of the messages state failed (test)');
+      return read(id, at);
+    };
+    const removed = records(cm).slice(0, 3).flatMap((r) => r.sourceIds);
+    for (const id of removed) cm.removeMessage(id);
+    assert.throws(() => messageStoreOf(cm).onBranch(removed[0]!), /a read of the messages state failed \(test\)/, 'onBranch throws when its read fails');
+    const getRecord = store.getRecord.bind(store);
+    store.getRecord = () => { throw new Error('a read of the record failed (test)'); };
+    assert.throws(() => messageStoreOf(cm).onBranch(removed[0]!), /a read of the record failed \(test\)/, 'onBranch throws when its read of the record fails');
+    store.getRecord = getRecord;
+
+    const later = add(cm, 40);
+    for (let i = 0; i < 50; i++) await cm.tick();
+    assert.ok(!later.some((id) => l1Sources(cm).has(id)), 'while the read fails: no L1 forms');
+    const debt = s.getCompressionDebt();
+    assert.strictEqual(debt.state, 'critical', 'while the read fails: the debt report is critical');
+    assert.strictEqual(debt.failure, 'chunk-records');
+    assert.match(debt.error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in its view \(a read of the messages state failed \(test\)\)\./, 'the cause is the read and its error');
+    assert.match(debt.error ?? '', /\nFix: fix what the cause names; the next rebuild asks again\.$/, 'its fix');
+    assert.doesNotMatch(debt.error ?? '', /chronicle before 0\.5\.0|onBranch|remove the records|reconcile/, 'it names no broken chain, view or removal');
+    const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
+    assert.match(failClosed[0]!, /couldn't read its messages chain[^\n]*\(a read of the messages state failed \(test\)\)[^\n]*the next rebuild asks again/);
+    assert.doesNotMatch(failClosed[0]!, /chronicle before 0\.5\.0|onBranch|into line/);
+
+    const { onBranch: _, ...withoutOnBranch } = messageStoreOf(cm).createView();
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(withoutOnBranch);
+    const trips = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(trips.length, 2, 'a trip on the off-chain cause after the failed read still logs');
+    assert.match(trips[1]!, /a view with held and without onBranch/);
+
+    // the records' held answers are kept and their ends' aren't, so held is asked again of the ends alone
+    const readAppend = store.getStateUpdateJson.bind(store);
+    store.getStateUpdateJson = () => { throw new Error('a read of the append record failed (test)'); };
+    assert.doesNotThrow(() => (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView()), 'a failed held read of an end leaves the rebuild going');
+    assert.match(s.getCompressionDebt().error ?? '', /\(a read of the append record failed \(test\)\)/, 'its cause is that read');
+    store.getStateUpdateJson = readAppend;
+
+    failing = false;
+    await laterMessagesCompress(cm, s, 'once the read succeeds');
+    await cm.close();
+  });
+
+  it('a read of a removed message\'s append record that fails halts the rebuild with its error as the cause, keeps no answer, and a later rebuild asks again', async (t) => {
+    mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    const removed = records(cm).slice(0, 3).flatMap((r) => r.sourceIds);
+    for (const id of removed) cm.removeMessage(id);
+    const store = (messageStoreOf(cm) as unknown as { store: { getStateUpdateJson(id: string): string | null } }).store;
+    const read = store.getStateUpdateJson.bind(store);
+    let failing = true;
+    store.getStateUpdateJson = (id) => {
+      if (failing) throw new Error('a read of the append record failed (test)');
+      return read(id);
+    };
+    assert.throws(() => messageStoreOf(cm).held(removed[0]!), /a read of the append record failed \(test\)/, 'held throws when its read fails');
+    assert.strictEqual(messageStoreOf(cm).held('ghost-0-a'), false, "an id that isn't a record id answers no without a read");
+
+    const later = add(cm, 40);
+    for (let i = 0; i < 50; i++) await cm.tick();
+    assert.ok(!later.some((id) => l1Sources(cm).has(id)), 'while the read fails: no L1 forms');
+    const debt = s.getCompressionDebt();
+    assert.strictEqual(debt.state, 'critical', 'while the read fails: the debt report is critical');
+    assert.strictEqual(debt.failure, 'chunk-records');
+    assert.match(debt.error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in its view \(a read of the append record failed \(test\)\)\./, 'the cause is the read and its error');
+    assert.doesNotMatch(debt.error ?? '', /can't show it ever held|reconcile|chronicle before 0\.5\.0/, 'it names no renumbered store or broken chain');
+
+    failing = false;
+    await laterMessagesCompress(cm, s, 'once the read succeeds');
+    await cm.close();
+  });
+
+  it('a read that fails for the one emptied record of 5 leaves later messages compressing', async (t) => {
+    mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm)[0]!.sourceIds) cm.removeMessage(id);
+    const store = (messageStoreOf(cm) as unknown as { store: { getStateUpdateJson(id: string): string | null } }).store;
+    store.getStateUpdateJson = () => { throw new Error('a read of the append record failed (test)'); };
+    await laterMessagesCompress(cm, s, 'one unread record of 5');
+    await cm.close();
+  });
+
+  const failReadsOf = (cm: ContextManager, ids: readonly string[]): void => {
+    const store = (messageStoreOf(cm) as unknown as { store: { getStateUpdateJson(id: string): string | null } }).store;
+    const read = store.getStateUpdateJson.bind(store);
+    const failing = new Set(ids);
+    store.getStateUpdateJson = (id) => {
+      if (failing.has(id)) throw new Error('a read of the append record failed (test)');
+      return read(id);
+    };
+  };
+
+  it('a record whose read fails between readable ends of the emptied records leaves later messages compressing', async (t) => {
+    mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    const emptied = records(cm).slice(0, 4);
+    for (const id of emptied.flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    failReadsOf(cm, emptied[1]!.sourceIds);
+    await laterMessagesCompress(cm, s, 'unread between the ends');
+    await cm.close();
+  });
+
+  for (const [end, at] of [['newest', 3], ['oldest', 0]] as const) {
+    it(`a record whose read fails at the ${end} end of the emptied records halts the rebuild with its error as the cause, and a later rebuild asks again`, async (t) => {
+      mock.method(console, 'error', () => {});
+      t.after(() => mock.restoreAll());
+      const s = strategy();
+      const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+      await growTo(cm, 5);
+      const emptied = records(cm).slice(0, 4);
+      for (const id of emptied.flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+      const store = (messageStoreOf(cm) as unknown as { store: { getStateUpdateJson(id: string): string | null } }).store;
+      const read = store.getStateUpdateJson.bind(store);
+      failReadsOf(cm, emptied[at]!.sourceIds);
+      const later = add(cm, 40);
+      for (let i = 0; i < 50; i++) await cm.tick();
+      assert.ok(!later.some((id) => l1Sources(cm).has(id)), `while the ${end} end's read fails: no L1 forms`);
+      assert.match(s.getCompressionDebt().error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in its view \(a read of the append record failed \(test\)\)\./, 'the cause is the read and its error');
+      store.getStateUpdateJson = read;
+      await laterMessagesCompress(cm, s, `once the ${end} end's read succeeds`);
+      await cm.close();
+    });
+  }
+
+  it('a record whose read fails, where it could make a never-held majority, halts the rebuild with its error as the cause', async (t) => {
+    mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const path = freshPath();
+    {
+      const writer = await ContextManager.open({ path, strategy: new PassthroughStrategy(), membrane });
+      const ids = add(writer, 2);
+      for (const id of ids) writer.removeMessage(id);
+      const store = writer.getStore();
+      // emptied, unread (a record number never assigned), never held, never held, emptied
+      const sources = [[ids[0]!], ['900000'], ['ghost-2'], ['ghost-3'], [ids[1]!]];
+      sources.forEach((sourceIds, c) => store.appendToStateJson(CHUNKS, { id: `c-${c}`, sourceIds, compressed: true, summaryId: `L1-${c}` }));
+      writer.sync();
+      await writer.close();
+    }
+    const s = strategy();
+    const cm = await ContextManager.open({ path, strategy: s, membrane });
+    assert.match(s.getCompressionDebt().error ?? '', /can't show it ever held/, 'setup: read, 3 of 5 records are never held');
+    const store = cm.getStore() as unknown as { getRecord(id: string): unknown };
+    const getRecord = store.getRecord.bind(store);
+    store.getRecord = (id: string) => {
+      if (id === '900000') throw new Error('a read of the record failed (test)');
+      return getRecord(id);
+    };
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView());
+    assert.match(s.getCompressionDebt().error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in its view \(a read of the record failed \(test\)\)\./, 'unread, it could be the third never-held record of 5');
+    await cm.close();
+  });
+
+  it('a read that fails for a record number chunk records name halts the rebuild with its error as the cause, not as never held', async (t) => {
+    mock.method(console, 'error', () => {});
+    t.after(() => mock.restoreAll());
+    const path = freshPath();
+    {
+      const cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+      const store = cm.getStore();
+      for (let c = 0; c < 4; c++) {
+        store.appendToStateJson(CHUNKS, { id: `c-${c}`, sourceIds: [String(900000 + 2 * c), String(900001 + 2 * c)], compressed: true, summaryId: `L1-${c}` });
+      }
+      cm.sync();
+      await cm.close();
+    }
+    const s = strategy();
+    const cm = await ContextManager.open({ path, strategy: s, membrane });
+    assert.match(s.getCompressionDebt().error ?? '', /can't show it ever held/, 'setup: the guard holds on numbers never assigned');
+    const store = cm.getStore() as unknown as { getRecord(id: string): unknown };
+    const getRecord = store.getRecord.bind(store);
+    store.getRecord = () => { throw new Error('a read of the record failed (test)'); };
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView());
+    assert.match(s.getCompressionDebt().error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in its view \(a read of the record failed \(test\)\)\./, 'the cause is the read and its error');
+    store.getRecord = getRecord;
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView());
+    assert.match(s.getCompressionDebt().error ?? '', /can't show it ever held/, 'once the read succeeds, the numbers read never held again');
     await cm.close();
   });
 });

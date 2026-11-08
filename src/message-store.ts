@@ -369,6 +369,14 @@ export interface TokenEstimatorOptions {
 }
 
 /**
+ * Chronicle's record ids are decimal numbers, and it throws for an id of any
+ * other form, which names no message here; `held` and `onBranch` answer no
+ * for one without asking, so every throw they let through is a read that
+ * failed.
+ */
+const RECORD_ID = /^\d+$/;
+
+/**
  * Wrapper around Chronicle append_log state for message storage.
  * Handles blob extraction and provides a clean interface for message operations.
  */
@@ -1176,17 +1184,13 @@ export class MessageStore {
    * an id it never gave a message of this slot. A removed id costs one
    * decode of its append record, which grows with the message's size: about
    * 0.14 ms for a 6,000-character message and 2.7 ms for a 100,000-character
-   * one, measured on Linux under Node 24.
+   * one, measured on Linux under Node 24. A read that fails throws its error
+   * rather than answering.
    */
   held(messageId: MessageId): boolean {
     if (this.lookupIndex(messageId) !== undefined) return true;
-    let update: string | null;
-    try {
-      update = this.store.getStateUpdateJson(messageId);
-    } catch {
-      // chronicle throws for an id that isn't a record id
-      return false;
-    }
+    if (!RECORD_ID.test(messageId)) return false;
+    const update = this.store.getStateUpdateJson(messageId);
     if (update === null) return false;
     const { state_id, operation } = JSON.parse(update) as { state_id?: unknown; operation?: unknown };
     return state_id === this.stateId && typeof operation === 'object' && operation !== null && 'Append' in operation;
@@ -1198,17 +1202,13 @@ export class MessageStore {
    * through a fork; false for one another branch wrote after the fork, for
    * one in a chain a lost state index left behind, and for an id this slot
    * never gave a message. A message not in the listing costs one
-   * reconstruction of the messages state as it stood at its append.
+   * reconstruction of the messages state as it stood at its append, and a
+   * read that fails throws its error rather than answering.
    */
   onBranch(messageId: MessageId): boolean {
     if (this.lookupIndex(messageId) !== undefined) return true;
-    let record: { sequence: number } | null;
-    try {
-      record = this.store.getRecord(messageId);
-    } catch {
-      // chronicle throws for an id that isn't a record id
-      return false;
-    }
+    if (!RECORD_ID.test(messageId)) return false;
+    const record = this.store.getRecord(messageId);
     if (record === null) return false;
     const atAppend = this.store.getStateJsonAt(this.stateId, Number(record.sequence));
     return Array.isArray(atAppend) && atAppend.some((m) => (m as { id?: unknown } | null)?.id === messageId);

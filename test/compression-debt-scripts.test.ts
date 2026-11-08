@@ -368,7 +368,7 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
 });
 
 describe('the drain on a store whose chain-break guard holds', () => {
-  it('stops before any tick and fails, saying a drain run again stops too', async () => {
+  it('stops before any tick and fails, pointing to the debt report for when a run again can go on', async () => {
     const path = join(dir, 'guard');
     const seed = await ContextManager.open({
       path, namespace: 'probe', strategy: new AutobiographicalStrategy({ autoTickOnNewMessage: false } as never),
@@ -386,7 +386,25 @@ describe('the drain on a store whose chain-break guard holds', () => {
     const finish = seen.at(-1)!;
     assert.deepEqual([finish.completed, finish.stopped, finish.debtFailure], [false, 'chunk-records', 'chunk-records']);
     assert.match(String(finish.debtError), /chunk records name message ids its store can't show it ever held/);
-    assert.match(r.stderr, /not drained \(chunk-records\): the chain-break guard holds, and a drain run again stops here too\. Its debt report says:\nCompression of new conversation has stopped\./);
+    assert.match(r.stderr, /not drained \(chunk-records\): the chain-break guard holds\. Its debt report says when a drain run again can go on:\nCompression of new conversation has stopped\./);
     assert.doesNotMatch(r.stderr, /run the drain again/);
+  });
+
+  it('the audit of such a store whose ledger can\'t be read prints the ledger\'s error once, after the guard\'s', async () => {
+    const path = join(dir, 'guard-ledger');
+    const seed = await ContextManager.open({
+      path, namespace: 'probe', strategy: new AutobiographicalStrategy({ autoTickOnNewMessage: false } as never),
+      membrane: { complete: async () => { throw new Error('no provider call while seeding (test)'); } } as never,
+    });
+    for (let c = 0; c < 4; c++) {
+      seed.getStore().appendToStateJson('probe/autobio:chunks', { id: `c-${c}`, sourceIds: [`ghost-${c}`], compressed: true, summaryId: `L1-${c}` });
+    }
+    seed.sync();
+    await seed.close();
+    const r = run(AUDIT, [path, '--namespace', 'probe'], UNREADABLE_LEDGER);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /chunk records name message ids its store can't show it ever held/, 'setup: the guard holds');
+    assert.match(r.stdout, /\n  stranded summaries: not checked \(see above\)\n/, r.stdout);
+    assert.equal(r.stdout.split("couldn't read this agent's compression quarantine ledger").length, 2, 'the ledger error is printed once');
   });
 });

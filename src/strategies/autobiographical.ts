@@ -247,9 +247,31 @@ function chunkRecordsNeverHeldMessage(): string {
 function chunkRecordsOffBranchMessage(): string {
   return [
     'Compression of new conversation has stopped.',
-    "Cause: most of this agent's chunk records name no message on this branch, and the oldest or newest of them names messages its messages chain doesn't hold, as when the store's messages chain broke under chronicle before 0.5.0 and a new chain began, or when the strategy reads the store through a view with `held` and without `onBranch`, which can't tell.",
+    "Cause: most of this agent's chunk records name no message in its view, and the oldest or newest of those a removal or a filter emptied names messages its messages chain doesn't hold, as when the store's messages chain broke under chronicle before 0.5.0 and a new chain began, or when the strategy reads the store through a view with `held` and without `onBranch`, which can't tell.",
     'Effect: no new chunk forms, so new conversation goes unsummarized, and in time its context fills and its turns fail.',
-    "Fix: bring the chunk records into line with the messages chain: restore the chain they were written against, or remove the records, and the summaries over them, that name messages this branch doesn't hold, then reopen it.",
+    "Fix: bring the chunk records into line with the messages chain: restore the chain they were written against, or remove the records, and the summaries over them, that name messages this branch doesn't hold; or give the strategy a view with `onBranch`. Then reopen it.",
+  ].join('\n');
+}
+
+/** Why the chain-break guard holds: records naming ids never held, emptied records off the branch's chain, or a read of the chain that failed. */
+type ChunkRecordsCause = 'never-held' | 'off-branch' | { chainUnread: unknown };
+
+function chunkRecordsMessage(cause: ChunkRecordsCause): string {
+  return cause === 'never-held' ? chunkRecordsNeverHeldMessage()
+    : cause === 'off-branch' ? chunkRecordsOffBranchMessage()
+    : chunkRecordsChainUnreadMessage(cause.chainUnread);
+}
+
+/**
+ * Under the same 500 characters as compressionQuarantineUnreadableMessage,
+ * with its cause cut to 180 (causeText).
+ */
+function chunkRecordsChainUnreadMessage(cause: unknown): string {
+  return [
+    'Compression of new conversation has stopped.',
+    `Cause: the store couldn't read its messages chain to check the chunk records that name no message in its view (${causeText(cause)}).`,
+    'Effect: no new chunk forms until the read succeeds.',
+    'Fix: fix what the cause names; the next rebuild asks again.',
   ].join('\n');
 }
 
@@ -2314,11 +2336,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * than delayed compression.
    */
   protected chunkRecordsOrphaned = false;
-  /** Why the latch is set: records naming ids never held, or emptied records whose messages are off this branch's chain. */
-  private _orphanCause: 'never-held' | 'off-branch' = 'never-held';
+  /**
+   * Why the latch is set: records naming ids never held, emptied records
+   * whose messages are off this branch's chain, or a read of that chain
+   * that failed, with its error.
+   */
+  private _orphanCause: ChunkRecordsCause = 'never-held';
   private _orphanWarned = false;
+  /** Whether a failed read of the chain has been logged this load, apart from _orphanWarned, so a later trip on a broken chain still logs. */
+  private _chainUnreadWarned = false;
   private readonly _emptiedRecordHeld = new WeakMap<ChunkRecord, boolean>();
-  /** Per emptied record that was held: whether its first held message is off this branch's messages chain (emptiedEndOffBranch). */
+  /** Per emptied record that was held: whether its first held message is off this branch's messages chain (emptiedEndCause). */
   private readonly _emptiedRecordOffBranch = new WeakMap<ChunkRecord, boolean>();
   /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
@@ -3355,6 +3383,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
     this._orphanWarned = false;
+    this._chainUnreadWarned = false;
     this._overlapBlocked.clear();
     this.summaries = [];
     this.summaryIdCounter = 0;
@@ -9950,7 +9979,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         state = withNone === stateWith(1) ? withNone : 'unknown';
       }
       const stopped = this.chunkRecordsOrphaned
-        ? { error: [this._orphanCause === 'off-branch' ? chunkRecordsOffBranchMessage() : chunkRecordsNeverHeldMessage(), ...(error !== undefined ? [error] : [])].join('\n\n'), failure: 'chunk-records' as const }
+        ? { error: [chunkRecordsMessage(this._orphanCause), ...(error !== undefined ? [error] : [])].join('\n\n'), failure: 'chunk-records' as const }
         : error !== undefined ? { error, failure: 'quarantine-ledger' as const } : undefined;
       if (this.chunkRecordsOrphaned) state = 'critical';
       const report = {
@@ -19498,31 +19527,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * one end (the oldest where the new chain was kept, the newest where a
    * repair kept the old one), so the two ends answer for the records
    * between. A view without `onBranch` answers yes, as the guard did before
-   * it counted removed messages. Each record is asked once.
+   * it counted removed messages. Each record's answer is kept; a read of the
+   * chain that fails answers with its error and keeps nothing, so the next
+   * rebuild asks again.
    */
-  private emptiedEndOffBranch(records: readonly ChunkRecord[], store: MessageStoreView): boolean {
-    if (records.length === 0) return false;
-    if (!store.onBranch || !store.held) return true;
+  private emptiedEndCause(records: readonly ChunkRecord[], store: MessageStoreView): ChunkRecordsCause | null {
+    if (records.length === 0) return null;
+    if (!store.onBranch || !store.held) return 'off-branch';
     for (const record of [records[0]!, records[records.length - 1]!]) {
       let off = this._emptiedRecordOffBranch.get(record);
       if (off === undefined) {
-        const id = record.sourceIds.find((x) => store.held!(x));
-        off = id === undefined || !store.onBranch(id);
+        try {
+          const id = record.sourceIds.find((x) => store.held!(x));
+          off = id === undefined || !store.onBranch(id);
+        } catch (error) {
+          return { chainUnread: error };
+        }
         this._emptiedRecordOffBranch.set(record, off);
       }
-      if (off) return true;
+      if (off) return 'off-branch';
     }
-    return false;
+    return null;
   }
 
   private unusedRecordNumber(id: MessageId): boolean {
-    if (!this.store) return false;
-    try {
-      return this.store.getRecord(id) === null;
-    } catch {
-      // chronicle throws for an id that isn't a record id, which no later write takes
-      return false;
-    }
+    // chronicle's record ids are decimal numbers, and it throws for an id of
+    // any other form, which no later write takes; any other throw is a read
+    // that failed
+    return !!this.store && /^\d+$/.test(id) && this.store.getRecord(id) === null;
   }
 
   /**
@@ -19562,6 +19594,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let orphaned = 0;
     // Records a removal or a filter emptied, each holding an id the store held, in record order.
     const emptiedHeld: ChunkRecord[] = [];
+    // Records with no message in the view whose read failed, and the first failure.
+    let unreadCount = 0;
+    let unread: { chainUnread: unknown } | undefined;
+    // Whether the oldest and the newest of the records the chain check can
+    // ask about, emptiedHeld's and the unread ones, are unread.
+    let oldestUnread: boolean | undefined;
+    let newestUnread = false;
     for (let r = 0; r < this.chunkRecords.length; r++) {
       const rec = this.chunkRecords[r];
       const kept = reusable && r < memo!.entries.length ? memo!.entries[r] : null;
@@ -19585,8 +19624,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         entries.push({ record: rec, messages: msgs, tokens, positions });
       }
       if (msgs.length === 0) {
-        if (this.recordWasHeld(rec, store)) emptiedHeld.push(rec);
-        else orphaned++;
+        let held: boolean;
+        try {
+          held = this.recordWasHeld(rec, store);
+        } catch (error) {
+          // a read that failed answers nothing, so nothing is kept
+          unreadCount++;
+          unread ??= { chainUnread: error };
+          oldestUnread ??= true;
+          newestUnread = true;
+          continue;
+        }
+        if (held) {
+          emptiedHeld.push(rec);
+          oldestUnread ??= false;
+          newestUnread = false;
+        } else orphaned++;
         continue;
       }
       const chunk: Chunk = {
@@ -19615,17 +19668,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // chronicle before 0.5.0 leaves its old messages held as well, off the
     // chain a new one began. So where the emptied records together pass
     // the threshold, the oldest and newest of the held ones are asked
-    // whether their messages are on this branch's chain.
+    // whether their messages are on this branch's chain. A record whose read
+    // failed could be never held or off the chain, so the guard halts this
+    // rebuild alone, with that read's error as the cause, where such records
+    // could make a never-held majority or one is the oldest or newest of the
+    // records the chain check can ask about; between readable ends, they
+    // change nothing the ends answer.
     const n = this.chunkRecords.length;
+    const unreadEnd = oldestUnread === true || newestUnread ? unread : undefined;
     const cause = !this.chunkPersistenceEnabled || n < 3 ? null
       : orphaned / n > 0.5 ? 'never-held' as const
-      : (orphaned + emptiedHeld.length) / n > 0.5 && this.emptiedEndOffBranch(emptiedHeld, store) ? 'off-branch' as const
+      : unread && (orphaned + unreadCount) / n > 0.5 ? unread
+      : (orphaned + emptiedHeld.length + unreadCount) / n > 0.5 ? unreadEnd ?? this.emptiedEndCause(emptiedHeld, store)
       : null;
     if (cause !== null) {
       this.chunkRecordsOrphaned = true;
       this._orphanCause = cause;
       this.compressionQueue = [];
-      if (!this._orphanWarned) {
+      if (typeof cause === 'object') {
+        if (!this._chainUnreadWarned) {
+          this._chainUnreadWarned = true;
+          this.diag.error(
+            `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +
+            `records that name no message in the view (${causeText(cause.chainUnread)}). Chunk compression ` +
+            `halted for this rebuild; the next rebuild asks again.`,
+          );
+        }
+      } else if (!this._orphanWarned) {
         this._orphanWarned = true;
         this.diag.error(cause === 'never-held'
           ? `[autobiographical] FAIL-CLOSED: ${orphaned}/${n} chunk ` +
@@ -19633,8 +19702,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `reconciliation signature). Chunk compression halted to prevent duplicate ` +
             `memory formation — reconcile the store before resuming.`
           : `[autobiographical] FAIL-CLOSED: ${orphaned + emptiedHeld.length}/${n} chunk ` +
-            `records name no message on this branch, and the oldest or newest of them names messages ` +
-            `this branch's messages chain doesn't hold (a chain broken under chronicle before 0.5.0). ` +
+            `records name no message in the view, and the oldest or newest of those a removal or a filter ` +
+            `emptied names messages this branch's messages chain doesn't hold (a chain broken under ` +
+            `chronicle before 0.5.0, or a view with held and without onBranch). ` +
             `Chunk compression halted to prevent duplicate memory formation — bring the chunk records ` +
             `into line with the messages chain before resuming.`,
         );
@@ -22402,6 +22472,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
       orphanCause: this._orphanCause,
       orphanWarned: this._orphanWarned,
+      chainUnreadWarned: this._chainUnreadWarned,
       prevCacheKeys: this._prevCacheKeys,
       lastFrontierTokens: this.lastFrontierTokens,
       transitionBlocked: this.transitionBlocked,
@@ -22435,6 +22506,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
       this._orphanCause = saved.orphanCause;
       this._orphanWarned = saved.orphanWarned;
+      this._chainUnreadWarned = saved.chainUnreadWarned;
       this._prevCacheKeys = saved.prevCacheKeys;
       this.lastFrontierTokens = saved.lastFrontierTokens;
       this.transitionBlocked = saved.transitionBlocked;

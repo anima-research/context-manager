@@ -14,7 +14,8 @@
  * key to clear before the first tick (repeatable). Its finish line says why
  * it stopped (`stopped`): drained, waiting-on-tools, max-steps, tick-error,
  * chunk-records or debt-unreadable.
- * Run again, it goes on from the store as it stands.
+ * Run again, it goes on from the store as it stands; after chunk-records, the
+ * debt report it prints says when a run again can go on.
  */
 
 import {
@@ -221,8 +222,8 @@ if (stopped === 'waiting-on-tools') {
   console.error(`not drained (waiting-on-tools): ${final.waitingOnTools} chunks and merges wait on the resident's tool definitions; ` +
     'run the drain again with --tools-log=<a log of its requests>');
 } else if (stopped === 'chunk-records') {
-  console.error('not drained (chunk-records): the chain-break guard holds, and a drain run again stops here too. ' +
-    `Its debt report says:\n${final.debtError}`);
+  console.error('not drained (chunk-records): the chain-break guard holds. ' +
+    `Its debt report says when a drain run again can go on:\n${final.debtError}`);
 } else if (!completed) {
   console.error(`not drained (${stopped}): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands` +
     (stopped === 'debt-unreadable' ? ', once the debt report can be read' : ''));
