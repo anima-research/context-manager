@@ -3333,18 +3333,18 @@ describe('OverBudgetError in the hierarchical middle', () => {
     });
   });
 
-  it('floors no summary the xml envelope\'s cap leaves out of the combined pair', async () => {
+  it('floors every summary of the combined pair under the xml envelope\'s cap, since the cap cuts each on its own', async () => {
     const strategy = middleStrategy({ positionedRecallPairs: false, recallEnvelope: 'xml', maxMessageTokens: 20 });
     await withManager(strategy, async (manager) => {
       const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
-      // The cap cuts the first summary's text, and the envelope's cap then admits nothing after it.
+      // The cap cuts each summary's text on its own, and both stay in the answer.
       strategy.seedCarrierL1('L1-first', [ids[0]!], 400, 'memory '.repeat(50));
       strategy.seedCarrierL1('L1-second', [ids[1]!], 400, 'memory '.repeat(50));
       const error = await refusal(manager, undefined, { maxTokens: 220, reserveForResponse: 20 });
       assert.equal(unit(error), 'selection-items');
       assert.match(error.message, /selected middle representations=2,/, 'the premise: both are selected');
       // Each floor adds about 300, so one floor reads between 200 and 600, and two past 600.
-      assert.ok(error.actual > 200 && error.actual < 600, `the first summary's floor alone: ${error.actual}`);
+      assert.ok(error.actual > 600, `both summaries' floors: ${error.actual}`);
     });
   });
 
@@ -3364,12 +3364,12 @@ describe('OverBudgetError in the hierarchical middle', () => {
     });
   });
 
-  it('names nothing at the combined pair, or at the raw message after it, for a merge of summaries the xml envelope\'s cap leaves out of it', async () => {
+  it('names compression at the combined pair, and at the raw message after it, for a merge of summaries the xml envelope\'s cap leaves in it', async () => {
     const strategy = middleStrategy({ positionedRecallPairs: false, recallEnvelope: 'xml', maxMessageTokens: 20 });
     await withManager(strategy, async (manager) => {
       // m3 stays raw after the pair.
       const ids = Array.from({ length: 4 }, (_, i) => say(manager, i));
-      // The cap cuts the first summary's text, and the envelope's cap then admits nothing after it.
+      // The cap cuts each summary's text on its own, and all three stay in the answer.
       strategy.seedCarrierL1('L1-first', [ids[0]!], 400, 'memory '.repeat(50));
       strategy.seedCarrierL1('L1-second', [ids[1]!], 400, 'memory '.repeat(50));
       strategy.seedCarrierL1('L1-third', [ids[2]!], 400, 'memory '.repeat(50));
@@ -3378,10 +3378,10 @@ describe('OverBudgetError in the hierarchical middle', () => {
       assert.equal(unit(error), 'selection-items');
       assert.match(error.message, /selected middle representations=3,/, 'the premise: all three are selected');
       assert.equal(strategy.countsCompressionWork(), true, 'the premise: the merge counts over the whole middle');
-      assert.deepEqual(error.clearedBy, [], 'the merge folds only summaries the answer leaves out');
+      assert.deepEqual(error.clearedBy, ['compression'], 'the merge folds summaries the answer holds');
       const after = await refusal(manager, undefined, holding(error.actual));
       assert.equal(unit(after), 'raw-messages', 'the premise: the pair fits, and m3 after it refuses');
-      assert.deepEqual(after.clearedBy, [], 'nor does the merge shrink what refused at m3');
+      assert.deepEqual(after.clearedBy, ['compression'], 'and the merge shrinks what refused at m3');
     }, { membrane: true });
   });
 

@@ -2013,8 +2013,11 @@ export interface AutobiographicalConfig {
    */
   recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. A value that
-   *  isn't a positive number, such as 0 or NaN, means no limit. */
+   *  this limit have their text/tool_result content truncated. The combined
+   *  recall answer of `positionedRecallPairs: false` is the exception. Each
+   *  summary in it is cut to this limit, as a positioned recall answer is, so
+   *  the answer as a whole can pass it. A value that isn't a positive number,
+   *  such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
 
   /**

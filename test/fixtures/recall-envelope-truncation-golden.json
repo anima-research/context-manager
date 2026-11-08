@@ -158,12 +158,24 @@
         },
         {
           "type": "text",
-          "text": "[content omitted: this message reached its token limit]"
+          "text": "\n\n---\n\n"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-plain-prose"
+        },
+        {
+          "type": "text",
+          "text": "\n\n---\n\n"
         },
         {
           "type": "thinking",
           "thinking": "zz-carrier-reasoning",
           "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-with-carriers"
         }
       ]
     },
@@ -196,12 +208,24 @@
         },
         {
           "type": "text",
-          "text": "[content omitted: this message reached its token limit]"
+          "text": "\n\n---\n\n"
+        },
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 6 tokens]"
+        },
+        {
+          "type": "text",
+          "text": "\n\n---\n\n"
         },
         {
           "type": "thinking",
           "thinking": "zz-carrier-reasoning",
           "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-m\n\n[truncated — original was 6 tokens]"
         }
       ]
     },
@@ -211,6 +235,56 @@
         {
           "type": "text",
           "text": "zz-t\n\n[truncated — original was 19 tokens]"
+        }
+      ]
+    }
+  ],
+  "hierarchicalCombinedUncut": [
+    {
+      "participant": "Context Manager",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you remember from earlier?"
+        }
+      ]
+    },
+    {
+      "participant": "Claude",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-memory-merged-level covering the first two turns"
+        },
+        {
+          "type": "text",
+          "text": "\n\n---\n\n"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-plain-prose"
+        },
+        {
+          "type": "text",
+          "text": "\n\n---\n\n"
+        },
+        {
+          "type": "thinking",
+          "thinking": "zz-carrier-reasoning",
+          "signature": "zz-signature"
+        },
+        {
+          "type": "text",
+          "text": "zz-memory-with-carriers"
+        }
+      ]
+    },
+    {
+      "participant": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
         }
       ]
     }

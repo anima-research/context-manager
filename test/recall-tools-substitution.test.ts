@@ -237,7 +237,7 @@ describe('{tools}: the tools a summary\'s rounds called', () => {
     });
   });
 
-  it('the combined pair names only the summaries its cap leaves in the answer', async () => {
+  it('the combined pair names every summary\'s tools, since the cap cuts each summary on its own', async () => {
     await withStore(async (path) => {
       const { manager, strategy, ids } = await positioned(path,
         { positionedRecallPairs: false, summaryContextLabel: '{tools}', maxMessageTokens: 40 },
@@ -248,8 +248,8 @@ describe('{tools}: the tools a summary\'s rounds called', () => {
       const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
       const answer = compiled.messages[compiled.messages.findIndex((m) => m.participant === 'Context Manager') + 1]!;
       const answerText = answer.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
-      assert.ok(answerText.includes('zz-short') && !answerText.includes('zz-after'), `premise: the cap ends inside the second summary: ${answerText.slice(0, 120)}`);
-      assert.deepStrictEqual(questions(compiled.messages), ['alpha, beta']);
+      assert.ok(answerText.includes('zz-short') && answerText.includes('zz-after'), `premise: the cap cuts only the second summary: ${answerText.slice(0, 120)}`);
+      assert.deepStrictEqual(questions(compiled.messages), ['alpha, beta, gamma']);
       manager.close();
     });
   });

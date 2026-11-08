@@ -159,7 +159,7 @@ describe('autobiographical rendered layout', () => {
     });
   });
 
-  it('never claims a summary the combined answer\'s cap dropped, and marks the one it cut', async () => {
+  it('names every summary of the combined answer, and marks the one its own cut took something from', async () => {
     for (const recallEnvelope of ['none', 'xml'] as const) {
       await withStore(async (path) => {
         const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 12, recallEnvelope });
@@ -168,8 +168,8 @@ describe('autobiographical rendered layout', () => {
         const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
           u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
         );
-        // L2-100 whole, L1-101 cut by the cap, L1-102 dropped: its message is omitted.
-        assert.deepEqual(units.slice(0, 3), ['s[L2-100]', 's[L1-101~]', `omit ${ids[3]}..${ids[3]}`], recallEnvelope);
+        // L2-100 and L1-101 fit the cap of 12 on their own, and L1-102, 49 characters, is cut to it.
+        assert.deepEqual(units.slice(0, 3), ['s[L2-100]', 's[L1-101]', 's[L1-102~]'], recallEnvelope);
         cm.close();
       });
     }
@@ -198,10 +198,9 @@ describe('autobiographical rendered layout', () => {
     });
   });
 
-  it('doesn\'t claim a summary of which only the omission marker shows, when the cap ends inside a separator', async () => {
+  it('shows and names every summary whole that fits the cap on its own, though together they pass it', async () => {
     await withStore(async (path) => {
-      // 44 characters: A's 40 fit, the 7-character separator after it is cut, and B's text is the first
-      // text dropped, so the omission marker stands in its place.
+      // 44 characters: A's 40 and B's 19 each fit, and the separator between them is charged to neither.
       const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 11, recallEnvelope: 'none' });
       const [a, b] = ids as [string, string];
       strategy.seed({ id: 'L1-a', level: 1, content: 'first summary text that the cap shortens', tokens: 8, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
@@ -209,25 +208,25 @@ describe('autobiographical rendered layout', () => {
       const result = await cm.compile(BUDGET);
       const answer = JSON.stringify(result.messages);
       assert.ok(answer.includes('first summary text that the cap shortens'), 'A is whole');
-      assert.ok(answer.includes('[content omitted: this message reached its token limit]'), 'the marker stands for what was dropped');
-      assert.ok(!answer.includes('second summary text'), 'none of B shows');
+      assert.ok(answer.includes('second summary text'), 'B is whole');
+      assert.ok(!answer.includes(OMISSION_MARKER), 'nothing is left out');
       const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
         u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
       );
-      assert.deepEqual(units.slice(0, 2), ['s[L1-a]', `omit ${b}..${b}`]);
+      assert.deepEqual(units.slice(0, 2), ['s[L1-a]', 's[L1-b]']);
       cm.close();
     });
   });
 
-  it('counts a text block past the cap that holds nothing as whole, since leaving it out loses nothing, and an opaque carrier it drops as lost', async () => {
-    // 44 characters: A's 44-character block spends the cap exactly, so its next block is the first
-    // one past it. An empty or whitespace-only one is left out, which loses nothing; a carrier holds
-    // an item, so the marker stands for it.
+  it('measures each summary against the cap alone: a block past it that holds nothing loses nothing, and a carrier within it goes out', async () => {
+    // 44 characters: A's 44-character block spends A's cap exactly. A whitespace-only block after it
+    // takes A past the cap and is left out, which loses nothing. An empty block and a carrier estimate
+    // at nothing, so A fits its cap and goes out as it is, carrier included. B fits its own cap whole.
     const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'z' } } as ContentBlock;
     for (const [label, second, expected] of [
       ['empty', { type: 'text', text: '' } as ContentBlock, 's[L1-a]'],
       ['whitespace', { type: 'text', text: '  \n ' } as ContentBlock, 's[L1-a]'],
-      ['carrier', carrier, 's[L1-a~]'],
+      ['carrier', carrier, 's[L1-a]'],
     ] as const) {
       await withStore(async (path) => {
         const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 11, recallEnvelope: 'none' });
@@ -240,24 +239,24 @@ describe('autobiographical rendered layout', () => {
         const result = await cm.compile(BUDGET);
         const answer = JSON.stringify(result.messages);
         assert.ok(answer.includes(prose), `${label}: A's text shows whole`);
-        assert.ok(!answer.includes('second summary text'), `${label}: none of B shows`);
+        if (label === 'carrier') assert.ok(answer.includes('cmp_1'), 'the carrier goes out');
+        assert.ok(answer.includes('second summary text'), `${label}: B shows whole`);
         const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
           u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
         );
-        assert.deepEqual(units.slice(0, 2), [expected, `omit ${b}..${b}`], label);
+        assert.deepEqual(units.slice(0, 2), [expected, 's[L1-b]'], label);
         cm.close();
       });
     }
   });
 });
 
-describe('autobiographical rendered layout: a summary past the cap that holds nothing', () => {
-  it('is left out, and neither it nor the dropped summary before it is listed as shown', async () => {
+describe('autobiographical rendered layout: a summary that holds nothing beside summaries that fill the cap', () => {
+  it('leaves no summary that holds anything out, and writes no omission marker', async () => {
     for (const empty of ['', '  \n ']) {
       await withStore(async (path) => {
-        // A spends the cap exactly, so the separator after it is the first block dropped and the marker
-        // stands there, and B's text is dropped too. C, a summary a store kept from before empty ones
-        // were refused, holds nothing, so the cap leaves it out, which loses nothing.
+        // A spends its cap exactly, and B fits its own. C, a summary a store kept from before empty
+        // ones were refused, holds nothing.
         const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 11, recallEnvelope: 'none' });
         const [a, b, c] = ids as [string, string, string];
         const prose = 'first summary text that fills the cap'.padEnd(44, '.');
@@ -267,37 +266,38 @@ describe('autobiographical rendered layout: a summary past the cap that holds no
         const result = await cm.compile(BUDGET);
         const answer = result.messages.find((m) => m.content.some((x) => x.type === 'text' && x.text === prose));
         assert.ok(answer, 'premise: the combined answer shows A');
-        assert.deepEqual(answer.content.filter((x) => x.type === 'text').map((x) => (x as { text: string }).text), [prose, OMISSION_MARKER],
-          `${JSON.stringify(empty)}: A, then the marker, and nothing of B or C`);
+        const texts = answer.content.filter((x) => x.type === 'text').map((x) => (x as { text: string }).text);
+        assert.ok(texts.includes('second summary text'), `${JSON.stringify(empty)}: B shows whole`);
+        assert.ok(!texts.includes(OMISSION_MARKER), `${JSON.stringify(empty)}: nothing is left out`);
         const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
           u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
         );
-        assert.ok(!units.some((u) => u.includes('L1-b') || u.includes('L1-c')), `${JSON.stringify(empty)}: neither B nor C is listed as shown: ${JSON.stringify(units)}`);
+        assert.deepEqual(units.slice(0, 2), ['s[L1-a]', 's[L1-b]'], `${JSON.stringify(empty)}: A and B are listed whole: ${JSON.stringify(units)}`);
         cm.close();
       });
     }
   });
 });
 
-describe('the combined recall answer with recallEnvelope xml: the omission marker after its last answer', () => {
+describe('the combined recall answer with recallEnvelope xml, under a cap', () => {
   const answerOf = (messages: Array<{ content: ContentBlock[] }>): ContentBlock[] => {
     const answer = messages.find((m) => m.content.some((b) => b.type === 'text' && b.text.includes('<cm-recall')));
     assert.ok(answer, 'the combined answer is rendered');
     return answer.content;
   };
 
-  it('is written though a summary the cap kept holds text equal to the marker', async () => {
+  it('writes no omission marker after the last answer, where a summary\'s text equals the marker', async () => {
     await withStore(async (path) => {
-      // A's prose is the marker's 55 characters, 14 tokens, so a cap of 15 keeps it whole and
-      // can't pay for B's separator.
+      // A's prose is the marker's 55 characters, 14 tokens, so a cap of 15 keeps it whole, and B
+      // fits its own cap.
       const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 15, recallEnvelope: 'xml' });
       const [a, b] = ids as [string, string];
       strategy.seed({ id: 'L1-a', level: 1, content: OMISSION_MARKER, tokens: 14, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
       strategy.seed({ id: 'L1-b', level: 1, content: 'second summary text', tokens: 6, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
       const content = answerOf((await cm.compile(BUDGET)).messages);
-      assert.ok(!JSON.stringify(content).includes('second summary text'), 'premise: the cap left B out');
+      assert.ok(JSON.stringify(content).includes('second summary text'), 'B is in the answer');
       const last = content.at(-1);
-      assert.ok(last?.type === 'text' && last.text === OMISSION_MARKER, 'the marker follows the last answer');
+      assert.ok(last?.type === 'text' && last.text.includes('second summary text'), 'B\'s answer ends it, with no marker after');
       cm.close();
     });
   });
@@ -319,7 +319,7 @@ describe('the combined recall answer with recallEnvelope xml: the omission marke
     });
   });
 
-  it('is not written when the only summary the cap left out holds nothing', async () => {
+  it('writes no omission marker beside a summary that holds nothing', async () => {
     for (const empty of ['', '  \n ']) {
       await withStore(async (path) => {
         const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 11, recallEnvelope: 'xml' });
@@ -330,7 +330,6 @@ describe('the combined recall answer with recallEnvelope xml: the omission marke
         const content = answerOf((await cm.compile(BUDGET)).messages);
         const text = JSON.stringify(content);
         assert.ok(text.includes(prose), `${JSON.stringify(empty)}: premise: A is shown`);
-        assert.equal((text.match(/<cm-recall/g) ?? []).length, 1, `${JSON.stringify(empty)}: premise: the cap left B out`);
         assert.ok(!text.includes(OMISSION_MARKER), `${JSON.stringify(empty)}: nothing was lost, so nothing is said`);
         cm.close();
       });
