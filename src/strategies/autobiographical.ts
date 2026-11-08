@@ -9648,10 +9648,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const stubs = pricing?.stubTokens;
       if (!(err instanceof OverBudgetError) || !this.stubRefusals.has(err) || pricing?.allowance === undefined
         || stubs === undefined || stubs >= pricing.allowance) throw err;
+      const refusedPreview = this._lastPreview;
       pricing.stubReserve = stubs;
       pricing.stubTokens = undefined;
       this._lastPreview = undefined;
-      return select();
+      try {
+        return select();
+      } catch (retryErr) {
+        if (!(retryErr instanceof OverBudgetError || retryErr instanceof UncoveredDropError)
+          || (retryErr instanceof OverBudgetError && this.stubRefusals.has(retryErr))) throw retryErr;
+        this._lastPreview = refusedPreview;
+        throw err;
+      }
     }
   }
 

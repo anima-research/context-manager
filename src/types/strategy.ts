@@ -1398,9 +1398,10 @@ export interface RenderStats {
    * `allowanceTokens`, present only when the limit lowered the select's
    * target or its hard bound, is what it left the window: the limit less
    * `reserveForResponse`, the injections and the overhead, at the price the
-   * select kept it at. `stubTokens`, present only under a limit where the
-   * pairing repair added tool-result stubs, is their price, which `total`
-   * doesn't count; the limit counts them.
+   * select kept it at, and less the price of the first select's stubs where
+   * a second select reserved room for them. `stubTokens`, present only under
+   * a limit where the pairing repair added tool-result stubs, is their price,
+   * which `total` doesn't count; the limit counts them.
    */
   request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number; stubTokens?: number };
 
