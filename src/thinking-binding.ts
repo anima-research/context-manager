@@ -228,7 +228,8 @@ export interface BindOutcome {
   /** The messages to send. */
   messages: NormalizedMessage[];
   /** Set when a reply's thinking is newly left out, other than a reply a
-   *  host noted as set aside by the provider. */
+   *  host noted, after the compile that wrote the branch's record, as set
+   *  aside by the provider. */
   strip?: ThinkingStrip;
   /** What a committing compile records. Its `without` is every stored body
    *  whose thinking this compile leaves out. */

@@ -237,8 +237,9 @@ export interface CompileResult {
 
   /**
    * Set on a compile with `thinkingBinding.binds` that newly leaves out a
-   * stored reply's thinking, other than one a host noted as set aside by
-   * the provider (`ContextManager.noteThinkingDropped`): what, and why (see
+   * stored reply's thinking, other than one a host noted, after the compile
+   * that wrote the branch's record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`): what, and why (see
    * `SelectOptions.thinkingBinding`).
    */
   thinkingStrip?: ThinkingStrip;

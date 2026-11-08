@@ -3923,9 +3923,11 @@ export class ContextManager {
    * the note didn't name, other than those the record's compile sent without
    * their thinking, are reported in `thinkingStrip`.
    *
-   * A noted reply isn't reported again in a later compile's `thinkingStrip`:
-   * the provider's report of the request it was set aside in already told
-   * the host. Returns true when `compileId` is the compile that wrote the
+   * A noted reply isn't reported in a later compile's `thinkingStrip`, since
+   * the provider's report of the request it was set aside in told the host,
+   * unless a committing compile with `binds` that didn't send it came
+   * between: as `ThinkingStrip.newly` says, it can then be reported again.
+   * Returns true when `compileId` is the compile that wrote the
    * branch's record, and false, writing nothing, when it isn't or the branch
    * has no record, as `noteRequestSent` does. It writes only when an id it's
    * given isn't already noted, so a repeated note writes nothing. A

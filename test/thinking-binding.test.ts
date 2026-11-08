@@ -1383,6 +1383,28 @@ describe('thinking binding: noteThinkingDropped', () => {
     await manager.close();
   });
 
+  it('a noted reply that a committing compile in between didn\u2019t send is reported again when it renders', async () => {
+    cleanup();
+    let hidden: MessageId | undefined;
+    class Hiding extends PassthroughStrategy {
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
+        return super.select(store, log, budget, opts).filter((e) => e.sourceMessageId === undefined || e.sourceMessageId !== hidden);
+      }
+    }
+    const manager = await open(STORE, new Hiding());
+    const { a1 } = seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(dropped(manager, [a1]), true);
+    hidden = a1;
+    const between = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal('A1' in thinkingByText(between), false, 'setup: the compile in between doesn\u2019t send A1');
+    hidden = undefined;
+    const again = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(again).A1, false);
+    assert.ok(again.thinkingStrip?.newly.includes(a1), `A1 is reported: ${JSON.stringify(again.thinkingStrip)}`);
+    await manager.close();
+  });
+
   it('writes nothing on a branch with no record, or for a compile other than the record\u2019s, and refuses what it can\u2019t record before writing', async () => {
     cleanup();
     const manager = await open();
@@ -1404,7 +1426,6 @@ describe('thinking binding: noteThinkingDropped', () => {
       assert.throws(call, (error: unknown) => error instanceof Error && message.test(error.message), label);
     }
     assert.equal(JSON.stringify(recordOf(manager)), recorded, 'the record is as it was');
-    // A dry compile, or one without binds, writes no record, so the note still matches.
     await manager.compile(BIG, undefined, bind({ dropBlock: true, dryRun: true }));
     await manager.compile(BIG);
     assert.equal(manager.noteThinkingDropped([a1], c2.provenance!.compileId), true);
