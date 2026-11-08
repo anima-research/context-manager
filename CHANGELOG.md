@@ -12,6 +12,30 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.25.1 — 2026-11-08
+
+### Added
+
+- `ContextManager.noteThinkingDropped(messageIds, compileId)` (new): a host calls it with the stored replies whose thinking the provider set aside under the drop control (`ThinkingBinding.dropBlock`), in a request of a stream built from the branch's last committing compile with `binds`, naming that compile's `provenance.compileId`. Each id is a body's head as the compile's provenance names it (`RawBodySource.messageId`), the id `addMessage` returned. The record then holds them as set aside, so from the next compile on each goes without it, and the replies after it keep theirs, unless it has changed since it was sent or compiles into one message with a body the note didn't name: that message and the replies after it then go without theirs. A noted reply isn't reported in a later `thinkingStrip`, unless a committing compile came between that didn't leave its thinking out. A repeated note writes nothing. It returns false, writing nothing, when `compileId` isn't the compile that wrote the branch's record, and on a branch with no record or one it can't read, or when the store can't write it, as `noteRequestSent` does.
+
+### Changed
+
+- **Under the drop control, a reply whose thinking the provider set aside goes without it from the compile after a host notes so** with `noteThinkingDropped`. Before, nothing told the record of a block the provider set aside: a reply stored before its branch's record began, which the drop control leaves for the provider to judge, was sent with its thinking at every request and set aside every time. A host that doesn't call `noteThinkingDropped` sees no change.
+  - **The replies after a noted one keep their thinking.** A noted reply that hasn't changed since it was sent, sent without its thinking, still matches the record's form of it as it was sent, so the replies after it keep their thinking, for the provider to judge. A message that differs from the record still takes the thinking of every reply after it, and so does a compiled message holding a body the note didn't name, which is then reported in `thinkingStrip`.
+  - **`thinkingStrip` doesn't report a noted reply,** unless a committing compile came between that didn't leave its thinking out. Its `newly` leaves out the replies a host noted, though the compile that wrote the branch's record sent them with their thinking, and a compile that newly leaves out only noted replies sets no `thinkingStrip`.
+  - **Prompt cache:** a request's bytes change where a noted reply's thinking leaves it, so the cache may be written once from the earliest such reply.
+
+### Fixed
+
+- `AutobiographicalStrategy.reportRealInputTokens` now spends the compile's
+  one calibration sample on a report whose total is 0, negative, NaN or
+  infinite, and learns nothing from it. Before, such a report left the
+  sample to the next report. When that report came from a later call built
+  on the same compile, whose request the turn's tool rounds and
+  continuations had grown since, the sample compared the grown request with
+  the compile's estimate, the comparison one sample per compile exists to
+  prevent. The next compile still takes its own sample.
+
 ## 0.25.0 — 2026-11-07
 
 ### Breaking
