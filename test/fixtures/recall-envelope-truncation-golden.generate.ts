@@ -27,13 +27,9 @@
  * turn the old one left folded, cut the same way. The four hierarchical cases
  * are byte-identical.
  *
- * It was captured again, on purpose, when the combined recall answer began
- * cutting each summary to the cap on its own (#467), where it had cut the
- * whole answer as one message. Only `hierarchicalCombined` and
- * `hierarchicalCombinedTightCap` changed: each answer now holds all three
- * summaries. `hierarchicalCombinedUncut`, a combined case at a cap of 60 that
- * cuts nothing, was added then, captured from the source before that change,
- * which renders it byte for byte.
+ * Its combined cases pin each summary of the combined answer cut to the cap
+ * on its own, and `hierarchicalCombinedUncut` pins a combined answer the cap
+ * cuts nothing from.
  *
  *   npm run build && node dist/test/fixtures/recall-envelope-truncation-golden.generate.js
  */

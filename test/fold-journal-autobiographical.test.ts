@@ -299,6 +299,7 @@ describe('the combined recall answer with recallEnvelope xml, under a cap', () =
       strategy.seed({ id: 'L1-a', level: 1, content: OMISSION_MARKER, tokens: 14, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
       strategy.seed({ id: 'L1-b', level: 1, content: 'second summary text', tokens: 6, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
       const content = answerOf((await cm.compile(BUDGET)).messages);
+      assert.ok(content.some((b) => b.type === 'text' && b.text.includes(OMISSION_MARKER)), 'A, whose text is the marker, is in the answer');
       assert.ok(JSON.stringify(content).includes('second summary text'), 'B is in the answer');
       const last = content.at(-1);
       assert.ok(last?.type === 'text' && last.text.includes('second summary text'), 'B\'s answer ends it, with no marker after');

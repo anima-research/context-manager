@@ -13,9 +13,9 @@
  * Two properties are asserted here:
  *
  *  1. Under a cap, on every path that renders recall pairs, every emitted
- *     envelope is whole: a complete opener, a complete closer, and the
- *     truncation marker INSIDE them. This holds down to caps far smaller than
- *     the tag text itself — the envelope is not charged against
+ *     envelope is whole: a complete opener, a complete closer, and, where
+ *     the cap cuts, the truncation marker INSIDE them. This holds down to
+ *     caps far smaller than the tag text itself — the envelope is not charged against
  *     `maxMessageTokens` (it is priced in `capRecallPairs`, where the
  *     accounting is load bearing), so what a tight cap buys is a few
  *     characters of prose inside intact tags rather than a broken tag.
@@ -23,10 +23,9 @@
  *     before the fix apart from the omission marker the truncator writes
  *     where it drops text, and the adaptive renders' choice of what to fold,
  *     which pricing a capped raw message as it renders (#223) moved, and the
- *     two combined cases' answers, which cutting each summary of the combined
- *     answer on its own (#467) changed, for each of which the golden was
- *     captured again (see its generator), pinned
- *     against `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
+ *     combined cases' answers, which cut each summary on its own, for each of
+ *     which the golden was captured again (see its generator), pinned against
+ *     `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
  *     null golden runs the fixtures UNCAPPED and so cannot see this
  *     restructure; a red here is the fix leaking into the default path.
  */
@@ -122,7 +121,7 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
     }
   });
 
-  it('keeps every envelope whole where a cap falls between concatenated answers', async () => {
+  it('keeps every envelope whole where the cap cuts a summary of the combined turn', async () => {
     const rendered = await renderCappedCase('hierarchicalCombined', 'xml');
     const answers = recallAnswers(rendered.messages);
     assert.equal(answers.length, 1, 'the legacy combined path emits exactly one recall answer');
@@ -216,12 +215,12 @@ describe('recallEnvelope under maxMessageTokens: the combined turn cuts each sum
 
 describe('recallEnvelope under maxMessageTokens: the disabled path is untouched', () => {
   for (const name of CAPPED_RENDER_CASE_NAMES) {
-    it(`${name}: default mode matches the pre-fix capped golden byte-for-byte`, async () => {
+    it(`${name}: default mode matches the capped golden byte-for-byte`, async () => {
       const rendered = await renderCappedCase(name);
       assert.equal(
         JSON.stringify(rendered.messages),
         JSON.stringify(GOLDEN[name]),
-        `${name}: capped default-mode render drifted from the pre-fix golden — fix the fix, not the golden`,
+        `${name}: capped default-mode render drifted from the golden — fix the code, not the golden`,
       );
     });
   }
@@ -232,7 +231,7 @@ describe('recallEnvelope under maxMessageTokens: the disabled path is untouched'
       assert.equal(
         JSON.stringify(explicit.messages),
         JSON.stringify(GOLDEN[name]),
-        `${name}: explicit none must render the pre-fix bytes too`,
+        `${name}: explicit none must render the golden bytes too`,
       );
     }
   });

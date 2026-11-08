@@ -249,6 +249,7 @@ describe('{tools}: the tools a summary\'s rounds called', () => {
       const answer = compiled.messages[compiled.messages.findIndex((m) => m.participant === 'Context Manager') + 1]!;
       const answerText = answer.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
       assert.ok(answerText.includes('zz-short') && answerText.includes('zz-after'), `premise: the cap cuts only the second summary: ${answerText.slice(0, 120)}`);
+      assert.match(answerText, /zz-short[\s\S]*zz-long word[\s\S]*\[truncated — original was \d+ tokens\][\s\S]*zz-after/, 'the second summary is in the answer, cut, between the other two');
       assert.deepStrictEqual(questions(compiled.messages), ['alpha, beta, gamma']);
       manager.close();
     });

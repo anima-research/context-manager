@@ -193,10 +193,12 @@ export async function renderHierarchicalFixture(
       ],
     });
 
-    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
-    const summaries = summariesOf(strategy);
-    manager.close();
-    return { messages: project(compiled.messages), summaries, compressionRequests: [] };
+    try {
+      const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      return { messages: project(compiled.messages), summaries: summariesOf(strategy), compressionRequests: [] };
+    } finally {
+      manager.close();
+    }
   });
 }
 
