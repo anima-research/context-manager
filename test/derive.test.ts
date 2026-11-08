@@ -676,6 +676,24 @@ describe('ContextManager.derive', () => {
     await resumed.compile(BUDGET);
   });
 
+  it('reopening a derived context creates no branch', { skip }, async () => {
+    const path = storePath();
+    const parent = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
+    const derivation = child.getDerivation()!;
+    parent.close();
+
+    const reopened = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(reopened);
+    const store = reopened.getStore();
+    const branches = () => store.listBranches().map((b) => b.name).sort();
+    const before = branches();
+    const resumed = await ContextManager.reopenDerived({ store, derivation, strategy: folding(), membrane: mockMembrane() as never });
+    assert.equal(resumed.currentBranch().name, 'dendrite/child', 'premise: it reopened the child\'s branch');
+    assert.deepEqual(branches(), before);
+  });
+
   it('a derived context can itself be derived from', { skip }, async () => {
     const { parent, ids } = await foldedParent();
     const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
