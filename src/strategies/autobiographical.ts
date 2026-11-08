@@ -11921,7 +11921,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           requestCarriesReasoning(attemptRequest));
         try {
           if (carrierKnownRejected) {
-            throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
+            throw Object.assign(new Error('carrier rejection known from progress, or from a binding refusal of this model'), { name: 'CompressionKnownCarrierRejection' });
           }
           response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
@@ -11957,7 +11957,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           // The rejection answers the request with its carriers, whose
           // failures ran under the rung's own label: it ends that run, whether
-          // it came now or is reused from progress.
+          // it came now, is reused from progress, or is known from a binding
+          // refusal of this model.
           this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           if (!carriersRefused) {
             this.diag.error(

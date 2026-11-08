@@ -5119,6 +5119,31 @@ describe('a binding refusal of recall carriers', () => {
     fx.manager.close();
   });
 
+  it('a merge refused for a binding mismatch teaches the strategy too: the next chunk is sent once, without carriers', async () => {
+    const mock = flexibleMembrane([
+      { error: bindingRefusal() },
+      { stop: 'end_turn', text: 'zz the merge summarized ' + 'detail '.repeat(20) },
+      { stop: 'end_turn', text: 'memory of the next chunk' },
+    ]);
+    const fx = await fixture(mock.membrane, { hierarchical: true, compressionRefusalCurveFallbacks: 0 });
+    fx.strategy.clearQueues();
+    withCarriers(fx);
+    const a = summary('L1-300', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+    const b = summary('L1-301', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+    fx.strategy.seed(a);
+    fx.strategy.seed(b);
+    fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+    const logs: string[] = [];
+    await logged(() => fx.strategy.tick(managerContext(fx.manager)), logs);
+    assert.equal(mock.calls.length, 2, 'premise: the merge was refused, then retried without carriers');
+    assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the merge carried carriers first');
+    await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 998), managerContext(fx.manager)), logs);
+    assert.equal(mock.calls.length, 3, 'the next chunk is sent once');
+    assert.equal(carries(mock.calls[2]!), false, 'without carriers');
+    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 1, 'one error line, for the refusal that taught it');
+    fx.manager.close();
+  });
+
   it('a chunk quarantined after the strategy learned is found by key at the next instance\u2019s first attempt', async () => {
     const path = freshPath();
     const mock = flexibleMembrane([

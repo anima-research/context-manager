@@ -178,7 +178,7 @@ describe('summarizer requests on a model that binds its thinking', () => {
     assert.deepEqual(accepted, showing.calls.map((call) => stripped(call.messages)));
   });
 
-  it('an account that shows the blocks gets every recall pair with its carrier, as before', async () => {
+  it('an account that shows the blocks is never refused, and its summarizer requests still carry carriers', async () => {
     const showing = await run(false);
     assert.equal(showing.calls.filter((call) => call.refused).length, 0);
     assert.equal(showing.errorLines.length, 0);
