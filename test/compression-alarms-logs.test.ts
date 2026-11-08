@@ -114,6 +114,45 @@ describe('compression lifecycle: alarms and logs', () => {
     manager.close();
   });
 
+  it('a quarantined merge sounds its repeating alarm every 15 minutes by default, counted from when it last sounded', async (t) => {
+    mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    t.after(() => mock.timers.reset());
+    const errors = logged('error', t);
+    const strategy = new AutobiographicalStrategy(config({ hierarchical: true, mergeThreshold: 2, mergeAttemptLimit: 1 }));
+    const membrane = membraneOf((request) => {
+      if (isMerge(request)) throw failure('invalid_request');
+      return OK;
+    });
+    const manager = await ContextManager.open({ path: join(tempDir(t), 'store'), strategy, membrane: membrane.membrane });
+    for (let i = 0; i < 10 && strategy.getCompressionDebt().mergeQuarantineCount === 0; i++) {
+      closeChunks(manager, 1);
+      for (let j = 0; j < 20 && !manager.isReady(); j++) await manager.tick().catch(() => {});
+    }
+    assert.equal(strategy.getCompressionDebt().mergeQuarantineCount, 1, 'premise: a merge is quarantined');
+
+    const alarm = /\[merge-quarantine\] ⚠️ \d+ merge\(s\) quarantined/;
+    const start = Date.now();
+    await manager.tick();
+    assert.equal(errors(alarm), 1, 'the alarm sounds once the merge is quarantined');
+    mock.timers.setTime(start + 15 * 60_000 - 1);
+    await manager.tick();
+    assert.equal(errors(alarm), 1, 'not again before 15 minutes');
+    mock.timers.setTime(start + 15 * 60_000);
+    await manager.tick();
+    assert.equal(errors(alarm), 2, 'again at 15 minutes');
+    mock.timers.setTime(start + 35 * 60_000);
+    await manager.tick();
+    assert.equal(errors(alarm), 3, 'again at a tick that comes late, at 35 minutes');
+    mock.timers.setTime(start + 50 * 60_000 - 1);
+    await manager.tick();
+    assert.equal(errors(alarm), 3, 'not again before 15 minutes after that late repeat');
+    mock.timers.setTime(start + 50 * 60_000);
+    await manager.tick();
+    assert.equal(errors(alarm), 4, 'again 15 minutes after it');
+    assert.equal(strategy.getCompressionDebt().mergeQuarantineCount, 1, 'the merge stays quarantined throughout');
+    manager.close();
+  });
+
   it('a pause writes a compression:lane-paused event to the compression log', async (t) => {
     const dir = tempDir(t);
     const log = join(dir, 'compression.jsonl');
