@@ -5097,7 +5097,8 @@ describe('a binding refusal of recall carriers', () => {
     assert.equal(mock.calls.length, 3, 'the second chunk is sent once');
     assert.equal(carries(mock.calls[2]!), false, 'without carriers');
     assert.equal(fx.target.compressed, true);
-    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 1, 'one error line, for the refusal that taught it');
+    assert.equal(logs.length, 1, 'one error line, and no other');
+    assert.ok(logs[0]!.includes('transport rejected reasoning carriers'), 'for the refusal that taught it');
     fx.manager.close();
   });
 
@@ -5115,7 +5116,8 @@ describe('a binding refusal of recall carriers', () => {
     await logged(() => fx.strategy.run(fx.target, managerContext(fx.manager)), logs);
     assert.equal(mock.calls.length, 4);
     assert.deepEqual(mock.calls.map(carries), [true, false, true, false], 'each chunk is tried with carriers first');
-    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 2);
+    assert.equal(logs.length, 2, 'two error lines, and no other');
+    assert.ok(logs.every((line) => line.includes('transport rejected reasoning carriers')), 'each for a fallback');
     fx.manager.close();
   });
 
@@ -5140,8 +5142,37 @@ describe('a binding refusal of recall carriers', () => {
     await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 998), managerContext(fx.manager)), logs);
     assert.equal(mock.calls.length, 3, 'the next chunk is sent once');
     assert.equal(carries(mock.calls[2]!), false, 'without carriers');
-    assert.equal(logs.filter((line) => line.includes('transport rejected reasoning carriers')).length, 1, 'one error line, for the refusal that taught it');
+    assert.equal(logs.length, 1, 'one error line, and no other');
+    assert.ok(logs[0]!.includes('transport rejected reasoning carriers'), 'for the refusal that taught it');
     fx.manager.close();
+  });
+
+  it('what the strategy learns is a membrane\u2019s and a model\u2019s: another membrane, or another model, is sent carriers again', async () => {
+    const path = freshPath();
+    const taught = flexibleMembrane([
+      { error: bindingRefusal() },
+      { stop: 'end_turn', text: 'memory of the first chunk' },
+      { stop: 'end_turn', text: 'memory under another model' },
+    ]);
+    const fx = await fixture(taught.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    withCarriers(fx);
+    await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []);
+    assert.equal(taught.calls.length, 2, 'premise: refused, then retried without carriers');
+    fx.strategy.setCompressionModel('another-model');
+    await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 997), managerContext(fx.manager)), []);
+    assert.equal(taught.calls.length, 3);
+    assert.equal(carries(taught.calls[2]!), true, 'another model is sent carriers');
+    fx.strategy.setCompressionModel(MODEL);
+    fx.manager.close();
+
+    const other = flexibleMembrane([{ stop: 'end_turn', text: 'memory through another membrane' }]);
+    const manager = await ContextManager.open({ path, strategy: fx.strategy, membrane: other.membrane });
+    const ctx = managerContext(manager);
+    const messages = fx.target.messages.map((message) => ctx.messageStore.get(message.id)).filter(Boolean) as StoredMessage[];
+    await logged(() => fx.strategy.run({ ...fx.target, messages }, ctx), []);
+    assert.equal(other.calls.length, 1);
+    assert.equal(carries(other.calls[0]!), true, 'another membrane is sent carriers');
+    manager.close();
   });
 
   it('a chunk quarantined after the strategy learned is found by key at the next instance\u2019s first attempt', async () => {

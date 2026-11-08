@@ -1881,8 +1881,10 @@ export interface AutobiographicalConfig {
    * `thinking` / `redacted_thinking` blocks) are replayed.
    *
    *  - `'full'` (default) — carriers ride every surface a memory renders on,
-   *    exactly as they have since the 2026-07-15 round-trip landed. Output is
-   *    byte-identical to the pre-knob render on both surfaces.
+   *    exactly as they have since the 2026-07-15 round-trip landed, unless the
+   *    provider has refused one for a binding mismatch (see MINT-REQUEST
+   *    RECALL). Otherwise output is byte-identical to the pre-knob render on
+   *    both surfaces.
    *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
    *    and merge requests still recall them verbatim, unless the provider has
    *    refused one for a binding mismatch (see MINT-REQUEST RECALL).
@@ -1908,8 +1910,8 @@ export interface AutobiographicalConfig {
    *    model that binds its thinking, on an account that enforces it, refuses
    *    a request whose carrier is bound to a different conversation, which a
    *    recall pair's carrier always is. After such a refusal, the strategy
-   *    sends that model's summarizer requests without carriers for the rest
-   *    of its life, as the one-shot fallback's retry is sent, without a
+   *    sends that model's summarizer requests through the same membrane
+   *    without carriers, as the one-shot fallback's retry is sent, without a
    *    refused request first.
    *  - LIVE-WINDOW RENDER — what the agent whose memory it is reads back.
    *    Thinking blocks are not read there, they are INHABITED, and a carrier

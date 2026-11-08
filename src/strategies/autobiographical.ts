@@ -1878,7 +1878,9 @@ function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
  * where carrier-bearing ones pass). Text-only is the DEGRADED mode, entered
  * only when the transport itself rejects the carrier blocks — an
  * invalid_request 400 about thinking blocks (e.g. the "cannot be modified"
- * class), never a policy refusal. Retry once, stripped, loudly.
+ * class), never a policy refusal. Retry once, stripped, loudly. After a
+ * binding refusal (isCarrierBindingRefusal), that model's later requests
+ * through the same membrane are sent text-only from the start, logging no error.
  */
 function isCarrierTransportRejection(error: unknown): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
@@ -11915,7 +11917,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const carrierLabel = `${curveLabel}:carrier-rejected`;
         const attemptHash = sha256Json(attemptRequest);
         const attemptModel = this.compressionRequestModel(attemptRequest);
-        const carriersRefused = attemptModel !== undefined && this.carriersRefusedFor.has(attemptModel) &&
+        const carriersRefused = attemptModel !== undefined &&
+          this.carriersRefusedFor.get(ctx.membrane!)?.has(attemptModel) === true &&
           requestCarriesReasoning(attemptRequest);
         const carrierKnownRejected = carriersRefused || (knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
           requestCarriesReasoning(attemptRequest));
@@ -11953,7 +11956,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               outcome: 'provider_error',
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
-            if (attemptModel !== undefined && isCarrierBindingRefusal(error)) this.carriersRefusedFor.add(attemptModel);
+            if (attemptModel !== undefined && isCarrierBindingRefusal(error)) this.noteCarriersRefused(ctx.membrane!, attemptModel);
           }
           // The rejection answers the request with its carriers, whose
           // failures ran under the rung's own label: it ends that run, whether
@@ -14367,7 +14370,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
     const mergeModel = this.compressionRequestModel(dispatchRequest);
-    if (mergeModel !== undefined && this.carriersRefusedFor.has(mergeModel) && requestCarriesReasoning(dispatchRequest)) {
+    if (mergeModel !== undefined && this.carriersRefusedFor.get(ctx.membrane)?.has(mergeModel) === true &&
+      requestCarriesReasoning(dispatchRequest)) {
       acceptedRequest = stripReasoningFromRequest(dispatchRequest);
     }
 
@@ -14398,7 +14402,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           !isCarrierTransportRejection(error) ||
           !requestCarriesReasoning(acceptedRequest)
         ) throw error;
-        if (mergeModel !== undefined && isCarrierBindingRefusal(error)) this.carriersRefusedFor.add(mergeModel);
+        if (mergeModel !== undefined && isCarrierBindingRefusal(error)) this.noteCarriersRefused(ctx.membrane, mergeModel);
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -16198,10 +16202,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  under `carrierPolicy: 'live-strip'`. */
   private thinkingBound = false;
 
-  /** Compression models the provider has refused a recall carrier for
-   *  (isCarrierBindingRefusal): their summarizer requests are sent without
-   *  carriers, as the carrier fallback's retry is, for this instance's life. */
-  private readonly carriersRefusedFor = new Set<string>();
+  /** For each membrane, the compression models the provider has refused a
+   *  recall carrier for through it (isCarrierBindingRefusal): their
+   *  summarizer requests through that membrane are sent without carriers, as
+   *  the carrier fallback's retry is. A membrane can be another account. */
+  private readonly carriersRefusedFor = new WeakMap<Membrane, Set<string>>();
+
+  private noteCarriersRefused(membrane: Membrane, model: string): void {
+    const models = this.carriersRefusedFor.get(membrane) ?? new Set<string>();
+    models.add(model);
+    this.carriersRefusedFor.set(membrane, models);
+  }
 
   /** The carrier policy the live window renders and prices under: the
    *  configured one, or `'live-strip'` while thinking is bound. */

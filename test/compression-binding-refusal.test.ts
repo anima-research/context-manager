@@ -33,6 +33,17 @@ function withoutCacheControl(value: unknown): unknown {
 const digest = (v: unknown) => createHash('sha256').update(JSON.stringify(withoutCacheControl(v))).digest('hex').slice(0, 16);
 const isThinking = (b: unknown) => ['thinking', 'redacted_thinking'].includes((b as { type?: string }).type ?? '');
 
+/** A value with every thinking block taken out of every content list in it. */
+function withoutThinking(value: unknown): unknown {
+  if (Array.isArray(value)) return value.filter((v) => !isThinking(v)).map(withoutThinking);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = withoutThinking(v);
+    return out;
+  }
+  return value;
+}
+
 /** The wire messages without any thinking block, and without a message that held nothing else. */
 function stripped(messages: unknown[]): unknown[] {
   return messages
@@ -44,6 +55,7 @@ function stripped(messages: unknown[]): unknown[] {
 }
 
 interface Call {
+  request: unknown;
   messages: unknown[];
   carriers: number;
   refused: boolean;
@@ -83,7 +95,7 @@ class BindingProvider implements ProviderAdapter {
     const thinking = ((request.extra as { thinking?: unknown } | undefined)?.thinking ?? request.thinking) as
       { block_binding?: { prefix_mismatch_behavior?: string } } | undefined;
     const refused = this.enforces && mismatched !== undefined && thinking?.block_binding?.prefix_mismatch_behavior !== 'drop_block';
-    this.calls.push({ messages: structuredClone(request.messages), carriers, refused });
+    this.calls.push({ request: structuredClone({ ...request, messages: undefined }), messages: structuredClone(request.messages), carriers, refused });
     if (refused) {
       const body = { type: 'error', error: { type: 'invalid_request_error', message: `${mismatched}: ${REFUSAL}` } };
       throw errorFromProviderStatus({ provider: 'anthropic', status: 400, body, message: `400 ${JSON.stringify(body)}` });
@@ -110,6 +122,7 @@ interface Run {
   summaries: Array<{ level: number; content: string; carries: boolean }>;
   queued: number;
   errorLines: string[];
+  allErrorLines: string[];
 }
 
 async function run(enforces: boolean): Promise<Run> {
@@ -149,6 +162,7 @@ async function run(enforces: boolean): Promise<Run> {
       summaries: internals.summaries.map((s) => ({ level: s.level, content: s.content, carries: (s.responseContent ?? []).some(isThinking) })),
       queued: internals.compressionQueue.length,
       errorLines: errorLines.filter((line) => line.includes('transport rejected reasoning carriers')),
+      allErrorLines: errorLines,
     };
   } finally {
     console.error = original;
@@ -168,20 +182,23 @@ describe('summarizer requests on a model that binds its thinking', () => {
     assert.deepEqual(enforcing.summaries.map((s) => [s.level, s.content]), showing.summaries.map((s) => [s.level, s.content]), 'the same summaries');
     assert.equal(enforcing.queued, 0);
     assert.equal(enforcing.errorLines.length, 1, 'one error line, for the refusal that taught it');
+    assert.equal(enforcing.allErrorLines.length, 1, 'and no other');
     assert.ok(enforcing.summaries.every((s) => s.carries), 'carriers are still captured');
   });
 
   it('the requests an enforcing account accepts are those an account that shows the blocks is sent, without their thinking', async () => {
     const enforcing = await run(true);
     const showing = await run(false);
-    const accepted = enforcing.calls.filter((call) => !call.refused).map((call) => call.messages);
-    assert.deepEqual(accepted, showing.calls.map((call) => stripped(call.messages)));
+    const accepted = enforcing.calls.filter((call) => !call.refused).map((call) => ({ request: call.request, messages: call.messages }));
+    assert.ok(accepted.length > 2, 'premise: summarizer calls ran');
+    assert.deepEqual(accepted, showing.calls.map((call) => ({ request: withoutThinking(call.request), messages: stripped(call.messages) })));
   });
 
   it('an account that shows the blocks is never refused, and its summarizer requests still carry carriers', async () => {
     const showing = await run(false);
+    assert.ok(showing.calls.length > 2, 'premise: summarizer calls ran');
     assert.equal(showing.calls.filter((call) => call.refused).length, 0);
-    assert.equal(showing.errorLines.length, 0);
+    assert.equal(showing.allErrorLines.length, 0, 'no error');
     const withCarriers = showing.calls.filter((call) => call.carriers > 0).length;
     assert.ok(withCarriers >= showing.calls.length - 2, `recall pairs carry their carriers: ${withCarriers} of ${showing.calls.length}`);
   });
