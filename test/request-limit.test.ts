@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { ContextEntry, ContextInjection, ContextLogView, MessageStoreView, RenderStats, SelectOptions, StoredMessage, TokenBudget } from '../src/types/index.js';
 import type { RequestOverhead } from '../src/index.js';
-import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy, jsonTokenEstimator } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'request-limit-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -28,7 +28,7 @@ const summarizer = {
 
 type Shape = { adaptiveResolution?: boolean; overBudgetGraceRatio?: number; enforceBudget?: boolean };
 
-async function openManager(name: string, shape: Shape = {}) {
+async function openManager(name: string, shape: Shape = {}, turns = 60) {
   const strategy = new AutobiographicalStrategy({
     compressionModel: 'zz-model',
     targetChunkTokens: 120,
@@ -42,7 +42,7 @@ async function openManager(name: string, shape: Shape = {}) {
   } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
   const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane: summarizer as never });
   if (cm.getMessageCount() === 0) {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < turns; i++) {
       cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `turn ${i}: steady traffic about the ongoing work, with specifics `.repeat(4) }]);
       for (let k = 0; k < 200 && !cm.isReady(); k++) await cm.tick();
     }
@@ -51,13 +51,13 @@ async function openManager(name: string, shape: Shape = {}) {
 }
 
 /** A store whose calibration record holds `multiplier`, so it isn't provisional. */
-async function seededAt(name: string, multiplier: number, shape: Shape = {}) {
-  const first = await openManager(name, shape);
+async function seededAt(name: string, multiplier: number, shape: Shape = {}, turns = 60) {
+  const first = await openManager(name, shape, turns);
   await first.cm.compile(BUDGET);
   first.internals.store!.setStateJson(first.internals.calibrationStateId,
     { multiplier, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
   first.cm.close();
-  return openManager(name, shape);
+  return openManager(name, shape, turns);
 }
 
 const TOOLS: ToolDefinition[] = Array.from({ length: 6 }, (_, i) => ({
@@ -152,7 +152,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     const limit = BUDGET.reserveForResponse + probe.request!.overheadTokens + probe.request!.injectedTokens;
     await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit }), (e: Error) => {
       assert.equal(e.name, 'OverBudgetError');
-      assert.ok(e.message.includes(String(limit)), e.message);
+      assert.ok(e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`), e.message);
       return true;
     });
     const after = await cm.compile(BUDGET, INJECTIONS);
@@ -185,6 +185,9 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
         const d = (e as Error & { diagnostics: { requestLimitTokens?: number; requestAllowanceTokens?: number } }).diagnostics;
         assert.equal(d.requestLimitTokens, limit, 'the refusal names the limit');
         assert.equal(typeof d.requestAllowanceTokens, 'number', 'and what it left the window');
+        const noRoom = e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`);
+        if (allowance === 0) assert.ok(noRoom && d.requestAllowanceTokens! <= 0, `the no-room refusal: ${e.message}`);
+        else assert.ok(!noRoom && d.requestAllowanceTokens! > 0, `a refusal inside the select, within a positive allowance: ${d.requestAllowanceTokens}, ${e.message}`);
         return true;
       });
       const after = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
@@ -284,8 +287,12 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     const live = await seededAt('dry-live', 1);
     const d = await dry.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit, dryRun: true });
     const l = await live.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit });
+    assert.ok(l.renderStats!.request!.allowanceTokens !== undefined, 'premise: the limit lowered the live compile\'s target');
+    assert.ok(l.renderStats!.total.tokens < base.total.tokens, 'and it selected less than without the limit');
+    assert.ok(requestTokens(l.renderStats!) <= limit, `the live request ${requestTokens(l.renderStats!)} is within ${limit}`);
     assert.deepStrictEqual(d.messages, l.messages);
     assert.equal(d.renderStats!.total.tokens, l.renderStats!.total.tokens);
+    assert.equal(d.renderStats!.request!.allowanceTokens, l.renderStats!.request!.allowanceTokens);
     dry.cm.close();
     live.cm.close();
   });
@@ -304,6 +311,32 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     assert.deepStrictEqual(strip(after.renderStats!), strip(first.renderStats!));
     cm.close();
     twin.cm.close();
+  });
+
+  it('reserves room only for the injections the compile inserts, not a caller\'s own messageInjections option', async () => {
+    const base = await uncappedOn('phantom-base', () => seededAt('phantom-base', 1));
+    const limit = requestTokens(base) - Math.floor(base.total.tokens / 4);
+    const plain = await seededAt('phantom-plain', 1);
+    const phantom = await seededAt('phantom', 1);
+    const a = await plain.cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: limit });
+    const b = await phantom.cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: limit, messageInjections: [INJECTIONS[0]!.content] });
+    assert.equal(b.renderStats!.request!.injectedTokens, 0, 'no injection is priced that the compile doesn\'t insert');
+    assert.deepStrictEqual(b.messages, a.messages, 'the same select as without the option');
+    plain.cm.close();
+    phantom.cm.close();
+  });
+
+  it('a preview refused for want of room reports the limit and what it left the window, as the refusal does', async () => {
+    const { cm } = await seededAt('preview-no-room', 1);
+    const probe = (await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
+    const limit = BUDGET.reserveForResponse + probe.request!.overheadTokens;
+    const preview = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: limit });
+    assert.ok(preview, 'premise: the adaptive path previews');
+    assert.equal(preview!.fits, false);
+    assert.equal(preview!.exhausted, false, 'no picker ran, so none exhausted');
+    assert.equal(preview!.requestLimitTokens, limit, 'the limit');
+    assert.equal(preview!.requestAllowanceTokens, 0, 'and the window\'s allowance under it');
+    cm.close();
   });
 
   type View = Pick<MessageStoreView, 'estimateTokens'>;
@@ -390,8 +423,43 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: BESIDE, requestLimitTokens: exact - 1, dryRun: true }), (e: Error) => {
       assert.equal(e.name, 'OverBudgetError');
       assert.ok(e.message.includes(String(exact - 1)), e.message);
+      const d = (e as Error & { diagnostics: { requestLimitTokens?: number; requestAllowanceTokens?: number } }).diagnostics;
+      assert.equal(d.requestLimitTokens, exact - 1, 'the refusal names the limit, as the no-room one does');
+      assert.equal(d.requestAllowanceTokens, strategy.lastWindow - 1, 'and what it left the window');
       return true;
     });
     cm.close();
   });
+
+  for (const [label, shape, turns] of [['hierarchical', { adaptiveResolution: false }, 60], ['adaptive', {}, 6]] as Array<[string, Shape, number]>) {
+    it(`counts the tool-result stubs the pairing repair adds against the limit, refusing in the select a request they take past it (${label})`, async () => {
+      const { cm } = await seededAt(`stubbed-${label}`, 1, shape, turns);
+      cm.addMessage('Claude', [{ type: 'text', text: 'Let me look.' }, { type: 'tool_use', id: 'x1', name: 'look', input: { at: 'the mill' } }] as ContentBlock[]);
+      cm.addMessage('User', [{ type: 'text', text: 'And what did you see there?' }]);
+      cm.addMessage('Claude', [{ type: 'text', text: 'Nothing yet.' }]);
+      cm.addMessage('User', [{ type: 'text', text: 'Look again.' }]);
+      const open = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true });
+      const stubs = open.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'x1');
+      assert.equal(stubs.length, 1, 'premise: the repair stubs the unanswered call');
+      const stubPrice = jsonTokenEstimator((stubs[0] as { content: string }).content);
+      const top = requestTokens(open.renderStats!);
+      await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true }), (e: Error) => {
+        assert.equal(e.name, 'OverBudgetError', e.message);
+        assert.ok(e.message.startsWith('The tool-result stubs the pairing repair added'), `the select refused it for the stubs: ${e.message}`);
+        const d = (e as Error & { diagnostics: { requestLimitTokens?: number } }).diagnostics;
+        assert.equal(d.requestLimitTokens, top);
+        return true;
+      }, `the window at ${top} leaves no room for the stub's ${stubPrice}`);
+      const fits = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice, dryRun: true });
+      assert.equal(fits.renderStats!.request!.stubTokens, stubPrice, 'the stub is priced as the store prices its block');
+      if (label === 'adaptive') {
+        const refused = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
+        const planned = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice })!;
+        assert.equal(refused.fits, false, 'a preview the stubs refused doesn\'t fit');
+        assert.equal(refused.exhausted, planned.exhausted, 'and reports the picker as its plan found it');
+      }
+      assert.ok(requestTokens(fits.renderStats!) + stubPrice <= top + stubPrice, 'and the request with it is within the limit');
+      cm.close();
+    });
+  }
 });

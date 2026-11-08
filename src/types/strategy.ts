@@ -872,10 +872,19 @@ export class NoFoldPlanToPreviewError extends Error {
  * the rendered entries. Mirrors the diagnostics `OverBudgetError` would carry.
  */
 export interface PreviewResult {
-  /** Rendered token total the layout would occupy. */
+  /** Rendered token total the layout would occupy. A preview a request
+   *  limit refused before planning, for want of room, gives what the request
+   *  holds besides the window instead. */
   finalTokens: number;
-  /** Hard budget the preview ran against. */
+  /** Hard budget the preview ran against; for that refusal, the limit. */
   budgetTokens: number;
+  /** The limit and what it left the window, where the refusal the preview
+   *  reports carries them in its diagnostics (`requestLimitTokens`,
+   *  `requestAllowanceTokens`), as the strategy's over-budget refusals under
+   *  `SelectOptions.requestLimitTokens` do. A preview of a plan over its
+   *  bound reports the plan instead, without them. */
+  requestLimitTokens?: number;
+  requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
   /** True when the picker could not fold any further. */
@@ -1382,9 +1391,11 @@ export interface RenderStats {
    * `allowanceTokens`, present only when the limit lowered the select's
    * target or its hard bound, is what it left the window: the limit less
    * `reserveForResponse`, the injections and the overhead, at the price the
-   * select kept it at.
+   * select kept it at. `stubTokens`, present only under a limit where the
+   * pairing repair added tool-result stubs, is their price, which `total`
+   * doesn't count; the limit counts them.
    */
-  request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number };
+  request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number; stubTokens?: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
