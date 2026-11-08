@@ -28,7 +28,7 @@ const summarizer = {
 
 type Shape = { adaptiveResolution?: boolean; overBudgetGraceRatio?: number; enforceBudget?: boolean };
 
-async function openManager(name: string, shape: Shape = {}, turns = 60) {
+async function openManager(name: string, shape: Shape = {}, turns = 60, unansweredCalls = false) {
   const strategy = new AutobiographicalStrategy({
     compressionModel: 'zz-model',
     targetChunkTokens: 120,
@@ -44,6 +44,10 @@ async function openManager(name: string, shape: Shape = {}, turns = 60) {
   if (cm.getMessageCount() === 0) {
     for (let i = 0; i < turns; i++) {
       cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `turn ${i}: steady traffic about the ongoing work, with specifics `.repeat(4) }]);
+      if (unansweredCalls && i % 2 === 1 && i > 30) {
+        cm.addMessage('Claude', [{ type: 'text', text: `Checking ${i}.` }, { type: 'tool_use', id: `m${i}`, name: 'look', input: { at: i } }] as ContentBlock[]);
+        cm.addMessage('User', [{ type: 'text', text: `turn ${i}b: and then?` }]);
+      }
       for (let k = 0; k < 200 && !cm.isReady(); k++) await cm.tick();
     }
   }
@@ -51,13 +55,13 @@ async function openManager(name: string, shape: Shape = {}, turns = 60) {
 }
 
 /** A store whose calibration record holds `multiplier`, so it isn't provisional. */
-async function seededAt(name: string, multiplier: number, shape: Shape = {}, turns = 60) {
-  const first = await openManager(name, shape, turns);
+async function seededAt(name: string, multiplier: number, shape: Shape = {}, turns = 60, unansweredCalls = false) {
+  const first = await openManager(name, shape, turns, unansweredCalls);
   await first.cm.compile(BUDGET);
   first.internals.store!.setStateJson(first.internals.calibrationStateId,
     { multiplier, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
   first.cm.close();
-  return openManager(name, shape, turns);
+  return openManager(name, shape, turns, unansweredCalls);
 }
 
 const TOOLS: ToolDefinition[] = Array.from({ length: 6 }, (_, i) => ({
@@ -333,7 +337,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     const preview = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: limit });
     assert.ok(preview, 'premise: the adaptive path previews');
     assert.equal(preview!.fits, false);
-    assert.equal(preview!.exhausted, false, 'no picker ran, so none exhausted');
+    assert.equal(preview!.exhausted, true, 'no fold can make room');
     assert.equal(preview!.requestLimitTokens, limit, 'the limit');
     assert.equal(preview!.requestAllowanceTokens, 0, 'and the window\'s allowance under it');
     cm.close();
@@ -432,7 +436,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
   });
 
   for (const [label, shape, turns] of [['hierarchical', { adaptiveResolution: false }, 60], ['adaptive', {}, 6]] as Array<[string, Shape, number]>) {
-    it(`counts the tool-result stubs the pairing repair adds against the limit, refusing in the select a request they take past it (${label})`, async () => {
+    it(`counts the tool-result stubs the pairing repair adds against the limit, refusing in the select a request they take past it where a select with their price reserved can't make room (${label})`, async () => {
       const { cm } = await seededAt(`stubbed-${label}`, 1, shape, turns);
       cm.addMessage('Claude', [{ type: 'text', text: 'Let me look.' }, { type: 'tool_use', id: 'x1', name: 'look', input: { at: 'the mill' } }] as ContentBlock[]);
       cm.addMessage('User', [{ type: 'text', text: 'And what did you see there?' }]);
@@ -444,22 +448,37 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       const stubPrice = jsonTokenEstimator((stubs[0] as { content: string }).content);
       const top = requestTokens(open.renderStats!);
       await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true }), (e: Error) => {
-        assert.equal(e.name, 'OverBudgetError', e.message);
-        assert.ok(e.message.startsWith('The tool-result stubs the pairing repair added'), `the select refused it for the stubs: ${e.message}`);
-        const d = (e as Error & { diagnostics: { requestLimitTokens?: number } }).diagnostics;
-        assert.equal(d.requestLimitTokens, top);
+        assert.ok(e.name === 'OverBudgetError' || e.name === 'UncoveredDropError', `${e.name}: ${e.message}`);
+        assert.ok(!e.message.startsWith('The compiled request would hold'), `the select refused it itself: ${e.message}`);
         return true;
-      }, `the window at ${top} leaves no room for the stub's ${stubPrice}`);
+      }, `the window at ${top} leaves no room for the stub's ${stubPrice}, and this store can't fold to make it`);
       const fits = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice, dryRun: true });
       assert.equal(fits.renderStats!.request!.stubTokens, stubPrice, 'the stub is priced as the store prices its block');
-      if (label === 'adaptive') {
-        const refused = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
-        const planned = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice })!;
-        assert.equal(refused.fits, false, 'a preview the stubs refused doesn\'t fit');
-        assert.equal(refused.exhausted, planned.exhausted, 'and reports the picker as its plan found it');
-      }
       assert.ok(requestTokens(fits.renderStats!) + stubPrice <= top + stubPrice, 'and the request with it is within the limit');
       cm.close();
     });
   }
+
+  it('makes room for the stubs with one more select, pricing the stubs that select sends', async () => {
+    const { cm } = await seededAt('stub-room', 1, {}, 60, true);
+    for (let i = 0; i < 20; i++) {
+      cm.addMessage('Claude', [{ type: 'text', text: `Looking ${i}.` }, { type: 'tool_use', id: `o${i}`, name: 'look', input: { at: i } }] as ContentBlock[]);
+      cm.addMessage('User', [{ type: 'text', text: `And ${i}?` }]);
+    }
+    const sentStubs = (messages: { content: ContentBlock[] }[]) => messages.flatMap((m) => m.content)
+      .filter((b) => b.type === 'tool_result' && /^[om]\d+$/.test((b as { toolUseId: string }).toolUseId));
+    const open = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true });
+    const before = sentStubs(open.messages);
+    const top = requestTokens(open.renderStats!);
+    const allowance = top - BUDGET.reserveForResponse - open.renderStats!.request!.overheadTokens - open.renderStats!.request!.injectedTokens;
+    assert.ok(before.length >= 20, `premise: the repair stubs many calls (${before.length})`);
+    const room = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true });
+    const after = sentStubs(room.messages);
+    const price = after.reduce((n, b) => n + jsonTokenEstimator((b as { content: string }).content), 0);
+    assert.ok(room.renderStats!.request!.allowanceTokens! < allowance, 'the second select ran with the stubs\' price reserved');
+    assert.ok(after.length < before.length, `it folded away some unanswered calls (${after.length} of ${before.length} stubs)`);
+    assert.equal(room.renderStats!.request!.stubTokens, price, 'and the stubs it sends are priced, not the first select\'s');
+    assert.ok(requestTokens(room.renderStats!) + price <= top, `the request with them, ${requestTokens(room.renderStats!) + price}, is within ${top}`);
+    cm.close();
+  });
 });
