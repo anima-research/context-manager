@@ -1193,6 +1193,28 @@ export class MessageStore {
   }
 
   /**
+   * Whether this branch's messages chain holds the message `messageId`
+   * names: true for a live message, one removed since and one inherited
+   * through a fork; false for one another branch wrote after the fork, for
+   * one in a chain a lost state index left behind, and for an id this slot
+   * never gave a message. A message not in the listing costs one
+   * reconstruction of the messages state as it stood at its append.
+   */
+  onBranch(messageId: MessageId): boolean {
+    if (this.lookupIndex(messageId) !== undefined) return true;
+    let record: { sequence: number } | null;
+    try {
+      record = this.store.getRecord(messageId);
+    } catch {
+      // chronicle throws for an id that isn't a record id
+      return false;
+    }
+    if (record === null) return false;
+    const atAppend = this.store.getStateJsonAt(this.stateId, Number(record.sequence));
+    return Array.isArray(atAppend) && atAppend.some((m) => (m as { id?: unknown } | null)?.id === messageId);
+  }
+
+  /**
    * Get a message as it was at a specific sequence (time travel).
    */
   getAt(messageId: MessageId, atSequence: Sequence): StoredMessage | null {
@@ -1568,6 +1590,7 @@ export class MessageStore {
       get: (id) => this.get(id),
       sequenceOf: (id) => this.sequenceOf(id),
       held: (id) => this.held(id),
+      onBranch: (id) => this.onBranch(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),

@@ -1652,6 +1652,7 @@ export function presentedMessageView(merged: MessageStoreView, index: WindowInde
       return recordPositionOf(merged, merged.getAll(), id);
     },
     held: merged.held ? (id) => merged.held!(id) : undefined,
+    onBranch: merged.onBranch ? (id) => merged.onBranch!(id) : undefined,
     getFrom: (index_) => (presented() ? all().slice(index_) : merged.getFrom(index_)),
     getTail: (count) => {
       if (!presented()) return merged.getTail(count);

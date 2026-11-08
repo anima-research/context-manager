@@ -60,6 +60,7 @@ export function filterMessageStoreView(
       return msg && keep(msg) ? msg : null;
     },
     held: view.held ? (id: MessageId) => view.held!(id) : undefined,
+    onBranch: view.onBranch ? (id: MessageId) => view.onBranch!(id) : undefined,
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {
       const messages = all();
@@ -151,6 +152,9 @@ export function mergeMessageStoreViews(
     },
     held: [primary, ...auxiliary].every((view) => view.held)
       ? (id: MessageId) => [primary, ...auxiliary].some((view) => view.held!(id))
+      : undefined,
+    onBranch: [primary, ...auxiliary].every((view) => view.onBranch)
+      ? (id: MessageId) => [primary, ...auxiliary].some((view) => view.onBranch!(id))
       : undefined,
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {
