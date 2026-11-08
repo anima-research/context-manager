@@ -57,7 +57,7 @@ export interface FixtureRender {
 }
 
 /** Strategy subclass that can seed summaries without an LLM round trip. */
-class SeedableStrategy extends AutobiographicalStrategy {
+export class SeedableStrategy extends AutobiographicalStrategy {
   seedSummary(entry: Omit<SummaryEntry, 'id' | 'created'> & { id?: string }): SummaryEntry {
     const seeded: SummaryEntry = {
       ...entry,
@@ -123,9 +123,10 @@ export const HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT = 'zz-turn-latest ' + 'Z'.rep
  */
 export async function renderHierarchicalFixture(
   options: AutobiographicalOptions = {},
+  Strategy: typeof SeedableStrategy = SeedableStrategy,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
-    const strategy = new SeedableStrategy({
+    const strategy = new Strategy({
       headWindowTokens: 0,
       recentWindowTokens: 8,
       ...options,
