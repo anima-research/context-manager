@@ -175,14 +175,17 @@ describe('autobiographical rendered layout', () => {
     }
   });
 
-  it('attributes a summary whose thinking block survived the cap after its text was dropped', async () => {
+  it('attributes a summary whose thinking block survived its own cut after its text was dropped', async () => {
     await withStore(async (path) => {
       const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 3, recallEnvelope: 'none' });
       const [a, b] = ids as [string, string];
       strategy.seed({ id: 'L1-a', level: 1, content: 'first summary text that the cap shortens', tokens: 8, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+      // B's blank block, 12 characters, spends its own cap of 3 tokens exactly, so its
+      // thinking passes and its text is dropped: the thinking is all of B that shows.
       strategy.seed({
         id: 'L1-b', level: 1, content: 'second summary text', tokens: 6, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b },
         responseContent: [
+          { type: 'text', text: ' '.repeat(12) },
           { type: 'thinking', thinking: 'retained reasoning', signature: 'sig-b' } as ContentBlock,
           { type: 'text', text: 'second summary text' },
         ],
@@ -190,7 +193,7 @@ describe('autobiographical rendered layout', () => {
       const result = await cm.compile(BUDGET);
       const answer = JSON.stringify(result.messages);
       assert.ok(answer.includes('retained reasoning'), 'the truncator kept B\'s thinking block');
-      assert.ok(!answer.includes('second summary text'), 'and dropped its text');
+      assert.ok(!answer.includes('second'), 'and dropped all of its text');
       const named = summaryUnits(result.provenance!.layout!).flatMap(([, , sm]) => sm);
       assert.ok(named.includes('L1-b@1~'), `B is named as partially rendered: ${JSON.stringify(named)}`);
       assert.ok(named.includes('L1-a@1~'), 'A was cut');

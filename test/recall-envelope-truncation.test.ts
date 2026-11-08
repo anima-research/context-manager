@@ -147,7 +147,7 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
         // against the cap, so a cap below the tag's own size still buys the
         // prose it names — never an empty envelope, never a bare fragment.
         for (const body of bodies) {
-          assert.ok(TRUNCATION_MARKER.test(body) || body.includes(OMISSION_MARKER), `${label}: a tight cap must cut every summary`);
+          assert.match(body, TRUNCATION_MARKER, `${label}: a tight cap must truncate every summary's prose`);
           assert.ok(body.length > 0, `${label}: the envelope must not be empty`);
         }
       }

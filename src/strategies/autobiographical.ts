@@ -523,11 +523,9 @@ const EXPECTED_PAIR_SAMPLE = 12;
 
 /**
  * The interstitial text between two summaries in the legacy combined recall
- * answer (`positionedRecallPairs: false`). Hoisted out of
- * `renderCombinedRecallAnswer` because the shared-budget path must PRICE it
- * before deciding whether the next summary can be admitted, and the tests that
- * pin that arithmetic derive their caps from this same string: one source of
- * truth for the separator's bytes, and therefore for its cost.
+ * answer (`positionedRecallPairs: false`). Exported so the tests that count
+ * the answer's summaries match this same string. It isn't charged against
+ * `maxMessageTokens`, which cuts each summary on its own.
  */
 export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
@@ -21976,11 +21974,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * last makes opener and closer survive every cap by construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
-   * capped enveloped answer runs over the cap by its own tag text, and the
-   * legacy combined answer under an envelope (`'xml'` or `'bare'`) also by the omission
-   * marker it writes after its last envelope when summaries that hold anything
-   * are left out, unless that answer's own cut already wrote it inside its
-   * envelope. That is
+   * capped enveloped answer runs over the cap by its own tag text. That is
    * the same soft-cap overshoot the truncator already takes for granted — it
    * appends its `[truncated — original was N tokens]` marker AFTER spending
    * the budget — and the envelope is priced where the accounting is load
