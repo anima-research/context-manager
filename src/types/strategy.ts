@@ -658,7 +658,9 @@ export interface ThinkingBinding {
    *  without the option, and neither reads nor writes the branch's record. */
   binds?: boolean;
   /** The request carries the provider's drop control, so a stale block is
-   *  set aside rather than refused. Absent means false. */
+   *  set aside rather than refused. A host that notes the blocks set aside
+   *  (`ContextManager.noteThinkingDropped`) has them left out from the next
+   *  compile. Absent means false. */
   dropBlock?: boolean;
   /** The participant whose messages are the model's own replies, such as
    *  the agent's name. Required with `binds`: another participant's reply
@@ -755,13 +757,18 @@ export interface SelectOptions {
    * after them
    * (`ContextManager.noteRequestSent`): what its stream's requests went on
    * to carry and, once the stream ended, its last reply. With them it keeps
-   * the stored bodies the compile sent without their thinking, the
-   * compile's `identity`, and the branch's sequence where the record began.
+   * the stored bodies the compile sent without their thinking or a host
+   * noted since as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`), the compile's `identity`, and
+   * the branch's sequence where the record began.
    * A compile compares what it renders with the record in order. From the
    * first message that differs, or from the first message when an
    * `identity` digest changed, every message goes without its thinking, and
    * so does every message past the record's end: only the host knows which
-   * stored reply answered which request. A reply whose stored body went
+   * stored reply answered which request. A noted reply sent without its
+   * thinking doesn't count as differing where the record holds it as sent
+   * with its thinking, so the replies after it keep their thinking, for the
+   * provider to judge. A reply whose stored body went
    * without its thinking goes without it again, since what came after it
    * was minted without it. A message whose participant isn't
    * `participant`, or that has no stored body (a summary's recall answer,
@@ -778,6 +785,12 @@ export interface SelectOptions {
    * thinking as it is. Either way it starts the record. Each committing
    * compile with `binds` writes the record; a dry compile reports what it
    * would leave out and writes no record. The record survives a restart.
+   *
+   * Under `dropBlock`, a reply whose thinking the provider set aside goes
+   * without it from the compile after the host notes so
+   * (`ContextManager.noteThinkingDropped`), and the replies after it keep
+   * theirs. A host that doesn't note it sends the block again at every
+   * request, for the provider to set aside again.
    *
    * So once a branch has a record, a reply keeps its thinking at the compile
    * after it's stored only if the host has noted it: each later round of a

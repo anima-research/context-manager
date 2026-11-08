@@ -1248,6 +1248,113 @@ describe('thinking binding: compile', () => {
   });
 });
 
+describe('thinking binding: noteThinkingDropped', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  /** Note drops for the stream of the compile that wrote the branch's record. */
+  const dropped = (manager: ContextManager, ids: readonly MessageId[], compileId = recordCompileId(manager)): boolean =>
+    manager.noteThinkingDropped(ids, compileId);
+
+  it('a reply the provider set aside, once noted, goes without its thinking from the next compile on, and the replies after it keep theirs', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const first = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(first), { U1: false, A1: true, U2: false, A2: true }, 'setup: the drop control sends both');
+    assert.equal(manager.noteThinkingDropped([a1, a1], first.provenance!.compileId), true);
+    assert.deepEqual((recordOf(manager) as BindingRecord).without, [a1], 'each once');
+    const store = manager.getStore() as unknown as { setStateJson: (...args: unknown[]) => unknown };
+    const setStateJson = store.setStateJson;
+    let writes = 0;
+    store.setStateJson = (...args) => {
+      writes += 1;
+      return setStateJson.apply(store, args);
+    };
+    assert.equal(manager.noteThinkingDropped([a1], first.provenance!.compileId), true, 'a repeat matches the record');
+    assert.equal(writes, 0, 'and writes nothing');
+    store.setStateJson = setStateJson;
+    for (const label of ['the next compile', 'and the one after']) {
+      const next = await manager.compile(BIG, undefined, BIND_DROP);
+      assert.deepEqual(thinkingByText(next), { U1: false, A1: false, U2: false, A2: true }, label);
+      assert.equal(next.thinkingStrip, undefined, `${label}: a noted reply isn\u2019t reported as a strip`);
+    }
+    assert.ok((recordOf(manager) as BindingRecord).without.includes(a1), 'the compile keeps it in the record');
+    assert.ok(!(recordOf(manager) as BindingRecord).without.includes(a2), 'control');
+    await manager.close();
+  });
+
+  it('a noted reply still lets a changed message after it take the replies that follow', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const u2 = manager.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'U2'))!.id;
+    await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(dropped(manager, [a1]), true);
+    manager.editMessage(u2, [text('U2 zz-edited')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(next).A1, false);
+    assert.equal(thinkingByText(next).A2, false, 'the edit before A2 takes its thinking');
+    assert.deepEqual(next.thinkingStrip, { newly: [a2], cause: 'messages' });
+    await manager.close();
+  });
+
+  it('the match by a reply\u2019s whole form is a noted reply\u2019s alone: one left out as stored before the record still takes the replies after it', async () => {
+    cleanup();
+    const manager = await open();
+    seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
+    assert.equal(note(manager, [a3], identity()), true, 'setup: the record holds A3');
+    const next = await manager.compile(BIG, undefined, BIND);
+    assert.deepEqual(thinkingByText(next), { U1: false, A1: false, U2: false, A2: false, A3: false });
+    await manager.close();
+  });
+
+  it('writes nothing on a branch with no record, or for a compile other than the record\u2019s, and refuses what it can\u2019t record before writing', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1 } = seed(manager);
+    assert.equal(manager.noteThinkingDropped([a1], 'zz-no-compile'), false, 'no record yet');
+    assert.equal(recordOf(manager), null);
+    const c1 = await manager.compile(BIG, undefined, BIND_DROP);
+    const c2 = await manager.compile(BIG, undefined, BIND_DROP);
+    const recorded = JSON.stringify(recordOf(manager));
+    assert.equal(manager.noteThinkingDropped([a1], c1.provenance!.compileId), false, 'a stale compile');
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'nothing written');
+    const refused: Array<[string, () => unknown, RegExp]> = [
+      ['ids not a list', () => manager.noteThinkingDropped('zz' as unknown as MessageId[], c2.provenance!.compileId), /`messageIds` must be an array/],
+      ['an id not a string', () => manager.noteThinkingDropped([a1, 3 as unknown as MessageId], c2.provenance!.compileId), /id 1 must be a message id/],
+      ['a compileId not a string', () => manager.noteThinkingDropped([a1], undefined as unknown as string), /`compileId` must be a string, the provenance.compileId of the compile the stream was built from; got undefined/],
+    ];
+    for (const [label, call, message] of refused) {
+      assert.throws(call, (error: unknown) => error instanceof Error && message.test(error.message), label);
+    }
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'the record is as it was');
+    // A dry compile, or one without binds, writes no record, so the note still matches.
+    await manager.compile(BIG, undefined, bind({ dropBlock: true, dryRun: true }));
+    await manager.compile(BIG);
+    assert.equal(manager.noteThinkingDropped([a1], c2.provenance!.compileId), true);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(next).A1, false);
+    await manager.close();
+  });
+
+  it('writes the record of the branch it\u2019s on, and leaves another branch\u2019s', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1 } = seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const mainRecord = JSON.stringify(recordOf(manager));
+    await manager.fork('zz-fork');
+    assert.equal(dropped(manager, [a1]), true, 'the fork holds main\u2019s record and its compile');
+    assert.deepEqual((recordOf(manager) as BindingRecord).without, [a1]);
+    await manager.switchBranch('main');
+    assert.equal(JSON.stringify(recordOf(manager)), mainRecord, 'main\u2019s record is as it was');
+    await manager.close();
+  });
+});
+
 describe('thinking binding: a summary\u2019s carriers', () => {
   it('a binding select renders and prices the live window as under live-strip', async () => {
     // Carriers big enough that pricing them changes what fits in 900 tokens.

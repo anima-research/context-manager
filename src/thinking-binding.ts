@@ -12,10 +12,14 @@
  * (`ContextManager.noteRequestSent`): what its stream's requests went on to
  * carry and, once the stream ended, its last reply. A compile keeps a
  * message's thinking only while nothing up to it differs from the record,
- * and past the record's end nothing keeps its thinking: only the host knows
- * which stored reply answered which request. On a branch with no record, a
- * reply keeps its thinking only with the drop control, for the provider to
- * judge.
+ * where a reply sent without its thinking because the host noted that the
+ * provider set it aside doesn't count as differing while the record holds
+ * it as sent with its thinking, and past the record's end nothing keeps its
+ * thinking: only the host knows which stored reply answered which request.
+ * On a branch with no record, a reply keeps its thinking only with the drop
+ * control, for the provider to judge. A reply whose thinking the provider
+ * set aside under the drop control goes without it from the compile after
+ * the host notes so (`ContextManager.noteThinkingDropped`).
  *
  * The record is a Chronicle snapshot state in the manager's namespace, so it
  * is per branch, survives a restart, and a branch made from another starts
@@ -82,7 +86,8 @@ export interface BindingRecord {
    *  `UNVOUCHED` for a row the next compile can't reproduce. Empty until a
    *  note. */
   continued: string[];
-  /** The stored bodies that compile sent without their thinking. */
+  /** The stored bodies that compile sent without their thinking, and those a
+   *  host noted since the provider set aside (`noteThinkingDropped`). */
   without: MessageId[];
   /** The head digests that compile sent. */
   identity: RequestIdentity;
@@ -221,7 +226,8 @@ export interface BindInput {
 export interface BindOutcome {
   /** The messages to send. */
   messages: NormalizedMessage[];
-  /** Set when a reply's thinking is newly left out. */
+  /** Set when a reply's thinking is newly left out, other than a reply a
+   *  host noted as set aside by the provider. */
   strip?: ThinkingStrip;
   /** What a committing compile records. Its `without` is every stored body
    *  whose thinking this compile leaves out. */
@@ -255,13 +261,16 @@ function rawBodies(source: CompiledMessageSources | undefined): RawBodySource[] 
  * `SelectOptions.thinkingBinding`), and the record that compile leaves.
  *
  * A message keeps its thinking only when it is the participant's own, from a
- * stored body; none of its bodies was sent without thinking by the record's
- * compile; it was stored after the record began, unless the request carries
- * the drop control; and, where there is a record, nothing up to it differs
- * from the record, which it is within. With no record, only the drop control
- * keeps a reply's thinking. Any other message's thinking (another
- * participant's, a summary's recall, an injection) was never minted in this
- * agent's requests, and is always left out.
+ * stored body; none of its bodies is in the record's `without`, sent without
+ * thinking by the record's compile or noted as set aside by the provider; it
+ * was stored after the record began, unless the request carries the drop
+ * control; and, where there is a record, nothing up to it differs from the
+ * record, which it is within. A noted reply sent now without its thinking
+ * still matches the record's whole form of it, so the replies after it keep
+ * theirs. With no record, only the drop control keeps a reply's thinking.
+ * Any other message's thinking (another participant's, a summary's recall,
+ * an injection) was never minted in this agent's requests, and is always
+ * left out.
  */
 export function bindThinking(input: BindInput): BindOutcome {
   const { record, identity, participant } = input;
@@ -294,8 +303,13 @@ export function bindThinking(input: BindInput): BindOutcome {
     }
     let out = thinking && !keep ? stripped(message) : message;
     let digest = messageDigest(out);
+    // A noted reply's record entry may still be the form sent with its
+    // thinking. Its thinking going isn't a difference, so the replies after
+    // it keep theirs, for the provider to judge.
+    const noted = (): boolean =>
+      thinking && bodies.length > 0 && bodies.every((body) => wasWithout.has(body.messageId)) && messageDigest(message) === recorded[i];
     // Past the record's end, nothing was vouched for.
-    if (!diverged && record !== null) diverged = i >= recorded.length || digest !== recorded[i];
+    if (!diverged && record !== null) diverged = i >= recorded.length || (digest !== recorded[i] && !noted());
     if (diverged && keep) {
       keep = false;
       out = stripped(message);
