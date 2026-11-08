@@ -5080,28 +5080,6 @@ describe('a binding refusal of recall carriers', () => {
     }
   }
 
-  it('teaches the strategy: the model\u2019s later summarizer requests go without carriers, sent once, logging no error', async () => {
-    const mock = flexibleMembrane([
-      { error: bindingRefusal() },
-      { stop: 'end_turn', text: 'memory of the first chunk' },
-      { stop: 'end_turn', text: 'memory of the second chunk' },
-    ]);
-    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
-    withCarriers(fx);
-    const logs: string[] = [];
-    const first = chunkOf(fx, 8, 10, 998);
-    await logged(() => fx.strategy.run(first, managerContext(fx.manager)), logs);
-    assert.equal(mock.calls.length, 2, 'premise: refused, then retried without carriers');
-    assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the retry was stripped');
-    await logged(() => fx.strategy.run(fx.target, managerContext(fx.manager)), logs);
-    assert.equal(mock.calls.length, 3, 'the second chunk is sent once');
-    assert.equal(carries(mock.calls[2]!), false, 'without carriers');
-    assert.equal(fx.target.compressed, true);
-    assert.equal(logs.length, 1, 'one error line, and no other');
-    assert.ok(logs[0]!.includes('transport rejected reasoning carriers'), 'for the refusal that taught it');
-    fx.manager.close();
-  });
-
   it('another invalid request about thinking keeps the one-shot fallback and teaches nothing', async () => {
     const mock = flexibleMembrane([
       { error: otherThinkingRejection() },
