@@ -16194,7 +16194,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   reportRealInputTokens(realTotal: number, overhead?: RequestOverhead): void {
     this.requireLoadedBranch('reportRealInputTokens');
-    if (!Number.isFinite(realTotal) || realTotal <= 0) return;
+    if (!Number.isFinite(realTotal) || realTotal <= 0) {
+      this._calibrationArmed = false;
+      return;
+    }
     const window = this._lastCompileEstimate;
     if (!window || window <= 0) return;
 
