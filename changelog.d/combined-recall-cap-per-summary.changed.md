@@ -9,8 +9,11 @@
   every selected summary except any whose own cut leaves nothing of it that
   holds anything, and can be longer than `maxMessageTokens`; past the grace
   window it refuses with `OverBudgetError`, as a positioned pair does. The
-  first compile after upgrading that is past the cap changes the request
-  from the recall pair on, which misses the prompt cache from there.
+  compile's layout, and so the fold journal, names each summary the answer
+  holds, whole or partial by its own cut, where the old cut named the later
+  ones partial or left them out. The first compile after upgrading that is
+  past the cap can change the request from the recall pair on, which then
+  misses the prompt cache from there.
   `maxMessageTokens`' doc adds: "The combined recall answer of
   `positionedRecallPairs: false` is the exception. Each summary in it is cut
   to this limit, as a positioned recall answer is, so the answer as a whole

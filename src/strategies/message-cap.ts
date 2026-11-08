@@ -13,13 +13,12 @@ import type { MessageStoreView, StoredMessage } from '../types/index.js';
 export { isEmptyTextBlock };
 
 /** Written once in a message the cap cuts, so it doesn't read as ending at
- *  the cut: where the first dropped text block that held anything was, or,
- *  in the autobiographical strategy's combined recall answer with
- *  `recallEnvelope: 'xml'` or `'bare'`, after its last answer when the cap left
- *  summaries out. It stands alone for content of text blocks that hold
- *  nothing when the cap leaves one of them out, and as that combined answer
- *  when the cap admits none of its summaries, so neither comes back empty or
- *  as whitespace alone. */
+ *  the cut, where the first dropped text block that held anything was. It
+ *  stands alone for content of text blocks that hold nothing when the cap
+ *  leaves one of them out, and as the autobiographical strategy's combined
+ *  recall answer when every summary's own cut took something and left
+ *  nothing of it that holds anything, so neither comes back empty or as
+ *  whitespace alone. */
 export const CAP_OMISSION_TEXT = '[content omitted: this message reached its token limit]';
 
 /** The marker blocks capContent wrote, so a reader of its output can tell the
@@ -83,8 +82,7 @@ function safeSlice(str: string, start: number, end: number): string {
  *   compression input drops one (`stripEmptyTextBlocks`). Across the cap,
  *   the cap ends there, as it does at a cut. So such a block is kept only
  *   while every block before it was kept, as it was or as a copy that gave
- *   up a raw form: the autobiographical strategy's combined recall answer
- *   reads this output back block by block on that rule. Content whose every
+ *   up a raw form. Content whose every
  *   block is such a text block comes back as one `CAP_OMISSION_TEXT` block
  *   when the cap leaves one of them out, so a message isn't emptied or left as
  *   whitespace alone, which the API refuses. Both strategies' estimates read
