@@ -97,7 +97,12 @@ describe('a summary whose own cut leaves nothing of it that holds anything', () 
       strategy.seedSummary({ id: 'L1-b', level: 1, content: 'zz-memory-b', tokens: 3, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
       await assert.rejects(
         cm.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
-        (err: Error) => err.name === 'UncoveredDropError' && err.message.includes('covered-by-unemitted-summary'),
+        (err: Error & { droppedIds?: readonly string[] }) => {
+          assert.equal(err.name, 'UncoveredDropError');
+          assert.ok(err.message.includes('covered-by-unemitted-summary'), err.message);
+          assert.deepEqual(err.droppedIds, [a], 'the history left uncovered is A\'s, the summary its own cut left nothing of');
+          return true;
+        },
       );
       cm.close();
     } finally {

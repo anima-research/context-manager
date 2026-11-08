@@ -194,6 +194,7 @@ describe('autobiographical rendered layout', () => {
       const answer = JSON.stringify(result.messages);
       assert.ok(answer.includes('retained reasoning'), 'the truncator kept B\'s thinking block');
       assert.ok(!answer.includes('second'), 'and dropped all of its text');
+      assert.ok(answer.includes(OMISSION_MARKER), 'B\'s text gave way to the omission marker, so no prefix of it was kept');
       const named = summaryUnits(result.provenance!.layout!).flatMap(([, , sm]) => sm);
       assert.ok(named.includes('L1-b@1~'), `B is named as partially rendered: ${JSON.stringify(named)}`);
       assert.ok(named.includes('L1-a@1~'), 'A was cut');

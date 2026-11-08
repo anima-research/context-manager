@@ -5,10 +5,17 @@
   message at `maxMessageTokens`, so the summaries past the cut went out as
   one `[content omitted: this message reached its token limit]` block, and
   the compile counted the history under them as sent. A compile whose answer
-  fits the cap sends the same bytes as before. Past the cap, the answer holds
+  fits the cap sends the same bytes as before, unless a strategy overrides
+  `liveWindowAnswerContent`: with `recallEnvelope` at `'none'`, its default,
+  the answer was built from it, and is now built from
+  `liveWindowAnswerProse`, as a positioned answer is. Past the cap, the
+  answer holds
   every selected summary except any whose own cut leaves nothing of it that
   holds anything, and can be longer than `maxMessageTokens`; past the grace
-  window it refuses with `OverBudgetError`, as a positioned pair does. The
+  window it refuses with `OverBudgetError`, as a positioned pair does, and
+  where it leaves the recent window too little room within the grace window,
+  the compile refuses with `UncoveredDropError` for the recent messages it
+  can't send. The
   compile's layout, and so the fold journal, names each summary the answer
   holds, whole or partial by its own cut, where the old cut named the later
   ones partial or left them out. The first compile after upgrading that is
