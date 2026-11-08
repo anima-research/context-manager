@@ -1892,13 +1892,6 @@ function isCarrierTransportRejection(error: unknown): boolean {
   return badRequest && (msg.includes('thinking') || msg.includes('reasoning'));
 }
 
-/**
- * The provider's refusal of a carrier signed in another request, from a model
- * that binds its thinking on an account that enforces it. A recall pair's
- * carrier is always replayed after a conversation other than the one it was
- * signed in, so that model's later summarizer requests would be refused the
- * same way while they carry carriers.
- */
 function isCarrierBindingRefusal(error: unknown): boolean {
   const message = (error as { message?: unknown } | null)?.message;
   return compressionErrorType(error) === 'invalid_request' &&
@@ -11934,6 +11927,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!known) {
             noteDispatchedModel(error, attemptRequest);
             if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
+            if (attemptModel !== undefined && isCarrierBindingRefusal(error) && requestCarriesReasoning(attemptRequest)) {
+              this.noteCarriersRefused(ctx.membrane!, attemptModel);
+            }
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -11956,7 +11952,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               outcome: 'provider_error',
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
-            if (attemptModel !== undefined && isCarrierBindingRefusal(error)) this.noteCarriersRefused(ctx.membrane!, attemptModel);
           }
           // The rejection answers the request with its carriers, whose
           // failures ran under the rung's own label: it ends that run, whether
@@ -12024,9 +12019,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The provider's count of a request the ladder rewrites, its base, only
       // where the provider counted the request as planned. After a carrier
       // rejection the count is the stripped copy's, while the rewrite is built
-      // from the request with its carriers and first sent with them, so that
-      // base gives no count and admission prices the rewrite by its complete
-      // bound (compressionAdmission).
+      // from the request with its carriers, first sent with them or, after a
+      // binding refusal, sent stripped from the start, so that base gives no
+      // count and admission prices the rewrite by its complete bound
+      // (compressionAdmission).
       const baseInputTokens = (counted: unknown): number | undefined =>
         counted && typeof counted === 'object' && countedStripped.has(counted)
           ? undefined
@@ -14381,6 +14377,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response = await this.callProvider(ctx.membrane, acceptedRequest);
       } catch (error) {
         noteDispatchedModel(error, acceptedRequest);
+        if (mergeModel !== undefined && isCarrierBindingRefusal(error) && requestCarriesReasoning(acceptedRequest)) {
+          this.noteCarriersRefused(ctx.membrane, mergeModel);
+        }
         // An error on work that lost its currency is discarded as its result
         // would be, before the carrier fallback: no second call follows.
         if (stale(error)) return false;
@@ -14402,7 +14401,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           !isCarrierTransportRejection(error) ||
           !requestCarriesReasoning(acceptedRequest)
         ) throw error;
-        if (mergeModel !== undefined && isCarrierBindingRefusal(error)) this.noteCarriersRefused(ctx.membrane, mergeModel);
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -16202,10 +16200,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  under `carrierPolicy: 'live-strip'`. */
   private thinkingBound = false;
 
-  /** For each membrane, the compression models the provider has refused a
-   *  recall carrier for through it (isCarrierBindingRefusal): their
-   *  summarizer requests through that membrane are sent without carriers, as
-   *  the carrier fallback's retry is. A membrane can be another account. */
   private readonly carriersRefusedFor = new WeakMap<Membrane, Set<string>>();
 
   private noteCarriersRefused(membrane: Membrane, model: string): void {
@@ -21923,7 +21917,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
    * live render alone: whole blocks dropped, so the same entry's mint-side
-   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * recall still replays its signed blocks byte-verbatim, unless a binding
+   * refusal was learned for that membrane and model. Mutating a carrier
    * here would break the signature that the mint surface depends on — hence
    * omission, never rewriting. Every surviving block is passed through by
    * reference, except a Responses item a stripped reasoning item led to: every

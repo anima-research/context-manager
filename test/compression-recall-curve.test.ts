@@ -5125,6 +5125,46 @@ describe('a binding refusal of recall carriers', () => {
     fx.manager.close();
   });
 
+  for (const site of ['an L1', 'a merge'] as const) {
+    it(`a binding refusal that comes back after ${site}'s work went stale still teaches the strategy`, async () => {
+      const calls: RecordedCall[] = [];
+      let moveAway: () => Promise<void> = async () => {};
+      const membrane = {
+        complete: async (request: NormalizedRequest) => {
+          calls.push({ request: structuredClone(request), originalRequest: request });
+          if (calls.length === 1) {
+            await moveAway();
+            throw bindingRefusal();
+          }
+          return response('end_turn', 'zz memory ' + 'detail '.repeat(20));
+        },
+      } as never;
+      const fx = await fixture(membrane, { hierarchical: true, compressionRefusalCurveFallbacks: 0 });
+      fx.strategy.clearQueues();
+      withCarriers(fx);
+      const main = fx.manager.currentBranch().name;
+      const fork = fx.manager.getStore().createBranchAt('stale-fork', main, fx.manager.getStore().currentSequence()).name;
+      moveAway = () => fx.manager.switchBranch(fork);
+      if (site === 'an L1') {
+        await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []).catch(() => undefined);
+      } else {
+        const a = summary('L1-310', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
+        const b = summary('L1-311', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
+        fx.strategy.seed(a);
+        fx.strategy.seed(b);
+        fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
+        await logged(() => fx.strategy.tick(managerContext(fx.manager)), []).catch(() => undefined);
+      }
+      assert.equal(calls.length, 1, 'premise: the stale work made no second call');
+      assert.equal(carries(calls[0]!), true, 'premise: its call carried carriers');
+      await fx.manager.switchBranch(main);
+      await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 997), managerContext(fx.manager)), []);
+      assert.equal(calls.length, 2, 'the next chunk is sent once');
+      assert.equal(carries(calls[1]!), false, 'without carriers');
+      fx.manager.close();
+    });
+  }
+
   it('what the strategy learns is a membrane\u2019s and a model\u2019s: another membrane, or another model, is sent carriers again', async () => {
     const path = freshPath();
     const taught = flexibleMembrane([
@@ -5153,7 +5193,7 @@ describe('a binding refusal of recall carriers', () => {
     manager.close();
   });
 
-  it('a chunk quarantined after the strategy learned is found by key at the next instance\u2019s first attempt', async () => {
+  it('a chunk quarantined after the strategy learned is found at the next instance\u2019s first attempt', async () => {
     const path = freshPath();
     const mock = flexibleMembrane([
       { error: bindingRefusal() },
@@ -5187,7 +5227,7 @@ describe('a binding refusal of recall carriers', () => {
     const ctx = managerContext(manager);
     const messages = targetIds.map((id) => ctx.messageStore.get(id)).filter(Boolean) as StoredMessage[];
     await logged(() => restarted.run({ index: 999, startIndex: 10, endIndex: 12, messages, tokens: 100, compressed: false }, ctx), []);
-    assert.equal(restartMock.calls.length, 0, 'the quarantine is found by key');
+    assert.equal(restartMock.calls.length, 0, 'the quarantine is found');
     manager.close();
   });
 });

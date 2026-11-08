@@ -33,7 +33,6 @@ function withoutCacheControl(value: unknown): unknown {
 const digest = (v: unknown) => createHash('sha256').update(JSON.stringify(withoutCacheControl(v))).digest('hex').slice(0, 16);
 const isThinking = (b: unknown) => ['thinking', 'redacted_thinking'].includes((b as { type?: string }).type ?? '');
 
-/** A value with every thinking block taken out of every content list in it. */
 function withoutThinking(value: unknown): unknown {
   if (Array.isArray(value)) return value.filter((v) => !isThinking(v)).map(withoutThinking);
   if (value && typeof value === 'object') {
@@ -44,7 +43,6 @@ function withoutThinking(value: unknown): unknown {
   return value;
 }
 
-/** The wire messages without any thinking block, and without a message that held nothing else. */
 function stripped(messages: unknown[]): unknown[] {
   return messages
     .map((m) => {
@@ -61,12 +59,6 @@ interface Call {
   refused: boolean;
 }
 
-/**
- * The provider, for a model that binds its thinking: an answer leads with an
- * empty thinking block signed for its request's conversation, and an account
- * that enforces the binding refuses a request carrying a block whose earlier
- * conversation differs, unless the request carries the drop control.
- */
 class BindingProvider implements ProviderAdapter {
   readonly name = 'binding-provider';
   readonly reportsContentAlterations = true;
