@@ -5080,6 +5080,17 @@ describe('a binding refusal of recall carriers', () => {
     }
   }
 
+  async function warned<T>(run: () => Promise<T>, lines: string[]): Promise<T> {
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')); };
+    try {
+      return await run();
+    } finally {
+      console.warn = original;
+    }
+  }
+  const learnedLine = (line: string) => line.includes("refused a recalled summary's thinking as bound to a different conversation");
+
   it('another invalid request about thinking keeps the one-shot fallback and teaches nothing', async () => {
     const mock = flexibleMembrane([
       { error: otherThinkingRejection() },
@@ -5145,18 +5156,20 @@ describe('a binding refusal of recall carriers', () => {
       const main = fx.manager.currentBranch().name;
       const fork = fx.manager.getStore().createBranchAt('stale-fork', main, fx.manager.getStore().currentSequence()).name;
       moveAway = () => fx.manager.switchBranch(fork);
+      const warnings: string[] = [];
       if (site === 'an L1') {
-        await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []).catch(() => undefined);
+        await warned(() => logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []), warnings).catch(() => undefined);
       } else {
         const a = summary('L1-310', 1, [fx.ids[8]!, fx.ids[9]!], fx.ids[8]!, fx.ids[9]!);
         const b = summary('L1-311', 1, [fx.ids[10]!, fx.ids[11]!], fx.ids[10]!, fx.ids[11]!);
         fx.strategy.seed(a);
         fx.strategy.seed(b);
         fx.strategy.enqueueMergeForStress(2, [a.id, b.id]);
-        await logged(() => fx.strategy.tick(managerContext(fx.manager)), []).catch(() => undefined);
+        await warned(() => logged(() => fx.strategy.tick(managerContext(fx.manager)), []), warnings).catch(() => undefined);
       }
       assert.equal(calls.length, 1, 'premise: the stale work made no second call');
       assert.equal(carries(calls[0]!), true, 'premise: its call carried carriers');
+      assert.equal(warnings.filter(learnedLine).length, 1, `the learning is logged though the work went stale: ${warnings.join(' | ')}`);
       await fx.manager.switchBranch(main);
       await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 997), managerContext(fx.manager)), []);
       assert.equal(calls.length, 2, 'the next chunk is sent once');
@@ -5165,21 +5178,55 @@ describe('a binding refusal of recall carriers', () => {
     });
   }
 
+  it('two refusals of one model through one membrane log what was learned once', async () => {
+    const calls: RecordedCall[] = [];
+    let release: () => void = () => {};
+    const bothSent = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push({ request: structuredClone(request), originalRequest: request });
+        if (carries(calls.at(-1)!)) {
+          if (calls.filter(carries).length === 2) release();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([bothSent, new Promise((resolve) => { timer = setTimeout(resolve, 2000); })]);
+          clearTimeout(timer);
+          throw bindingRefusal();
+        }
+        return response('end_turn', 'memory ' + calls.length);
+      },
+    } as never;
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    withCarriers(fx);
+    const warnings: string[] = [];
+    await warned(() => logged(() => Promise.all([
+      fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)),
+      fx.strategy.run(chunkOf(fx, 12, 14, 997), managerContext(fx.manager)),
+    ]), []), warnings);
+    assert.equal(calls.filter(carries).length, 2, 'premise: both chunks were sent with carriers before either refusal came back');
+    assert.equal(warnings.filter(learnedLine).length, 1, warnings.join(' | '));
+    fx.manager.close();
+  });
+
   it('what the strategy learns is a membrane\u2019s and a model\u2019s: another membrane, or another model, is sent carriers again', async () => {
     const path = freshPath();
     const taught = flexibleMembrane([
       { error: bindingRefusal() },
       { stop: 'end_turn', text: 'memory of the first chunk' },
+      { stop: 'end_turn', text: 'memory of the second chunk' },
       { stop: 'end_turn', text: 'memory under another model' },
     ]);
     const fx = await fixture(taught.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    for (const i of [14, 15]) fx.ids.push(fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'substantive '.repeat(18))]));
     withCarriers(fx);
     await logged(() => fx.strategy.run(chunkOf(fx, 8, 10, 998), managerContext(fx.manager)), []);
     assert.equal(taught.calls.length, 2, 'premise: refused, then retried without carriers');
+    await logged(() => fx.strategy.run(chunkOf(fx, 14, 16, 996), managerContext(fx.manager)), []);
+    assert.equal(taught.calls.length, 3, 'premise: the same model through the same membrane is sent once');
+    assert.equal(carries(taught.calls[2]!), false, 'premise: without carriers, as learned');
     fx.strategy.setCompressionModel('another-model');
     await logged(() => fx.strategy.run(chunkOf(fx, 12, 14, 997), managerContext(fx.manager)), []);
-    assert.equal(taught.calls.length, 3);
-    assert.equal(carries(taught.calls[2]!), true, 'another model is sent carriers');
+    assert.equal(taught.calls.length, 4);
+    assert.equal(carries(taught.calls[3]!), true, 'another model is sent carriers');
     fx.strategy.setCompressionModel(MODEL);
     fx.manager.close();
 
@@ -5226,8 +5273,11 @@ describe('a binding refusal of recall carriers', () => {
     const manager = await ContextManager.open({ path, strategy: restarted, membrane: restartMock.membrane });
     const ctx = managerContext(manager);
     const messages = targetIds.map((id) => ctx.messageStore.get(id)).filter(Boolean) as StoredMessage[];
-    await logged(() => restarted.run({ index: 999, startIndex: 10, endIndex: 12, messages, tokens: 100, compressed: false }, ctx), []);
-    assert.equal(restartMock.calls.length, 0, 'the quarantine is found');
+    assert.equal(messages.length, targetIds.length, 'premise: every target message reopens');
+    const warnings: string[] = [];
+    await warned(() => logged(() => restarted.run({ index: 999, startIndex: 10, endIndex: 12, messages, tokens: 100, compressed: false }, ctx), []), warnings);
+    assert.equal(restartMock.calls.length, 0, 'no provider call');
+    assert.ok(warnings.some((line) => line.includes('compression quarantine skipped chunk')), `skipped for its quarantine: ${warnings.join(' | ')}`);
     manager.close();
   });
 });

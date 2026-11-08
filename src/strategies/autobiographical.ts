@@ -16204,6 +16204,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private noteCarriersRefused(membrane: Membrane, model: string): void {
     const models = this.carriersRefusedFor.get(membrane) ?? new Set<string>();
+    if (!models.has(model)) {
+      this.diag.warn(
+        `[autobiographical] '${model}' refused a recalled summary's thinking as bound to a different conversation: ` +
+          'its later compression and merge requests through this membrane are sent without carriers',
+      );
+    }
     models.add(model);
     this.carriersRefusedFor.set(membrane, models);
   }
