@@ -16114,7 +16114,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       recentStart: effectiveRecentStart,
     });
     this.postProcessToolEntries(merged);
-    this.keepStubsUnderRequestLimit(merged, budget, 'picker-chunks');
     // Strip stale images BEFORE placing markers, so they describe the
     // post-strip context the agent actually receives. This selection budgets
     // by postStripEstimates, so the strip counts as they do (see
@@ -16185,12 +16184,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     this.assertMiddleCoverage();
+    this.keepStubsUnderRequestLimit(merged, budget, 'picker-chunks');
 
     // Commit the carried frontier only after EVERY refusal-capable stage has
     // succeeded: plan budget, emission budget, tail reservation, structural
-    // repair, full coverage, tool pairing, and marker placement. A rejected
-    // compile may still enqueue demanded summaries above, but it cannot become
-    // the next compile's presentation state.
+    // repair, full coverage, tool pairing, marker placement, and the stubs
+    // under a request limit. A rejected compile may still enqueue demanded
+    // summaries above, but it cannot become the next compile's presentation
+    // state.
     if (pendingResolutionChanges.length > 0 && !dryRun) {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
