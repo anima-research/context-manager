@@ -20,8 +20,9 @@
   hold, the head window's end and the chunker each keep the call's result
   with the whole body, as they keep a result with a call stored whole.
 - **Hosts upgrading a store:** such a body keeps more tokens raw for a
-  while. While an edge of the head or recent window falls inside it or on
-  its result, that window takes the whole body. And if it isn't yet in a
+  while. While the recent window's start, or a compression hold, falls
+  inside it or on its result, that window or hold takes the whole body
+  (the head window gives such a body up whole). And if it isn't yet in a
   closed chunk when the host upgrades, the chunk that takes it closes only
   after its result, so the body stays raw until that chunk is summarized,
   where its earlier parts used to fold. Measured once, a 30,000-token reply
