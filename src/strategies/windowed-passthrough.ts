@@ -92,7 +92,8 @@ export interface WindowedPassthroughOptions {
    * `imageStripDepthTokens` from the newest message, or past
    * `maxLiveImageBytes` of cumulative inline image bytes (newest-first).
    * Defaults follow `DEFAULT_AUTOBIOGRAPHICAL_CONFIG` (and the memory
-   * strategy's byte wall). A count or byte limit of 0 means up to its
+   * strategy's byte wall): none of the three strips unless a host sets it.
+   * A count or byte limit of 0 means up to its
    * image ceiling, below, and a depth of 0 means no depth strip. A strip changes the
    * bytes at that position, which the cache-marker placement absorbs by
    * measurement (the marker falls back to the deepest byte-stable entry).
@@ -128,7 +129,7 @@ interface ImagePolicy {
 }
 
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
-const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_LIVE_IMAGE_BYTES = 0;
 
 /**
  * Passthrough over a recent window, anchored at a sequence number while the

@@ -20318,9 +20318,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     verdicts: ReadonlyMap<number, ReadonlyMap<unknown, ReadonlyArray<ImageVerdict>>>;
   } | null = null;
 
-  /** Byte wall default: 20 MiB of base64, under the default image byte
-   *  ceiling (24 MiB), which leaves room under membrane's 28 MiB cap. */
-  protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+  /** Byte wall default: none of its own (0), so the window keeps images up
+   *  to the image byte ceiling (24 MiB by default), which leaves room under
+   *  membrane's 28 MiB cap. */
+  protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 0;
 
   /** Which ceilings have been said to strip the live window (once each per instance). */
   private readonly ceilingBoundReported = { images: false, bytes: false };
@@ -20364,7 +20365,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  layer gave or no layer gave, and those the host gave as undefined or
    *  null where configuredImageLimits then applies a default. For
    *  maxLiveImages it applies none: an explicit undefined erases the default
-   *  6 and reads as no limit, which is the host's doing. */
+   *  layer's value and reads as no limit, which is the host's doing. */
   private imageLimitsDefaulted(): ReadonlySet<string> {
     const keys = ['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling', 'maxCompressionImageBytes'] as const;
     return new Set(keys.filter((key) => {
