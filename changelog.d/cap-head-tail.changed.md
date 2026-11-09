@@ -45,16 +45,18 @@
   Text blocks that hold nothing are still left out at no loss: where
   leaving them out brings a message under the cap, it comes back without
   them and nothing else is cut, as `main` left them out past the cap. A cap
-  smaller than the least cut, the marker and a notice for each later
-  string tool result, sends that cut, over the cap, with any block the cut
-  passes through, such as thinking, except that the cut is never longer
-  than the whole: where the marker and those notices estimate at least as
-  much as the text they would stand for, the message goes whole. A text
-  block that holds nothing, or an opaque carrier, at the end is now kept in
-  the tail, where past the cap it was left out. A strategy's
-  `truncateContent` override gains a `whole` argument naming the stored
-  message or summary; an override that doesn't pass it on gets markers
-  that name none.
+  smaller than the cut that keeps nothing, the marker and a notice for each
+  later string tool result, sends that cut, over the cap, with any block
+  the cut passes through, such as thinking, though a cut keeping a short
+  result whole could fit. That cut is never longer than the whole: where
+  the marker and those notices estimate at least as much as the text they
+  would stand for, the message goes whole. The cut halves over how much it
+  keeps, and keeping more can cost less, so it can keep less than the
+  largest cut that fits. A text block that holds nothing, or an opaque
+  carrier, at the end is now kept in the tail, where past the cap it was
+  left out. A strategy's `truncateContent` override gains a `whole`
+  argument naming the stored message or summary; an override that doesn't
+  pass it on gets markers that name none.
 - Under `positionedRecallPairs: false` (with `adaptiveResolution` off, the
   only path that reads it), the combined recall answer cuts each summary on
   its own, head and tail, as a positioned recall answer is cut, in every

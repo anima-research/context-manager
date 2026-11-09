@@ -215,14 +215,16 @@ function cutAt(content: readonly ContentBlock[], headEnd: number, tailStart: num
  *   thinking, never shrinks the text kept. Content whose measured blocks
  *   fit once its text blocks that hold nothing (`isEmptyTextBlock`) are
  *   left out comes back without them, which loses nothing.
- * - Otherwise it keeps the largest head and tail whose kept blocks and
- *   marker, estimated alone, fit `maxTokens`: the head 60% of what it keeps
- *   and the tail 40%, each end moved to a line break within half its share,
- *   neither inside a surrogate pair. A cap the least cut, the marker and a
- *   notice for each later string tool result, passes keeps neither, and
- *   where that cut estimates at least as much as the measured blocks
- *   it stands for, the content comes back whole: the cut is never longer
- *   than the whole.
+ * - Otherwise it keeps a head and tail whose kept blocks and marker,
+ *   estimated alone, fit `maxTokens`: the head 60% of what it keeps and the
+ *   tail 40%, each end moved to a line break within half its share, neither
+ *   inside a surrogate pair. It halves over how much it keeps, and keeping
+ *   more can cost less, so it can stop short of the largest cut that fits.
+ *   Where the cut that keeps nothing, the marker and a notice for each
+ *   later string tool result, doesn't fit, it sends that cut over the cap,
+ *   though a cut keeping a short result whole could fit, and where that cut
+ *   estimates at least as much as the measured blocks it stands for, the
+ *   content comes back whole: the cut is never longer than the whole.
  * - The marker says which characters of the measured text it elided, and,
  *   with `opts.whole`, where the whole is stored, then the clause
  *   `opts.hint` gives, if any (`guardedHint`): `[truncated — chars H to T of M elided here; the
