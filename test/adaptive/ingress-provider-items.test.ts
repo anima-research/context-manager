@@ -1,0 +1,107 @@
+/**
+ * Ingestion-time chunking and provider items.
+ *
+ * A message whose content carries a provider item (a block with an object
+ * `rawItem`, as membrane's Responses parser gives it) is stored whole, as one
+ * row with its content as given, however long it is. A long message without
+ * one is still split into shards, and a message under the threshold is
+ * stored whole either way.
+ */
+
+import { describe, it, before, after, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { rmSync, existsSync } from 'node:fs';
+import type { ContentBlock } from '@animalabs/membrane';
+
+import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
+
+const TEST_STORE_PATH = './test-adaptive-ingress-provider-items-store';
+
+function cleanup() {
+  if (existsSync(TEST_STORE_PATH)) rmSync(TEST_STORE_PATH, { recursive: true, force: true });
+}
+
+const mockMembrane = {
+  complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock summary]' }] }),
+};
+
+const prose = (chars: number) => 'The answer goes on. '.repeat(Math.ceil(chars / 20)).slice(0, chars);
+
+async function stored(content: ContentBlock[]) {
+  const strategy = new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution: true });
+  const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: mockMembrane as any });
+  try {
+    manager.addMessage('User', [{ type: 'text', text: 'hello' }]);
+    manager.addMessage('Claude', content);
+    return manager.getAllMessages().filter((m) => m.participant === 'Claude').map((m) => m.content);
+  } finally {
+    manager.close();
+  }
+}
+
+describe('AutobiographicalStrategy — ingestion keeps provider items', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+  beforeEach(() => cleanup());
+
+  it('a long message with a compaction item is stored whole, item and order kept', async () => {
+    const content = [
+      { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'E'.repeat(3_000) } },
+      { type: 'text', text: prose(40_000) },
+    ] as ContentBlock[];
+    const rows = await stored(content);
+    assert.equal(rows.length, 1, `stored as ${rows.length} rows`);
+    assert.deepEqual(rows, [content]);
+  });
+
+  it("a long Responses reply's message parts are stored whole, each keeping its item and phase", async () => {
+    const item = {
+      type: 'message', id: 'msg_1', role: 'assistant', phase: 'final_answer',
+      content: [{ type: 'output_text', text: prose(20_000) }, { type: 'output_text', text: prose(20_000) }],
+    };
+    const content = [
+      { type: 'text', text: prose(20_000), rawItem: item },
+      { type: 'text', text: prose(20_000), rawItem: item },
+    ] as ContentBlock[];
+    const rows = await stored(content);
+    assert.equal(rows.length, 1, `stored as ${rows.length} rows`);
+    assert.deepEqual(rows, [content]);
+  });
+
+  it('a long message with a reasoning item and its follower is stored whole, the pairing in its order', async () => {
+    const content = [
+      { type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque' } },
+      { type: 'text', text: prose(40_000), rawItem: { type: 'message', id: 'msg_1', role: 'assistant', phase: 'final_answer', content: [] } },
+    ] as ContentBlock[];
+    const rows = await stored(content);
+    assert.equal(rows.length, 1, `stored as ${rows.length} rows`);
+    assert.deepEqual(rows, [content]);
+  });
+
+  it('an item on a block that is not text keeps a long message whole too', async () => {
+    const content = [
+      { type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque' } },
+      { type: 'text', text: prose(40_000) },
+    ] as ContentBlock[];
+    const rows = await stored(content);
+    assert.equal(rows.length, 1, `stored as ${rows.length} rows`);
+    assert.deepEqual(rows, [content]);
+  });
+
+  it('a message under the threshold with a compaction item is stored whole', async () => {
+    const content = [
+      { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'E'.repeat(3_000) } },
+      { type: 'text', text: prose(20_000) },
+    ] as ContentBlock[];
+    const rows = await stored(content);
+    assert.equal(rows.length, 1, `stored as ${rows.length} rows`);
+    assert.deepEqual(rows, [content]);
+  });
+
+  it('a long message with no provider item is still split into shards', async () => {
+    const text = prose(40_000);
+    const rows = await stored([{ type: 'text', text }] as ContentBlock[]);
+    assert.ok(rows.length > 1, `expected shards, got ${rows.length} row(s)`);
+    assert.equal(rows.flat().map((b) => (b as { text: string }).text).join(''), text);
+  });
+});

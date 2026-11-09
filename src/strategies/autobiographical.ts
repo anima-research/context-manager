@@ -93,7 +93,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
-import { isCompactionCarrier, isOpaqueCarrier, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { carriesRawItem, isCompactionCarrier, isOpaqueCarrier, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -3069,6 +3069,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * StoredMessage, and the render path concatenates them back into one
    * API message at compile time (preserving KV cache structure).
    *
+   * A message with a block that carries a provider item (an object
+   * `rawItem`, as a Responses reply's message parts and reasoning do) is
+   * never split: it is stored whole, however long, with every item in its
+   * place.
+   *
    * Multi-block content: text blocks are concatenated for chunking, then
    * the resulting shards are emitted as text blocks. Non-text blocks
    * (images, tool results) are passed through unchanged on the first
@@ -3078,6 +3083,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
     if (!this.config.adaptiveResolution) return null;
+    if (content.some(carriesRawItem)) return null;
 
     // Separate text and non-text blocks.
     const textParts: string[] = [];

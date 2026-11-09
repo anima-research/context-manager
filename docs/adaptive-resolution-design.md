@@ -81,7 +81,7 @@ This is the principle the spec opens with, and it's load-bearing here. Concretel
 
 ### 3.2 Chunks, levels, and resolutions
 
-A **chunk** is the unit of fold operations. For chat messages under `chunkThreshold` (default 8K tokens), one chunk = the whole message. For larger messages — pasted documents, large tool-call results, dumped logs — a message is split into multiple chunks at ingestion (see §3.6).
+A **chunk** is the unit of fold operations. For chat messages under `chunkThreshold` (default 8K tokens), one chunk = the whole message. For larger messages — pasted documents, large tool-call results, dumped logs — a message is split into multiple chunks at ingestion, unless it carries a provider item (see §3.6).
 
 A **level** is a non-negative integer:
 - `L0` (level 0) = render the chunk's raw content.
@@ -201,11 +201,13 @@ Solvers shipped:
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
-Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is split into shards at ingestion. Each shard is its own `MessageEntry` with:
+Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is split into shards at ingestion, unless it carries a provider item (below). Each shard is its own `MessageEntry` with:
 
 - A stable `bodyGroupId` shared with its sibling shards.
 - A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.
 - The same `participant` as the original message.
+
+A message with a block that carries a provider item, an object `rawItem` as a Responses reply's message parts and reasoning do, is never split. It is stored whole, however long, with every item in its place, and is one unit for folding.
 
 The chunker (`src/adaptive/chunker.ts`) additionally computes a per-shard
 `sourceHash` and `{ startByte, endByte }` range, but those live in the

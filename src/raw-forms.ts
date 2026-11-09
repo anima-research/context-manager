@@ -90,11 +90,17 @@ export function isCompactionCarrier(block: ContentBlock): boolean {
   return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
 }
 
-function itemKey(block: ContentBlock): string | undefined {
+/** Whether a block carries a provider item: the Responses formatter emits only an object `rawItem`. */
+export function carriesRawItem(block: ContentBlock): boolean {
   const raw = (block as RawFormCarrier).rawItem;
-  // The Responses formatter emits only an object, deduplicated per message by
-  // `type:id`, or by its JSON when it has no string id.
-  if (!raw || typeof raw !== 'object') return undefined;
+  return !!raw && typeof raw === 'object';
+}
+
+function itemKey(block: ContentBlock): string | undefined {
+  // The Responses formatter emits only an object (carriesRawItem), deduplicated
+  // per message by `type:id`, or by its JSON when it has no string id.
+  if (!carriesRawItem(block)) return undefined;
+  const raw = (block as RawFormCarrier).rawItem;
   const item = raw as { type?: unknown; id?: unknown };
   return typeof item.id === 'string'
     ? `item:${String(item.type ?? '')}:${item.id}`
