@@ -7,11 +7,12 @@
   `mergeMessageStoreViews` and the window a manager presents provide. It halts
   only where one isn't: a messages chain broken under chronicle before 0.5.0,
   or a store rebuilt under new ids. A strategy that reads the store through a
-  view without `onBranch` halts as before. The README's section on the
+  view without `onBranch` halts as before, and a read of the chain that fails
+  halts that rebuild alone. The README's section on the
   autobiographical strategy names the states that hold message ids, for a
   store rebuilt under new ones.
-- While the guard halts, `getCompressionDebt()` reads `critical` with
-  `failure: 'chunk-records'`, and its `error` gives the cause and the first
-  step, which changes nothing. The `FAIL-CLOSED` log line gives every step.
+- While the guard halts, no chunk is summarized and no new merge is queued,
+  and `getCompressionDebt()` reads `critical` with `failure: 'chunk-records'`.
+  Its `error` gives the cause and the first step, which changes nothing. The `FAIL-CLOSED` log line gives every step.
   `scripts/drain-autobiographical.ts` then stops before any step, with
   `stopped: 'chunk-records'`, and exits 1.

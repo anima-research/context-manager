@@ -105,8 +105,9 @@ const halts = async (cm: ContextManager, s: AutobiographicalStrategy, label: str
   const debt = s.getCompressionDebt();
   assert.strictEqual(debt.state, 'critical', `${label}: the debt report is critical`);
   assert.strictEqual(debt.failure, 'chunk-records', label);
-  assert.match(debt.error ?? '', /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one that isn't on this branch's messages chain/, `${label}: the off-chain cause`);
-  assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line says what to do for each answer\.$/, `${label}: the fix's first step`);
+  assert.match(debt.error ?? '', /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/, `${label}: the off-chain cause`);
+  assert.match(debt.error ?? '', /\nEffect: no chunk, waiting or new, is summarized, and no new merge is queued\.\n/, `${label}: what waits`);
+  assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step\.$/, `${label}: the fix's first step`);
 };
 const offBranch = (cm: ContextManager, ids: string[], label: string): void => {
   const store = messageStoreOf(cm);
@@ -282,6 +283,22 @@ describe('the chain-break guard still halts for a broken chain or a store rebuil
     offBranch(cm, records(cm).flatMap((r) => r.sourceIds), 'restarted chain');
     for (const m of lived) cm.addMessage(m.participant, m.content);
     await halts(cm, s, 'restarted chain');
+    await cm.close();
+  });
+
+  it('switching back from a branch whose chain restarted, to the chain its records were written against, compresses again in the same process', async () => {
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 6);
+    const main = cm.currentBranch().name;
+    const store = cm.getStore();
+    const messagesState = MessageStore.registrationFor().id;
+    const carried = store.listStates().map((st) => st.id).filter((id) => id !== messagesState);
+    store.createBranchWithStates('restarted-then-back', main, { stateIds: carried });
+    await cm.switchBranch('restarted-then-back');
+    await halts(cm, s, 'restarted');
+    await cm.switchBranch(main);
+    await laterMessagesCompress(cm, s, 'back on the chain the records were written against');
     await cm.close();
   });
 

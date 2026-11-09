@@ -499,7 +499,9 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           self.chunks = [];
           self.compressionQueue = [99];
           self.chunkRecordsOrphaned = true;
+          self._orphanCause = 'no-on-branch';
           self._orphanWarned = true;
+          self._chainUnreadWarned = true;
           self._prevCacheKeys = ['zz'];
           self.lastFrontierTokens = 1;
           self.transitionBlocked = 'transition-pace-floor';
@@ -533,7 +535,7 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     const expected = before();
     // Every field select() saves and restores, read by identity.
     const fields = [
-      'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
+      'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanCause', '_orphanWarned', '_chainUnreadWarned', '_prevCacheKeys', 'lastFrontierTokens',
       'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_calibrationLoaded',
       '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_storeOrderSource', '_cachedHeadStartIndex',
       '_ownedIdsCache',

@@ -389,7 +389,7 @@ describe('the scripts on a store whose chain-break guard has stopped compression
     assert.deepEqual(seen.map((e) => e.event), ['start', 'finish'], 'no step');
     const finish = seen.at(-1)!;
     assert.deepEqual([finish.completed, finish.stopped, finish.debtFailure], [false, 'chunk-records', 'chunk-records']);
-    assert.match(String(finish.debtError), /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one that isn't on this branch's messages chain/);
+    assert.match(String(finish.debtError), /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/);
     assert.match(r.stderr, /not drained \(chunk-records\): the chain-break guard has stopped compression\. Its debt report says what has to change before a drain can go on:\nCompression of new conversation has stopped\./);
     assert.doesNotMatch(r.stderr, /run the drain again/);
   });

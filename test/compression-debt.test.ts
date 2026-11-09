@@ -473,9 +473,9 @@ describe('getCompressionDebt while the chain-break guard has stopped compression
   // The guard's flag set with its default cause, the off-chain one.
   const STOPPED = [
     'Compression of new conversation has stopped.',
-    "Cause: most chunk records name no message in view, and the oldest or newest names one that isn't on this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
-    'Effect: no new chunk forms, so new conversation goes unsummarized.',
-    "Fix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line says what to do for each answer.",
+    "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
+    'Effect: no chunk, waiting or new, is summarized, and no new merge is queued.',
+    "Fix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
   ].join('\n');
 
   it('reads critical, saying what stopped it, with every count still reported', () => {
