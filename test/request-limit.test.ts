@@ -84,6 +84,10 @@ function requestTokens(stats: RenderStats, reserve = BUDGET.reserveForResponse):
   return stats.total.tokens + stats.request!.injectedTokens + stats.request!.overheadTokens + reserve;
 }
 
+const pricedOf = (stats: RenderStats): number => stats.total.tokens + stats.request!.injectedTokens + stats.request!.overheadTokens;
+const besidesOf = (stats: RenderStats): number => stats.request!.injectedTokens + stats.request!.overheadTokens;
+const BIG: RequestOverhead = { system: `You are a resident. ${'Be precise about the work in front of you. '.repeat(600)}`, tools: TOOLS };
+
 const strip = (s: RenderStats) => ({ ...s, planVsActual: s.planVsActual && { ...s.planVsActual, compileMs: 0, solveMs: 0 } });
 
 /** What a compile without a limit sends, on a twin store. */
@@ -129,23 +133,63 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     cm.close();
   });
 
-  it('while the multiplier is provisional, keeps the request within the limit priced at the calibration\'s ceiling, and its first sample replaces it', async () => {
+  it('while the multiplier is provisional, keeps the request within the limit priced at that multiplier, as a measured store does, and its first sample replaces it', async () => {
     const base = await uncappedOn('provisional-base', () => openManager('provisional-base'));
-    const limit = requestTokens(base) + 200;
+    const limit = BUDGET.reserveForResponse + Math.ceil((requestTokens(base) - BUDGET.reserveForResponse) * 1.1);
     const { cm, strategy } = await openManager('provisional');
     const first = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit })).renderStats!;
     assert.equal(first.calibration!.provisional, true, 'premise: a store with no record is provisional');
-    const ceiling = first.calibration!.ceiling!;
-    const priced = first.total.tokens + first.request!.injectedTokens + first.request!.overheadTokens;
-    assert.ok(priced * ceiling + BUDGET.reserveForResponse <= limit,
-      `priced at the ceiling ${ceiling}, the request ${Math.ceil(priced * ceiling) + BUDGET.reserveForResponse} is within ${limit}`);
-    // A true rate of 1.5, under the ceiling: the provider's count fits, and its sample ends the provisional state.
-    assert.ok(priced * 1.5 + BUDGET.reserveForResponse <= limit, 'premise: at a true rate of 1.5 the provider accepts it');
-    strategy.reportRealInputTokens(priced * 1.5, OVERHEAD);
+    assert.equal(first.calibration!.multiplier, 1, 'premise: at 1');
+    assert.equal(first.total.tokens, base.total.tokens, 'priced at its multiplier, the request is within the limit, so the window is the one it selects with no limit');
+    const priced = pricedOf(first);
+    assert.ok(priced * 1.0625 + BUDGET.reserveForResponse <= limit, 'premise: at a true rate of 1.0625 the provider accepts it');
+    strategy.reportRealInputTokens(priced * 1.0625, OVERHEAD);
     const next = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit })).renderStats!;
-    assert.equal(next.calibration!.multiplier, 1.5, 'the sample set the rate');
+    assert.equal(next.calibration!.multiplier, 1.0625, 'the sample set the rate');
     assert.ok(!next.calibration!.provisional, 'and ended the provisional state');
     assert.ok(requestTokens(next) <= limit, `at the sampled rate, ${requestTokens(next)} is within ${limit}`);
+    cm.close();
+  });
+
+  it('compiles a fresh store whose overhead fits the limit at its multiplier but not at the calibration\'s ceiling, as a store measured at 1 does', async () => {
+    const twin = await seededAt('fresh-fits-twin', 1);
+    const besides = besidesOf((await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!);
+    const limit = BUDGET.reserveForResponse + Math.floor(besides * 1.6);
+    const measured = await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit, dryRun: true });
+    assert.ok(requestTokens(measured.renderStats!) <= limit, 'premise: a store measured at 1 fits the limit');
+    twin.cm.close();
+    const { cm } = await openManager('fresh-fits');
+    const { messages, renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit });
+    assert.equal(renderStats!.calibration!.provisional, true, 'premise: a store with no record is provisional');
+    assert.ok(requestTokens(renderStats!) <= limit, `the request ${requestTokens(renderStats!)} is within ${limit}`);
+    assert.deepStrictEqual(messages, measured.messages, 'the select a store measured at 1 makes');
+    cm.close();
+  });
+
+  it('names the rate an own refusal under a limit priced the request at', async () => {
+    const twin = await seededAt('names-rate-twin', 1);
+    const probe = (await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!;
+    const besides = besidesOf(probe);
+    const noRoom = BUDGET.reserveForResponse + Math.floor(besides / 2);
+    await assert.rejects(twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: noRoom }), (e: Error) => {
+      assert.ok(e.message.startsWith(`The request limit of ${noRoom} tokens leaves the window no room`), e.message);
+      assert.ok(e.message.includes(' (those two priced at the store\'s multiplier of 1.00) come to '), `a measured store: ${e.message}`);
+      return true;
+    });
+    const inSelect = BUDGET.reserveForResponse + besides + 100;
+    await assert.rejects(twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: inSelect }), (e: Error) => {
+      assert.equal(e.name, 'OverBudgetError', e.message);
+      assert.ok(!e.message.startsWith('The request limit of'), `premise: refused inside the select: ${e.message}`);
+      assert.ok(e.message.endsWith('; under the request limit, the request is priced at the store\'s multiplier of 1.00'), e.message);
+      return true;
+    });
+    twin.cm.close();
+    const { cm } = await openManager('names-rate-fresh');
+    await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: noRoom }), (e: Error) => {
+      assert.ok(e.message.includes(' (those two priced at the store\'s provisional multiplier of 1.00, which no request has measured under the current pricing) come to '),
+        `a fresh store: ${e.message}`);
+      return true;
+    });
     cm.close();
   });
 
@@ -176,30 +220,44 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     return openManager(name);
   }
 
-  for (const [label, allowance] of [['the limit leaves no room', 0], ['the select refuses within the allowance the limit set', 100]] as const) {
-    it(`keeps a provisional multiplier above 1 when the limit made the refusal: ${label}`, async () => {
-      const { cm } = await provisionalAt(`keep-provisional-${allowance}`, 1.4);
-      const probe = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
-      assert.equal(probe.calibration!.provisional, true, 'premise: provisional');
-      assert.equal(probe.calibration!.multiplier, 1.4, 'premise: at 1.4');
-      const scale = probe.calibration!.multiplier / probe.calibration!.ceiling!;
-      const limit = Math.ceil(BUDGET.reserveForResponse + (allowance + probe.request!.overheadTokens + probe.request!.injectedTokens) / scale);
-      await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit }), (e: Error) => {
-        assert.equal(e.name, 'OverBudgetError', e.message);
-        const d = (e as Error & { diagnostics: { requestLimitTokens?: number; requestAllowanceTokens?: number } }).diagnostics;
-        assert.equal(d.requestLimitTokens, limit, 'the refusal names the limit');
-        assert.equal(typeof d.requestAllowanceTokens, 'number', 'and what it left the window');
-        const noRoom = e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`);
-        if (allowance === 0) assert.ok(noRoom && d.requestAllowanceTokens! <= 0, `the no-room refusal: ${e.message}`);
-        else assert.ok(!noRoom && d.requestAllowanceTokens! > 0, `a refusal inside the select, within a positive allowance: ${d.requestAllowanceTokens}, ${e.message}`);
-        return true;
-      });
-      const after = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
-      assert.equal(after.calibration!.multiplier, 1.4, 'no drop can help a refusal whose bound the limit set, so none is made');
-      assert.equal(after.calibration!.reset, undefined, 'and none is recorded');
+  for (const [label, arm] of [['the limit leaves no room at it', 'no-room'], ['the select refuses within the allowance the limit set', 'in-select']] as const) {
+    it(`drops a provisional multiplier above 1 that a limit refuses to 1, as a budget refusal does, and compiles: ${label}`, async () => {
+      const twin = await seededAt(`drop-twin-${arm}`, 1);
+      const besides = besidesOf((await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!);
+      const limit = BUDGET.reserveForResponse + (arm === 'no-room' ? Math.floor(besides * 1.3) : Math.ceil(besides * 1.4) + 100);
+      const measured = await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit, dryRun: true });
+      assert.ok(requestTokens(measured.renderStats!) <= limit, 'premise: a store measured at 1 fits the limit');
+      twin.cm.close();
+      const { cm } = await provisionalAt(`drop-${arm}`, 1.4);
+      const probe = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!;
+      assert.deepStrictEqual([probe.calibration!.provisional, probe.calibration!.multiplier], [true, 1.4], 'premise: provisional at 1.4');
+      const { messages, renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit });
+      assert.equal(renderStats!.calibration!.multiplier, 1, 'dropped to 1');
+      assert.equal(renderStats!.calibration!.reset?.discardedMultiplier, 1.4, 'with the reset recorded');
+      assert.ok(requestTokens(renderStats!) <= limit, `the request ${requestTokens(renderStats!)} is within ${limit}`);
+      assert.deepStrictEqual(messages, measured.messages, 'the select a store measured at 1 makes');
       cm.close();
     });
   }
+
+  it('keeps a provisional multiplier above 1 that a limit refuses once the provider\'s rate prices the request, where no drop can make it fit', async () => {
+    const twin = await seededAt('rate-no-drop-twin', 1);
+    const besides = besidesOf((await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!);
+    twin.cm.close();
+    const limit = BUDGET.reserveForResponse + Math.floor(besides * 1.3);
+    const { cm, strategy } = await provisionalAt('rate-no-drop', 1.4);
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit * 4 });
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, BIG).changed, true, 'premise: a count-less refusal sets the provider\'s rate');
+    await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit }), (e: Error) => {
+      assert.ok(e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`), e.message);
+      assert.ok(e.message.includes(' (those two priced at the provider\'s rate of 1.80) come to '), e.message);
+      return true;
+    });
+    const after = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!;
+    assert.equal(after.calibration!.multiplier, 1.4, 'no drop is made');
+    assert.equal(after.calibration!.reset, undefined, 'and none is recorded');
+    cm.close();
+  });
 
   it('windowed-passthrough with an image its policy strips, nested in a tool_result, is never refused by the compile\'s own check where it kept to the limit', async () => {
     const strategy = new SpiedWindowed({ imageStripDepthTokens: 1 });
@@ -506,5 +564,243 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       return true;
     });
     cm.close();
+  });
+});
+
+describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)', () => {
+  const R = BUDGET.reserveForResponse;
+  const BUDGET_ABOVE_LIMIT = { ...BUDGET, maxTokens: 40_000 };
+  const compileUnder = async (cm: ContextManager, limit: number, budget = BUDGET) =>
+    (await cm.compile(budget, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit })).renderStats!;
+  const compileFree = async (cm: ContextManager) => (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
+  const allowanceAt = (limit: number, scale: number, stats: RenderStats) =>
+    Math.floor((limit - R) * scale - stats.request!.overheadTokens - stats.request!.injectedTokens);
+  const countFor = (stats: RenderStats, multiplier: number, rate: number) => Math.round(pricedOf(stats) / multiplier * rate);
+  const rateOf = (count: number, stats: RenderStats, multiplier: number) => count / pricedOf(stats) * multiplier;
+  async function bound(name: string, multiplier: number, rate = multiplier) {
+    const base = await uncappedOn(`${name}-base`, () => seededAt(`${name}-base`, multiplier));
+    const limit = R + Math.floor((pricedOf(base) - Math.floor(base.total.tokens / 4)) / multiplier * rate);
+    return { limit, ...(await seededAt(name, multiplier)) };
+  }
+
+  it('a provisional store learns a stated count its calibration band takes outright, and says so on its calibration line', async () => {
+    const base = await uncappedOn('learn-base', () => openManager('learn-base'));
+    const limit = requestTokens(base) + 200;
+    const { cm, strategy } = await openManager('learn');
+    const first = await compileUnder(cm, limit);
+    assert.equal(first.calibration!.provisional, true, 'premise: provisional');
+    const count = countFor(first, 1, 1.5);
+    const why = `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, so the next compile prices the request at a rate of 1.50.`;
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let refused: { changed: boolean; why: string };
+    try {
+      refused = strategy.reportRefusedAsTooLong(count, OVERHEAD);
+    } finally {
+      console.warn = warn;
+    }
+    assert.deepStrictEqual(refused, { changed: true, why });
+    assert.ok(warned.some((line) => line.includes(`[estimator-calibration] a too-long refusal: ${why}`)), warned.join('\n'));
+    const next = await compileUnder(cm, limit);
+    assert.ok(Math.abs(next.calibration!.multiplier - 1.5) < 0.01, `the count set the multiplier: ${next.calibration!.multiplier}`);
+    assert.ok(!next.calibration!.provisional, 'and ended the provisional state');
+    assert.ok(requestTokens(next) <= limit, `the retry's request ${requestTokens(next)} is within ${limit}`);
+    cm.close();
+  });
+
+  it('a stated count over the store\'s price that the multiplier doesn\'t step to sets the provider\'s rate, and the next compile fits at it', async () => {
+    const { cm, strategy, limit } = await bound('over-a-little', 1.2);
+    const first = await compileUnder(cm, limit);
+    assert.notEqual(first.request!.allowanceTokens, undefined, 'premise: the limit binds');
+    const count = countFor(first, 1.2, 1.2 * 1.015);
+    const rate = rateOf(count, first, 1.2);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: true,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, so the next compile prices the request at a rate of ${rate.toFixed(2)}.`,
+    });
+    const next = await compileUnder(cm, limit);
+    assert.equal(next.calibration!.multiplier, 1.2, 'the multiplier stays');
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1.2 / rate, next), 'the allowance is priced at the provider\'s rate');
+    assert.ok(pricedOf(next) / 1.2 * rate + R <= limit, 'so at that rate the request fits');
+    cm.close();
+  });
+
+  it('a stated count at a true 2.5: the retry fits, its sample keeps the rate, the next turn fits, and so does the turn after the run lands the multiplier at its ceiling', async () => {
+    const { cm, strategy, limit } = await bound('true-rate', 1, 2.5);
+    const first = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    const count = countFor(first, 1, 2.5);
+    const rate = rateOf(count, first, 1);
+    assert.equal(strategy.reportRefusedAsTooLong(count, OVERHEAD).changed, true);
+    const retry = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(retry.request!.allowanceTokens, allowanceAt(limit, 1 / rate, retry), 'the retry is priced at the provider\'s rate');
+    assert.ok(pricedOf(retry) * rate + R <= limit, 'and fits at it');
+    const served = countFor(retry, 1, 2.5);
+    strategy.reportRealInputTokens(served, OVERHEAD);
+    cm.addMessage('User', [{ type: 'text', text: 'And the next thing?' }]);
+    const next = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(next.calibration!.multiplier, 1, 'premise: two out-of-band samples leave the multiplier');
+    const kept = rateOf(served, retry, 1);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / kept, next), 'the retry\'s sample keeps the provider\'s rate');
+    assert.ok(pricedOf(next) * kept + R <= limit, 'so the next turn fits');
+    const third = countFor(next, 1, 2.5);
+    strategy.reportRealInputTokens(third, OVERHEAD);
+    cm.addMessage('Claude', [{ type: 'text', text: 'Here it is.' }]);
+    const after = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(after.calibration!.multiplier, 1.8, 'premise: the third agreeing sample lands the multiplier at its ceiling');
+    const last = rateOf(third, next, 1);
+    assert.equal(after.request!.allowanceTokens, allowanceAt(limit, 1.8 / last, after), 'and the provider\'s rate still prices the request');
+    assert.ok(pricedOf(after) / 1.8 * last + R <= limit, 'so it fits');
+    cm.close();
+  });
+
+  it('a stated count no higher than the store\'s price changes nothing, and says the limit or the reply\'s reserve is above what the provider takes', async () => {
+    const { cm, strategy, limit } = await bound('priced-right', 1.2);
+    const first = await compileUnder(cm, limit);
+    const count = countFor(first, 1.2, 1.19);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${count} input tokens, no more than the store's price of ${pricedOf(first)}, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes.`,
+    });
+    const next = await compileUnder(cm, limit);
+    assert.equal(next.calibration!.multiplier, 1.2);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1, next), 'the allowance is priced at the multiplier');
+    cm.close();
+  });
+
+  it('with the provider\'s rate at 2.5, a count implying 2.3 changes nothing and leaves the rate', async () => {
+    const { cm, strategy, limit } = await bound('rate-lower', 1, 2.5);
+    const first = await compileUnder(cm, limit);
+    const count = countFor(first, 1, 2.5);
+    const rate = rateOf(count, first, 1);
+    strategy.reportRefusedAsTooLong(count, OVERHEAD);
+    const retry = await compileUnder(cm, limit);
+    const lower = countFor(retry, 1, 2.3);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(lower, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${lower} input tokens, no more than the store's price of ${Math.round(pricedOf(retry) / 1 * rate)}, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes.`,
+    });
+    const next = await compileUnder(cm, limit);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / rate, next), 'the provider\'s rate stays');
+    cm.close();
+  });
+
+  it('a count-less refusal prices the request at the calibration\'s ceiling, until a sample replaces that rate or clears it', async () => {
+    const { cm, strategy, limit } = await bound('count-less', 1, 1.8);
+    await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: true,
+      why: 'The provider refused the request as too long without stating its count, so the next compile prices the request at the calibration\'s ceiling of 1.80.',
+    });
+    const atCeiling = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(atCeiling.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, atCeiling), 'priced at 1.8');
+    const higher = countFor(atCeiling, 1, 2);
+    strategy.reportRealInputTokens(higher, OVERHEAD);
+    const replaced = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(replaced.request!.allowanceTokens, allowanceAt(limit, 1 / rateOf(higher, atCeiling, 1), replaced), 'a sample above the multiplier replaces the rate');
+    strategy.reportRealInputTokens(countFor(replaced, 1, 0.95), OVERHEAD);
+    const cleared = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(cleared.calibration!.multiplier, 1, 'premise: the multiplier stays at 1');
+    assert.equal(cleared.request!.allowanceTokens, allowanceAt(limit, 1, cleared), 'and one at or below the multiplier ends it: the allowance is priced at the multiplier');
+    cm.close();
+  });
+
+  it('a count-less refusal changes nothing where the store already prices the request at the ceiling or above', async () => {
+    const ceiling = await bound('count-less-ceiling', 1.8);
+    await compileUnder(ceiling.cm, ceiling.limit);
+    assert.deepStrictEqual(ceiling.strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: false,
+      why: 'The provider refused the request as too long without stating its count, and the store already prices it at a rate of 1.80, at or above the calibration\'s ceiling of 1.80, so it has nothing to raise.',
+    });
+    const next = await compileUnder(ceiling.cm, ceiling.limit);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(ceiling.limit, 1, next), 'priced at the multiplier still');
+    ceiling.cm.close();
+    const above = await bound('count-less-above', 1, 2.5);
+    const first = await compileUnder(above.cm, above.limit);
+    const count = countFor(first, 1, 2.5);
+    above.strategy.reportRefusedAsTooLong(count, OVERHEAD);
+    await compileUnder(above.cm, above.limit);
+    assert.deepStrictEqual(above.strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: false,
+      why: `The provider refused the request as too long without stating its count, and the store already prices it at a rate of ${rateOf(count, first, 1).toFixed(2)}, at or above the calibration's ceiling of 1.80, so it has nothing to raise.`,
+    });
+    above.cm.close();
+  });
+
+  it('takes only the compile\'s own sample: a refusal after it was reported changes nothing, and a usage report after a refusal is not taken', async () => {
+    const { cm, strategy, limit } = await bound('not-armed', 1);
+    const first = await compileUnder(cm, limit);
+    strategy.reportRealInputTokens(pricedOf(first), OVERHEAD);
+    const why = 'The store has no estimate of the refused request to learn from: its last compile was already reported, or there is none.';
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(countFor(first, 1, 2), OVERHEAD), { changed: false, why });
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(undefined, OVERHEAD), { changed: false, why }, 'a count-less one too');
+    const next = await compileUnder(cm, limit);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1, next), 'no provider\'s rate was set');
+    cm.close();
+    const base = await uncappedOn('not-armed-fresh-base', () => openManager('not-armed-fresh-base'));
+    const fresh = await openManager('not-armed-fresh');
+    const taken = await compileUnder(fresh.cm, requestTokens(base) + 200);
+    assert.equal(fresh.strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'premise: the refusal took the sample');
+    fresh.strategy.reportRealInputTokens(countFor(taken, 1, 1.5), OVERHEAD);
+    const after = (await fresh.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
+    assert.deepStrictEqual([after.calibration!.multiplier, after.calibration!.provisional], [1, true], 'the usage report after it teaches nothing');
+    fresh.cm.close();
+  });
+
+  it('a branch the strategy loads anew starts with no provider\'s rate', async () => {
+    const { cm, strategy, limit } = await bound('rate-branch', 1, 1.8);
+    await compileUnder(cm, limit);
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'premise: the refusal kept the ceiling as the rate');
+    await cm.fork('other');
+    const forked = await compileUnder(cm, limit);
+    assert.equal(forked.calibration!.multiplier, 1, 'premise: at 1');
+    const reported = forked.request!.allowanceTokens;
+    assert.ok(reported === undefined || reported === allowanceAt(limit, 1, forked),
+      `the allowance, where the limit lowers the bound, is priced at the multiplier: ${reported} against ${allowanceAt(limit, 1, forked)}`);
+    cm.close();
+  });
+
+  it('a dry compile between a compile and its refusal leaves what the refusal reads', async () => {
+    const { cm, strategy, limit } = await bound('dry-between', 1, 1.8);
+    await compileUnder(cm, limit);
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true });
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'the refusal is of a compile under the limit');
+    const next = await compileUnder(cm, limit);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, next), 'priced at the ceiling');
+    cm.close();
+  });
+
+  it('without a request limit, a stated count is an ordinary sample, no provider\'s rate is kept, and a retry is worth it only where the multiplier rose', async () => {
+    const fresh = await openManager('no-limit-fresh');
+    const a = await compileFree(fresh.cm);
+    const countA = countFor(a, 1, 1.5);
+    assert.deepStrictEqual(fresh.strategy.reportRefusedAsTooLong(countA, OVERHEAD), {
+      changed: true,
+      why: `The provider counted ${countA} input tokens, more than the store's price of ${pricedOf(a)}, so the next compile prices the request at a rate of 1.50.`,
+    });
+    fresh.cm.close();
+    const measured = await seededAt('no-limit-measured', 1.2);
+    const b = await compileFree(measured.cm);
+    const countB = countFor(b, 1.2, 1.19);
+    assert.deepStrictEqual(measured.strategy.reportRefusedAsTooLong(countB, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${countB} input tokens, no more than the store's price of ${pricedOf(b)}, so the compile's budget, with what the request sends beside the window, is above what the provider takes.`,
+    });
+    const c = await compileFree(measured.cm);
+    const countC = countFor(c, 1.2, 2.5);
+    assert.deepStrictEqual(measured.strategy.reportRefusedAsTooLong(countC, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${countC} input tokens, more than the store's price of ${pricedOf(c)}, but this sample doesn't move the multiplier, and without a request limit the store keeps no other rate, so the next compile prices the request as this one did.`,
+    });
+    const limit = requestTokens(c) - Math.floor(c.total.tokens / 4);
+    const limited = await compileUnder(measured.cm, limit);
+    assert.equal(limited.calibration!.multiplier, 1.2, 'premise: the multiplier stays');
+    assert.equal(limited.request!.allowanceTokens, allowanceAt(limit, 1, limited), 'no provider\'s rate was kept');
+    await compileFree(measured.cm);
+    assert.deepStrictEqual(measured.strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: false,
+      why: 'The provider refused the request as too long without stating its count, and without a request limit the store keeps no rate to raise for it.',
+    });
+    measured.cm.close();
   });
 });
