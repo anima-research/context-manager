@@ -16323,10 +16323,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private learnFromRefusal(stated: number | undefined, overhead: RequestOverhead): { changed: boolean; why: string } {
     const counted = stated !== undefined && Number.isFinite(stated) && stated > 0;
-    if (!this._calibrationArmed || !(this._lastCompileEstimate > 0)) {
+    if (!this._calibrationArmed) {
       return { changed: false, why: 'The store has no estimate of the refused request to learn from: its last compile was already reported, there is none, or its select doesn\'t calibrate (adaptiveResolution off).' };
     }
     const limitRoom = this._lastCompileLimitRoom;
+    if (!(this._lastCompileEstimate > 0)) {
+      const empty = 'The refused request\'s window was empty, so it was all overhead and injections, which the store can\'t fold; ' +
+        'what the request sends beside the window, with the reply\'s reserve against max_tokens, is above what the provider takes';
+      return { changed: false, why: `${empty}${limitRoom !== null ? ', and so is the request limit' : ''}.` };
+    }
     const ceiling = CALIBRATION_CEILING.toFixed(2);
     const raw = this.compileRawEstimate(overhead);
     const aboveLimit = 'so the request limit, or the reply\'s reserve against max_tokens, is above what the provider takes.';
