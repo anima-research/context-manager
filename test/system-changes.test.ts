@@ -1,9 +1,11 @@
 /**
  * System changes (membrane's `system_change` block, SystemChangeContent): a
- * message of them changes the tools and system text the model is offered from
- * its place on (src/system-changes.ts). context-manager prices one from its
- * JSON, keeps one alone in its message (a write refuses one that isn't, and
- * a read leaves it out), compiles one in place and unaltered under every
+ * message of them changes the tools and system text the model is offered, or
+ * the effort it answers with, from its place on (src/system-changes.ts).
+ * context-manager prices one from its JSON, keeps one alone in its message,
+ * and one carrying effort alone in its block and its message at one of
+ * membrane's levels (a write refuses one that isn't, and a read leaves it
+ * out), compiles one in place and unaltered under every
  * strategy (the autobiographical strategy keeps it raw as a pin keeps a
  * message, and puts the ones before a reset head in the head, ahead of the
  * head window; the passthrough strategies keep it when their window starts
@@ -42,6 +44,11 @@ let opened = 0;
 const tool = { name: 'get_weather', description: 'Weather.', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } };
 const change = (extra: Record<string, unknown> = {}): ContentBlock =>
   ({ type: 'system_change', defineTools: [tool], addSystem: ['Use metric units.'], ...extra }) as unknown as ContentBlock;
+const effort = (level: unknown): ContentBlock => ({ type: 'system_change', effort: level }) as unknown as ContentBlock;
+const SHAPES = [
+  { title: '', tools: true, of: (tools: ContentBlock, _level: string): ContentBlock => tools },
+  { title: 'an effort-only change, ', tools: false, of: (_tools: ContentBlock, level: string): ContentBlock => effort(level) },
+] as const;
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const toolUse = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'get_weather', input: { city: 'Oslo' } }) as ContentBlock;
 const toolResult = (id: string, t = 'Sunny.'): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: t }) as ContentBlock;
@@ -127,7 +134,8 @@ describe('a system change, written and priced', () => {
     assert.equal(cm.getAllMessages().length, 0);
   });
 
-  it('is refused while the nearest call before it has no result between them, by the manager before an expired hold is released and by the store, and taken after the result', async () => {
+  for (const shape of SHAPES) it(`${shape.title}is refused while the nearest call before it has no result between them, by the manager before an expired hold is released and by the store, and taken after the result`, async () => {
+    const block = shape.of(change(), 'low');
     const clock = { t: 0 };
     let released = 0;
     const strategy = new (class extends PassthroughStrategy {
@@ -137,18 +145,18 @@ describe('a system change, written and priced', () => {
     cm.addMessage('User', [text('Weather in Oslo?')], undefined, undefined, { holdCompression: { timeoutMs: 100 } });
     const call = cm.addMessage('Claude', [toolUse('t1')]);
     clock.t = 150;
-    assert.throws(() => cm.addMessage('Harness', [change()]), (e: Error) => e.message ===
+    assert.throws(() => cm.addMessage('Harness', [block]), (e: Error) => e.message ===
       `Message refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (t1) with no result between it and this change. ` +
-      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+      'Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.');
     assert.equal(released, 0, 'refused before the expired hold was released');
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[]): unknown } }).messageStore;
-    assert.throws(() => store.append('Harness', [change()]), /a system change can't go between a tool call and its result/);
+    assert.throws(() => store.append('Harness', [block]), /a system change can't go between a tool call and its result/);
     assert.equal(cm.getAllMessages().length, 2);
     cm.addMessage('User', [toolResult('t1')]);
     assert.equal(released, 1);
     // After the result, and after another change there.
-    cm.addMessage('Harness', [change()]);
-    cm.addMessage('Harness', [change({ addSystem: ['Be brief.'] })]);
+    cm.addMessage('Harness', [block]);
+    cm.addMessage('Harness', [shape.of(change({ addSystem: ['Be brief.'] }), 'high')]);
     assert.equal(cm.getAllMessages().length, 5);
   });
 
@@ -159,7 +167,7 @@ describe('a system change, written and priced', () => {
     cm.addMessage('User', [toolResult('a')]);
     assert.throws(() => cm.addMessage('Harness', [change()]), (e: Error) => e.message ===
       `Message refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (b) with no result between it and this change. ` +
-      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+      'Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.');
     cm.addMessage('User', [toolResult('b')]);
     cm.addMessage('Harness', [change()]);
     assert.equal(cm.getAllMessages().length, 5);
@@ -271,7 +279,7 @@ describe('a system change, written and priced', () => {
     const later = cm.addMessage('Harness', [change()]);
     assert.throws(() => cm.editMessage(result, [change()]), (e: Error) => e.message ===
       `Edit of ${result} refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (t1) with no result between it and this change. ` +
-      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+      'Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.');
     assert.throws(() => store.edit(result, [change()]), /a system change can't go between a tool call and its result/);
     // A call whose results, in the messages after it, run into a change first.
     assert.throws(() => cm.editMessage(reply, [toolUse('t2'), toolUse('t3')]), (e: Error) => e.message ===
@@ -336,6 +344,58 @@ describe('a system change, written and priced', () => {
     assert.deepEqual(read([{ type: 'tool_result', toolUseId: 't3', content: change() }]), [{ type: 'tool_result', toolUseId: 't3', content: [] }]);
     assert.match(lines.pop()!, /message m-1: .*content\[0\]\.content/);
   });
+
+  it('is refused carrying effort beside another change, in its block or its message, or at a level membrane has no name for, each by name, and taken alone', async () => {
+    const levels = 'not low, medium, high, xhigh or max';
+    const inBlock = 'a system change carrying effort changes nothing else';
+    const inMessage = 'a system change carrying effort goes in a message of its own';
+    for (const [content, places] of [
+      [[change({ effort: 'low' })], [`content[0] carries effort beside defineTools and addSystem; ${inBlock}`]],
+      [[change({ defineTools: undefined, addSystem: undefined, removeTools: ['get_time'], effort: 2 })], [
+        `content[0].effort is a number, ${levels}`,
+        `content[0] carries effort beside removeTools; ${inBlock}`,
+      ]],
+      [[effort('low'), change()], [`content[0] carries effort beside other blocks; ${inMessage}`]],
+      [[effort('low'), effort('high')], [`content[0] carries effort beside other blocks; ${inMessage}`, `content[1] carries effort beside other blocks; ${inMessage}`]],
+      [[effort('extreme')], [`content[0].effort is "extreme", ${levels}`]],
+      [[effort('LOW')], [`content[0].effort is "LOW", ${levels}`]],
+      [[effort(null)], [`content[0].effort is null, ${levels}`]],
+    ] as const) {
+      assert.deepEqual(malformedContentPlaces(content), places, JSON.stringify(content));
+    }
+    for (const content of [
+      [effort('low')], [effort('medium')], [effort('high')], [effort('xhigh')], [effort('max')],
+      [change({ defineTools: [], addSystem: [], removeTools: [], effort: 'low' })],
+      [change({ effort: undefined })],
+    ]) {
+      assert.deepEqual(malformedContentPlaces(content), [], JSON.stringify(content));
+    }
+    const cm = await open(new PassthroughStrategy());
+    for (const content of [[change({ effort: 'low' })], [effort('low'), change()], [effort('extreme')]]) {
+      assert.throws(() => cm.addMessage('Harness', content), MalformedContentError, JSON.stringify(content));
+    }
+    assert.equal(cm.getAllMessages().length, 0);
+    const id = cm.addMessage('Harness', [effort('low')]);
+    assert.deepEqual(cm.getMessage(id)!.content, [effort('low')]);
+    assert.throws(() => cm.editMessage(id, [effort('extreme')]), MalformedContentError);
+  });
+
+  it('carrying effort, is left out by a read where a write would refuse it, the rest kept, with one line naming where', () => {
+    const lines: string[] = [];
+    const log = { error: (line: string) => { lines.push(line); }, warn: () => {}, info: () => {}, debug: () => {} } as never;
+    const read = (content: unknown[]): unknown[] => wellFormedContent(content as never, 'message m-1', new Set(), log);
+    const alone = [effort('low')];
+    assert.equal(read(alone), alone);
+    assert.equal(lines.length, 0);
+    assert.deepEqual(read([change({ effort: 'low' })]), [], 'beside another change in its block, the whole block goes');
+    assert.match(lines.pop()!, /message m-1: .*content\[0\] carries effort beside defineTools and addSystem/);
+    assert.deepEqual(read([effort('low'), change()]), [change()], 'beside another block in its message, the effort change goes and the other stands');
+    assert.match(lines.pop()!, /content\[0\] carries effort beside other blocks/);
+    assert.deepEqual(read([effort('extreme')]), []);
+    assert.match(lines.pop()!, /content\[0\]\.effort is "extreme", not low, medium, high, xhigh or max/);
+    assert.equal(lines.length, 0);
+  });
+
 });
 
 describe('the autobiographical strategy and a system change', () => {
@@ -352,60 +412,69 @@ describe('the autobiographical strategy and a system change', () => {
     });
   };
 
-  for (const [label, overrides, headWindowTokens] of [
-    ['hierarchical', {}, 0],
-    ['adaptive', { adaptiveResolution: true }, 0],
-    ['hierarchical, the head window holding a change', {}, 300],
-    ['adaptive, the head window holding a change', { adaptiveResolution: true }, 300],
-  ] as const) {
-    it(`${label}: no fold takes it, it compiles exactly in place as stored, and no summarizer request reads it`, async () => {
-      const { requests, membrane } = recordingMembrane();
-      const strategy = new AutobiographicalStrategy({
-        compressionModel: 'm', targetChunkTokens: 200, headWindowTokens, recentWindowTokens: 0, autoTickOnNewMessage: false,
-        minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, ...overrides,
+  for (const shape of SHAPES) {
+    for (const [label, overrides, headWindowTokens] of [
+      ['hierarchical', {}, 0],
+      ['adaptive', { adaptiveResolution: true }, 0],
+      ['hierarchical, the head window holding a change', {}, 300],
+      ['adaptive, the head window holding a change', { adaptiveResolution: true }, 300],
+      ['hierarchical, positionedRecallPairs: false', { positionedRecallPairs: false }, 0],
+      ['adaptive, positionedRecallPairs: false', { adaptiveResolution: true, positionedRecallPairs: false }, 0],
+    ] as const) {
+      it(`${shape.title}${label}: no fold takes it, it compiles exactly in place as stored, and no summarizer request reads it`, async () => {
+        const { requests, membrane } = recordingMembrane();
+        const strategy = new AutobiographicalStrategy({
+          compressionModel: 'm', targetChunkTokens: 200, headWindowTokens, recentWindowTokens: 0, autoTickOnNewMessage: false,
+          minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, ...overrides,
+        });
+        const cm = await open(strategy, membrane);
+        const block = shape.of(change(), 'low');
+        const headBlock = shape.of(change({ addSystem: ['Answer briefly.'] }), 'max');
+        let changeId = '';
+        for (let i = 0; i < 160; i++) {
+          if (i === 41) changeId = cm.addMessage('Harness', [block]);
+          else if (i === 1 && headWindowTokens > 0) cm.addMessage('Harness', [headBlock]);
+          else cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
+        }
+        await settle(cm, requests);
+        assert.ok(requests.length > 5, `setup: the strategy compressed (${requests.length} calls)`);
+        const compiled = await cm.compile({ maxTokens: 4000, reserveForResponse: 0 });
+        const changes = compiled.messages.filter((m) => holdsChange(m.content));
+        assert.deepEqual(changes.map((m) => m.content), headWindowTokens > 0 ? [[headBlock], [block]] : [[block]], 'the changes are in the compile, each as stored');
+        const at = compiled.messages.indexOf(changes.at(-1)!);
+        assert.ok(compiled.messages.length < 160, 'setup: the history folded');
+        const positions = new Map(cm.getAllMessages().map((m, i) => [m.id, i] as const));
+        const position = positions.get(changeId)!;
+        if ('positionedRecallPairs' in overrides) {
+          const raw = rawIds(compiled).map((id) => positions.get(id)!);
+          assert.ok(raw.includes(position), 'it is sent raw');
+          assert.deepEqual(raw, [...raw].sort((a, b) => a - b), 'the raw messages, it among them, in stored order');
+        } else {
+          // Everything before it stands for history before it, and everything after for history after.
+          spansOf(cm, strategy, compiled).forEach((span, i) => {
+            if (!span || i === at) return;
+            if (i < at) assert.ok(span[1] < position, `compiled ${i} (${span}) comes before the change at ${position}`);
+            else assert.ok(span[0] > position, `compiled ${i} (${span}) comes after the change at ${position}`);
+          });
+        }
+        assert.ok(!JSON.stringify(requests).includes('system_change'), 'no summarizer request carries one');
+        const chunks = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks;
+        assert.ok(chunks.length > 0 && chunks.every((c) => c.messages.every((m) => m.id !== changeId)), 'no chunk holds it');
       });
-      const cm = await open(strategy, membrane);
-      const block = change();
-      const headBlock = change({ addSystem: ['Answer briefly.'] });
-      let changeId = '';
-      for (let i = 0; i < 160; i++) {
-        if (i === 41) changeId = cm.addMessage('Harness', [block]);
-        else if (i === 1 && headWindowTokens > 0) cm.addMessage('Harness', [headBlock]);
-        else cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
-      }
-      await settle(cm, requests);
-      assert.ok(requests.length > 5, `setup: the strategy compressed (${requests.length} calls)`);
-      const compiled = await cm.compile({ maxTokens: 4000, reserveForResponse: 0 });
-      const changes = compiled.messages.filter((m) => holdsChange(m.content));
-      assert.equal(changes.length, headWindowTokens > 0 ? 2 : 1, 'the changes are in the compile');
-      const at = compiled.messages.indexOf(changes.at(-1)!);
-      assert.deepEqual(compiled.messages[at]!.content, [block]);
-      assert.ok(compiled.messages.length < 160, 'setup: the history folded');
-      // Everything before it stands for history before it, and everything after for history after.
-      const spans = spansOf(cm, strategy, compiled);
-      const position = cm.getAllMessages().findIndex((m) => m.id === changeId);
-      spans.forEach((span, i) => {
-        if (!span || i === at) return;
-        if (i < at) assert.ok(span[1] < position, `compiled ${i} (${span}) comes before the change at ${position}`);
-        else assert.ok(span[0] > position, `compiled ${i} (${span}) comes after the change at ${position}`);
-      });
-      assert.ok(!JSON.stringify(requests).includes('system_change'), 'no summarizer request carries one');
-      const chunks = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks;
-      assert.ok(chunks.length > 0 && chunks.every((c) => c.messages.every((m) => m.id !== changeId)), 'no chunk holds it');
-    });
+    }
   }
 
-  for (const [label, overrides, opts] of [
+  for (const shape of SHAPES) for (const [label, overrides, opts] of [
     ['hierarchical', {}, undefined],
     ['adaptive', { adaptiveResolution: true }, undefined],
     ['kv-unified', { adaptiveResolution: true, foldingStrategy: 'kv-unified', kvUnified: KV_UNIFIED }, { kvUnifiedImmutablePrefixHash: 'v1' }],
   ] as const) {
-    it(`${label}: after a head-window reset, the changes before the head are part of it, ahead of the head window, in order, once`, async () => {
+    it(`${shape.title}${label}: after a head-window reset, the changes before the head are part of it, ahead of the head window, in order, once`, async () => {
       const strategy = new AutobiographicalStrategy({ headWindowTokens: 400, recentWindowTokens: 100, autoTickOnNewMessage: false, ...overrides } as never);
       const cm = await open(strategy);
-      const define = change();
-      const remove = change({ defineTools: undefined, addSystem: undefined, removeTools: ['get_weather'] });
-      const inHead = change({ defineTools: undefined, addSystem: ['Answer briefly.'] });
+      const define = shape.of(change(), 'low');
+      const remove = shape.of(change({ defineTools: undefined, addSystem: undefined, removeTools: ['get_weather'] }), 'high');
+      const inHead = shape.of(change({ defineTools: undefined, addSystem: ['Answer briefly.'] }), 'medium');
       const ids: string[] = [];
       for (let i = 0; i < 30; i++) {
         if (i === 5) ids.push(cm.addMessage('Harness', [define]));
@@ -422,7 +491,9 @@ describe('the autobiographical strategy and a system change', () => {
       assert.ok(where(21) === where(20) + 1 && where(0) > where(20), 'setup: the head runs from message 20, and the history before it comes after it');
       assert.deepEqual([where(5), where(12), where(20), where(21), where(22)], [0, 1, 2, 3, 4], 'the changes lead, in their order, then the head window, a change inside it in its place');
       assert.equal(order.filter((id) => id === ids[5] || id === ids[12] || id === ids[22]).length, 3, 'each once');
-      assert.deepEqual(toolsAfter(compiled), [], 'the removal applies after the definition it removes');
+      assert.deepEqual(changesSent(compiled), [5, 12, 22].map((i) => cm.getMessage(ids[i]!)!.content), 'each as stored');
+      if (shape.tools) assert.deepEqual(toolsAfter(compiled), [], 'the removal applies after the definition it removes');
+      else assert.deepEqual(changesSent(compiled), [[define], [remove], [inHead]], 'each level as written');
       // The head costs what it sends: the changes before it and the window, each once.
       const head = order.slice(0, where(0));
       const headTokens = head.reduce((n, id) => n + estimateOf(cm, id), 0);
@@ -438,20 +509,23 @@ describe('the autobiographical strategy and a system change', () => {
     });
   }
 
-  for (const [label, overrides, opts] of [
+  for (const shape of SHAPES) for (const [label, overrides, opts] of [
     ['hierarchical', {}, undefined],
     ['adaptive', { adaptiveResolution: true }, undefined],
     ['kv-unified', { adaptiveResolution: true, foldingStrategy: 'kv-unified', kvUnified: KV_UNIFIED }, { kvUnifiedImmutablePrefixHash: 'v1' }],
   ] as const) {
-    it(`${label}: with the head window disabled, a reset sends the history before it once, in order, a change in it in its place`, async () => {
+    it(`${shape.title}${label}: with the head window disabled, a reset sends the history before it once, in order, a change in it in its place`, async () => {
       const strategy = new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100, autoTickOnNewMessage: false, ...overrides } as never);
       const cm = await open(strategy);
+      const block = shape.of(change(), 'low');
       const ids: string[] = [];
-      for (let i = 0; i < 30; i++) ids.push(i === 15 ? cm.addMessage('Harness', [change()]) : cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(10)}`)]));
+      for (let i = 0; i < 30; i++) ids.push(i === 15 ? cm.addMessage('Harness', [block]) : cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(10)}`)]));
       // A reset before the recent window starts, and one inside it.
       for (const at of [20, 27]) {
         strategy.resetHeadWindow(ids[at]!);
-        assert.deepEqual(rawIds(await cm.compile(BIG, undefined, opts as never)), ids, `reset at ${at}`);
+        const compiled = await cm.compile(BIG, undefined, opts as never);
+        assert.deepEqual(rawIds(compiled), ids, `reset at ${at}`);
+        assert.deepEqual(changesSent(compiled), [[block]], `reset at ${at}: as stored`);
       }
     });
   }
@@ -476,13 +550,13 @@ describe('the autobiographical strategy and a system change', () => {
     });
   });
 
-  it('a transition summary reads no change: a head message of changes alone adds no entry to its request', async () => {
+  for (const shape of SHAPES) it(`${shape.title}a transition summary reads no change: a head message of changes alone adds no entry to its request`, async () => {
     const { requests, membrane } = recordingMembrane();
     const cm = await open(new AutobiographicalStrategy({
       compressionModel: 'm', headWindowTokens: 100_000, recentWindowTokens: 100_000, autoTickOnNewMessage: false,
     }), membrane);
     cm.addMessage('User', [text('first')]);
-    cm.addMessage('Harness', [change()]);
+    cm.addMessage('Harness', [shape.of(change(), 'low')]);
     cm.addMessage('Claude', [text('second')]);
     await cm.resetHeadWindow();
     assert.equal(requests.length, 1);
@@ -491,11 +565,11 @@ describe('the autobiographical strategy and a system change', () => {
     assert.ok(!sent.includes('Harness'), 'no entry for the message of changes');
   });
 
-  it('the coverage check names an unrendered change before the head\'s start as the head\'s only while the head window holds messages', async () => {
+  for (const shape of SHAPES) it(`${shape.title}the coverage check names an unrendered change before the head's start as the head's only while the head window holds messages`, async () => {
     const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false });
     const cm = await open(strategy);
     const ids: string[] = [];
-    for (let i = 0; i < 10; i++) ids.push(i === 3 ? cm.addMessage('Harness', [change()]) : cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i}`)]));
+    for (let i = 0; i < 10; i++) ids.push(i === 3 ? cm.addMessage('Harness', [shape.of(change(), 'low')]) : cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i}`)]));
     const messages = cm.getAllMessages() as StoredMessage[];
     // Every message but the change, as a compile that lost it would hand the check.
     const entries = messages.filter((m) => m.id !== ids[3]).map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'raw' as const, participant: m.participant, content: m.content }));
@@ -514,8 +588,9 @@ describe('the autobiographical strategy and a system change', () => {
     assert.match(label(5, 0), /before-head-start-not-rendered=1/);
   });
 
-  it('KnowledgeStrategy: no chunk holds or spans a change, and a chunk closes there', async () => {
+  for (const shape of SHAPES) it(`${shape.title}KnowledgeStrategy: no chunk holds or spans a change, and a chunk closes there; it compiles exactly in place as stored, and no summarizer request reads it`, async () => {
     const { requests, membrane } = recordingMembrane();
+    const block = shape.of(change(), 'xhigh');
     const strategy = new KnowledgeStrategy({
       compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0, autoTickOnNewMessage: false,
       minChunkCharsForLLM: 0, summaryParticipant: 'Claude', mergeThreshold: 6,
@@ -523,12 +598,21 @@ describe('the autobiographical strategy and a system change', () => {
     const cm = await open(strategy, membrane);
     let changeId = '';
     for (let i = 0; i < 80; i++) {
-      if (i === 21) changeId = cm.addMessage('Harness', [change()]);
+      if (i === 21) changeId = cm.addMessage('Harness', [block]);
       else cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
     }
     await settle(cm, requests);
-    await cm.compile({ maxTokens: 4000, reserveForResponse: 0 });
+    const compiled = await cm.compile({ maxTokens: 4000, reserveForResponse: 0 });
     const position = new Map(cm.getAllMessages().map((m, i) => [m.id, i] as const));
+    assert.ok(compiled.messages.length < 80, 'setup: the history folded');
+    assert.deepEqual(changesSent(compiled), [[block]], 'the change is in the compile, as stored');
+    const at = compiled.messages.findIndex((m) => holdsChange(m.content));
+    spansOf(cm, strategy, compiled).forEach((span, i) => {
+      if (!span || i === at) return;
+      if (i < at) assert.ok(span[1] < 21, `compiled ${i} (${span}) comes before the change at 21`);
+      else assert.ok(span[0] > 21, `compiled ${i} (${span}) comes after the change at 21`);
+    });
+    assert.ok(!JSON.stringify(requests).includes('system_change'), 'no summarizer request carries one');
     const chunks = (strategy as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks;
     assert.ok(chunks.some((c) => c.messages.some((m) => position.get(m.id)! < 21)), 'setup: chunks before the change');
     assert.ok(chunks.every((c) => c.messages.every((m) => m.id !== changeId)), 'no chunk holds it');
@@ -715,10 +799,10 @@ describe('the autobiographical strategy and a system change', () => {
     }), 'a chunk runs across the pin');
   });
 
-  it('stays raw under a level pin over it, where pin bounds are read', async () => {
+  for (const shape of SHAPES) it(`${shape.title}stays raw under a level pin over it, where pin bounds are read`, async () => {
     const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, foldingStrategy: 'kv-stable', autoTickOnNewMessage: false } as never);
     const cm = await open(strategy);
-    const ids = [cm.addMessage('User', [text('a')]), cm.addMessage('Harness', [change()]), cm.addMessage('User', [text('b')])];
+    const ids = [cm.addMessage('User', [text('a')]), cm.addMessage('Harness', [shape.of(change(), 'low')]), cm.addMessage('User', [text('b')])];
     cm.pinRange(ids[0]!, ids[2]!, { name: 'level-1', level: 1 });
     const bounds = (strategy as unknown as { resolvedPinBounds(m: StoredMessage[]): Map<number, unknown> }).resolvedPinBounds(cm.getAllMessages());
     assert.deepEqual([bounds.get(0), bounds.get(1), bounds.get(2)], [{ level: 1 }, 'raw', { level: 1 }]);
@@ -751,20 +835,20 @@ describe('the passthrough strategies and a system change before their window', (
    * `first`, a change A, M-00..M-15, a change B, M-16..M-19: B sits among the
    * newest five messages, and the budget fits both changes and those five.
    */
-  async function seeded(strategy: ContextStrategy): Promise<{ cm: ContextManager; ids: Map<string, string>; T: number; A: number; B: number }> {
+  async function seeded(strategy: ContextStrategy, shape: (typeof SHAPES)[number]): Promise<{ cm: ContextManager; ids: Map<string, string>; T: number; A: number; B: number }> {
     const cm = await open(strategy);
     const ids = new Map<string, string>();
     ids.set('first', cm.addMessage('User', [text('first ' + 'word '.repeat(50))]));
-    ids.set('A', cm.addMessage('Harness', [change()]));
+    ids.set('A', cm.addMessage('Harness', [shape.of(change(), 'low')]));
     for (let i = 0; i < 20; i++) {
-      if (i === 16) ids.set('B', cm.addMessage('Harness', [change({ addSystem: ['Use metric units, always.'] })]));
+      if (i === 16) ids.set('B', cm.addMessage('Harness', [shape.of(change({ addSystem: ['Use metric units, always.'] }), 'high')]));
       const label = `M-${String(i).padStart(2, '0')}`;
       ids.set(label, cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`${label} ${'word '.repeat(30)}`)]));
     }
     const T = estimateOf(cm, ids.get('M-00')!);
     const A = estimateOf(cm, ids.get('A')!);
     const B = estimateOf(cm, ids.get('B')!);
-    assert.ok(B > T / 2, `setup: a change counted twice would cost a message (B ${B}, T ${T})`);
+    if (shape.tools) assert.ok(B > T / 2, `setup: a change counted twice would cost a message (B ${B}, T ${T})`);
     return { cm, ids, T, A, B };
   }
   const expected = ['A', 'M-15', 'B', 'M-16', 'M-17', 'M-18', 'M-19'];
@@ -773,8 +857,8 @@ describe('the passthrough strategies and a system change before their window', (
     return rawIds(compiled).map((id) => label.get(id)!);
   };
 
-  it('passthrough: when the oldest no longer fit, the changes are sent ahead of the rest, counted once, within the budget', async () => {
-    const { cm, ids, T, A, B } = await seeded(new PassthroughStrategy());
+  for (const shape of SHAPES) it(`${shape.title}passthrough: when the oldest no longer fit, the changes are sent ahead of the rest, counted once, within the budget`, async () => {
+    const { cm, ids, T, A, B } = await seeded(new PassthroughStrategy(), shape);
     const budget = A + B + 5 * T + Math.floor(T / 2);
     const compiled = await cm.compile({ maxTokens: budget, reserveForResponse: 0 });
     assert.deepEqual(labelsOf(ids, compiled), expected);
@@ -782,9 +866,9 @@ describe('the passthrough strategies and a system change before their window', (
     assert.deepEqual(changesSent(compiled), [cm.getMessage(ids.get('A')!)!.content, cm.getMessage(ids.get('B')!)!.content], 'each as stored');
   });
 
-  it('windowed-passthrough: a re-anchor past a change keeps it ahead of the window, sizes the window as that fraction of the room the changes leave, and no compile exceeds the budget', async () => {
+  for (const shape of SHAPES) it(`${shape.title}windowed-passthrough: a re-anchor past a change keeps it ahead of the window, sizes the window as that fraction of the room the changes leave, and no compile exceeds the budget`, async () => {
     const strategy = new WindowedPassthroughStrategy({ reAnchorFraction: 0.5 });
-    const { cm, ids, T, A, B } = await seeded(strategy);
+    const { cm, ids, T, A, B } = await seeded(strategy, shape);
     const budget = 2 * (A + B + 5 * T) + T;
     const compiled = await cm.compile({ maxTokens: budget, reserveForResponse: 0 });
     assert.ok(strategy.getAnchor() > cm.getMessage(ids.get('A')!)!.sequence, 'setup: the anchor moved past the change');
@@ -823,9 +907,9 @@ describe('the passthrough strategies and a system change before their window', (
     assert.deepEqual(rawIds(compiled), [big, user, last]);
   });
 
-  it('every strategy refuses with OverBudgetError, rather than drop one, when the changes alone exceed the budget, and names nothing that would clear it', async () => {
-    const huge = change({ addSystem: ['Rule. '.repeat(400)] });
-    const budget: TokenBudget = { maxTokens: 300, reserveForResponse: 0 };
+  for (const shape of SHAPES) it(`${shape.title}every strategy refuses with OverBudgetError, rather than drop one, when the changes alone exceed the budget, and names nothing that would clear it`, async () => {
+    const block = shape.of(change({ addSystem: ['Rule. '.repeat(400)] }), 'low');
+    const budget: TokenBudget = { maxTokens: shape.tools ? 300 : jsonTokenEstimator(JSON.stringify(block)) - 1, reserveForResponse: 0 };
     for (const [label, strategy] of [
       ['passthrough', new PassthroughStrategy()],
       ['windowed-passthrough', new WindowedPassthroughStrategy()],
@@ -834,7 +918,7 @@ describe('the passthrough strategies and a system change before their window', (
     ] as const) {
       const cm = await open(strategy);
       cm.addMessage('User', [text('hello')]);
-      cm.addMessage('Harness', [huge]);
+      cm.addMessage('Harness', [block]);
       cm.addMessage('User', [text('again')]);
       await assert.rejects(cm.compile(budget), (err: unknown) => {
         assert.ok(err instanceof OverBudgetError, `${label}: ${String(err)}`);
@@ -853,7 +937,7 @@ describe('the passthrough strategies and a system change before their window', (
       ['windowed-passthrough', () => new WindowedPassthroughStrategy(), /^Windowed passthrough: its system changes alone/],
     ] as const) {
       const alone = await open(make());
-      const id = alone.addMessage('Harness', [huge]);
+      const id = alone.addMessage('Harness', [block]);
       await assert.rejects(alone.compile(budget), (err: unknown) => {
         assert.ok(err instanceof OverBudgetError, `${label}: ${String(err)}`);
         assert.match(err.message, stage, label);
@@ -864,7 +948,7 @@ describe('the passthrough strategies and a system change before their window', (
     // A preview reports rather than refuses: passthrough sends the change alone.
     const cm = await open(new PassthroughStrategy());
     cm.addMessage('User', [text('hello')]);
-    const id = cm.addMessage('Harness', [huge]);
+    const id = cm.addMessage('Harness', [block]);
     assert.deepEqual(rawIds(await cm.compile(budget, undefined, { dryRun: true })), [id]);
   });
 
