@@ -638,6 +638,19 @@ describe('raw forms: the recall envelope', () => {
     assert.deepEqual(refs.map((r) => r.id + (r.partial ? '~' : '')), ['L1-a~', 'L1-b~'], 'A was cut, and B shows its thinking');
   });
 
+  it("the combined answer drops a carrier past the cap, so the read-back doesn't pair a dropped block with it", () => {
+    class Exposed extends AutobiographicalStrategy {
+      render(entries: SummaryEntry[], cap: number) { return this.renderCombinedRecallAnswer(entries, cap); }
+    }
+    // A's text is cut at a cap of 200 characters, the separator after it becomes the marker, and B's
+    // text and its carrier are past the cap.
+    const a = { ...summary, id: 'L1-a', responseContent: [itemText('x'.repeat(400), { ...MESSAGE_ITEM, id: 'msg_a' })] };
+    const b = { ...summary, id: 'L1-b', responseContent: [itemText('second answer', { ...MESSAGE_ITEM, id: 'msg_b' }), opaqueCarrier()] };
+    const { content, refs } = new Exposed({}).render([a, b], 50);
+    assert.deepEqual(refs.map((r) => r.id + (r.partial ? '~' : '')), ['L1-a~'], 'B shows nothing, so it is not named');
+    assert.ok(!content.some((x) => rawOf(x).rawItem !== undefined && (rawOf(x).rawItem as { type?: string }).type === 'compaction'), 'the carrier is left out');
+  });
+
   it('a single recall answer whose cap left out only a blank part is listed whole', () => {
     class Exposed extends AutobiographicalStrategy {
       render(entry: SummaryEntry, cap: number) { return this.renderSummaryAnswer(entry, cap); }

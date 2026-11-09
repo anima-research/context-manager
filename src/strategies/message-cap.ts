@@ -5,7 +5,7 @@
  * reads them back, can't drift apart. Each strategy passes its own estimate.
  */
 import type { ContentBlock } from '@animalabs/membrane';
-import { isEmptyTextBlock, releaseVanishedRawForms } from '../raw-forms.js';
+import { isEmptyTextBlock, isOpaqueCarrier, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageStoreView, StoredMessage } from '../types/index.js';
 
 /** A text block that holds nothing, the one rule the cap and the raw-form
@@ -94,6 +94,10 @@ function safeSlice(str: string, start: number, end: number): string {
  *   every tool use): cut with the same suffix, or past the cap given its own
  *   omission notice in place of its content. An empty one stays as it is,
  *   since it loses nothing.
+ * - With `keepCarriers`, a zero-width carrier (`isOpaqueCarrier`) is kept
+ *   wherever it sits, past the cap too, since it has no text to cut. A raw
+ *   message is cut so. The combined recall answer isn't, since it reads this
+ *   output back on the rule above.
  * - Every other block passes through.
  *
  * Returns `content` itself when every block survives unchanged, as when the
@@ -113,6 +117,7 @@ export function capContent(
   content: ContentBlock[],
   maxTokens: number,
   estimate: (content: ContentBlock[]) => number,
+  keepCarriers = false,
 ): ContentBlock[] {
   if (!(maxTokens > 0)) return content;
   if (estimate(content) <= maxTokens) return content;
@@ -124,6 +129,10 @@ export function capContent(
 
   for (const block of content) {
     if (block.type === 'text') {
+      if (keepCarriers && isOpaqueCarrier(block)) {
+        result.push(block);
+        continue;
+      }
       if (isEmptyTextBlock(block)) {
         const text = (block as { text?: unknown }).text;
         const length = typeof text === 'string' ? text.length : 0;

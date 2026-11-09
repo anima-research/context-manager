@@ -75,6 +75,20 @@ describe('capContent', () => {
     assert.equal(control.length, 1, 'an empty text block alone past the cap is left out, and nothing marks it');
   });
 
+  it("keeps an opaque carrier past the cap when asked to, as a raw message is cut, and gives up a cut part's Responses item", () => {
+    const item = { type: 'message', id: 'msg_1', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'a'.repeat(2000) }] };
+    const carrier = opaqueCarrier();
+    const out = capContent([{ type: 'text', text: 'a'.repeat(2000), rawItem: item } as ContentBlock, carrier], 100, textEstimate, true);
+    assert.equal(out.length, 2, 'the cut part and the carrier, with no marker');
+    assert.match(textOf(out[0])!, /\[truncated — original was 500 tokens\]$/);
+    assert.equal((out[0] as { rawItem?: unknown }).rawItem, undefined, 'the cut part sends its text, not its item');
+    assert.equal(out[1], carrier, 'the carrier keeps its item');
+    const after = capContent([text('a'.repeat(2000)), carrier, text('dropped')], 100, textEstimate, true);
+    assert.equal(after.length, 3);
+    assert.equal(after[1], carrier);
+    assert.equal(textOf(after[2]), CAP_OMISSION_TEXT, 'a text block after the carrier is still dropped, and marked where it was');
+  });
+
   it('leaves out blocks that hold nothing past the cap, with no marker, and keeps the rest as they were', () => {
     const thinking = { type: 'thinking', thinking: 'y'.repeat(2000) } as ContentBlock;
     const kept = text('a'.repeat(400));

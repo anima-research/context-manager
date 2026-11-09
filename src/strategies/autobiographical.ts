@@ -22249,14 +22249,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries alike go through it, so an override changes both, and the
    * price of a raw message follows what the override sends. A compile cuts
    * each message more than once, to price it and to send it, so an override
-   * must answer the same arguments with the same content.
+   * must answer the same arguments with the same content. A raw message is
+   * cut with `keepCarriers` (see `capContent`), a summary's answer without.
    */
   protected truncateContent(
     content: ContentBlock[],
     maxTokens: number,
     estimate?: (content: ContentBlock[]) => number,
+    keepCarriers = false,
   ): ContentBlock[] {
-    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)));
+    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)), keepCarriers);
   }
 
   /**
@@ -22297,7 +22299,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // override's rewrite passed on to this class's cut.
     const sent = this.prunedForSend(store, msg);
     const content = this.truncateContent(sent.content, msgCap, (blocks) =>
-      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage), true);
     return { content, extra: cappedPriceExtra(store, sent, content) };
   }
 
