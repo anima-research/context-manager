@@ -41,8 +41,8 @@ export interface MessageStoreView {
    * ContextManager presents (presentedMessageView) as the view under it
    * does. The autobiographical strategy's chain-break guard asks it to tell
    * a removal or a filter from a broken chain; a view without it stops
-   * compression of new conversation wherever most chunk records name no
-   * message in the view.
+   * compression of new conversation wherever the store holds three or more
+   * chunk records and most name no message in the view.
    */
   onBranch?(id: MessageId): boolean;
   /**

@@ -287,7 +287,8 @@ function chunkRecordsFailClosedLine(emptied: number, total: number): string {
   return `[autobiographical] FAIL-CLOSED: ${emptied}/${total} chunk records name no message in the view, and ` +
     `the oldest or newest of them names a message that isn't on this branch's messages chain: a chain ` +
     `broken under chronicle before 0.5.0, or a store rebuilt under new ids. Chunk compression halted to ` +
-    `prevent duplicate memory formation. Before resuming, read the emptied records' messages by id ` +
+    `prevent duplicate memory formation. Before resuming, check the store was opened with every message ` +
+    `slot it was written with (auxiliaryMessageViews), then read the emptied records' messages by id ` +
     `(a broken chain leaves them readable; a store rebuilt elsewhere leaves nothing to read) and compare ` +
     `their content with the messages on this branch's chain; branch the chronicle before any removal or ` +
     `re-key. If that history isn't on this chain again, remove only the emptied chunk records and keep ` +
@@ -2343,16 +2344,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _salience: { listing: readonly StoredMessage[]; values: Float64Array } | null = null;
   protected chunkIdCounter = 0;
   /**
-   * Fail-closed latch: set when most persisted records resolve to zero live
-   * messages and the oldest or newest of those names a message off this
-   * branch's messages chain (the messages-chain-break signature), or the
-   * view can't say. While set, no chunk, waiting or new, is sent to be
-   * summarized — duplicate memories are strictly worse than delayed
-   * compression. Merges combine summaries that already exist, so they go
-   * on: merges already queued still run and can queue the next level; only
-   * the open's merge check and the one after a drop wait, and once the
-   * latch clears, the next tick that can send a chunk runs them first
-   * (_mergeCheckOwed).
+   * Fail-closed latch: set when most persisted records resolve to zero
+   * live messages and the oldest or newest of those names a message off
+   * this branch's messages chain (the messages-chain-break signature), or
+   * the view can't say. While set, no chunk, waiting or new, is sent to be
+   * summarized: the rebuild that sets it empties the queue, and demand
+   * (enqueueL1ForRange) queues nothing. Duplicate memories are strictly
+   * worse than delayed compression. Merges combine summaries that already
+   * exist, so they go on: merges already queued still run and can queue
+   * the next level; only the open's merge check and the one after a drop
+   * wait, and once the latch clears, the next tick that can send a chunk
+   * runs them first (_mergeCheckOwed).
    */
   protected chunkRecordsOrphaned = false;
   /** Whether the latch has cleared since it last held, so the merge checks it held back are owed to the next tick that can send a chunk. */
@@ -8039,6 +8041,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     opts?: { speculative?: boolean },
   ): void {
     this.requireBranchMutation('enqueueL1ForRange');
+    // While the chain-break guard holds, the queue stays as the rebuild that
+    // set it left it, empty: demand sends no chunk to be summarized.
+    if (this.chunkRecordsOrphaned) return;
     const messageIdToChunk = new Map<MessageId, Chunk>();
     for (const ch of this.chunks) {
       for (const m of ch.messages) messageIdToChunk.set(m.id, ch);
@@ -8840,15 +8845,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // which blocks the very merges that would bring the count back down.
     const hasMerges = this.config.hierarchical === true && this.mergeQueue.length > 0;
     const hasCompression = this.compressionQueue.length > 0;
-    if (!hasCompression && !hasMerges) return;
+    // The merge checks the chain-break guard held back are work too: the
+    // tick runs them before anything else, and they can queue a merge.
+    const hasOwedChecks = this._mergeCheckOwed && !this.chunkRecordsOrphaned;
+    if (!hasCompression && !hasMerges && !hasOwedChecks) return;
     // Only bail when the *sole* available work is L1 compression that the
-    // preflight currently forbids. Merge work always proceeds. Here no merge
-    // is queued, or `hierarchical` is off, and the cap holds nothing either
-    // way (speculativeCapHolds), so it can't be what stops the drain. With a
-    // merge queued and `hierarchical` on, tick's L1 step comes first and takes
-    // a chunk unless the queue is empty or the cap holds, and the merge runs
-    // otherwise.
-    if (!hasMerges && !this.shouldCompressPreflight()) return;
+    // preflight currently forbids. Merge work, and the owed merge checks,
+    // always proceed. Here no merge is queued, or `hierarchical` is off, and
+    // the cap holds nothing either way (speculativeCapHolds), so it can't be
+    // what stops the drain. With a merge queued and `hierarchical` on, tick's
+    // L1 step comes first and takes a chunk unless the queue is empty or the
+    // cap holds, and the merge runs otherwise.
+    if (!hasMerges && !hasOwedChecks && !this.shouldCompressPreflight()) return;
 
     const progressBefore = this._drainProgress;
     const drainIdentity = this.loadedBranchIdentity;
@@ -8983,10 +8991,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.activeCompressionPause(ctx)) return;
 
     // The merge checks the chain-break guard held back, before any chunk goes, as at open.
+    // They stay owed until both have run, so a check that throws is tried
+    // again at the next tick.
     if (this._mergeCheckOwed && !this.chunkRecordsOrphaned) {
-      this._mergeCheckOwed = false;
       this.sweepPaidOffMergeQuarantine();
       this.checkMergeThreshold();
+      this._mergeCheckOwed = false;
     }
 
     // Priority 1: Compress raw chunks → L1. Skipped while the speculative cap

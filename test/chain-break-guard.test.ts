@@ -33,16 +33,16 @@ const membrane = {
   }),
 } as any;
 
-const strategy = () =>
-  new AutobiographicalStrategy({
-    compressionModel: 'test-compression-model',
-    targetChunkTokens: 100,
-    summaryTargetTokens: 20,
-    headWindowTokens: 0,
-    recentWindowTokens: 300,
-    l1HoldbackChunks: 0,
-    autoTickOnNewMessage: false,
-  });
+const config = {
+  compressionModel: 'test-compression-model',
+  targetChunkTokens: 100,
+  summaryTargetTokens: 20,
+  headWindowTokens: 0,
+  recentWindowTokens: 300,
+  l1HoldbackChunks: 0,
+  autoTickOnNewMessage: false,
+};
+const strategy = () => new AutobiographicalStrategy(config);
 
 const t = (s: string): ContentBlock => ({ type: 'text', text: s });
 let n = 0;
@@ -375,7 +375,7 @@ class MergeQueueing extends AutobiographicalStrategy {
 describe('merges while the chain-break guard holds', () => {
   before(() => cleanup());
   after(() => cleanup());
-  const queueing = (mergeThreshold: number) => new MergeQueueing({
+  const queueing = (mergeThreshold: number, extra: Record<string, unknown> = {}) => new MergeQueueing({
     compressionModel: 'test-compression-model',
     targetChunkTokens: 100,
     summaryTargetTokens: 20,
@@ -384,6 +384,7 @@ describe('merges while the chain-break guard holds', () => {
     l1HoldbackChunks: 0,
     autoTickOnNewMessage: false,
     mergeThreshold,
+    ...extra,
   });
 
   it('merges queued before the guard tripped, and persisted, run at tick, and the one that lands last queues the next level', async () => {
@@ -422,7 +423,7 @@ describe('merges while the chain-break guard holds', () => {
   // A store whose guard held at open, its chain read failing, with the merge
   // check the open skipped owed: six L1s, the two whose messages remain a run
   // at this threshold. `added` messages arrive once the read succeeds.
-  const clearedAfterOpen = async (t: { after(fn: () => void): void }, added: number) => {
+  const clearedAfterOpen = async (t: { after(fn: () => void): void }, added: number, extra: Record<string, unknown> = {}) => {
     const path = freshPath();
     {
       const s = queueing(99);
@@ -441,7 +442,7 @@ describe('merges while the chain-break guard holds', () => {
       return onBranch.call(this, id);
     });
     t.after(() => failing.mock.restore());
-    const s = queueing(2);
+    const s = queueing(2, extra);
     const cm = await ContextManager.open({ path, strategy: s, membrane });
     assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds at open, its read failing');
     assert.deepStrictEqual(s.queuedLevels(), [], 'setup: the open queued no merge');
@@ -462,13 +463,174 @@ describe('merges while the chain-break guard holds', () => {
     await cm.close();
   });
 
+  const owedOf = (s: AutobiographicalStrategy) => () => (s as unknown as { _mergeCheckOwed: boolean })._mergeCheckOwed;
+  const merging = (cm: ContextManager, s: MergeQueueing) => s.queuedLevels().includes(2) || cm.getSummariesInRange({ level: 2 }).length > 0;
+  type Hooked = Record<string, (...args: unknown[]) => unknown>;
+  const proto = AutobiographicalStrategy.prototype as unknown as Hooked;
+
   it('a tick that sends a chunk runs the owed merge checks before it', async (t) => {
-    const { cm, s } = await clearedAfterOpen(t, 30);
+    // The quarantine alarm off, so only the owed checks sweep in this tick.
+    const { cm, s } = await clearedAfterOpen(t, 30, { quarantineAlarmIntervalMs: 0 });
     assert.ok(records(cm).length > 6, 'setup: chunks closed, so the tick sends one');
-    const owed = () => (s as unknown as { _mergeCheckOwed: boolean })._mergeCheckOwed;
+    const owed = owedOf(s);
     assert.strictEqual(owed(), true, 'setup: the checks are owed');
+    const order: string[] = [];
+    const sweep = proto.sweepPaidOffMergeQuarantine!;
+    const check = proto.checkMergeThreshold!;
+    const complete = membrane.complete;
+    const sweeping = mock.method(s as unknown as Hooked, 'sweepPaidOffMergeQuarantine', function (this: unknown, ...args: unknown[]) {
+      order.push('sweep');
+      return sweep.apply(this, args);
+    });
+    const checking = mock.method(s as unknown as Hooked, 'checkMergeThreshold', function (this: unknown, ...args: unknown[]) {
+      order.push('check');
+      return check.apply(this, args);
+    });
+    const sending = mock.method(membrane as Hooked, 'complete', async (...args: unknown[]) => {
+      order.push('send');
+      return complete(...args);
+    });
+    t.after(() => { sweeping.mock.restore(); checking.mock.restore(); sending.mock.restore(); });
     await cm.tick();
     assert.strictEqual(owed(), false, 'the first tick ran them');
+    const sent = order.indexOf('send');
+    assert.ok(sent >= 0, `the tick sent a chunk (${order.join(' ')})`);
+    assert.ok(order.indexOf('sweep') >= 0 && order.indexOf('sweep') < sent, `the sweep ran before the chunk went (${order.join(' ')})`);
+    assert.ok(order.indexOf('check') >= 0 && order.indexOf('check') < sent, `the merge check ran before the chunk went (${order.join(' ')})`);
+    await cm.close();
+  });
+
+  it('owed merge checks that throw stay owed, and the next tick runs them', async (t) => {
+    const { cm, s } = await clearedAfterOpen(t, 1, { quarantineAlarmIntervalMs: 0 });
+    const owed = owedOf(s);
+    assert.strictEqual(owed(), true, 'setup: the checks are owed');
+    const sweep = proto.sweepPaidOffMergeQuarantine!;
+    let fail = true;
+    const sweeping = mock.method(s as unknown as Hooked, 'sweepPaidOffMergeQuarantine', function (this: unknown, ...args: unknown[]) {
+      if (fail) { fail = false; throw new Error('a write of the merge quarantine failed (test)'); }
+      return sweep.apply(this, args);
+    });
+    t.after(() => sweeping.mock.restore());
+    await assert.rejects(cm.tick(), /a write of the merge quarantine failed \(test\)/);
+    assert.strictEqual(owed(), true, 'the checks are still owed after the tick that threw');
+    await cm.tick();
+    assert.strictEqual(owed(), false, 'the next tick ran them');
+    assert.ok(merging(cm, s), `a level-2 merge is queued or ran (queued ${JSON.stringify(s.queuedLevels())})`);
+    await cm.close();
+  });
+
+  it('with autoTickOnNewMessage, the background drain runs the owed merge checks with no chunk queued', async (t) => {
+    // The message that clears the guard stays in the recent window, so no chunk is queued.
+    const { cm, s } = await clearedAfterOpen(t, 1, { autoTickOnNewMessage: true });
+    for (let i = 0; i < 200 && !merging(cm, s); i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(merging(cm, s), `a level-2 merge is queued or ran with no tick called (queued ${JSON.stringify(s.queuedLevels())})`);
+    assert.strictEqual(owedOf(s)(), false, 'the checks ran');
+    const pending = () => (s as unknown as { pendingCompression: unknown }).pendingCompression;
+    for (let i = 0; i < 200 && pending(); i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    await cm.close();
+  });
+});
+
+class Demanding extends AutobiographicalStrategy {
+  demand(first: string, last: string): void {
+    this.enqueueL1ForRange(first, last);
+  }
+  /** A chunk whose L1 hasn't landed, by its first and last message. */
+  waitingChunk(): { first: string; last: string } | undefined {
+    const chunk = this.chunks.find((c) => !c.compressed && c.messages.length > 0);
+    return chunk && { first: chunk.messages[0]!.id, last: chunk.messages.at(-1)!.id };
+  }
+  queued(): number {
+    return this.compressionQueue.length;
+  }
+}
+
+describe('chunks while the chain-break guard holds', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  it('a chunk demanded while the guard holds isn\'t queued or sent, and the manager stays ready', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const path = freshPath();
+    {
+      const cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+      await growTo(cm, 4);
+      add(cm, 30);
+      assert.ok(records(cm).some((r) => !(r as { compressed?: boolean }).compressed), 'setup: chunk records whose L1 hasn\'t landed');
+      // Records naming no message in the store, after the real ones: off the chain, so the guard holds at the next open.
+      const store = cm.getStore();
+      for (let c = 0; c < 20; c++) {
+        store.appendToStateJson(CHUNKS, { id: `ghost-w-${c}`, sourceIds: [`ghost-w-${c}`], compressed: true, summaryId: `L1-ghost-w-${c}` });
+      }
+      cm.sync();
+      await cm.close();
+    }
+    let sent = 0;
+    const counting = { complete: async (...args: unknown[]) => { sent++; return membrane.complete(...args); } };
+    const s = new Demanding(config);
+    const cm = await ContextManager.open({ path, strategy: s, membrane: counting as never });
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds');
+    const waiting = s.waitingChunk();
+    assert.ok(waiting, 'setup: a chunk whose L1 hasn\'t landed, its messages in view');
+    assert.strictEqual(s.queued(), 0, 'setup: the open queued no chunk');
+    s.demand(waiting.first, waiting.last);
+    assert.strictEqual(s.queued(), 0, 'the demand queues no chunk');
+    assert.strictEqual(cm.isReady(), true, 'the manager stays ready');
+    for (let i = 0; i < 5; i++) await cm.tick();
+    assert.strictEqual(sent, 0, 'no chunk is sent');
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'the guard still holds');
+    await cm.close();
+  });
+
+  it('a chunk already sent when the guard trips isn\'t called back: its attempt runs to its end, a later rung of its ladder included', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const path = freshPath();
+    {
+      const cm = await ContextManager.open({ path, strategy: strategy(), membrane });
+      // Five L1s, below the merge threshold, so no summary above them.
+      await growTo(cm, 5);
+      add(cm, 12);
+      assert.ok(records(cm).some((r) => !(r as { compressed?: boolean }).compressed), 'setup: a chunk record whose L1 hasn\'t landed');
+      await cm.close();
+    }
+    // The first call waits, then is rejected as too long, which the ladder
+    // answers with its source-only rung; every later call answers.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const tooLong = Object.assign(new Error('the request is too long (test)'), { type: 'context_length', retryable: false });
+    const ladder = {
+      complete: async (...args: unknown[]) => {
+        calls++;
+        if (calls === 1) { await gate; throw tooLong; }
+        return membrane.complete(...args);
+      },
+    };
+    const s = new AutobiographicalStrategy({ ...config, compressionSourceOnlyFallback: true });
+    const cm = await ContextManager.open({ path, strategy: s, membrane: ladder as never });
+    assert.notStrictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard doesn\'t hold at open');
+    const ticking = cm.tick();
+    for (let i = 0; i < 200 && calls === 0; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.strictEqual(calls, 1, 'setup: the first call is out');
+    const work = (s as unknown as { pendingCompressionWork: { chunk?: { messages: Array<{ id: string }> } } | null }).pendingCompressionWork;
+    const inFlight = work?.chunk?.messages.map((m) => m.id) ?? [];
+    assert.ok(inFlight.length > 0, 'setup: a chunk is in flight');
+    // Trip the guard while the call waits: removals empty most records, and the chain says their messages are off it.
+    const offChain = mock.method(MessageStore.prototype, 'onBranch', () => false);
+    t.after(() => offChain.mock.restore());
+    const compressed = records(cm).filter((r) => (r as { compressed?: boolean }).compressed);
+    for (const id of compressed.flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    // A removal tells the strategy nothing until a host presents; the next message's rebuild asks.
+    add(cm, 1);
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', `setup: the guard holds while the call waits (${compressed.length} of ${records(cm).length} records emptied)`);
+    release();
+    await ticking;
+    assert.strictEqual(calls, 2, 'the attempt sent its ladder\'s next rung');
+    const covered = l1Sources(cm);
+    assert.ok(inFlight.every((id) => covered.has(id)), 'the chunk in flight landed as an L1');
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'the guard still holds');
     await cm.close();
   });
 });
@@ -628,12 +790,13 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
     assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
     const line = failClosed[0]!;
     assert.match(line, /4\/4 chunk records name no message in the view, and the oldest or newest of them names a message that isn't on this branch's messages chain/);
-    assert.match(line, /Before resuming, read the emptied records' messages by id/);
+    assert.match(line, /Before resuming, check the store was opened with every message slot it was written with \(auxiliaryMessageViews\), then read the emptied records' messages by id/);
     assert.match(line, /branch the chronicle before any removal or re-key/);
     assert.match(line, /If that history isn't on this chain again, remove only the emptied chunk records and keep their summaries\./);
     assert.match(line, /If it is, under new ids, restore the chain the records were written against, or re-key/);
     assert.match(line, /If it's unclear, or the messages can't be read, change nothing: the store stays halted, which discards nothing\. ns=default$/);
     assert.ok(line.indexOf('compare') < line.indexOf('remove only'), 'the comparison comes before any removal');
+    assert.ok(line.indexOf('every message slot') < line.indexOf('compare'), 'the slots are checked before anything is compared');
     await cm.close();
   });
 
