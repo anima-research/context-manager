@@ -1,13 +1,3 @@
-/**
- * Ingestion-time chunking and provider items.
- *
- * A message whose content carries a provider item (a block with an object
- * `rawItem`, as membrane's Responses parser gives it) is stored whole, as one
- * row with its content as given, however long it is. A long message without
- * one is still split into shards, and a message under the threshold is
- * stored whole either way.
- */
-
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
@@ -69,9 +59,10 @@ describe('AutobiographicalStrategy — ingestion keeps provider items', () => {
   });
 
   it('a long message with a reasoning item and its follower is stored whole, the pairing in its order', async () => {
+    const text = prose(40_000);
     const content = [
       { type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque' } },
-      { type: 'text', text: prose(40_000), rawItem: { type: 'message', id: 'msg_1', role: 'assistant', phase: 'final_answer', content: [] } },
+      { type: 'text', text, rawItem: { type: 'message', id: 'msg_1', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text }] } },
     ] as ContentBlock[];
     const rows = await stored(content);
     assert.equal(rows.length, 1, `stored as ${rows.length} rows`);

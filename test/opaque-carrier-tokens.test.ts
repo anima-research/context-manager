@@ -148,6 +148,7 @@ describe('zero-width carriers in a stored message', () => {
     const strategy = new Compressing({ targetChunkTokens: 5_000, recentWindowTokens: 50_000, compressionModel: 'mock' });
     const ctx = { messageStore: messages } as never;
     const answer: ContentBlock = { type: 'text', text: 'word '.repeat(200) };
+    assert.ok(strategy.sent([answer], ctx) > 0 && strategy.prepared([answer], ctx) > 0, 'premise: the answer itself has a price');
     for (const item of [COMPACTION, SEARCH_RESULT, HOSTED_CALL]) {
       assert.strictEqual(strategy.sent([carrier(item), answer], ctx), strategy.sent([answer], ctx), `sentTokensOf, ${String(item.type)}`);
       assert.strictEqual(strategy.prepared([carrier(item), answer], ctx), strategy.prepared([answer], ctx), `preparedTokensOf, ${String(item.type)}`);

@@ -38,6 +38,8 @@ describe('compression input and zero-width carriers', () => {
       const text: ContentBlock = { type: 'text', text: `${i === 1 ? 'the carrier turn ' : ''}${filler(30)}` };
       cm.addMessage(i % 2 === 0 ? 'User' : 'Claude', i === 1 ? [COMPACTION, SEARCH, text] : [text]);
     }
+    const stored = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && b.text.includes('the carrier turn')));
+    assert.strictEqual(stored?.content.filter((b) => (b as { rawItem?: unknown }).rawItem !== undefined).length, 2, 'premise: both carriers are stored');
     await cm.compile();
     await cm.tick();
 

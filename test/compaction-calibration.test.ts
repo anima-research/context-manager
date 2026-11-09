@@ -14,6 +14,7 @@ type Internals = {
   _calibration: number;
   _calibrationProvisional: unknown;
   _lastCompileEstimate: number;
+  _calibrationArmed: boolean;
   calibrationStateId: string;
   store: { setStateJson(id: string, value: unknown): void } | null;
 };
@@ -61,6 +62,7 @@ describe('calibration and compaction items', () => {
     const { cm, strategy, internals, carrierAt } = await openManager('compaction', COMPACTION);
     const first = await calibrationLines(async () => {
       await cm.compile(BUDGET);
+      assert.ok(internals._calibrationArmed, 'premise: the compile armed a sample');
       strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     });
     assert.strictEqual(internals._calibration, 1, 'a sample from a compile holding a compaction item is not learned');
@@ -69,6 +71,7 @@ describe('calibration and compaction items', () => {
 
     const second = await calibrationLines(async () => {
       await cm.compile(BUDGET);
+      assert.ok(internals._calibrationArmed, 'premise: the compile armed a sample');
       strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     });
     assert.strictEqual(internals._calibration, 1);
@@ -77,6 +80,7 @@ describe('calibration and compaction items', () => {
     cm.editMessage(carrierAt, [{ type: 'text', text: `turn 3 ${'lorem ipsum '.repeat(120)}` }]);
     const third = await calibrationLines(async () => {
       await cm.compile(BUDGET);
+      assert.ok(internals._calibrationArmed, 'premise: the compile armed a sample');
       strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     });
     assert.ok(Math.abs(internals._calibration - 1.2) < 1e-9, `learned once the compile holds none: got ${internals._calibration}`);
@@ -84,6 +88,7 @@ describe('calibration and compaction items', () => {
 
     const fourth = await calibrationLines(async () => {
       await cm.compile(BUDGET);
+      assert.ok(internals._calibrationArmed, 'premise: the compile armed a sample');
       strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2);
     });
     assert.deepStrictEqual(fourth.filter((l) => /compaction item/.test(l)), [], `no line about compaction once it learns again: ${JSON.stringify(fourth)}`);
@@ -119,7 +124,8 @@ describe('calibration and compaction items', () => {
     const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
     const strategy = new AutobiographicalStrategy({ targetChunkTokens: 5_000, recentWindowTokens: 50_000, compressionModel: 'mock', adaptiveResolution: true });
     const cm = await ContextManager.open({ path: join(dir, 'learned'), strategy, membrane });
-    await cm.compile(BUDGET);
+    const live = await cm.compile(BUDGET);
+    assert.ok(holds(live.messages, 'web_search_call'), 'premise: the reopened store holds the hosted call');
     const internals = strategy as unknown as Internals;
     assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1.3, null]);
     cm.close();
