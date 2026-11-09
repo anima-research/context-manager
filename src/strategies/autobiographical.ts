@@ -8845,17 +8845,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // which blocks the very merges that would bring the count back down.
     const hasMerges = this.config.hierarchical === true && this.mergeQueue.length > 0;
     const hasCompression = this.compressionQueue.length > 0;
-    // The merge checks the chain-break guard held back are work too: the
-    // tick runs them before anything else, and they can queue a merge.
-    const hasOwedChecks = this._mergeCheckOwed && !this.chunkRecordsOrphaned;
+    // The merge checks the chain-break guard held back are work too while no
+    // chunk is queued: the tick runs them before anything else, and they can
+    // queue a merge. With chunks queued, the preflight decides as before, and
+    // the next tick that can send a chunk runs them first.
+    const hasOwedChecks = !hasCompression && this._mergeCheckOwed && !this.chunkRecordsOrphaned;
     if (!hasCompression && !hasMerges && !hasOwedChecks) return;
     // Only bail when the *sole* available work is L1 compression that the
-    // preflight currently forbids. Merge work, and the owed merge checks,
-    // always proceed. Here no merge is queued, or `hierarchical` is off, and
-    // the cap holds nothing either way (speculativeCapHolds), so it can't be
-    // what stops the drain. With a merge queued and `hierarchical` on, tick's
-    // L1 step comes first and takes a chunk unless the queue is empty or the
-    // cap holds, and the merge runs otherwise.
+    // preflight currently forbids. Merge work always proceeds, and so do the
+    // owed merge checks with no chunk queued. Here no merge is queued, or
+    // `hierarchical` is off, and the cap holds nothing either way
+    // (speculativeCapHolds), so it can't be what stops the drain. With a
+    // merge queued and `hierarchical` on, tick's L1 step comes first and
+    // takes a chunk unless the queue is empty or the cap holds, and the
+    // merge runs otherwise.
     if (!hasMerges && !hasOwedChecks && !this.shouldCompressPreflight()) return;
 
     const progressBefore = this._drainProgress;

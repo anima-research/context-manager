@@ -529,6 +529,55 @@ describe('merges while the chain-break guard holds', () => {
     for (let i = 0; i < 200 && pending(); i++) await new Promise((resolve) => setTimeout(resolve, 0));
     await cm.close();
   });
+
+  it('with chunks queued when the guard clears and a preflight that forbids compression, the background drain sends nothing and the checks stay owed', async (t) => {
+    class NoPreflight extends MergeQueueing {
+      protected override shouldCompressPreflight(): boolean { return false; }
+    }
+    const path = freshPath();
+    {
+      const cm = await ContextManager.open({ path, strategy: queueing(99), membrane });
+      await growTo(cm, 6);
+      for (const id of records(cm).slice(0, 4).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+      await cm.close();
+    }
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const onBranch = MessageStore.prototype.onBranch;
+    let fail = true;
+    const failing = mock.method(MessageStore.prototype, 'onBranch', function (this: MessageStore, id: string) {
+      if (fail) throw new Error('a read of the messages state failed (test)');
+      return onBranch.call(this, id);
+    });
+    t.after(() => failing.mock.restore());
+    const s = new NoPreflight({
+      compressionModel: 'test-compression-model', targetChunkTokens: 100, summaryTargetTokens: 20,
+      headWindowTokens: 0, recentWindowTokens: 300, l1HoldbackChunks: 0,
+      autoTickOnNewMessage: true, mergeThreshold: 2, quarantineAlarmIntervalMs: 0,
+    });
+    const cm = await ContextManager.open({ path, strategy: s, membrane });
+    const flush = async () => { for (let i = 0; i < 300; i++) await new Promise((resolve) => setTimeout(resolve, 0)); };
+    const queue = () => (s as unknown as { compressionQueue: unknown[] }).compressionQueue.length;
+    add(cm, 30);
+    await flush();
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds while the read fails');
+    let sends = 0;
+    const complete = membrane.complete;
+    const sending = mock.method(membrane as Record<string, (...a: unknown[]) => unknown>, 'complete', async (...args: unknown[]) => { sends++; return complete(...args); });
+    t.after(() => sending.mock.restore());
+    fail = false;
+    add(cm, 1);
+    const queued = queue();
+    assert.strictEqual(s.getCompressionDebt().failure, undefined, 'setup: the guard cleared');
+    assert.ok(queued > 0, 'setup: chunks are queued');
+    assert.strictEqual(owedOf(s)(), true, 'setup: the checks are owed');
+    assert.deepStrictEqual(s.queuedLevels(), [], 'setup: no merge is queued');
+    await flush();
+    assert.strictEqual(sends, 0, 'the drain sends nothing against the preflight');
+    assert.strictEqual(queue(), queued, 'the queued chunks stay queued');
+    assert.strictEqual(owedOf(s)(), true, 'the checks stay owed for the next tick that can send a chunk');
+    await cm.close();
+  });
 });
 
 class Demanding extends AutobiographicalStrategy {
