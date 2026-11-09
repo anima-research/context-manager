@@ -869,10 +869,12 @@ export interface SelectOptions {
    * the refusal's stated count implies, where that is above both the
    * multiplier and the rate it priced the refused request at, or, where the
    * refusal stated no count, the calibration's ceiling, where it priced the
-   * request below that; in neither case a rate at which what the request
-   * sends beside the window leaves it no room. Each usage sample after that
-   * which declares its overhead replaces the rate with its own, and ends it
-   * where its own is no higher than the multiplier and the calibration's
+   * request below that. Where that rate, or the multiplier the refusal's
+   * count would set, would leave the window no room beside what the request
+   * sends, the strategy learns nothing from the refusal. Each usage sample
+   * after that which declares its overhead replaces the rate with its own
+   * where that is above the multiplier and leaves the window room, and ends
+   * it where its own is no higher than the multiplier and the calibration's
    * band doesn't reject it. The store rounds each block's price at the
    * multiplier by up to half a token, so at a true rate up to the one it
    * priced at, the request can pass the

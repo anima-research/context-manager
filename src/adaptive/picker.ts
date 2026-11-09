@@ -277,6 +277,9 @@ export class OverBudgetError extends Error {
      *  sites pass their own so a planner/emitter drift refusal doesn't
      *  masquerade as picker exhaustion (it cost a debugging session once). */
     stage?: string;
+    /** What the request is priced at under a request limit, named last in
+     *  the message's list, before any pins and the remedy that ends it. */
+    pricedAt?: string;
   }) {
     const countLabels = {
       'picker-chunks': 'middle picker chunks',
@@ -312,6 +315,7 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         (opts.diagnostics.requestLimitTokens === undefined ? '' : `, request limit=${opts.diagnostics.requestLimitTokens}`) +
         (opts.diagnostics.requestAllowanceTokens === undefined ? '' : `, request allowance=${opts.diagnostics.requestAllowanceTokens}`) +
+        (opts.pricedAt === undefined ? '' : `, priced at ${opts.pricedAt}`) +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across
