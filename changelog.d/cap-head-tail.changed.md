@@ -26,7 +26,9 @@
     `{ "_truncated": true, "_originalTokens": N, "_keys": [...] }`. New: it
     gains `"_whole": "[truncated — this call's input, M chars, is elided;
     the whole is stored message ID, call TOOL_USE_ID]"`, with the hint's
-    clause before the `]`. The input's text is still not kept.
+    clause before the `]`. The input's text is still not kept. An input
+    over the cap whose stub would be no shorter than it now goes whole,
+    where `main` sent the stub.
   - `maxMessageTokens`' doc. Old: "Messages exceeding this limit have their
     text/tool_result content truncated." New: "A message exceeding this
     limit keeps the head and the tail of its text and string tool results,
@@ -43,7 +45,10 @@
   Text blocks that hold nothing are still left out at no loss: where
   leaving them out brings a message under the cap, it comes back without
   them and nothing else is cut, as `main` left them out past the cap. A cap
-  smaller than the marker sends the marker alone, over the cap. A text
+  smaller than the marker sends the marker alone, over the cap, except
+  that the cut is never longer than the whole: where the marker alone
+  estimates at least as much as the text it would stand for, the message
+  goes whole. A text
   block that holds nothing, or an opaque carrier, at the end is now kept in
   the tail, where past the cap it was left out. A strategy's
   `truncateContent` override gains a `whole` argument naming the stored
@@ -71,7 +76,8 @@
   messages it can't send. The coverage check counts only the summaries the
   answer lists, so a summary left out of it, by a strategy's own
   `renderCombinedRecallAnswer` or because its head and tail hold nothing (a
-  cap smaller than the marker leaves every cut summary so), refuses the
+  cap smaller than the marker leaves every summary longer than its marker
+  so), refuses the
   compile with `UncoveredDropError` unless the compile sends its messages
   some other way. The compile's layout, and so the fold journal, names each
   summary the answer holds, whole or partial by its own cut.

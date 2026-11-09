@@ -5,7 +5,6 @@ import { registerStateIfAbsent } from '../state-registration.js';
 import { describeThrown } from '../describe-thrown.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
-  CapReadHint,
   ContextStrategy,
   ImageCeilings,
   ResettableStrategy,
@@ -98,7 +97,7 @@ import { withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { CAP_OMISSION_TEXT, capContent, capMeasuredTextOf, cappedPriceExtra, cappedWhole, cutInputText, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import { CAP_OMISSION_TEXT, capContent, capMeasuredTextOf, cappedPriceExtra, cappedWhole, cutInputText, guardedHint, isCapMarker, isEmptyTextBlock, type CapClause } from './message-cap.js';
 import type { CapWhole } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
@@ -728,30 +727,35 @@ function sameMarkers(a: ReadonlyMap<number, string> | undefined, b: ReadonlyMap<
   return true;
 }
 
+/** Whether `block`'s serialized input is over `cap` tokens
+ *  (`toolUseInputMaxTokens`), at four characters a token. */
+function inputOverCap(block: Extract<ContentBlock, { type: 'tool_use' }>, cap: number): boolean {
+  return Math.ceil(JSON.stringify(block.input).length / 4) > cap;
+}
+
 /** `block` with its input truncated, when its serialized input is over
  *  `cap` tokens (`toolUseInputMaxTokens`), at four characters a token: the
  *  input becomes `{ _truncated, _originalTokens, _keys, _whole }`, `_keys`
  *  holding its first five keys and `_whole` saying where the whole is stored
  *  (`cutInputText`), with the host's clause for reading it. Null when the
- *  input fits. */
+ *  input fits, or when that stub would be no shorter than the input, which
+ *  then goes whole. */
 function truncatedToolUse(
   block: Extract<ContentBlock, { type: 'tool_use' }>,
   cap: number,
   messageId: string,
-  hint: CapReadHint | undefined,
+  hint: CapClause | undefined,
 ): ContentBlock | null {
+  if (!inputOverCap(block, cap)) return null;
   const serialized = JSON.stringify(block.input);
-  const inputTokens = Math.ceil(serialized.length / 4);
-  if (inputTokens <= cap) return null;
-  return {
-    ...block,
-    input: {
-      _truncated: true,
-      _originalTokens: inputTokens,
-      _keys: Object.keys(block.input).slice(0, 5),
-      _whole: cutInputText(serialized.length, messageId, block.id, hint),
-    },
+  const input = {
+    _truncated: true,
+    _originalTokens: Math.ceil(serialized.length / 4),
+    _keys: Object.keys(block.input).slice(0, 5),
+    _whole: cutInputText(serialized.length, messageId, block.id, hint),
   };
+  if (JSON.stringify(input).length >= serialized.length) return null;
+  return { ...block, input };
 }
 
 /** Standard compression instruction for chat/general chunks. */
@@ -2379,6 +2383,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected ns: string = '';
   /** stderr lines about this strategy's work, each naming its namespace (#239). */
   protected readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
+  /** `capReadHint`'s clause for a marker, or none where it throws, which is said once. */
+  protected readonly capClause: CapClause = guardedHint(() => this.config.capReadHint, (line, thrown) => this.diag.warn(line, thrown));
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
@@ -16799,7 +16805,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (!(pruning.inputCap > 0)) return false;
-      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap, m.id, undefined) !== null));
+      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && inputOverCap(b, pruning.inputCap)));
     },
     // 5: generated images, which estimated as 0 before (an unknown block) and
     // are now priced as an image, wherever MessageStore prices them.
@@ -21811,7 +21817,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let next: ContentBlock = block;
       if (block.type === 'tool_use' && pruning.inputCap > 0) {
         inputs = true;
-        next = truncatedToolUse(block, pruning.inputCap, msg.id, this.config.capReadHint) ?? block;
+        next = truncatedToolUse(block, pruning.inputCap, msg.id, this.capClause) ?? block;
       } else if (block.type === 'tool_result') {
         const marker = results?.get(i);
         if (marker !== undefined) next = { ...block, content: marker };
@@ -22259,7 +22265,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContentBlock[] {
     return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)), {
       ...(whole ? { whole } : {}),
-      ...(this.config.capReadHint ? { hint: this.config.capReadHint } : {}),
+      hint: this.capClause,
     });
   }
 

@@ -15,4 +15,6 @@
   and the first elided offset (`offsetChars`), or with the call's id
   (`toolUseId`) for a cut tool input. It must be pure, since every compile
   writes it into the request again. Without it a marker names the stored
-  message or summary by id alone.
+  message or summary by id alone, and so does a marker it throws for: a
+  hint that throws fails no compile, and the strategy logs its first
+  throw.

@@ -25,9 +25,40 @@ export interface CapWhole {
   id: string;
 }
 
+/** The clause a marker ends with: the host's `capReadHint`'s, or none. */
+export type CapClause = (at: Parameters<CapReadHint>[0]) => string | undefined;
+
 export interface CapOptions {
   whole?: CapWhole;
-  hint?: CapReadHint;
+  hint?: CapClause;
+}
+
+/** What a strategy says, once, when the host's `capReadHint` throws. */
+export const CAP_HINT_THREW =
+  '[cap] capReadHint threw, so a marker it threw for names the stored message or summary by id alone (said once)';
+
+/**
+ * The host's `capReadHint`, read at each call through `hint`, as a clause
+ * that is none where there's no hint or where it throws: the marker then
+ * names the whole by id alone, as with no hint, so a host's bug in its hint
+ * fails no compile. `warn` hears the first throw, and one that throws
+ * itself is ignored.
+ */
+export function guardedHint(hint: () => CapReadHint | undefined, warn: (line: string, thrown: unknown) => void): CapClause {
+  let said = false;
+  return (at) => {
+    const read = hint();
+    if (!read) return undefined;
+    try {
+      return read(at);
+    } catch (thrown) {
+      if (!said) {
+        said = true;
+        try { warn(CAP_HINT_THREW, thrown); } catch {}
+      }
+      return undefined;
+    }
+  };
 }
 
 /** The marker blocks capContent wrote, so a reader of its output can tell
@@ -83,14 +114,16 @@ const TAIL_RESULT_TEXT = "[truncated — this result's start is in the chars the
 function markerText(head: number, tailStart: number, total: number, opts: CapOptions): string {
   const { whole, hint } = opts;
   const where = whole ? `; the whole is stored ${whole.kind} ${whole.id}` : '';
-  const read = whole && hint ? `; ${hint({ id: whole.id, offsetChars: head })}` : '';
+  const clause = whole && hint ? hint({ id: whole.id, offsetChars: head }) : undefined;
+  const read = clause === undefined ? '' : `; ${clause}`;
   return `[truncated — chars ${head} to ${tailStart} of ${total} elided here${where}${read}]`;
 }
 
 /** The stub's `_whole` for a call's input the input cap leaves out: how long
  *  it is, where its whole is stored, and the host's clause for reading it. */
-export function cutInputText(chars: number, messageId: string, toolUseId: string, hint?: CapReadHint): string {
-  const read = hint ? `; ${hint({ id: messageId, toolUseId })}` : '';
+export function cutInputText(chars: number, messageId: string, toolUseId: string, hint?: CapClause): string {
+  const clause = hint ? hint({ id: messageId, toolUseId }) : undefined;
+  const read = clause === undefined ? '' : `; ${clause}`;
   return `[truncated — this call's input, ${chars} chars, is elided; the whole is stored message ${messageId}, call ${toolUseId}${read}]`;
 }
 
@@ -184,10 +217,12 @@ function cutAt(content: readonly ContentBlock[], headEnd: number, tailStart: num
  *   marker, estimated alone, fit `maxTokens`: the head 60% of what it keeps
  *   and the tail 40%, each end moved to a line break within half its share,
  *   neither inside a surrogate pair. A cap the marker alone passes keeps
- *   neither.
+ *   neither, and where that marker estimates at least as much as the
+ *   measured blocks it stands for, the content comes back whole: the cut is
+ *   never longer than the whole.
  * - The marker says which characters of the measured text it elided, and,
- *   with `opts.whole`, where the whole is stored, then the host's
- *   `opts.hint` clause: `[truncated — chars H to T of M elided here; the
+ *   with `opts.whole`, where the whole is stored, then the clause
+ *   `opts.hint` gives, if any (`guardedHint`): `[truncated — chars H to T of M elided here; the
  *   whole is stored message ID; …]`. It stands where the middle starts: a
  *   block of its own where that's in a text block, told apart by identity
  *   (`isCapMarker`), and in a string tool result's own content where that's
@@ -237,7 +272,9 @@ export function capContent(
       else high = middle;
     }
   }
-  return releaseVanishedRawForms(content, cut(low).blocks);
+  const blocks = cut(low).blocks;
+  if (estimate(blocks.filter((block) => measuredText(block) !== null)) >= estimate(measured)) return content;
+  return releaseVanishedRawForms(content, blocks);
 }
 
 /**

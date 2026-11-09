@@ -24,7 +24,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { capContent, capMeasuredTextOf, cappedPriceExtra } from './message-cap.js';
+import { capContent, capMeasuredTextOf, cappedPriceExtra, guardedHint, type CapClause } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
   DEFAULT_IMAGE_BYTE_CEILING,
@@ -279,6 +279,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /** Its namespace, set in initialize(), which its stderr lines name (#239). */
   private ns = '';
   private readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
+  /** `capReadHint`'s clause for a marker, or none where it throws, which is said once. */
+  private readonly capClause: CapClause = guardedHint(() => this.capReadHint, (line, thrown) => this.diag.warn(line, thrown));
   /** The branch (name + generation) the in-memory state was loaded from. */
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
@@ -850,7 +852,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     if (cap <= 0) return msg.content;
     return capContent(msg.content, cap, estimateTextOnlyTokens, {
       whole: { kind: 'message', id: msg.id },
-      ...(this.capReadHint ? { hint: this.capReadHint } : {}),
+      hint: this.capClause,
     });
   }
 

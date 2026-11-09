@@ -241,7 +241,9 @@ export interface ReadinessState {
  * follows the cap's marker after `; `: for a message or summary from its
  * first elided character (`offsetChars`), for a call's input by the call's
  * id (`toolUseId`). It must be pure, the same arguments giving the same
- * text, since every compile writes it into the request again.
+ * text, since every compile writes it into the request again. One that
+ * throws fails no compile: that marker names the stored message or summary
+ * by id alone, as with no hint, and the strategy says the first throw.
  */
 export type CapReadHint = (at: { id: string; offsetChars?: number; toolUseId?: string }) => string;
 
