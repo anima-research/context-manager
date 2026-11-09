@@ -305,8 +305,7 @@ describe('Chunk persistence: close-then-compress', () => {
       const store = manager.getStore();
       const ids: string[] = [];
       for (let i = 0; i < 16; i++) {
-        const m = manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
-        ids.push((m as any).id ?? String(i));
+        ids.push(manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]));
       }
       const mk = (id: string, src: string[], extra: Record<string, unknown> = {}) => ({
         id,
@@ -344,8 +343,10 @@ describe('Chunk persistence: close-then-compress', () => {
     assert.ok(!bySummary.has('L1-1'), 'stale prefix generation L1-1 gets NO record');
     // Covered ground must not be re-compressed; only the uncovered tail
     // (ids[14..15], 2 messages — under min chunk length) may ever compress,
-    // and it cannot close here, so: zero calls.
-    assert.strictEqual(calls.length, 0, 'migration must not trigger recompression');
+    // and it cannot close here, so: zero compression requests.
+    const compressions = calls.filter((c) => c.messages.some((m) =>
+      m.content.some((b) => ((b as { text?: string }).text ?? '').includes('You will soon form a new memory'))));
+    assert.strictEqual(compressions.length, 0, 'migration must not trigger recompression');
     await manager.close();
   });
 });

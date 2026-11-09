@@ -1170,8 +1170,9 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 
 /**
  * A summary, projected to the flat shape a "browse my history" table-of-contents
- * wants: a resolved wall-clock span (`startMs`/`endMs`, derived from the first
- * and last source message's `timestamp`) instead of `SummaryEntry`'s message-ID
+ * wants: a resolved wall-clock span (`startMs`/`endMs`, derived from the
+ * `timestamp` of the first and last of its messages still in the view, in the
+ * record) instead of `SummaryEntry`'s message-ID
  * `sourceRange`. Produced by `listSummariesInRange`; not persisted anywhere —
  * this is a read-time view, not a new storage shape.
  */
@@ -1182,13 +1183,14 @@ export interface TimeRangeSummaryEntry {
   content: string;
   tokens: number;
   /**
-   * The `timestamp`, in epoch ms, of the first message the summary covers
-   * in the record (by sequence): `sourceRange.first`'s, until a host
-   * presents rows out of record order, after which a chunk is in the
-   * window's order and its first row needn't be its earliest.
+   * The `timestamp`, in epoch ms, of the first of the summary's messages
+   * still in the view, in the record (by sequence): `sourceRange.first`'s
+   * while it is in the view, until a host presents rows out of record
+   * order, after which a chunk is in the window's order and its first row
+   * needn't be its earliest.
    */
   startMs: number;
-  /** Likewise the last message's: `sourceRange.last`'s until then. */
+  /** Likewise the last such message's: `sourceRange.last`'s until then. */
   endMs: number;
   /**
    * Exact identity/order boundaries of the covered span, ALONGSIDE the
@@ -1199,8 +1201,7 @@ export interface TimeRangeSummaryEntry {
    * timestamp (wall-clock ms resolution, rapid-fire appends), but
    * `sequence` (chronicle's per-record sequence number) is strictly
    * monotonic and never ties. The `StoredMessage.id`/`.sequence` of the
-   * messages `startMs` and `endMs` are read from: `sourceRange.first`/
-   * `.last`'s until a host presents rows out of record order.
+   * messages `startMs` and `endMs` are read from.
    */
   firstMessageId: string;
   lastMessageId: string;
@@ -2260,7 +2261,11 @@ export interface AutobiographicalConfig {
    * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
    * defaults to `'report'`: those stores are known to carry gaps.
    * Independent of this policy, a merge that WOULD mint a crossed node is
-   * never executed: it is refused into the merge quarantine.
+   * never executed: it is refused into the merge quarantine, unless one of
+   * its sources had messages and has none left in the view: then it is
+   * dropped, with a warning naming what the check found, and its other
+   * sources are offered again, except where two or more others remain and the
+   * check finds a problem among them, which is refused as before.
    */
   topologyPolicy?: 'reject' | 'report';
   /**

@@ -720,7 +720,11 @@ describe('a retraction through another instance sharing the store', () => {
       const alerts = lines.filter((line) => line.includes('"compression:quarantine-alert"'));
       assert.equal(A.getCompressionQuarantineStatus().count, 0, `no quarantine record was written for the obsolete span: ${lines.join('\n')}`);
       assert.deepEqual(alerts, [], 'no alert was sent');
-      assert.ok(lines.some((line) => line.includes('quarantines nothing') && line.includes(recordId)), lines.join('\n'));
+      // The row is out of the window before the ladder's next call, so the
+      // discard before that call (#321) is what stops the ladder.
+      assert.ok(lines.some((line) => line.includes(`message ${row}, which its request carries, left the store or the view`)), lines.join('\n'));
+      assert.ok(!stored(store, CHUNKS).find((r) => r.id === recordId)?.sourceIds.includes(row), 'the record the other instance gave the row up from still lacks it');
+      assert.ok(!internals(A).chunkRecords.some((r) => r.sourceIds.includes(row)), 'the instance took up the store');
     } finally {
       gate.release();
       b?.close();

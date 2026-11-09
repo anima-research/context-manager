@@ -71,6 +71,24 @@ export function splitMixedToolMessages<T extends { participant: string; content:
   return out;
 }
 
+export function pairedToolBlocks(messages: ReadonlyArray<{ content: ContentBlock[] }>): (block: ContentBlock) => boolean {
+  const useIds = new Set<string>();
+  const resultIds = new Set<string>();
+  for (const msg of messages) {
+    for (const block of msg.content) {
+      if (block.type === 'tool_use') useIds.add((block as { id: string }).id);
+      else if (block.type === 'tool_result') {
+        resultIds.add((block as { toolUseId: string }).toolUseId);
+      }
+    }
+  }
+  return (block) => {
+    if (block.type === 'tool_use') return resultIds.has((block as { id: string }).id);
+    if (block.type === 'tool_result') return useIds.has((block as { toolUseId: string }).toolUseId);
+    return true;
+  };
+}
+
 /**
  * Strip `tool_use` blocks whose IDs have no matching `tool_result` anywhere
  * in the message list, and `tool_result` blocks whose IDs have no matching
@@ -100,26 +118,9 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
-  const useIds = new Set<string>();
-  const resultIds = new Set<string>();
-  for (const msg of messages) {
-    for (const block of msg.content) {
-      if (block.type === 'tool_use') useIds.add((block as { id: string }).id);
-      else if (block.type === 'tool_result') {
-        resultIds.add((block as { toolUseId: string }).toolUseId);
-      }
-    }
-  }
+  const keeps = pairedToolBlocks(messages);
   return messages.map((msg) => {
-    const trimmed = msg.content.filter((block) => {
-      if (block.type === 'tool_use') {
-        return resultIds.has((block as { id: string }).id);
-      }
-      if (block.type === 'tool_result') {
-        return useIds.has((block as { toolUseId: string }).toolUseId);
-      }
-      return true;
-    });
+    const trimmed = msg.content.filter(keeps);
     if (trimmed.length === msg.content.length) {
       return { participant: msg.participant, content: msg.content };
     }

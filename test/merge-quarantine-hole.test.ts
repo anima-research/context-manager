@@ -349,9 +349,9 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     await ticks(manager, 1);
     assert.deepEqual(strategy.quarantinedGroups(), [group], 'premise: the group is quarantined');
     assert.equal(strategy.heldIds().size, 3, 'premise: the record holds its sources');
-    // Deleting the first message a source covers leaves it with no position.
+    // Deleting every message a source covers leaves it with no position.
     const middle = strategy.all.find((s) => s.id === group[1])!;
-    manager.removeMessage(middle.sourceRange.first);
+    for (const id of middle.sourceIds) manager.removeMessage(id);
     await compile(manager);
     const after = strategy.all.find((s) => s.id === group[1]);
     assert.ok(after && !parented(after), 'premise: the source is still present and unparented');

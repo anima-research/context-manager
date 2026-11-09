@@ -1304,7 +1304,13 @@ describe('the autobiographical strategy lets go of rows that leave the window', 
       const status = strategy.getCompressionQuarantineStatus();
       if (leaves) {
         assert.equal(status.count, 0, `${label}: no quarantine record was written for the chunk the row left: ${lines.join('\n')}`);
-        assert.ok(lines.some((line) => line.includes('a row of its span left the window mid-request')), lines.join('\n'));
+        // With empty answers the ladder's next call is its plain-prose retry,
+        // and the discard before that call (#321) stops the ladder; with
+        // refusals, the ladder's end says why.
+        const why = answer === 'empty'
+          ? `message ${leaving}, which its request carries, left the store or the view`
+          : 'a row of its span left the window mid-request';
+        assert.ok(lines.some((line) => line.includes(why)), `${label}: ${lines.join('\n')}`);
       } else {
         assert.ok(status.count > 0, `${label}: the ladder that ended with no summary quarantined its chunk: ${lines.join('\n')}`);
       }

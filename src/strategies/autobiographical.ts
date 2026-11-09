@@ -43,7 +43,9 @@ import type {
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
 import {
-  adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
+  adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, placeRangeEnds, queuedMergeRuns, runGroups, runsAtLevel,
+  spanInStore,
+  strandedIn,
   type LevelRuns, type PendingFill, type StoreRunsInput,
 } from './merge-runs.js';
 import {
@@ -52,7 +54,7 @@ import {
 } from './settle-summaries.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
-import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { pairedToolBlocks, splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import {
   hoistToolProse,
   DEFAULT_TOOL_PROSE_FIELD,
@@ -685,6 +687,11 @@ type StripReplay = {
  *  answers it, by message and place in its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
 
+function extendsListing(prev: ReadonlyArray<unknown>, next: ReadonlyArray<unknown>): boolean {
+  for (let i = 0; i < prev.length; i++) if (next[i] !== prev[i]) return false;
+  return true;
+}
+
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the earliest call with its id before it, in its own message or an earlier
@@ -1163,12 +1170,15 @@ type CompressionAttemptOutcome =
  * next tick with no attempt accounting).
  */
 /**
- * A merge whose answer a compression hold placed on its span during the call
- * keeps out. The provider answered, so it is no failure: the entry stays
- * queued for the hold's release, and nothing is counted or paused.
+ * A merge whose work is kept out: a compression hold placed on its span
+ * during the call keeps its answer out (the entry waits for the release), and
+ * a message its request carries that left the store or the view keeps its
+ * retry without reasoning from going out (the next tick builds the request
+ * again from the messages still there). The entry stays queued, and nothing
+ * is counted or paused.
  */
-class MergeHoldDiscard extends Error {
-  override name = 'MergeHoldDiscard';
+class MergeDiscard extends Error {
+  override name = 'MergeDiscard';
 }
 
 class SummariesAcrossWindows extends Error {
@@ -1856,6 +1866,14 @@ function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
   return holdsSystemChange(stripped) ? stripped.filter((b) => !isSystemChange(b)) : stripped;
 }
 
+function sentMessageIds(
+  offered: ReadonlyArray<{ id: MessageId; content: ContentBlock[] }>,
+  request: ReadonlyArray<{ content: ContentBlock[] }>,
+): MessageId[] {
+  const keeps = pairedToolBlocks(request);
+  return offered.filter(({ content }) => stripEmptyTextBlocks(content.filter(keeps)).length > 0).map(({ id }) => id);
+}
+
 /**
  * Capture the summarizer's verbatim response blocks for storage on the
  * SummaryEntry — but only when the response carried reasoning blocks.
@@ -2177,6 +2195,8 @@ export interface StrandedSummary {
   beside: Array<{ kind: 'compression-quarantine' | 'merge-quarantine' | 'hold'; id: string; side: 'before' | 'after'; level: number }>;
 }
 
+const NO_LISTING: ReadonlyArray<{ id: MessageId }> = Object.freeze([]);
+
 /**
  * Autobiographical chunking strategy.
  * Compresses old conversation chunks into summaries in the model's own words.
@@ -2363,10 +2383,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private mergeQuarantineAlarmActive = false;
   protected nativeFormatter = new NativeFormatter();
 
-  /** Message ID from which the head window starts. null = start from message 0. */
+  /** Message ID from which the head window starts. null = start from message 0. An id no longer in the view gives
+   *  the latest topic transition still there, or message 0 (getHeadWindowStartIndex). */
   protected headWindowStartId: string | null = null;
-  /** Cached result of getHeadWindowStartIndex to avoid repeated linear scans. */
-  private _cachedHeadStartIndex: { id: string | null; msgCount: number; result: number } | null = null;
+  /** Cached result of getHeadWindowStartIndex for one listing, to avoid repeated linear scans. */
+  private _cachedHeadStartIndex: { id: string | null; listing: readonly StoredMessage[]; result: number } | null = null;
 
   /** Chronicle store for persistent state. Set in `initialize()`. */
   protected store: JsStore | null = null;
@@ -3191,13 +3212,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Restore headWindowStartId from last topic transition message
       const messages = ctx.messageStore.getAll();
-      let headWindowStartId: string | null = null;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (this.isTopicTransitionMessage(messages[i])) {
-          headWindowStartId = messages[i].id;
-          break;
-        }
-      }
+      const transition = this.latestTopicTransitionIndex(messages);
+      const headWindowStartId = transition >= 0 ? messages[transition].id : null;
       if (abortIfStale()) return;
       this.headWindowStartId = headWindowStartId;
       // Legacy stores (pre chunk-persistence) have L1 summaries but no chunk
@@ -3206,7 +3222,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.migrateChunkRecords(ctx.messageStore);
       if (abortIfStale()) return;
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       if (abortIfStale()) return;
       this.releaseRowsThatLeft(ctx);
       if (abortIfStale()) return;
@@ -3371,9 +3387,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._imageStripReplayMemo = null;
     this._lastKvStable = null;
     this._storeOrder = new Map();
-    this._storeOrderSource = [];
+    this._storeOrderSource = NO_LISTING;
     this._chunkByPosition = null;
     this._l1ByMessage = null;
+    this._summaryIndex = null;
     this._recordChunks = null;
     this._salience = null;
     this._exactL1 = null;
@@ -4007,7 +4024,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * List summaries whose source message span overlaps `[opts.fromMs, opts.toMs]`,
    * for a "browse my history" table-of-contents (agent-framework consumer) —
-   * read-only, generates nothing.
+   * read-only, generates nothing. A summary's span runs from the first to
+   * the last of its messages still in the view, in record order (a message
+   * removed from the store, or hidden by the view's filter, no longer
+   * bounds it). A summary with none left isn't listed.
    *
    * Deliberately channel-agnostic: `SummaryEntry` has no channel field — a
    * summary is a fold over whatever messages landed in a chunk, which can span
@@ -4036,10 +4056,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const toMs = opts.toMs ?? Infinity;
 
     // A summary's messages first and last in the record, by sequence, from
-    // its leaves (memoized per summary). Until a host presents rows out of
-    // record order these are sourceRange's ends; once it does, a chunk is in
-    // the window's order (agent-framework #291), and its ends needn't be the
-    // earliest and latest messages it covers.
+    // its leaves still in the view (memoized per summary). While both are in
+    // the view, and until a host presents rows out of record order, these are
+    // sourceRange's ends; once it does, a chunk is in the window's order
+    // (agent-framework #291), and its ends needn't be the earliest and latest
+    // messages it covers.
     const sequenceOf = (id: string) => (store.sequenceOf ? store.sequenceOf(id) : store.get(id)?.sequence);
     const ends = new Map<string, { first: string; firstAt: number; last: string; lastAt: number } | null>();
     const endsOf = (summary: SummaryEntry): { first: string; firstAt: number; last: string; lastAt: number } | null => {
@@ -4072,10 +4093,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (opts.level !== undefined && entry.level !== opts.level) continue;
 
       // Resolve the source span to wall-clock time via the message store.
-      // A source message can in principle be gone (redacted) by the time
-      // this runs; skip rather than throw so one stale entry doesn't blank
-      // the whole table-of-contents.
-      if (!store.get(entry.sourceRange.first) || !store.get(entry.sourceRange.last)) continue;
+      // The summary's ends are the first and last of its messages still in
+      // the view, in record order: a message removed, or one the view hides,
+      // answers no sequence, so a summary keeps its place by the messages it
+      // still has, and one that has none left is left out.
       const span = endsOf(entry);
       const firstMsg = span ? store.get(span.first) : null;
       const lastMsg = span ? store.get(span.last) : null;
@@ -6193,7 +6214,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           '(another instance sharing the store let go of a row of its span, or compressed it)',
       );
       this.takeUpStoreState();
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       return true;
     }
     const ids = chunk.messages.map((m) => m.id);
@@ -7192,8 +7213,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Store position per message id, refreshed from every listing we see. */
   private _storeOrder = new Map<MessageId, number>();
-  /** The listing `_storeOrder` was built from (append-only refreshes extend it). */
-  private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = [];
+  /** The listing `_storeOrder` was built from (append-only refreshes extend
+   *  it), or NO_LISTING until one is seen. */
+  private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = NO_LISTING;
+  /** Calls of refreshStoreOrder so far, so rechunk can tell whether a
+   *  rebuild refreshed the order itself. */
+  private _storeOrderRefreshes = 0;
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
 
@@ -7225,18 +7250,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
-    if (messages.length === 0) return;
+    this._storeOrderRefreshes++;
     const prev = this._storeOrderSource;
     if (messages === prev) return;
     // A listing that keeps every earlier element (same object, so same id
     // and position: the store reuses message objects until an edit) only
     // grew at the end — add the tail instead of rehashing the whole store.
-    let from = 0;
-    if (prev.length > 0 && messages.length >= prev.length) {
-      let i = 0;
-      while (i < prev.length && messages[i] === prev[i]) i++;
-      if (i === prev.length) from = prev.length;
-    }
+    const from = prev.length > 0 && extendsListing(prev, messages) ? prev.length : 0;
     // A dry select puts back the order it found, by reference (select()), so
     // it extends a copy instead of writing into that one.
     const order = from === 0
@@ -7253,16 +7273,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * member that listing did not contain (appended since) after it, in record
    * order. Two summaries are adjacent exactly when no listed message stands
    * between their sources. Without any listing (hosts that drive the
-   * grouping without a store view) this degrades to record order, as
-   * ownershipPositionIndex does.
+   * grouping without a store view) this degrades to record order. A summary's
+   * range ends that the listing doesn't hold are placed at its first and last
+   * messages it does (placeRangeEnds).
    */
   protected mergePositionIndex(): Map<MessageId, number> {
     const { members, chunkMember } = this.ownedMembers();
     const order = this._storeOrder;
-    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    if (this._storeOrderSource === NO_LISTING) return new Map(members.map((id, i) => [id, i] as const));
     const index = new Map(order);
     let position = this._storeOrderSource.length;
     for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
+    const byId = this.summaryIndex();
+    const live: SummaryEntry[] = [];
+    for (const id of this.liveL1Ids()) {
+      const s = byId.get(id);
+      if (s) live.push(s);
+    }
+    placeRangeEnds(index, order, live, byId, getSummaryParentId, (s) => {
+      const leaves = new Set<MessageId>();
+      this.expandSummaryToLeafMessageIds(s, byId, leaves);
+      return leaves;
+    });
     return index;
   }
 
@@ -7275,11 +7307,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * were kept apart at one, still has whole ownership (no owned message
    * between its sources is missing), so the audit leaves it as it stands,
    * though kv-unified's forest finds its live leaves non-contiguous.
+   * Its callers set the listing first: auditStoreTopology itself, and
+   * demoteSplitSummaries right after its own auditStoreTopology call.
    */
   protected ownershipPositionIndex(): Map<MessageId, number> {
     const { members, chunkMember } = this.ownedMembers();
     const order = this._storeOrder;
-    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    if (this._storeOrderSource === NO_LISTING) return new Map(members.map((id, i) => [id, i] as const));
     const known = members.filter((id) => order.has(id)).sort((a, b) => order.get(a)! - order.get(b)!);
     const index = new Map<MessageId, number>();
     let position = 0;
@@ -7669,7 +7703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `to their longest run in the window, releasing [${releasedUncompressed.join(', ')}] to be chunked where the window holds them`,
         );
       }
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
     }
   }
 
@@ -8493,7 +8527,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // those chunks again, as after a load.
       this._overlapBlocked.clear();
     } finally {
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
     }
     if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
       // A merge-quarantine record naming a dropped summary no longer stands.
@@ -8534,7 +8568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
         `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
     );
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
   }
 
   /**
@@ -8725,7 +8759,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private windowGrew(operation: string, ctx: StrategyContext): void {
     this.requireLoadedBranch(operation);
     this.letGoOfRowsLeftUnheard(ctx, operation);
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
     // each tick completes, if the queue still has work AND preflight
@@ -8978,11 +9012,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the fact) waits; the rebuild after release re-queues it. As on main,
       // a held chunk ends this tick's scan.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
+      // A message of the chunk left the store or the view: it isn't
+      // compressed, and the chunks are rebuilt without it. Where another
+      // instance sharing the store let go of a row of the span, which this
+      // one didn't hear, that is taken up first, as compressChunkHierarchical
+      // does as it begins, so the rebuild starts from the store's records
+      // rather than from this instance's (takeUpSpanLetGoElsewhere, which
+      // rebuilds them itself).
+      if (chunk.messages.some((m) => this.hasLeftView(m.id, ctx.messageStore))) {
+        const sources = chunk.recordId === undefined ? undefined : this.chunkRecords.find((record) => record.id === chunk.recordId)?.sourceIds;
+        const ordinals = this.windowOrdinalsOf(chunk.messages.map((m) => m.id), ctx);
+        if (!this.takeUpSpanLetGoElsewhere(chunk, sources, ctx, ordinals, `not compressing chunk ${chunk.recordId ?? `#${chunk.index}`}`, 'before its compression began')) {
+          this.rechunk(ctx.messageStore);
+        }
+        return;
+      }
 
       let quarantineSkipped = false;
       let requestStopped = false;
       let joinedWorkDiscarded = false;
       let toolsDeferred = false;
+      let carriedMessageLeft = false;
       const work: { chunk: Chunk; skipped?: true } = { chunk };
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
@@ -8996,6 +9046,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         joinedWorkDiscarded = true;
       }, () => {
         toolsDeferred = true;
+      }, () => {
+        carriedMessageLeft = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -9125,6 +9177,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         this.checkMergeThreshold();
       }
+      if (!chunk.compressed && (carriedMessageLeft || chunk.messages.some((m) => this.hasLeftView(m.id, ctx.messageStore)))) {
+        this.rechunk(ctx.messageStore);
+      }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
       if (!quarantineSkipped) {
@@ -9183,10 +9238,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         // Success, or a skipped entry: drop from head and persist the
         // shorter queue, if the head is still our merge. executeMerge drops
-        // the head itself when it refuses a crossed merge or skips an entry
-        // holding a held source, and a merge that took up another instance's
-        // state (parentedMergeSources) has replaced the queue with the
-        // store's while it ran: dequeuing again would drop the next entry.
+        // the head itself when it refuses a crossed merge, skips an entry
+        // holding a held source or drops one with a source that had messages
+        // and has none left in the view, and a merge that took up another
+        // instance's state (parentedMergeSources) has replaced the queue with
+        // the store's while it ran: dequeuing again would drop the next entry.
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
@@ -9219,11 +9275,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // not a crash. Anything else (429, network, timeout) keeps the
         // pre-existing semantics: rethrow, entry stays queued, next tick
         // retries with no attempt accounting.
-        if (error instanceof MergeHoldDiscard) {
-          // The provider answered, but a hold placed on the span during the
-          // call keeps the answer out. Nothing failed: no pause, nothing
-          // counted. The entry stays queued (the next tick waits on the
-          // hold), and its run ends, since its request answered.
+        if (error instanceof MergeDiscard) {
+          // A hold placed on the span during the call keeps its answer out,
+          // and a removal of a message the request carries keeps the request,
+          // or its retry without reasoning, from going out: no pause, nothing
+          // counted. The entry stays queued (the next tick waits on the hold,
+          // or builds the request again without the message), and its run
+          // ends, since that request won't be sent again.
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           this.mergeFailureOrder.delete(mergeFailureKey(merge));
           this.mergeFailureRuns.delete(mergeFailureKey(merge));
@@ -9384,7 +9442,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `${tookUpStore ? ' of another instance sharing the store' : ''} ` +
           `(${droppedSince.map((source) => source.id).join(', ')}); ${outcome}`,
       );
-      if (tookUpStore) this.rebuildChunks(ctx.messageStore);
+      if (tookUpStore) this.rechunk(ctx.messageStore);
       return true;
     }
     const leafRowsSince = this.leafRowsOf(sources);
@@ -9484,7 +9542,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
       this.letGoOfRowsLeftUnheard(this.hostContext, 'select');
-      this.rebuildChunks(store);
+      this.rechunk(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
       // A select refused after it placed its markers (assertMiddleCoverage,
@@ -9547,7 +9605,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
     this.selectPricing = pricing;
     try {
-      this.rebuildChunks(store);
+      this.rechunk(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
@@ -10872,6 +10930,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The chunk's request needs the host's tool definitions, which it hasn't
     // declared: no call was made.
     onToolsDeferred?: () => void,
+    // A message one of its requests carries left the store or the view, and
+    // the work was discarded before that request went. tick rebuilds the
+    // chunks.
+    onCarriedMessageLeft?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
@@ -11100,11 +11162,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       allMessages.map((message, index) => [message.id, index]),
     );
     const chunkFirstId = chunk.messages[0]?.id;
-    // The chunk's start is its first message still in the store: a host can
-    // remove a stored message (agent-framework's Discord module does, on a
-    // delete) while the chunk holding it waits in the queue. -1 only when
-    // none of its messages is left (startInStore).
-    const chunkStartIdx = this.startInStore(chunk.messages.map((m) => m.id), messageOrder);
+    // A chunk holding a message that has left is rebuilt before its request (#321).
+    const chunkStartIdx = chunkFirstId === undefined ? -1 : (messageOrder.get(chunkFirstId) ?? -1);
     // The head as of the chunk (headAsOf): after a head-window reset, history
     // from before it is given the head it followed, not the new topic's, which
     // came after it. Clipped at a hold there, as before.
@@ -11185,8 +11244,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // summary starts is summaryStartInStore's rule, the one
       // a merge's prior recall set uses: a summary whose first message a host
       // removed starts at its first message still there, and one with none
-      // left isn't recalled. A chunk with no message left (chunkStartIdx -1)
-      // recalls none.
+      // left isn't recalled. A chunk whose first message has left
+      // (chunkStartIdx -1) recalls none.
       const summariesById = new Map<string, SummaryEntry>();
       for (const s of this.summaries) summariesById.set(s.id, s);
       const startOf = new Map<string, number>();
@@ -11280,6 +11339,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries: readonly SummaryEntry[],
     ) => {
       const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
+      const offered: Array<{ id: MessageId; content: ContentBlock[] }> = [];
 
       // ---- 1. Head window (raw, FIRST, ownership-capped) ----
       //
@@ -11317,7 +11377,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           continue;
         }
         if (quarantinedIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        offered.push({ id: m.id, content });
       }
 
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
@@ -11340,7 +11402,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ].sort((a, b) => a.position - b.position);
       for (const { summary: s, message: m } of middle) {
         if (m) {
-          llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+          const content = compressionInputContent(m.content);
+          llmMessages.push({ participant: m.participant, content });
+          offered.push({ id: m.id, content });
           continue;
         }
         llmMessages.push({
@@ -11373,7 +11437,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // ---- 5. Chunk messages raw ----
       for (const m of chunk.messages) {
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        offered.push({ id: m.id, content });
       }
 
       // ---- 6. Instruction (reading-mode aware; worked out above) ----
@@ -11400,7 +11466,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // by its tool_result, and any tool_result that doesn't follow a use.
       const cleaned = stripUnpairedToolBlocks(collapsed);
 
-      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
+      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped, carried: sentMessageIds(offered, llmMessages) };
     };
 
     // The store's price of a built request as it is sent: each message with
@@ -11462,7 +11528,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const { priorSummaries, pinnedRawTokens } = history;
     const { kept: keptSummaries, keptTokens: recallTokens } = recall;
-    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
+    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped, carried } = built;
+    const chunkOffered = chunk.messages.map((m) => ({ id: m.id, content: compressionInputContent(m.content) }));
+    const chunkIds = sentMessageIds(chunkOffered, chunkOffered);
 
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
@@ -11833,6 +11901,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let successfulTrace: CompressionAttemptTrace | undefined;
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
+    let carriedMessageLeft = false;
     /**
      * Accepted attempt requests by their `requestHash`, so the one that
      * authored the summary can be persisted as a preimage once the
@@ -11855,6 +11924,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       const runAttempt = async (
         attemptRequest: NormalizedRequest,
+        carries: readonly MessageId[],
         curveLabel: string,
         recallIds: string[],
         recallLevels: number[],
@@ -11870,8 +11940,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
             name: 'CompressionBranchDiscard',
+            sentNothing: true,
           });
         }
+        const discardIfRemoved = (call: string, sentNothing: boolean): void => {
+          const gone = carries.find((id) => this.hasLeftView(id, ctx.messageStore));
+          if (gone === undefined) return;
+          carriedMessageLeft = true;
+          this.diag.warn(`[autobiographical] discarding the compression of the chunk from ${chunk.messages[0]?.id ?? '?'}: message ${gone}, which its request carries, left the store or the view (${call})`);
+          logCompressionCall({
+            event: 'compression:removed-message-discarded',
+            operation: 'compress_l1',
+            metadata: { phase: call, message_id: gone, quarantine_key: quarantineRecord.key, canonical_request_hash: quarantineRecord.canonicalRequestHash },
+          }, this.ns);
+          throw Object.assign(new Error('A message the compression request carries left the store or the view'), {
+            name: 'CompressionBranchDiscard',
+            sentNothing,
+          });
+        };
+        discardIfRemoved(`${curveLabel}:before_call`, true);
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -11942,6 +12029,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // failures ran under the rung's own label: it ends that run, whether
           // it came now or is reused from progress.
           this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
+          discardIfRemoved(`${carrierLabel}:before_call`, false);
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -12265,6 +12353,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let answeredRung: { curveLabel: string; requestHash: string } | undefined;
       const canonicalStep = await ladderStep('canonical', canonicalRequestHash, () => runAttempt(
         request,
+        carried,
         'canonical',
         canonicalRecallIds,
         canonicalRecallLevels,
@@ -12316,6 +12405,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const noToolsHash = sha256Json(noToolsRequest);
         const retryStep = await ladderStep('canonical-no-tools', noToolsHash, () => runAttempt(
           noToolsRequest,
+          carried,
           'canonical-no-tools',
           canonicalRecallIds,
           canonicalRecallLevels,
@@ -12358,6 +12448,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const toolslessHash = sha256Json(toolslessRequest);
           const toolslessStep = await ladderStep('canonical-toolless', toolslessHash, () => runAttempt(
             toolslessRequest,
+            carried,
             'canonical-toolless',
             canonicalRecallIds,
             canonicalRecallLevels,
@@ -12431,6 +12522,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // variant's is, and nothing is sent.
         const runToolProseRung = async (
           hoistedRequest: NormalizedRequest,
+          carries: readonly MessageId[],
           base: { request: NormalizedRequest; providerInputTokens: number | undefined },
           curveLabel: string,
           recallIds: string[],
@@ -12475,7 +12567,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
-            hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
+            hoistedRequest, carries, curveLabel, recallIds, recallLevels, coverageHash,
           ));
           if (result.kind === 'decided') return;
           const trace = attemptTraces[attemptTraces.length - 1]!;
@@ -12510,6 +12602,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedCanonical) {
             await runToolProseRung(
               hoistedCanonical,
+              carried,
               { request, providerInputTokens: canonicalProviderInputTokens },
               'tool-prose-hoist',
               canonicalRecallIds,
@@ -12573,6 +12666,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const result = await ladderStep(curveLabel, variant.requestHash, () => runAttempt(
             variant.request,
+            carried,
             curveLabel,
             variantFrontier.map((summary) => summary.id),
             variantFrontier.map((summary) => summary.level),
@@ -12664,7 +12758,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
-            sourceOnlyFallbackRequest!, curveLabel, [], [],
+            sourceOnlyFallbackRequest!, chunkIds, curveLabel, [], [],
             sha256Json(chunk.messages.map((message) => message.id)),
           ));
           if (result.kind === 'decided') {
@@ -12702,6 +12796,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedSourceOnly) {
             await runToolProseRung(
               hoistedSourceOnly,
+              chunkIds,
               { request: sourceOnlyFallbackRequest, providerInputTokens: progressSourceOnlyInputTokens },
               'source-only-tool-prose-hoist',
               [], [],
@@ -12821,7 +12916,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.splitCallTimes.push(slot);
             let res: unknown;
             try {
-              res = await runAttempt(sub, label, [], [], leafHash);
+              const subsetOffered = subset.map((m) => ({ id: m.id, content: compressionInputContent(m.content) }));
+              res = await runAttempt(sub, sentMessageIds(subsetOffered, subsetOffered), label, [], [], leafHash);
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
@@ -12833,7 +12929,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // part sends one call: its request carries no reasoning
               // (buildSub strips the raw thinking and adds no recall pairs), so
               // the carrier fallback never sends a second.
-              if (isNoCallDeferral(error) || compressionFailureKind(error) === 'abort') {
+              if (isNoCallDeferral(error) || compressionFailureKind(error) === 'abort' ||
+                (error as { sentNothing?: unknown } | null)?.sentNothing === true) {
                 calls--;
                 attempted.calls--;
                 const at = this.splitCallTimes.lastIndexOf(slot);
@@ -13092,6 +13189,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         const proseStep = await ladderStep('canonical-plain-prose', proseRequestHash, () => runAttempt(
           proseRequest,
+          carried,
           'canonical-plain-prose',
           keptSummaries.map((summary) => summary.id),
           keptSummaries.map((summary) => summary.level),
@@ -13314,7 +13412,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
-      if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
+      if (error instanceof Error && error.name === 'CompressionBranchDiscard') {
+        if (carriedMessageLeft) {
+          // Another instance's let-go of a row of the span is taken up first,
+          // as the checks after a call take it up, so tick's rebuild starts
+          // from the store's records rather than this instance's.
+          this.takeUpSpanLetGoElsewhere(chunk, recordSources, ctx, spanOrdinals, `discarding the compression of the chunk from ${chunk.messages[0]?.id ?? '?'}`);
+          onCarriedMessageLeft?.();
+        }
+        return;
+      }
       // A host's withdrawal isn't a failure: the host asked for it, so its
       // receipts say withdrawn rather than carrying an error, a moved
       // branch's included. On a current branch a coalesced waiter gets it
@@ -13358,7 +13465,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       settleInFlight({
         ...(inFlightError !== undefined ? { error: inFlightError, membrane: ctx.membrane } : {}),
-        ...(inFlightError === undefined && this.compressionBranchGeneration !== sourceBranch.strategyGeneration
+        ...(inFlightError === undefined &&
+          (this.compressionBranchGeneration !== sourceBranch.strategyGeneration || carriedMessageLeft)
           ? { discarded: true }
           : {}),
       });
@@ -13691,16 +13799,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Resolves true when it wrote the merged parent. It resolves false, having
    * written nothing, when it skips the entry with no call (a source missing,
-   * already parented or held out of merges, or a crossed merge refused), when
-   * its branch went stale during the call, or when its sources were parented
-   * while the call was out. tick drops a skipped entry from the queue unless
-   * the skip dropped it already, as a refused crossed merge and an entry
-   * holding a held source do, or replaced the queue with the store's, as one
-   * that took up another instance's state does: a later tick then drops
-   * the entry from that queue, if it holds it. Any answer
+   * already parented or held out of merges, a source that had messages and
+   * has none left in the view, or a crossed merge refused), when its branch
+   * went stale during the call, or when its sources were parented while the
+   * call was out. tick drops a skipped entry from the queue unless the skip
+   * dropped it already, as a refused crossed merge, an entry holding a held
+   * source and one with a source that had messages and has none left do, or
+   * replaced the queue with the store's, as one that took up another
+   * instance's state does: a later tick then drops the entry from that
+   * queue, if it holds it. Any answer
    * from the provider resumes the lane, a refusal included, but only a
    * written merge is a landing (noteCompressionLanded). A hold placed on the
-   * span during the call keeps a valid answer out (MergeHoldDiscard).
+   * span during the call keeps a valid answer out, and a removal of a message
+   * its request carries keeps the request, or its retry without reasoning,
+   * from going out (MergeDiscard).
    */
   protected async executeMerge(
     targetLevel: SummaryLevel,
@@ -13756,7 +13868,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `sharing it, or a write of this one's that failed) (${droppedBefore.map((source) => source.id).join(', ')}); ` +
           'skipping stale queue entry',
       );
-      this.rebuildChunks(ctx.messageStore);
+      this.rechunk(ctx.messageStore);
       return false;
     }
     // A row under a source is out of the window though the store's
@@ -13821,7 +13933,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // them (mergePositionIndex).
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
-      this.refuseCrossedMerge(targetLevel, sourceIds, topology);
+      const summaryById = this.summaryIndex();
+      const emptied = sources.filter((source) => {
+        const leaves = new Set<MessageId>();
+        this.expandSummaryToLeafMessageIds(source, summaryById, leaves);
+        return leaves.size > 0 && [...leaves].every((id) => this.hasLeftView(id, ctx.messageStore));
+      });
+      const rest = sources.filter((source) => !emptied.includes(source));
+      const restProblem = rest.length >= 2 ? this.mergeTopologyProblem(targetLevel, rest, position) : null;
+      if (emptied.length > 0 && !restProblem) {
+        this.diag.warn(
+          `executeMerge: ${emptied.length}/${sources.length} source(s) have no message left ` +
+            `(${emptied.map((source) => source.id).join(', ')}); skipping stale queue entry, whose merge ` +
+            `check found: ${topology}`,
+        );
+        const head = this.mergeQueue[0];
+        if (head && head.sourceIds === sourceIds) this.dequeueMerge();
+        this.checkMergeThreshold();
+        return false;
+      }
+      this.refuseCrossedMerge(targetLevel, sourceIds, restProblem ?? topology);
       return false;
     }
 
@@ -13967,6 +14098,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // merge over history from before a head-window reset is given the head
     // that history followed. Clipped at a hold there, as before.
     const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, mergeStartIdx);
+    const mergeOffered: Array<{ id: MessageId; content: ContentBlock[] }> = [];
+    let carriedIds: MessageId[] = [];
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -13975,7 +14108,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         continue;
       }
       if (quarantinedIds.has(m.id)) continue;
-      llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+      const content = compressionInputContent(m.content);
+      llmMessages.push({ participant: m.participant, content });
+      mergeOffered.push({ id: m.id, content });
     }
     if (headCoveredSkipped > 0) {
       this.diag.warn(
@@ -14061,7 +14196,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
         if (quarantinedIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+        const content = compressionInputContent(m.content);
+        llmMessages.push({ participant: m.participant, content });
+        mergeOffered.push({ id: m.id, content });
       }
     }
 
@@ -14101,6 +14238,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sources: sourceIds,
       }, this.ns);
     }
+    const discardIfRemoved = (what: string): void => {
+      const gone = carriedIds.find((id) => this.hasLeftView(id, ctx.messageStore));
+      if (gone === undefined) return;
+      throw new MergeDiscard(
+        `${what} not sent: message ${gone}, which its request carries, left the store or the view; the merge ` +
+          'stays queued, and the next tick builds it again from the messages still there',
+      );
+    };
     for (const src of sources) {
       if (refusalFallback) {
         // Emit the source itself as a recall pair, whatever its level.
@@ -14117,7 +14262,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
           if (m) {
-            llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
+            const content = compressionInputContent(m.content);
+            llmMessages.push({ participant: m.participant, content });
+            mergeOffered.push({ id: messageId, content });
           }
         }
       } else {
@@ -14232,6 +14379,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }],
     });
 
+    carriedIds = sentMessageIds(mergeOffered, llmMessages);
+
     // Same bundled-tool-cycle defense as compressChunkHierarchical, after the
     // same separation of recall answers from the agent's raw turns: an L2
     // target, or the raw middle, follows the last ladder answer.
@@ -14342,9 +14491,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       compressionFailureKind(error) === 'rejection' &&
       this.mergeOvertakenDuringCall(sources, targetLevel, leafOrdinals, ctx, 'its rejection is not counted, and nothing is written');
     // Preparing the request can run a subclass's prepareCompressionRequest(),
-    // so the currency is checked again just before the call, as each L1
-    // attempt checks it: a generation ended there makes no call.
+    // so the currency and the messages the request carries are checked again
+    // just before the call, as each L1 attempt checks them: a generation
+    // ended there, or a carried message gone, makes no call.
     if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
+    discardIfRemoved(`L${targetLevel} merge`);
 
     try {
       let response: NormalizedResponse;
@@ -14373,6 +14524,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           !isCarrierTransportRejection(error) ||
           !requestCarriesReasoning(dispatchRequest)
         ) throw error;
+        discardIfRemoved(`L${targetLevel} merge's retry without reasoning`);
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -14511,9 +14663,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       logNewSummaryId = newEntry.id;
 
       // Hold placed mid-request: the answer is kept out, and the merge stays
-      // queued and runs after the release (see MergeHoldDiscard).
+      // queued and runs after the release (see MergeDiscard).
       if (this.mergeBlockedByHold(sourceIds, ctx.messageStore)) {
-        throw new MergeHoldDiscard(`merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request`);
+        throw new MergeDiscard(
+          `merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request; ` +
+            'the merge stays queued until the hold is released',
+        );
       }
 
       // Provenance the auditor can READ: store the accepted request under the
@@ -14550,8 +14705,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const withdrawn = compressionFailureKind(error) === 'abort';
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
-      if (error instanceof MergeHoldDiscard) {
-        this.diag.warn(`[autobiographical] ${error.message}; the merge stays queued until the hold is released`);
+      if (error instanceof MergeDiscard) {
+        this.diag.warn(`[autobiographical] ${error.message}`);
       } else if (!(error instanceof MergeDispositionRejection) && !withdrawn) {
         this.diag.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
@@ -18764,9 +18919,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           | { kind: 'pin'; position: number; msg: StoredMessage };
 
         const items: Item[] = [];
+        const summariesById = this.summaryIndex();
         for (const s of selectedSummaries) {
-          const pos = positionOf.get(s.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          items.push({ kind: 'summary', position: pos, summary: s });
+          const start = positionOf.get(s.sourceRange.first) ?? this.summaryStartInStore(s, positionOf, summariesById);
+          items.push({ kind: 'summary', position: start >= 0 ? start : Number.MAX_SAFE_INTEGER, summary: s });
         }
         for (const p of middleRaw) {
           items.push({ kind: 'pin', position: p.position, msg: p.msg });
@@ -19243,19 +19399,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Sort selected summaries by source-range start position, so per-pair
-   * recall emission appears in chronological order. Falls back to the
-   * created timestamp for summaries whose source-range first message is
-   * no longer in the store.
+   * Sort selected summaries by where each starts, its sourceRange.first while
+   * that is listed, else its first message still in the store
+   * (summaryStartInStore), so they appear in chronological order.
+   * Summaries with neither go after the rest, by created timestamp.
    */
   protected sortSummariesChronologically(
     summaries: SummaryEntry[],
     messages: StoredMessage[],
   ): SummaryEntry[] {
     const positionOf = this.positionIndex(messages);
+    const summariesById = this.summaryIndex();
+    const start = new Map(summaries.map((s) => {
+      const at = positionOf.get(s.sourceRange.first) ?? this.summaryStartInStore(s, positionOf, summariesById);
+      return [s.id, at >= 0 ? at : Number.MAX_SAFE_INTEGER] as const;
+    }));
     return [...summaries].sort((a, b) => {
-      const posA = positionOf.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-      const posB = positionOf.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+      const posA = start.get(a.id)!;
+      const posB = start.get(b.id)!;
       if (posA !== posB) return posA - posB;
       return a.created - b.created;
     });
@@ -19447,6 +19608,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionQueueGeneration++;
     this.toolsDeferredChunks.clear();
     this.toolsDeferredMerge = undefined;
+  }
+
+  /**
+   * Rebuild the chunks over `store`, then refresh the store order merge
+   * placement reads (mergePositionIndex) to the store's listing if the
+   * rebuild didn't, whatever a subclass's rebuildChunks does. Placement takes
+   * a summary's range end that the last listing doesn't hold for one that
+   * left the view (placeRangeEnds), which holds only while no chunk, and so
+   * no L1, is newer than that listing: a rebuildChunks that doesn't refresh
+   * it (KnowledgeStrategy's) would leave every L1 written since unplaceable,
+   * and never merged. The base rebuildChunks refreshes the order from the
+   * listing it chunks, so it lists the store no more than before. Every
+   * rebuild goes through here.
+   */
+  private rechunk(store: MessageStoreView): void {
+    const refreshes = this._storeOrderRefreshes;
+    this.rebuildChunks(store);
+    if (this._storeOrderRefreshes === refreshes) this.refreshStoreOrder(store.getAll());
   }
 
   /**
@@ -20873,7 +21052,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   onCompressionHoldsReleased(ctx: StrategyContext): void {
     this.requireLoadedBranch('onCompressionHoldsReleased');
-    this.rebuildChunks(ctx.messageStore);
+    this.rechunk(ctx.messageStore);
     if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
       this.driveSpeculativeDrain(ctx);
     }
@@ -20889,6 +21068,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected chunkHasHeldMessage(chunk: Chunk, blocked: Set<string> | null): boolean {
     if (!blocked) return false;
     return chunk.messages.some((m) => blocked.has(m.id));
+  }
+
+  private hasLeftView(id: MessageId, store: MessageStoreView): boolean {
+    return store.get(id) === null;
   }
 
   protected getUnheldRecentWindowStart(store: MessageStoreView): number {
@@ -20915,21 +21098,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Index of the first message in the head window.
    * When headWindowStartId is set, the head window starts from that message
-   * instead of message 0 — old messages before it become compressible.
+   * instead of message 0 — old messages before it become compressible. When
+   * that message is no longer in the view (removed, or hidden by the filter),
+   * it starts where a restart starts it: at the latest topic transition still
+   * there, or at message 0.
    */
   protected getHeadWindowStartIndex(store: MessageStoreView): number {
     if (!this.headWindowStartId) return 0;
     const messages = store.getAll();
     // Cache to avoid repeated O(n) scans within the same select/rebuild pass
-    if (this._cachedHeadStartIndex
-      && this._cachedHeadStartIndex.id === this.headWindowStartId
-      && this._cachedHeadStartIndex.msgCount === messages.length) {
-      return this._cachedHeadStartIndex.result;
+    const cached = this._cachedHeadStartIndex;
+    if (cached && cached.id === this.headWindowStartId && cached.listing === messages) {
+      return cached.result;
     }
     const idx = messages.findIndex(m => m.id === this.headWindowStartId);
-    const result = idx >= 0 ? idx : 0;
-    this._cachedHeadStartIndex = { id: this.headWindowStartId, msgCount: messages.length, result };
+    const result = idx >= 0 ? idx : Math.max(0, this.latestTopicTransitionIndex(messages));
+    this._cachedHeadStartIndex = { id: this.headWindowStartId, listing: messages, result };
     return result;
+  }
+
+  /** The position of the latest topic transition message in `messages`, or -1 when there is none. */
+  protected latestTopicTransitionIndex(messages: readonly StoredMessage[]): number {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (this.isTopicTransitionMessage(messages[i])) return i;
+    }
+    return -1;
   }
 
   /**
@@ -20940,12 +21133,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * on; -1 means nothing in the store says when that history happened.
    */
   protected startInStore(ids: Iterable<MessageId>, position: ReadonlyMap<MessageId, number>): number {
-    let start = -1;
-    for (const id of ids) {
-      const at = position.get(id);
-      if (at !== undefined && (start < 0 || at < start)) start = at;
-    }
-    return start;
+    return spanInStore(ids, position)?.[0] ?? -1;
   }
 
   /**

@@ -343,6 +343,64 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(fx.strategy.attempted()!.calls, 0, 'and no call counted');
   });
 
+  for (const [removed, kept] of [[0, true], [1, false]] as const) {
+    it(`a message removed while the piece for raw-0 is out ${kept ? 'keeps that piece\'s answer, and the pieces after it go out' : 'keeps the piece holding it from going out, and that piece takes no window slot'}`, async () => {
+      const calls: NormalizedRequest[] = [];
+      let fx!: Awaited<ReturnType<typeof build>>;
+      const membrane = {
+        complete: async (request: NormalizedRequest) => {
+          calls.push(structuredClone(request));
+          const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+          if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+          if (targets[0]!.startsWith('raw-0 ')) fx.manager.removeMessage(fx.ids[removed]! as never);
+          return { content: [text(`piece:${targets[0]!.split(' ')[0]}`)], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 }, raw: { response: {} } };
+        },
+      } as never;
+      fx = await build(membrane, { split: true });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      const pieces = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
+      const sentOne = (i: number) => pieces.some((c) => texts(c).some((t) => t.startsWith(`raw-${i} `)) && texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
+      assert.ok(sentOne(0), 'premise: the piece for raw-0 was sent');
+      if (kept) {
+        assert.ok([1, 2, 3].every(sentOne), 'a piece after raw-0 was not sent');
+        assert.equal(fx.strategy.entries().length, 1, 'the stitched summary was not written');
+        assert.ok(fx.strategy.entries()[0]!.content.includes('piece:raw-0'), 'raw-0\'s answer is not in it');
+      } else {
+        assert.ok(!sentOne(1), 'the piece for raw-1 was sent');
+        assert.equal(fx.strategy.entries().length, 0, 'premise: nothing was written');
+        assert.equal((fx.strategy as unknown as { splitCallTimes: number[] }).splitCallTimes.length, pieces.length, 'the window counts a piece that sent nothing');
+      }
+    });
+  }
+
+  it('a piece a branch move stops before its call takes no window slot', async () => {
+    const calls: NormalizedRequest[] = [];
+    let checksLeft = Infinity;
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+        if (targets[0]!.startsWith('raw-0 ')) checksLeft = 1;
+        return { content: [text(`piece:${targets[0]!.split(' ')[0]}`)], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 }, raw: { response: {} } };
+      },
+    } as never;
+    const fx = await build(membrane, { split: true });
+    const strategy = fx.strategy as unknown as {
+      isCompressionBranchCurrent(branch: unknown): boolean;
+      logCompressionBranchDiscard(branch: unknown, label: string, record: unknown): void;
+    };
+    const current = strategy.isCompressionBranchCurrent.bind(fx.strategy);
+    strategy.isCompressionBranchCurrent = (branch) => checksLeft-- > 0 && current(branch);
+    const discards: string[] = [];
+    const logDiscard = strategy.logCompressionBranchDiscard.bind(fx.strategy);
+    strategy.logCompressionBranchDiscard = (branch, label, record) => { discards.push(label); logDiscard(branch, label, record); };
+    await fx.strategy.run(fx.target, managerContext(fx.manager)).catch(() => undefined);
+    assert.deepEqual(discards, ['split:1-1:before_call'], 'premise: the branch check before the piece for raw-1 stopped it');
+    const pieces = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
+    assert.equal((fx.strategy as unknown as { splitCallTimes: number[] }).splitCallTimes.length, pieces.length, 'the window counts a piece that sent nothing');
+  });
+
   it("a piece whose answer is classified as a provider error ends the rung with that error's type", async () => {
     const membrane = {
       complete: async (request: NormalizedRequest) => {

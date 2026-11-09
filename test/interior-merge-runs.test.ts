@@ -7,8 +7,8 @@ import { ContextManager } from '../src/index.js';
 import { AutobiographicalStrategy, type Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext } from '../src/types/index.js';
 import type { SummaryEntry } from '../src/types/strategy.js';
-import { strandedInStore } from '../src/repair/topology.js';
-import { mergeRunsByLevel, queuedMergeRuns, runGroups, runsAtLevel, strandedIn } from '../src/strategies/merge-runs.js';
+import { planTopologyRepair, strandedInStore } from '../src/repair/topology.js';
+import { mergeRunsByLevel, placeOf, placeRangeEnds, queuedMergeRuns, runGroups, runsAtLevel, strandedIn } from '../src/strategies/merge-runs.js';
 
 class Probe extends AutobiographicalStrategy {
   constructor(config: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
@@ -508,6 +508,96 @@ describe('parent pointers, read alike by the runtime and the planner', () => {
     assert.deepEqual(settled(['b0', 'b1']), [], 'P lists b0, so it is its parent');
     assert.deepEqual(settled(['b1']), ['b0'], 'control: listed by nothing and pointing nowhere, b0 stands alone');
   });
+});
+
+describe('a summary whose first message was removed, read alike by the runtime and the planner (#321)', () => {
+  it('places it at its first message still listed, so neither reads its neighbour as stranded', () => {
+    const owned = Array.from({ length: 40 }, (_, i) => `m-${i}`);
+    const messages = owned.filter((id) => id !== 'm-10').map((id) => ({ id }));
+    const summaries = run('s', 4, 0);
+    const p = probe({ mergeThreshold: 2 });
+    p.setChunks(owned);
+    p.setSummaries(summaries);
+    (p as unknown as { refreshStoreOrder(listing: unknown[]): void }).refreshStoreOrder(messages);
+    const runtime = p.getStrandedSummaries().summaries!.map((s) => s.id);
+    const planner = strandedInStore({
+      summaries: summaries as never, records: [{ id: 'c', sourceIds: owned, compressed: true }], messages,
+    }, { mergeThreshold: 2 }).map((s) => s.id);
+    assert.deepEqual(runtime, []);
+    assert.deepEqual(planner, runtime);
+    const rebuild = planTopologyRepair({
+      summaries: summaries as never, records: [{ id: 'c', sourceIds: owned, compressed: true }], messages,
+    }, { mode: 'rebuild', runs: { mergeThreshold: 2 } });
+    assert.deepEqual(rebuild.strandedLeft.map((x) => x.id), [], 'a rebuild finds nothing stranded either');
+  });
+});
+
+describe('a rebuild that dissolves a parent with a child that has no message left (#321)', () => {
+  it('places the child as the runtime does once the parent is gone: nowhere, so nothing is left stranded', () => {
+    const owned = Array.from({ length: 31 }, (_, i) => `m-${i}`);
+    const messages = owned.filter((id) => id !== 'm-10').map((id) => ({ id }));
+    const summaries = [
+      summary('lone', 0, 9),
+      summary('e', 10, 10, 1, 'P'), summary('f', 11, 20, 1, 'P'), { ...summary('P', 10, 20, 2), sourceIds: ['e', 'f'] },
+      summary('n', 21, 30),
+    ];
+    const plan = planTopologyRepair({
+      summaries: summaries as never, records: [{ id: 'c', sourceIds: owned, compressed: true }], messages,
+    }, { mode: 'rebuild', runs: { mergeThreshold: 2 } });
+    assert.deepEqual(plan.partnered.map((x) => [x.id, x.dissolved]), [['lone', 'P']], 'premise: lone is partnered by dissolving P');
+    assert.deepEqual(plan.strandedLeft, [], 'e, whose one message is gone, was placed where P had placed its end');
+  });
+});
+
+describe('placeRangeEnds (#321)', () => {
+  const tree = (): SummaryEntry[] => {
+    const l1 = (id: string, from: number, parent: string) => ({ ...summary(id, from, from + 1), mergedInto: parent }) as SummaryEntry;
+    const up = (id: string, level: number, sources: string[], first: number, last: number, parent?: string) =>
+      ({ ...summary(id, first, last, level), sourceIds: sources, ...(parent ? { mergedInto: parent } : {}) }) as SummaryEntry;
+    return [l1('a', 0, 'x'), l1('b', 2, 'x'), l1('c', 4, 'y'), l1('d', 6, 'y'),
+      up('x', 2, ['a', 'b'], 0, 3, 't'), up('y', 2, ['c', 'd'], 4, 7, 't'), up('t', 3, ['x', 'y'], 0, 7)];
+  };
+  const place = (summaries: SummaryEntry[], listedIds: string[], live: string[]) => {
+    const listed = new Map(listedIds.map((id, i) => [id, i] as const));
+    const position = new Map(listed);
+    const byId = new Map(summaries.map((s) => [s.id, s] as const));
+    const leaves = (s: SummaryEntry): string[] => s.level === 1 ? s.sourceIds : s.sourceIds.flatMap((id) => leaves(byId.get(id)!));
+    placeRangeEnds(position, listed, live.map((id) => byId.get(id)!), byId, (s) => s.mergedInto, leaves);
+    return (id: string) => placeOf(byId.get(id)!, position);
+  };
+
+  it('places a parent whose last child lost every message by its other children, whatever order its L1s come in', () => {
+    const listed = ['m-0', 'm-1', 'm-2', 'm-3'];
+    for (const live of [['a', 'b', 'c', 'd'], ['c', 'd', 'a', 'b']]) {
+      const at = place(tree(), listed, live);
+      assert.deepEqual(at('t'), [0, 3], live.join(','));
+      assert.equal(at('y'), undefined, 'y has no message left');
+    }
+  });
+
+  it('places only the live L1s and their ancestors', () => {
+    const apart = (): SummaryEntry[] => tree().filter((s) => s.id !== 't').map((s) => {
+      const { mergedInto, ...rest } = s;
+      return (mergedInto === 't' ? rest : s) as SummaryEntry;
+    });
+    const listed = ['m-1', 'm-2', 'm-3', 'm-4', 'm-5', 'm-6', 'm-7'];
+    assert.deepEqual(place(apart(), listed, ['a', 'b', 'c', 'd'])('x'), [0, 2]);
+    assert.equal(place(apart(), listed, ['c', 'd'])('x'), undefined);
+  });
+
+  for (const end of ['first', 'last'] as const) {
+    it(`leaves a child whose range's ${end} end isn't its own unplaced, and the parent that shares it`, () => {
+      const summaries = tree();
+      const byId = new Map(summaries.map((s) => [s.id, s] as const));
+      const [child, parent] = end === 'first' ? [byId.get('a')!, byId.get('x')!] : [byId.get('b')!, byId.get('x')!];
+      child.sourceRange = { ...child.sourceRange, [end]: 'no-such-message' };
+      parent.sourceRange = { ...parent.sourceRange, [end]: 'no-such-message' };
+      const at = place(summaries, ['m-0', 'm-1', 'm-2', 'm-3', 'm-4', 'm-5', 'm-6', 'm-7'], ['a', 'b', 'c', 'd']);
+      assert.equal(at(child.id), undefined, `${child.id} is placed`);
+      assert.equal(at(parent.id), undefined, `${parent.id} is placed`);
+      assert.deepEqual(at('y'), [4, 7], 'premise: the healthy parent is placed');
+    });
+  }
 });
 
 describe('which summaries a merge-quarantine record holds out of merges', () => {
