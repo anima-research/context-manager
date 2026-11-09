@@ -246,6 +246,40 @@ describe('stripUnpairedToolBlocks', () => {
   });
 });
 
+describe('stripUnpairedToolBlocks with keepCalls', () => {
+  const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
+  const r = (id: string, rawXml?: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res', ...(rawXml ? { rawXml } : {}) } as ContentBlock);
+  const t = (text: string): ContentBlock => ({ type: 'text', text });
+
+  it('keeps every call and removes only the results that answer none, copying a changed message with its other fields', () => {
+    const pending = { id: 'm1', participant: 'agent', content: [t('calling'), u('A')] };
+    const orphan = { id: 'm2', participant: 'user', content: [r('Z'), t('a note')] };
+    const out = stripUnpairedToolBlocks([pending, orphan], { keepCalls: true });
+    assert.equal(out[0], pending, 'a message left whole comes back as itself');
+    assert.deepEqual(out[1], { id: 'm2', participant: 'user', content: [t('a note')] });
+    assert.notEqual(out[1], orphan);
+    assert.deepEqual(orphan.content.map((b) => b.type), ['tool_result', 'text'], 'the input is left as it was');
+  });
+
+  it('gives an emptied message the placeholder, and leaves a message stored with no blocks as it was', () => {
+    const empty = { participant: 'user', content: [] as ContentBlock[] };
+    const out = stripUnpairedToolBlocks([{ participant: 'user', content: [r('Z')] }, empty], { keepCalls: true });
+    assert.deepEqual(out[0]!.content, [{ type: 'text', text: '[tool call omitted]' }]);
+    assert.equal(out[1], empty);
+  });
+
+  it('releases a raw form a removed result shared with one that stays', () => {
+    const raw = '<function_results>both</function_results>';
+    const out = stripUnpairedToolBlocks([{ participant: 'agent', content: [u('A')] }, { participant: 'user', content: [r('Z', raw), r('A', raw)] }], { keepCalls: true });
+    assert.deepEqual(out[1]!.content.map((b) => [(b as { toolUseId: string }).toolUseId, (b as { rawXml?: string }).rawXml]), [['A', undefined]]);
+  });
+
+  it('returns the listing itself where it removes nothing', () => {
+    const listing = [{ participant: 'agent', content: [u('A')] }, { participant: 'user', content: [r('A')] }];
+    assert.equal(stripUnpairedToolBlocks(listing, { keepCalls: true }), listing);
+  });
+});
+
 describe('answeredCallIndexes', () => {
   const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
   const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res' });
