@@ -881,8 +881,9 @@ export interface SelectOptions {
    * limit by up to half a token a block, scaled by that rate over the
    * multiplier. A select whose sum would still pass it, or whose limit
    * leaves the window no room, refuses with an `OverBudgetError`. An
-   * AutobiographicalStrategy's own such refusal names the rate it priced the
-   * request at.
+   * AutobiographicalStrategy's own such refusals name the rate it priced the
+   * request at, except the one for the pairing repair's stubs, which names
+   * the allowance and the limit instead.
    * It needs `requestOverhead`: one given without it, or one that isn't a
    * positive finite number, is refused with a `TypeError` before anything is
    * selected. */

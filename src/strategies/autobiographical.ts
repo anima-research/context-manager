@@ -2136,7 +2136,6 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
-/** What a sample would leave the calibration at (decideSample), and what applying it logs and persists. */
 type SampleDecision = {
   implied: number;
   rejected: boolean;
@@ -9512,6 +9511,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let entries: ContextEntry[];
       this.thinkingBound = opts?.thinkingBinding?.binds === true;
       this.selectPricing = pricing;
+      this._selectArmed = false;
       try {
         entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
@@ -9527,7 +9527,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // path strips its render last (applyImageStripping, `returned`), and a
       // strip with no limits records nothing, so the hits are this render's.
       this.reportCeilingHits();
-      this._lastSelect = { store, log, budget: { ...budget }, opts: opts && { ...opts }, keys: this.requestKeys(entries), stubs: pricing?.stubTokens ?? 0 };
+      if (this._selectArmed) {
+        this._lastSelect = { store, log, budget: { ...budget }, opts: opts && { ...opts }, keys: this.requestKeys(entries), stubs: pricing?.stubTokens ?? 0 };
+      }
       return entries;
     }
     // A dry run commits nothing, and that includes what a select leaves for
@@ -9611,11 +9613,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { maxTokens: Math.min(target, room), rejectionBudget: Math.min(bound, room) };
   }
 
-  /** What the request limit leaves the window, in the store's units, at a
-   *  multiplier and a rate (the multiplier and the rate the store prices by
-   *  when left out): the limit less the reply's reserve, scaled by the
-   *  multiplier over the rate, less the overhead and injections priced block
-   *  by block at the multiplier. */
   private allowanceUnderRequestLimit(
     pricing: SelectPricing,
     limit: number,
@@ -9636,8 +9633,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Whether the request limit of the last committing select would leave the
-   *  window room at a multiplier and a kept rate: true where it had no limit. */
   private roomUnderLastLimit(multiplier: number, rate: number | null): boolean {
     const last = this._lastSelect;
     const pricing = last ? this.selectPricingOf(last.opts) : null;
@@ -16271,6 +16266,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
       this._lastCompileInjected = this.priceMessageInjections(opts?.messageInjections);
       this._calibrationArmed = true; // exactly one sample per compile
+      this._selectArmed = true;
     }
     return merged;
   }
@@ -16278,6 +16274,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _lastCompileEstimate = 0;
   private _lastCompileInjected = 0;
   private _lastSelect: { store: MessageStoreView; log: ContextLogView; budget: TokenBudget; opts: SelectOptions | undefined; keys: string[]; stubs: number } | null = null;
+  private _selectArmed = false;
   private _storeView: MessageStoreView | null = null;
 
   /** Thinking the context manager left out after this strategy's committing
@@ -16409,7 +16406,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const raw = this._lastCompileEstimate / before + besides;
     const noRoom = 'what the request sends beside the window leaves it no room under the request limit';
     const aboveLimit = 'so the request limit, or the reply\'s reserve against max_tokens, is above what the provider takes.';
-    const aboveBudget = 'so the compile\'s budget, with what the request sends beside the window, is above what the provider takes.';
+    const aboveBudget = 'so the compile\'s budget with its over-budget grace, and what the request sends beside the window, is above what the provider takes.';
     if (!counted) {
       this._calibrationArmed = false;
       const noCount = 'The provider refused the request as too long without stating its count';
@@ -16485,7 +16482,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private requestPricedAt(): string {
     const rate = this.pricedRate();
-    if (rate > this._calibration) return `a rate of ${rate.toFixed(2)} kept from a too-long refusal`;
+    if (rate > this._calibration) return `a rate of ${rate.toFixed(2)} the store keeps for the request limit`;
     return this._calibrationProvisional
       ? `the store's provisional multiplier of ${rate.toFixed(2)}, which no request has measured under the current pricing`
       : `the store's multiplier of ${rate.toFixed(2)}`;
@@ -16512,9 +16509,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { implied: decision.implied, rejected: decision.rejected };
   }
 
-  /** What the compile's one sample would do to the calibration, decided
-   *  without writing anything, so a caller can weigh it before it applies
-   *  (applySample). Null where there is no sample to take. */
   private decideSample(realTotal: number, overhead: RequestOverhead | undefined): SampleDecision | null {
     if (!Number.isFinite(realTotal) || realTotal <= 0) return null;
     const window = this._lastCompileEstimate;
@@ -17217,8 +17211,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
                   `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
-                  `outright, and a compile it puts over budget, or over a request limit, drops it to 1.00 ` +
-                  `first. Stamped (epoch ` +
+                  `outright, and a compile it puts over budget, or over a request limit that no rate the store ` +
+                  `keeps for it prices, drops it to 1.00 first. Stamped (epoch ` +
                   `${current}) once a sample confirms it.`,
               );
             }
