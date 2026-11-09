@@ -34,6 +34,7 @@ import {
   type ResolvedImageLimits,
 } from '../live-image-limits.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
+import { roomUnderRequestLimit } from '../request-limit.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -680,7 +681,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     opts?: SelectOptions,
   ): ContextEntry[] {
     this.syncToBranch();
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
     const messages = store.getAll();
     const presented = this.presentedAnchor(opts?.dryRun === true);
     const shown = this.atOrAfterAnchor(presented);
