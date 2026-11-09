@@ -180,7 +180,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     await assert.rejects(twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: inSelect }), (e: Error) => {
       assert.equal(e.name, 'OverBudgetError', e.message);
       assert.ok(!e.message.startsWith('The request limit of'), `premise: refused inside the select: ${e.message}`);
-      assert.ok(e.message.endsWith('; under the request limit, the request is priced at the store\'s multiplier of 1.00'), e.message);
+      assert.ok(e.message.endsWith(' Under the request limit, the request is priced at the store\'s multiplier of 1.00.'), e.message);
       return true;
     });
     twin.cm.close();
@@ -201,6 +201,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit }), (e: Error) => {
       assert.equal(e.name, 'OverBudgetError');
       assert.ok(e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`), e.message);
+      assert.equal((e as Error & { diagnostics: { requestLimitBound?: boolean; requestAllowanceTokens?: number } }).diagnostics.requestLimitBound, true, 'the limit is the bound that refused');
       return true;
     });
     const after = await cm.compile(BUDGET, INJECTIONS);
@@ -240,22 +241,66 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     });
   }
 
-  it('keeps a provisional multiplier above 1 that a limit refuses once the provider\'s rate prices the request, where no drop can make it fit', async () => {
-    const twin = await seededAt('rate-no-drop-twin', 1);
+  it('drops a provisional multiplier above 1 that a limit refuses while the provider\'s rate prices the request, as it does any refusal', async () => {
+    const twin = await seededAt('rate-drop-twin', 1);
     const besides = besidesOf((await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!);
     twin.cm.close();
-    const limit = BUDGET.reserveForResponse + Math.floor(besides * 1.3);
-    const { cm, strategy } = await provisionalAt('rate-no-drop', 1.4);
-    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit * 4 });
-    assert.equal(strategy.reportRefusedAsTooLong(undefined, BIG).changed, true, 'premise: a count-less refusal sets the provider\'s rate');
-    await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit }), (e: Error) => {
-      assert.ok(e.message.startsWith(`The request limit of ${limit} tokens leaves the window no room`), e.message);
-      assert.ok(e.message.includes(' (those two priced at the provider\'s rate of 1.80) come to '), e.message);
+    const { cm, strategy } = await provisionalAt('rate-drop', 1.4);
+    const probe = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!;
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: BUDGET.reserveForResponse + Math.ceil(pricedOf(probe) / 1.4 * 1.6) });
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, BIG).changed, true, 'premise: a count-less refusal keeps the ceiling as the rate');
+    const noRoom = BUDGET.reserveForResponse + Math.floor(besides * 1.3);
+    await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: noRoom }), (e: Error) => {
+      assert.ok(e.message.includes(' (those two priced at a rate of 1.80 kept from a too-long refusal) come to '), `the rate prices the request: ${e.message}`);
       return true;
     });
     const after = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!;
-    assert.equal(after.calibration!.multiplier, 1.4, 'no drop is made');
-    assert.equal(after.calibration!.reset, undefined, 'and none is recorded');
+    assert.equal(after.calibration!.multiplier, 1, 'dropped to 1');
+    assert.equal(after.calibration!.reset?.discardedMultiplier, 1.4, 'with the reset recorded');
+    cm.close();
+  });
+
+  it('says on a refusal under a limit whether the limit, not the budget, is the bound that refused', async () => {
+    const twin = await seededAt('bound-twin', 1);
+    const besides = besidesOf((await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!);
+    twin.cm.close();
+    const { cm } = await seededAt('bound', 1);
+    const wide = { ...BUDGET, maxTokens: 40_000 };
+    const limit = BUDGET.reserveForResponse + besides + 50;
+    await assert.rejects(cm.compile(wide, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit, dryRun: true }), (e: Error) => {
+      const d = (e as Error & { diagnostics: { requestLimitBound?: boolean; requestAllowanceTokens?: number } }).diagnostics;
+      assert.ok(d.requestAllowanceTokens! > 0, `premise: the limit leaves the window a little room: ${e.message}`);
+      assert.equal(d.requestLimitBound, true, `a limit too small for the newest turn is the bound that refused: ${e.message}`);
+      return true;
+    });
+    await assert.rejects(cm.compile({ maxTokens: BUDGET.reserveForResponse + 1, reserveForResponse: BUDGET.reserveForResponse }, INJECTIONS,
+      { requestOverhead: OVERHEAD, requestLimitTokens: 1_000_000, dryRun: true }), (e: Error) => {
+      assert.equal(e.name, 'OverBudgetError', e.message);
+      assert.equal((e as Error & { diagnostics: { requestLimitBound?: boolean; requestAllowanceTokens?: number } }).diagnostics.requestLimitBound, undefined, `a budget refusal under a limit it is well within: ${e.message}`);
+      return true;
+    });
+    cm.close();
+  });
+
+  it('says the limit is the bound on a stub refusal whose room the budget\'s bound doesn\'t reach', async () => {
+    const { cm } = await openManager('stub-above-bound', { overBudgetGraceRatio: 0 }, 0);
+    for (let i = 0; i < 200; i++) {
+      cm.addMessage('Claude', [{ type: 'tool_use', id: `u${i}`, name: 'look', input: {} }] as ContentBlock[]);
+      cm.addMessage('User', [{ type: 'text', text: 'ok' }]);
+    }
+    const open = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, dryRun: true });
+    const stubs = open.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    const stubPrice = stubs.reduce((n, b) => n + jsonTokenEstimator((b as { content: string }).content), 0);
+    const target = BUDGET.maxTokens - BUDGET.reserveForResponse;
+    const room = target + 100;
+    assert.ok(open.renderStats!.total.tokens <= target && stubPrice >= room, `premise: the window fits the budget and its stubs alone pass the room: ${open.renderStats!.total.tokens}, ${stubPrice}`);
+    const limit = BUDGET.reserveForResponse + besidesOf(open.renderStats!) + room;
+    await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: limit, dryRun: true }), (e: Error) => {
+      assert.ok(e.message.startsWith('The tool-result stubs the pairing repair added'), `premise: the stubs refused it: ${e.message}`);
+      const d = (e as Error & { diagnostics: { requestLimitBound?: boolean; requestAllowanceTokens?: number } }).diagnostics;
+      assert.equal(d.requestLimitBound, true, 'the limit is the bound that refused, though its room is above the budget\'s');
+      return true;
+    });
     cm.close();
   });
 
@@ -488,6 +533,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       const d = (e as Error & { diagnostics: { requestLimitTokens?: number; requestAllowanceTokens?: number } }).diagnostics;
       assert.equal(d.requestLimitTokens, exact - 1, 'the refusal names the limit, as the no-room one does');
       assert.equal(d.requestAllowanceTokens, strategy.lastWindow - 1, 'and what it left the window');
+      assert.equal((d as { requestLimitBound?: boolean }).requestLimitBound, true, 'and that the limit is the bound that refused');
       return true;
     });
     cm.close();
@@ -508,8 +554,9 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       await assert.rejects(cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top, dryRun: true }), (e: Error) => {
         assert.equal(e.name, 'OverBudgetError', e.message);
         assert.ok(e.message.startsWith('The tool-result stubs the pairing repair added'), `the select refused it for the stubs: ${e.message}`);
-        const d = (e as Error & { diagnostics: { requestLimitTokens?: number } }).diagnostics;
+        const d = (e as Error & { diagnostics: { requestLimitTokens?: number; requestLimitBound?: boolean } }).diagnostics;
         assert.equal(d.requestLimitTokens, top);
+        assert.equal(d.requestLimitBound, true, 'the limit is the bound that refused');
         return true;
       }, `the window at ${top} leaves no room for the stub's ${stubPrice}, and this store can't fold to make it`);
       const fits = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice, dryRun: true });
@@ -609,11 +656,65 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     cm.close();
   });
 
+  it('under a generous limit, a count that raises the multiplier past what the budget held is a change, since a retry folds the window', async () => {
+    const base = await uncappedOn('both-bounds-base', () => openManager('both-bounds-base'));
+    const limit = requestTokens(base) * 3;
+    const { cm, strategy } = await openManager('both-bounds');
+    const first = await compileUnder(cm, limit);
+    assert.equal(first.calibration!.provisional, true, 'premise: provisional, so the sample sets the multiplier outright');
+    assert.ok(first.total.tokens * 1.25 > BUDGET.maxTokens - BUDGET.reserveForResponse, `premise: at 1.25 the window passes the budget's target (${first.total.tokens})`);
+    const count = countFor(first, 1, 1.25);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: true,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, so the next compile prices the request at a rate of 1.25.`,
+    });
+    cm.close();
+  });
+
+  it('a count inside the dead band under a generous limit changes nothing for a window sent within grace above the budget\'s target, since a retry is the same request', async () => {
+    const shape = { overBudgetGraceRatio: 0.35 };
+    const { cm, strategy } = await seededAt('grace-window', 1, shape);
+    const target = BUDGET.maxTokens - R;
+    const big = `the newest message, long enough to be past the target alone `.repeat(Math.ceil((target - 100) * 2.9 / 60));
+    cm.addMessage('User', [{ type: 'text', text: big }]);
+    const open = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!;
+    const limit = requestTokens(open) * 3;
+    const first = await compileUnder(cm, limit);
+    assert.ok(!first.calibration!.provisional, 'premise: a measured store, so the sample steps the multiplier');
+    assert.ok(first.total.tokens > target && first.total.tokens <= target * 1.35, `premise: the window sent sits within grace above the target (${first.total.tokens}, target ${target})`);
+    const count = countFor(first, 1, 1.05);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, but at a rate of 1.05 the refused request still fits the request limit, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes.`,
+    });
+    const next = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit, dryRun: true })).renderStats!;
+    assert.equal(next.calibration!.multiplier, 1, 'premise: the count stayed inside the dead band');
+    cm.close();
+  });
+
+  it('under a limit, a count no more than a kept rate\'s price that raises the multiplier past what the budget held is a change, since a retry folds the window', async () => {
+    const base = await uncappedOn('kept-rate-fold-base', () => openManager('kept-rate-fold-base'));
+    const limit = requestTokens(base) * 3;
+    const { cm, strategy } = await openManager('kept-rate-fold');
+    await compileUnder(cm, limit);
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, false, 'premise: a count-less refusal that still fits keeps the ceiling as the rate');
+    const second = await compileUnder(cm, limit);
+    assert.equal(second.calibration!.provisional, true, 'premise: provisional, so the sample sets the multiplier outright');
+    assert.ok(second.total.tokens * 1.3 > BUDGET.maxTokens - R, `premise: at 1.3 the window passes the budget's target (${second.total.tokens})`);
+    const count = countFor(second, 1, 1.3);
+    const price = Math.round(pricedOf(second) * 1.8);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: true,
+      why: `The provider counted ${count} input tokens, no more than the store's price of ${price}, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes; the sample raises the multiplier to 1.30, at which the window passes the compile's budget, so a retry folds it.`,
+    });
+    cm.close();
+  });
+
   it('a stated count over the store\'s price that the multiplier doesn\'t step to sets the provider\'s rate, and the next compile fits at it', async () => {
     const { cm, strategy, limit } = await bound('over-a-little', 1.2);
     const first = await compileUnder(cm, limit);
     assert.notEqual(first.request!.allowanceTokens, undefined, 'premise: the limit binds');
-    const count = countFor(first, 1.2, 1.2 * 1.015);
+    const count = countFor(first, 1.2, 1.2 * 1.08);
     const rate = rateOf(count, first, 1.2);
     assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
       changed: true,
@@ -731,7 +832,7 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     const { cm, strategy, limit } = await bound('not-armed', 1);
     const first = await compileUnder(cm, limit);
     strategy.reportRealInputTokens(pricedOf(first), OVERHEAD);
-    const why = 'The store has no estimate of the refused request to learn from: its last compile was already reported, or there is none.';
+    const why = 'The store has no estimate of the refused request to learn from: its last compile was already reported, there is none, or its select doesn\'t calibrate (adaptiveResolution off).';
     assert.deepStrictEqual(strategy.reportRefusedAsTooLong(countFor(first, 1, 2), OVERHEAD), { changed: false, why });
     assert.deepStrictEqual(strategy.reportRefusedAsTooLong(undefined, OVERHEAD), { changed: false, why }, 'a count-less one too');
     const next = await compileUnder(cm, limit);
@@ -762,17 +863,67 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
 
   it('a dry compile between a compile and its refusal leaves what the refusal reads', async () => {
     const { cm, strategy, limit } = await bound('dry-between', 1, 1.8);
-    await compileUnder(cm, limit);
+    const first = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
     await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true });
-    assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'the refusal is of a compile under the limit');
-    const next = await compileUnder(cm, limit);
-    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, next), 'priced at the ceiling');
+    const count = countFor(first, 1, 2.5);
+    const rate = rateOf(count, first, 1);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: true,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, so the next compile prices the request at a rate of ${rate.toFixed(2)}.`,
+    }, 'the refusal is of the compile under the limit, at its estimate');
+    const next = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / rate, next), 'priced at its rate');
+    cm.close();
+  });
+
+  it('a refusal changes nothing where the refused request still fits the request limit at the rate it leaves, since a retry would be the same request', async () => {
+    const base = await uncappedOn('limit-above-base', () => seededAt('limit-above-base', 1));
+    const limit = requestTokens(base) * 3;
+    const { cm, strategy } = await seededAt('limit-above', 1);
+    const first = await compileUnder(cm, limit);
+    const count = countFor(first, 1, 1.5);
+    const rate = rateOf(count, first, 1);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, but at a rate of ${rate.toFixed(2)} the refused request still fits the request limit, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes.`,
+    });
+    await compileUnder(cm, limit);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: false,
+      why: 'The provider refused the request as too long without stating its count, and at the calibration\'s ceiling of 1.80 the refused request still fits the request limit, so the request limit, or the reply\'s reserve against max_tokens, is above what the provider takes.',
+    });
+    cm.close();
+  });
+
+  it('without a request limit, a count that raises the multiplier changes nothing where the window still fits the budget at it', async () => {
+    const small = await openManager('no-limit-small', {}, 6);
+    const a = await compileFree(small.cm);
+    assert.equal(a.calibration!.provisional, true, 'premise: provisional, so the sample sets the multiplier outright');
+    assert.ok(a.total.tokens * 1.5 < BUDGET.maxTokens - BUDGET.reserveForResponse, `premise: the window fits the budget at 1.5 (${a.total.tokens})`);
+    const count = countFor(a, 1, 1.5);
+    assert.deepStrictEqual(small.strategy.reportRefusedAsTooLong(count, OVERHEAD), {
+      changed: false,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(a)}, but at the multiplier of 1.50 the window still fits the compile's budget, so the compile's budget, with what the request sends beside the window, is above what the provider takes.`,
+    });
+    small.cm.close();
+  });
+
+  it('a usage sample that leaves out the request\'s overhead leaves the provider\'s rate as it is', async () => {
+    const { cm, strategy, limit } = await bound('undeclared', 1, 1.8);
+    await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'premise: the refusal keeps the ceiling as the rate');
+    const priced = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    strategy.reportRealInputTokens(countFor(priced, 1, 5));
+    const next = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
+    assert.equal(next.calibration!.multiplier, 1, 'premise: the undeclared sample leaves the multiplier');
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, next), 'still priced at 1.80');
     cm.close();
   });
 
   it('without a request limit, a stated count is an ordinary sample, no provider\'s rate is kept, and a retry is worth it only where the multiplier rose', async () => {
     const fresh = await openManager('no-limit-fresh');
     const a = await compileFree(fresh.cm);
+    await fresh.cm.compile(BUDGET_ABOVE_LIMIT, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true });
     const countA = countFor(a, 1, 1.5);
     assert.deepStrictEqual(fresh.strategy.reportRefusedAsTooLong(countA, OVERHEAD), {
       changed: true,
