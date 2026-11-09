@@ -22612,11 +22612,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Both selects send raw every message the view holds that no summary
    * covers, whichever region holds it: the head window, the middle (the
    * history before a head window that was reset included) or the recent
-   * window. Each such message goes through `cappedForSend`, apart from a
-   * body's shards in the adaptive middle (below). The image pass decides by
-   * stored position, newest first, not by where a region puts an entry. So
-   * these steps give a message's form wherever the compile places it, and
-   * no id the view holds comes back as null. Two kinds of message differ.
+   * window. Each such message goes through `cappedForSend`. The image pass
+   * decides by stored position, newest first, not by where a region puts an
+   * entry. So these steps give a message's form wherever the compile places
+   * it, and no id the view holds comes back as null. Two kinds of message
+   * differ.
    * - A message a summary covers comes back raw, while the compile sends its
    *   summary where its plan folds it. Under the hierarchical select without
    *   `imageStripHysteresisRatio`, its images, rendered raw, also count
@@ -22625,9 +22625,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   and every path under `imageStripHysteresisRatio`, count every stored
    *   message's images, folded or not, as the render does.
    * - A body whose shards the compile doesn't send together. A body whose
-   *   shards sit across the middle and a window, or across a reset head window's end with the history
-   *   from before the reset between them, goes out in more than one entry.
-   *   Here such a body comes back whole, as the windows join it.
+   *   shards sit across the middle and a window, or across a reset head
+   *   window's end with the history from before the reset between them,
+   *   goes out in more than one entry. Here such a body comes back whole, as
+   *   the windows join it.
    *
    * The form is the compile's, but not always the place: after a head-window
    * reset, the head is sent ahead of the history from before the reset, and
