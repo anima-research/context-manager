@@ -313,6 +313,29 @@ describe('imageStripHysteresisRatio', () => {
     await m.close();
   });
 
+  it('an edit replays a different history too, under a tool pruning override that keeps one decision: shrinking text between images can strip an image newer than it, as a removal does', async () => {
+    class OneDecision extends ImageRatioStrategy {
+      private readonly decision = { replaced: new Map(), inputCap: 0 };
+      protected override toolPruning() { return this.decision; }
+    }
+    const m = await ContextManager.open({
+      path: STORE,
+      strategy: new OneDecision({ headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true,
+        imageStripDepthTokens: 6000, imageStripHysteresisRatio: 0.5 } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+    });
+    const ids: Record<string, string> = {};
+    ids.t0 = m.addMessage('user', prose('t0', 1000));
+    const gaps = [400, 1600, 400, 1400, 300];
+    for (let i = 1; i <= 6; i++) {
+      m.addMessage('user', img(`img-${i}`));
+      if (i < 6) ids[`t${i}`] = m.addMessage('user', prose(`t${i}`, gaps[i - 1]!));
+    }
+    assert.equal(await stripped(m, 6), '....II');
+    m.editMessage(ids.t4! as never, prose('t4', 10));
+    assert.equal(await stripped(m, 6), '.....I');
+    await m.close();
+  });
+
   it('depth is counted at the store\'s calibrated estimates, so a calibration change can move the set, as the doc says', () => {
     // Three image messages of 1,600 tokens under a depth of 5,000: at
     // calibration 1 the oldest is at 4,800, within it; at 1.1 it is at 5,280,

@@ -172,8 +172,15 @@ its turn. So no two files' output mixes, and if a file never ends, the log
 shows what the earliest such file has written.
 
 Push-time CI (`ci.yml`) runs on every push to `main` and every PR. It
-typechecks, builds and tests once, on ubuntu at the engines floor (Node
-22.12.0). Every other leg, on ubuntu and macos, installs with `npm ci`, packs
+typechecks, builds and tests on ubuntu at the engines floor (Node 22.12.0),
+first with the releases the lockfile holds. It does so again with each
+dependency, optional and peer ones included, at the lowest release its range
+admits, since a host's own lockfile can hold that one. A range that joins lines
+with `||` gets one more run for each of its lines' lowest releases other than
+the range's own, with every other dependency at its lowest
+(`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
+aren't tested in crossed combinations.
+Every other leg, on ubuntu and macos, installs with `npm ci`, packs
 the package, installs the tarball into an empty project and imports it. The
 lockfile is committed and strict: `npm install` on npm >= 11 will quietly
 re-resolve platform packages missing from the lock, so only `npm ci` fails

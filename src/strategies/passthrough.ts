@@ -10,6 +10,7 @@ import type {
   SelectOptions,
 } from '../types/index.js';
 import { OverBudgetError } from '../adaptive/picker.js';
+import { roomUnderRequestLimit } from '../request-limit.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
@@ -32,7 +33,12 @@ export class PassthroughStrategy implements ContextStrategy {
   }
 
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
-    // No-op: context is rebuilt on select()
+    // No-op: context is rebuilt on select(). There is deliberately no
+    // onPresented beside it, so a subclass that overrides this still hears
+    // each row of this manager's slot as it enters the window, at the add
+    // in legacy mode and at its presentation once a host presents rows (a
+    // row of an auxiliary slot is heard only when a host presents it:
+    // ContextStrategy.onNewMessage).
   }
 
   select(
@@ -44,7 +50,7 @@ export class PassthroughStrategy implements ContextStrategy {
     const messages = store.getAll();
     const entries: ContextEntry[] = [];
     let totalTokens = 0;
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
 
     // Add messages until we hit the budget
     for (let i = 0; i < messages.length; i++) {

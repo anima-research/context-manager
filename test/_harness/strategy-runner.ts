@@ -206,6 +206,7 @@ export async function runStrategyOnWorkload(
   let currentTurn = -1;
 
   const adapter = new MockAdapter({
+    completeDelayMs: 0,
     responseGenerator: (req) => {
       const sysText = stringifySystem(
         (req as { system?: unknown }).system,
