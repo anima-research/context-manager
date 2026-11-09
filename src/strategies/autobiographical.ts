@@ -20023,12 +20023,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const posById = this.positionIndex(messages);
     // Image-bearing entries, newest-first by source position. Entries with no
     // resolvable source position sort last (pos -1).
-    // An entry joining a body's parts in the middle names its newest part.
     const ordered = entries
-      .map((entry, idx) => {
-        const source = entry.sourceMessageId ?? entry.sourceMessageIds?.at(-1);
-        return { idx, pos: source !== undefined ? posById.get(source) ?? -1 : -1 };
-      })
+      .map((entry, idx) => ({
+        idx,
+        pos: entry.sourceMessageId !== undefined ? posById.get(entry.sourceMessageId) ?? -1 : -1,
+      }))
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
