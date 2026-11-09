@@ -9,8 +9,9 @@
   sent it: where tool pruning has since replaced a result of that message,
   the text read now differs, so a reader whose text's length isn't M
   doesn't page it; a replacement of the same length passes that check. It returns null for a row the view
-  doesn't hold, an id nothing has, a call the message doesn't hold, and
-  under a strategy with no per-message cap. Strategies answer it through
+  doesn't hold, an id nothing has, a call the message doesn't hold, any
+  call under windowed passthrough, which cuts no call's input, and under a
+  strategy with no per-message cap. Strategies answer it through
   the optional `ContextStrategy.capMeasuredText`, which the autobiographical
   (so knowledge) and windowed passthrough strategies implement.
 - `capReadHint` (`AutobiographicalConfig`, `WindowedPassthroughOptions`), of

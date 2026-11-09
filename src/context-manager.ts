@@ -3813,7 +3813,8 @@ export class ContextManager {
    * its id; with `toolUseId`, that call's input as JSON. Null for a row this
    * agent's view doesn't hold, such as one the view filter leaves out or one
    * not yet presented, for an id nothing has, for a call the message doesn't
-   * hold, and under a strategy with no per-message cap.
+   * hold, for any call under windowed passthrough, which never cuts a call's
+   * input, and under a strategy with no per-message cap.
    *
    * The marker's offsets, `chars H to T of M`, count UTF-16 code units
    * (JavaScript string indices) from 0: H is the first elided, T the first

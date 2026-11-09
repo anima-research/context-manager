@@ -314,8 +314,10 @@ export interface ContextStrategy {
    * of that call's input: the text a capped message's marker gives offsets
    * into, so a reader paging it from the marker's first offset reads exactly
    * what the cap elided. Null where the view holds no such row, for a
-   * summary the strategy doesn't have, and for a call the message doesn't
-   * hold. A strategy with no per-message cap has none. See
+   * summary the strategy doesn't have, for a call the message doesn't
+   * hold, and, under a strategy that never cuts a call's input, such as
+   * windowed passthrough, for any call. A strategy with no per-message cap
+   * has none. See
    * `ContextManager.capMeasuredText` for what the offsets count and when
    * they stop indexing it.
    */

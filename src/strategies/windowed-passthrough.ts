@@ -858,13 +858,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   /** See `ContextStrategy.capMeasuredText`: a message's text blocks and
    *  string tool results as it's stored, which this strategy sends before
-   *  the cut, or with `toolUseId` that call's input as JSON. */
+   *  the cut. Null with `toolUseId`, since this strategy cuts no call's
+   *  input, so no marker it writes names one. */
   capMeasuredText(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null {
+    if (at.toolUseId !== undefined) return null;
     const msg = store.get(at.id as MessageId);
-    if (!msg) return null;
-    if (at.toolUseId === undefined) return capMeasuredTextOf(msg.content);
-    const call = msg.content.find((b) => b.type === 'tool_use' && b.id === at.toolUseId) as Extract<ContentBlock, { type: 'tool_use' }> | undefined;
-    return call ? JSON.stringify(call.input) : null;
+    return msg ? capMeasuredTextOf(msg.content) : null;
   }
 
   /**

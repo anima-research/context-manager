@@ -100,6 +100,14 @@ describe('capMeasuredText', () => {
     });
   });
 
+  it('reads no call input under windowed passthrough, which cuts none', async () => {
+    await withManager(new WindowedPassthroughStrategy({ imageStripDepthTokens: 0 } as ConstructorParameters<typeof WindowedPassthroughStrategy>[0]), (cm) => {
+      const id = cm.addMessage('assistant', [text('zz-a'), toolUse('t9', 'search', { q: 'zz-q' })]);
+      assert.equal(cm.capMeasuredText({ id }), 'zz-a');
+      assert.equal(cm.capMeasuredText({ id, toolUseId: 't9' }), null, 'a call the message holds');
+    });
+  });
+
   it('is null under a strategy that has no per-message cap', async () => {
     await withManager(new PassthroughStrategy(), (cm) => {
       const id = cm.addMessage('user', [text('zz-a')]);
