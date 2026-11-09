@@ -81,7 +81,7 @@ This is the principle the spec opens with, and it's load-bearing here. Concretel
 
 ### 3.2 Chunks, levels, and resolutions
 
-A **chunk** is the unit of fold operations. For chat messages under the ingestion threshold, twice `targetChunkTokens` (6,000 tokens by default), one chunk = the whole message. For larger messages — pasted documents, large tool-call results, dumped logs — a message is split into multiple chunks at ingestion, unless it carries a provider item (see §3.6).
+A **chunk** is the unit of fold operations. For chat messages under the ingestion threshold, twice `targetChunkTokens` (6,000 tokens by default), one chunk = the whole message. For larger messages — pasted documents, dumped logs — a message is split into multiple chunks at ingestion, unless it carries a provider item (see §3.6).
 
 A **level** is a non-negative integer:
 - `L0` (level 0) = render the chunk's raw content.
@@ -201,7 +201,7 @@ Solvers shipped:
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
-Any message whose token count exceeds twice `targetChunkTokens` (6,000 tokens by default) is split into shards at ingestion, unless it carries a provider item (below). Each shard is its own `MessageEntry` with:
+Any message whose text blocks together exceed twice `targetChunkTokens` (6,000 tokens by default) is split into shards at ingestion, unless it carries a provider item (below). Each shard is its own `MessageEntry` with:
 
 - A stable `bodyGroupId` shared with its sibling shards.
 - A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.

@@ -14,8 +14,8 @@
   Responses item on Anthropic, is over-counted by it.
 - Calibration learns nothing from a compile whose window holds a Responses
   compaction item, since the provider may count such a request from the item
-  onward. It logs once when it stops for one, and once when a compile without
-  one lets it learn again.
+  onward. While a branch stays loaded, it logs once when it stops for one, and
+  once when a compile without one lets it learn again.
 - The pricing epoch stays 6, and a learned multiplier is kept: agent-framework
   releases from 0.6.5 on, before the one that carries
   anima-research/agent-framework#988, leave carriers out of a turn's first

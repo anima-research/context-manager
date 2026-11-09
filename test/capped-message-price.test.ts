@@ -69,8 +69,6 @@ const CASES: Record<string, Case> = {
       ['u', [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock]],
     ],
   },
-  // A zero-width carrier has no text to cut, so the cap keeps it, priced as
-  // its item.
   'text past the cap and a compaction carrier after it': {
     cap: 100,
     old: 'too little',
@@ -190,7 +188,10 @@ describe('a raw message keeps a zero-width carrier past the cap', () => {
         const sent = (await manager.compile(BIG)).messages.flatMap((m) => m.content);
         const typeOf = (b: ContentBlock) => ((b as { rawItem?: { type?: string } }).rawItem)?.type;
         assert.ok(sent.some((b) => typeOf(b) === 'compaction'), 'the carrier is sent');
-        assert.ok(!sent.some((b) => typeOf(b) === 'message'), 'the cut part sends its text, not its item');
+        assert.ok(!sent.some((b) => typeOf(b) === 'message'), 'the cut part gives up its item');
+        const texts = sent.map((b) => (b as { text?: string }).text ?? '').filter((t) => t.length > 0);
+        assert.equal(texts.length, 1, 'one text is sent');
+        assert.match(texts[0], /^c{400}\n\n\[truncated — original was \d+ tokens\]$/, 'the cut part sends its text, cut at the cap');
       } finally {
         await close();
       }

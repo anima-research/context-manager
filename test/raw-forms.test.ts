@@ -642,8 +642,6 @@ describe('raw forms: the recall envelope', () => {
     class Exposed extends AutobiographicalStrategy {
       render(entries: SummaryEntry[], cap: number) { return this.renderCombinedRecallAnswer(entries, cap); }
     }
-    // A's text is cut at a cap of 200 characters, the separator after it becomes the marker, and B's
-    // text and its carrier are past the cap.
     const a = { ...summary, id: 'L1-a', responseContent: [itemText('x'.repeat(400), { ...MESSAGE_ITEM, id: 'msg_a' })] };
     const b = { ...summary, id: 'L1-b', responseContent: [itemText('second answer', { ...MESSAGE_ITEM, id: 'msg_b' }), opaqueCarrier()] };
     const { content, refs } = new Exposed({}).render([a, b], 50);

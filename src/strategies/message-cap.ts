@@ -95,9 +95,7 @@ function safeSlice(str: string, start: number, end: number): string {
  *   omission notice in place of its content. An empty one stays as it is,
  *   since it loses nothing.
  * - With `keepCarriers`, a zero-width carrier (`isOpaqueCarrier`) is kept
- *   wherever it sits, past the cap too, since it has no text to cut. A raw
- *   message is cut so. The combined recall answer isn't, since it reads this
- *   output back on the rule above.
+ *   wherever it sits, past the cap too, since it has no text to cut.
  * - Every other block passes through.
  *
  * Returns `content` itself when every block survives unchanged, as when the
