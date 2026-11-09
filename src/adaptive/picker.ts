@@ -92,6 +92,13 @@ export interface OverBudgetDiagnostics {
    */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /**
+   * Present, and true, where the request limit, not the budget, is the bound
+   * this refusal measured against: what the limit left the window was below
+   * the budget's hard bound, or the limit refused the request outright. A
+   * refusal under a limit without it is the budget's.
+   */
+  requestLimitBound?: true;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
