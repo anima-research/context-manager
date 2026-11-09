@@ -12,9 +12,14 @@ import type {
 import { OverBudgetError } from '../adaptive/picker.js';
 import { roomUnderRequestLimit } from '../request-limit.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
+import { cleanStarts, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 
 /**
- * Simple passthrough strategy that copies all messages to context.
+ * Simple passthrough strategy that copies all messages to context, but for
+ * a tool_result that answers no tool_use before it in the view, which it
+ * leaves out (a message that held nothing else sends `[tool call omitted]`).
+ * When they don't all fit, the most recent that do, from a message where no
+ * tool_result it sends has its tool_use left out (cleanStarts).
  * No compression, no background work. Always ready.
  * Good for testing and simple use cases.
  */
@@ -47,7 +52,7 @@ export class PassthroughStrategy implements ContextStrategy {
     budget: TokenBudget,
     opts?: SelectOptions,
   ): ContextEntry[] {
-    const messages = store.getAll();
+    const messages = stripUnpairedToolBlocks(store.getAll(), { keepCalls: true });
     const entries: ContextEntry[] = [];
     let totalTokens = 0;
     const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
@@ -76,7 +81,7 @@ export class PassthroughStrategy implements ContextStrategy {
     // If we hit the limit before adding all messages,
     // keep the most recent ones that fit
     if (entries.length < messages.length) {
-      return this.selectFromEnd(store, maxTokens, opts);
+      return this.selectFromEnd(store, messages, maxTokens, opts);
     }
 
     return entries;
@@ -96,10 +101,13 @@ export class PassthroughStrategy implements ContextStrategy {
    * sends nothing, as on main. Where a change can go in a request is
    * membrane's to say (after a user turn): this strategy can't tell a user
    * participant from another, and membrane refuses a request holding a
-   * change it can't place.
+   * change it can't place. The window starts only where no tool_result it
+   * sends has its tool_use left out (cleanStarts), so a cut across a call
+   * and its result leaves both out, and the newest conversation message
+   * counts with every message back to the calls its results answer.
    */
-  private selectFromEnd(store: MessageStoreView, maxTokens: number, opts?: SelectOptions): ContextEntry[] {
-    const messages = store.getAll();
+  private selectFromEnd(store: MessageStoreView, messages: readonly StoredMessage[], maxTokens: number, opts?: SelectOptions): ContextEntry[] {
+    const clean = cleanStarts(messages);
     const changes = systemChangePositions(messages);
     let changeTokens = 0;
     for (const i of changes) changeTokens += store.estimateTokens(messages[i]!);
@@ -126,7 +134,7 @@ export class PassthroughStrategy implements ContextStrategy {
       }
 
       totalTokens += tokens;
-      start = i;
+      if (clean[i]) start = i;
     }
     // A store of changes alone gets here only when they're over the budget:
     // select() sends every message when all fit. A committing select refused
@@ -134,13 +142,18 @@ export class PassthroughStrategy implements ContextStrategy {
     if (start === messages.length && changes.length > 0 && !opts?.dryRun) {
       let newest = messages.length - 1;
       while (holdsSystemChange(messages[newest]!.content)) newest--;
-      const newestTokens = store.estimateTokens(messages[newest]!);
+      let unit = newest;
+      while (unit > 0 && (!clean[unit] || holdsSystemChange(messages[unit]!.content))) unit--;
+      let unitTokens = 0;
+      for (let i = unit; i < messages.length; i++) if (!holdsSystemChange(messages[i]!.content)) unitTokens += store.estimateTokens(messages[i]!);
       throw new OverBudgetError({
         budget: maxTokens,
-        actual: changeTokens + newestTokens,
-        stage: 'Passthrough: its system changes and the newest conversation message',
+        actual: changeTokens + unitTokens,
+        stage: unit === newest
+          ? 'Passthrough: its system changes and the newest conversation message'
+          : 'Passthrough: its system changes and the newest conversation message, back to the calls its tool results answer',
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
-        diagnostics: { headTokens: changeTokens, tailTokens: newestTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
+        diagnostics: { headTokens: changeTokens, tailTokens: unitTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
       });
     }
 
