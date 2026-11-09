@@ -451,4 +451,31 @@ describe('passthrough strategies send no tool result without its call', () => {
       cm.close();
     }
   });
+
+  it('14. windowed, an anchor past every message and system changes over the budget: a preview holds the newest unit back to its call, and a compile refuses counting it', async () => {
+    const strategy = priced(new WindowedPassthroughStrategy());
+    const cm = await open(strategy);
+    const rules = { type: 'system_change', addSystem: [`RULES ${'rule '.repeat(2000)}`] } as unknown as ContentBlock;
+    const ids = [
+      cm.addMessage('User', [text('hi')]),
+      cm.addMessage('Harness', [rules]),
+      cm.addMessage('Claude', [text('CALLING'), call('t1')]),
+      cm.addMessage('User', [result('t1', 'FILE')]),
+    ];
+    try {
+      await cm.compile(OPEN);
+      const tight = budget(cost(strategy, ids[1]!) - 10);
+      strategy.setAnchor(cm.getMessage(ids[3]!)!.sequence + 1);
+      const preview = await cm.compile(tight, undefined, { dryRun: true });
+      assert.deepEqual(shape(preview.messages), ['Harness: system_change', 'Claude: CALLING, tool_use', 'User: tool_result']);
+      assert.deepEqual(orphans(preview.messages), []);
+      await assert.rejects(cm.compile(tight), (err: unknown) => {
+        assert.ok(err instanceof OverBudgetError, String(err));
+        assert.equal(err.actual, cost(strategy, ids[1]!, ids[2]!, ids[3]!), 'the changes and the unit: the call and its result');
+        return true;
+      });
+    } finally {
+      cm.close();
+    }
+  });
 });

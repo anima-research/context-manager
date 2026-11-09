@@ -157,17 +157,17 @@ export function cleanStarts(messages: ReadonlyArray<{ content: readonly ContentB
  * With `{ keepCalls: true }`, every `tool_use` stays, and only each
  * `tool_result` that answers no call before it goes, its raw form given up
  * and an emptied message given the same placeholder. Each message the strip
- * leaves whole comes back as itself, and one it changes as a copy of it
- * with the new content, so its other fields stay. Where it changes none, it
+ * leaves whole comes back as itself, and one it changes as a plain object
+ * with its own fields and the new content. Where it changes none, it
  * returns `messages` itself. A message stored with no blocks is left whole.
  */
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
-): Array<{ participant: string; content: ContentBlock[] }>;
-export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
-  messages: readonly T[],
   options: { keepCalls: true },
 ): readonly T[];
+export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
+  messages: readonly T[],
+): Array<{ participant: string; content: ContentBlock[] }>;
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
   options?: { keepCalls?: boolean },

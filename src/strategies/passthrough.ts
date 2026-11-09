@@ -97,7 +97,8 @@ export class PassthroughStrategy implements ContextStrategy {
    * message, so when the newest conversation message doesn't fit beside
    * them a committing select refuses too, as the windowed strategy does: a
    * budget refusal, which a newer conversation message that fits clears
-   * while they leave room. Without changes, a select that fits no message
+   * while they leave room, unless a tool result in it answers a call in what
+   * was refused. Without changes, a select that fits no message
    * sends nothing, as on main. Where a change can go in a request is
    * membrane's to say (after a user turn): this strategy can't tell a user
    * participant from another, and membrane refuses a request holding a

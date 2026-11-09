@@ -785,7 +785,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       // every tool result goes with its call.
       if (newStart === messages.length && messages.length > 0) {
         newStart = messages.length - 1;
-        while (newStart > start && (holdsSystemChange(messages[newStart]!.content) || !clean[newStart])) newStart--;
+        const floor = start < messages.length ? start : 0;
+        while (newStart > floor && (holdsSystemChange(messages[newStart]!.content) || !clean[newStart])) newStart--;
       }
       start = newStart;
       total = 0;

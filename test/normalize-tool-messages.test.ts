@@ -278,6 +278,13 @@ describe('stripUnpairedToolBlocks with keepCalls', () => {
     const listing = [{ participant: 'agent', content: [u('A')] }, { participant: 'user', content: [r('A')] }];
     assert.equal(stripUnpairedToolBlocks(listing, { keepCalls: true }), listing);
   });
+
+  it('keeps the one-argument form as the type its Parameters and ReturnType read', () => {
+    const forward = (...args: Parameters<typeof stripUnpairedToolBlocks>) => stripUnpairedToolBlocks(...args);
+    const out: ReturnType<typeof stripUnpairedToolBlocks> = forward([{ participant: 'user', content: [t('hi')] }]);
+    out.push({ participant: 'user', content: [] });
+    assert.equal(out.length, 2);
+  });
 });
 
 describe('answeredCallIndexes', () => {
