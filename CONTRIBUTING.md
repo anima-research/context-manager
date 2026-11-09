@@ -176,8 +176,8 @@ typechecks, builds and tests on ubuntu at the engines floor (Node 22.12.0),
 first with the releases the lockfile holds. It does so again with each
 dependency, optional and peer ones included, at the lowest release its range
 admits, since a host's own lockfile can hold that one. A range that joins lines
-with `||` gets one more run for each line other than its lowest, at that line's
-lowest release, with every other dependency at its lowest
+with `||` gets one more run for each of its lines' lowest releases other than
+the range's own, with every other dependency at its lowest
 (`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
 aren't tested in crossed combinations.
 Every other leg, on ubuntu and macos, installs with `npm ci`, packs

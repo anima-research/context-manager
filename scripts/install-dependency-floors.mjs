@@ -19,6 +19,7 @@ const manifest = read('package.json');
 const ranges = new Map();
 for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
   for (const [name, range] of Object.entries(manifest[field] ?? {})) {
+    if (/[:/]/.test(range)) throw new Error(`${name} is declared as ${range}, which isn't a registry range, so this job has no floor to test for it`);
     if (ranges.has(name) && ranges.get(name) !== range) throw new Error(`${name} has two ranges, ${ranges.get(name)} and ${range}`);
     ranges.set(name, range);
   }
