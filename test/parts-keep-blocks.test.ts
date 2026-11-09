@@ -521,3 +521,39 @@ describe('a newest message carrying a provider item, too large to go raw, refuse
     });
   }
 });
+
+describe("a long reply's thinking goes out with its call once the reply's earlier parts fold", () => {
+  const summarizer = {
+    complete: async () => ({
+      stopReason: 'end_turn',
+      content: [{ type: 'text', text: 'A memory of this stretch, kept brief.' }],
+      usage: { input_tokens: 1000, output_tokens: 10 },
+    }),
+  };
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: the call goes out with the thinking that led to it`, async () => {
+      const o = await open({ kind, membrane: summarizer, config: { headWindowTokens: 0, recentWindowTokens: 2_000, targetChunkTokens: 4_000 } });
+      try {
+        for (let k = 0; k < 6; k++) o.add(k % 2 ? 'a' : 'u', [text(long(`turn${k}`, 4_000))]);
+        const reply = o.add('a', [thinking('why I call it'), text(long('REPLY', 200_000)), call('c1')]);
+        o.add('u', [result('c1', 'what the tool said')]);
+        await o.manager.compile(BIG);
+        for (let k = 0; k < 500 && !o.manager.isReady(); k++) await o.manager.tick();
+        assert.ok(reply.length > 1, 'premise: stored in parts');
+        const size = sum(o.estimates(), reply[0]!, reply.at(-1)! + 1);
+        const compiled = await o.manager.compile({ maxTokens: Math.floor(size * 0.8), reserveForResponse: 0 });
+        const at = new Map(o.all().map((m, k) => [m.id, k] as const));
+        const covered = compiled.provenance!.messages.flatMap((m) => (m.kind === 'summary' ? m.summaries : []))
+          .map((s) => o.manager.getSummary(s.id)!.sourceRange)
+          .filter((range) => reply.slice(0, -1).some((k) => at.get(range.first)! <= k && k <= at.get(range.last)!));
+        assert.ok(covered.length > 0, 'premise: a summary the compile sends covers an earlier part');
+        const sent = compiled.messages as Sent[];
+        const withCall = sent.find((m) => m.content.some((b) => b.type === 'tool_use'))!;
+        assert.ok(withCall, 'premise: the call goes out');
+        assert.ok(withCall.content.some((b) => b.type === 'thinking'), `the call's message carries its thinking: ${JSON.stringify(withCall.content.map((b) => b.type))}`);
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});

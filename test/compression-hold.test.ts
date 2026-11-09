@@ -298,7 +298,11 @@ describe('compression holds', () => {
 
   it('G2: sharded tool_use message stays with its held tool_result', async () => {
     const { prompts, membrane } = recordingMembrane();
-    const strategy = new AutobiographicalStrategy({
+    const strategy = new (class extends AutobiographicalStrategy {
+      protected override lastMessageContainsToolUse(): boolean {
+        return false;
+      }
+    })({
       compressionModel: 'test-compression-model',
       targetChunkTokens: 50,
       headWindowTokens: 0,

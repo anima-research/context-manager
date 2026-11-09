@@ -297,20 +297,75 @@ describe('a view whose listing gives fresh objects at each read', () => {
 });
 
 describe("the chunker's check of a long body", () => {
-  it('reads each of a body\'s 2,000 parts a bounded number of times as the chunker walks it', () => {
-    const p = new Probe({ adaptiveResolution: true, compressionModel: 'mock' } as never);
-    const N = 2_000;
-    const parts = Array.from({ length: N }, (_, k) =>
-      ({ id: `p${k}`, sequence: k, participant: 'u', content: [text(`part ${k}`)], timestamp: new Date(0), bodyGroupId: 'g', shardIndex: k }) as unknown as StoredMessage);
-    let reads = 0;
-    const listing = new Proxy(parts, {
-      get(target, key, receiver) {
-        if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
-        return Reflect.get(target, key, receiver);
-      },
+  for (const every of [1, 2, 4]) {
+    it(`reads each of a body's 2,000 parts a bounded number of times, checked at every ${every === 1 ? '' : `${every === 2 ? 'second' : 'fourth'} `}part`, () => {
+      const p = new Probe({ adaptiveResolution: true, compressionModel: 'mock' } as never);
+      const N = 2_000;
+      const parts = Array.from({ length: N }, (_, k) =>
+        ({ id: `p${k}`, sequence: k, participant: 'u', content: [text(`part ${k}`)], timestamp: new Date(0), bodyGroupId: 'g', shardIndex: k }) as unknown as StoredMessage);
+      let reads = 0;
+      const listing = new Proxy(parts, {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      const position = new Map(parts.map((m, k) => [m.id, k] as const));
+      for (let k = every - 1; k < N; k += every) p.endsOnCall([parts[k]!], listing, position);
+      assert.ok(reads < 10 * N, `${reads} reads of the listing for ${N} parts`);
     });
-    const position = new Map(parts.map((m, k) => [m.id, k] as const));
-    for (let k = 0; k < N; k++) p.endsOnCall([parts[k]!], listing, position);
-    assert.ok(reads < 10 * N, `${reads} reads of the listing for ${N} parts`);
-  });
+  }
+});
+
+describe('a run of messages that each hold a call and a result', () => {
+  async function run(shape: 'own' | 'chained') {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
+    o.add('u', [text('intro')]);
+    o.add('a', [text('hello')]);
+    const at: number[] = [];
+    if (shape === 'own') {
+      for (let k = 0; k < 8; k++) at.push(...o.add('a', [call(`s${k}`), result(`s${k}`, `answer ${k}`), text(`step ${k}`)]));
+    } else {
+      at.push(...o.add('a', [call('c0')]));
+      for (let k = 1; k < 8; k++) at.push(...o.add('a', [result(`c${k - 1}`, `answer ${k - 1}`), call(`c${k}`)]));
+    }
+    o.add('u', shape === 'own' ? [text('after')] : [result('c7', 'answer 7')]);
+    o.add('a', [text('done')]);
+    assert.equal(at.length, 8, 'premise: none of the run is split');
+    return { ...o, at };
+  }
+  const expected = (shape: 'own' | 'chained', at: number[], landed: number) => (shape === 'own' ? landed - 1 : at[0]!);
+  for (const shape of ['own', 'chained'] as const) {
+    const label = shape === 'own' ? 'each its own call\'s result' : 'each the result of the call before it';
+    it(`${label}: the recent window's start moves back ${shape === 'own' ? 'one message, as on main' : 'to the run\'s first message'}`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), landed) });
+        assert.equal(o.strategy.recentStart(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+    it(`${label}: a compression hold does too`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.manager.holdCompression([o.all()[landed]!.id]);
+        assert.equal(o.strategy.holdStart(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+    it(`${label}: the head window's end pulls back ${shape === 'own' ? 'one message, as on main' : 'to the run\'s first message'}`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.strategy.set({ headWindowTokens: sum(o.estimates(), 0, landed) });
+        assert.equal(o.strategy.headEnd(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+  }
 });
