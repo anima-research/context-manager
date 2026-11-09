@@ -7,6 +7,7 @@ import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { CompileResult, ContextEntry, ContextInjection, ContextLogView, MessageStoreView, RenderStats, SelectOptions, StoredMessage, TokenBudget } from '../src/types/index.js';
 import type { RequestOverhead } from '../src/index.js';
 import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy, jsonTokenEstimator } from '../src/index.js';
+import type { Picker, PickerInputs } from '../src/adaptive/picker.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'request-limit-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -28,8 +29,21 @@ const summarizer = {
 
 type Shape = { adaptiveResolution?: boolean; overBudgetGraceRatio?: number; enforceBudget?: boolean };
 
-async function openManager(name: string, shape: Shape = {}, turns = 60, unansweredCalls = false) {
-  const strategy = new AutobiographicalStrategy({
+/** Says its plan is over whatever it renders while `overstate` is set, as a planner that overestimates does. */
+class OverstatingStrategy extends AutobiographicalStrategy {
+  overstate = false;
+
+  protected buildPicker(inputs: PickerInputs, ...rest: unknown[]): Picker {
+    const picker = (super.buildPicker as (inputs: PickerInputs, ...rest: unknown[]) => Picker).call(this, inputs, ...rest);
+    if (!this.overstate) return picker;
+    const run = picker.run.bind(picker);
+    picker.run = (runInputs, budget) => ({ ...run(runInputs, budget), finalTokens: 10_000, budgetMet: false });
+    return picker;
+  }
+}
+
+async function openManager(name: string, shape: Shape = {}, turns = 60, unansweredCalls = false, Strategy: typeof AutobiographicalStrategy = AutobiographicalStrategy) {
+  const strategy = new Strategy({
     compressionModel: 'zz-model',
     targetChunkTokens: 120,
     headWindowTokens: 0,
@@ -184,7 +198,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     await assert.rejects(twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: inSelect }), (e: Error) => {
       assert.equal(e.name, 'OverBudgetError', e.message);
       assert.ok(!e.message.startsWith('The request limit of'), `premise: refused inside the select: ${e.message}`);
-      assert.ok(e.message.endsWith(' Under the request limit, the request is priced at the store\'s multiplier of 1.00.'), e.message);
+      assert.ok(e.message.includes(', priced at the store\'s multiplier of 1.00)'), e.message);
       return true;
     });
     twin.cm.close();
@@ -700,7 +714,6 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
   const BUDGET_ABOVE_LIMIT = { ...BUDGET, maxTokens: 40_000 };
   const compileUnder = async (cm: ContextManager, limit: number, budget = BUDGET) =>
     (await cm.compile(budget, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit })).renderStats!;
-  const compileFree = async (cm: ContextManager) => (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
   const sentUnder = (cm: ContextManager, limit: number, budget = BUDGET) =>
     cm.compile(budget, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit });
   const sentFree = (cm: ContextManager, budget: TokenBudget = BUDGET) => cm.compile(budget, INJECTIONS, { requestOverhead: OVERHEAD });
@@ -820,11 +833,12 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
       why: `${empty}, and either the store's price of it is below the provider's count, or the request limit is above what the provider takes too.`,
     });
     assert.ok(!differs(limitedSent, await sentUnder(cm, 1_000_000)), 'and the retry sends the refused request');
-    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
+    const freeSent = await sentFree(cm);
     assert.deepStrictEqual(strategy.reportRefusedAsTooLong(5_000, OVERHEAD), {
       changed: false,
       why: `${empty}.`,
     });
+    assert.ok(!differs(freeSent, await sentFree(cm)), 'and without a limit, the retry sends the refused request too');
     cm.close();
   });
 
@@ -954,11 +968,12 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     const first = await compileUnder(above.cm, above.limit);
     const count = countFor(first, 1, 2.5);
     above.strategy.reportRefusedAsTooLong(count, OVERHEAD);
-    await compileUnder(above.cm, above.limit);
+    const aboveSent = await sentUnder(above.cm, above.limit);
     assert.deepStrictEqual(above.strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
       changed: false,
       why: `The provider refused the request as too long without stating its count, and the store already prices it at a rate of ${rateOf(count, first, 1).toFixed(2)}, at or above the calibration's ceiling of 1.80, so it has nothing to raise.`,
     });
+    assert.ok(!differs(aboveSent, await sentUnder(above.cm, above.limit)), 'and the retry above the ceiling sends the refused request too');
     above.cm.close();
   });
 
@@ -1055,9 +1070,9 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
     assert.equal(strategy.reportRefusedAsTooLong(undefined, OVERHEAD).changed, true, 'premise: the refusal keeps the ceiling as the rate');
     const priced = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
-    strategy.reportRealInputTokens(countFor(priced, 1, 5));
+    strategy.reportRealInputTokens(Math.round((priced.total.tokens + priced.request!.injectedTokens) * 0.95));
     const next = await compileUnder(cm, limit, BUDGET_ABOVE_LIMIT);
-    assert.equal(next.calibration!.multiplier, 1, 'premise: the undeclared sample leaves the multiplier');
+    assert.equal(next.calibration!.multiplier, 1, 'premise: the undeclared sample, implying a little under 1, leaves the multiplier inside the dead band');
     assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, next), 'still priced at 1.80');
     cm.close();
   });
@@ -1095,11 +1110,12 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     const limited = await compileUnder(measured.cm, limit);
     assert.equal(limited.calibration!.multiplier, 1.2, 'premise: the multiplier stays');
     assert.equal(limited.request!.allowanceTokens, allowanceAt(limit, 1, limited), 'no provider\'s rate was kept');
-    await compileFree(measured.cm);
+    const dSent = await sentFree(measured.cm);
     assert.deepStrictEqual(measured.strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
       changed: false,
       why: 'The provider refused the request as too long without stating its count, and without a request limit the store keeps no rate to raise for it.',
     });
+    assert.ok(!differs(dSent, await sentFree(measured.cm)), 'and the retry of a count-less refusal sends the refused request');
     measured.cm.close();
   });
 
@@ -1260,13 +1276,212 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
         changed: false,
         why: count === undefined
           ? `The provider refused the request as too long without stating its count, and at the calibration's ceiling of 1.80 ${leaves}, so the store doesn't keep the ceiling as a rate.`
-          : `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, and at the rate of ${rateOf(count, first, 1).toFixed(2)} that implies, ${leaves}, so the store keeps no rate from it.`,
+          : `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, and at the rate of ${rateOf(count, first, 1).toFixed(2)} that it teaches, ${leaves}, so the store learns nothing from it.`,
       });
       const retry = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: limit });
       assert.ok(!differs(sent, retry), 'and the retry, priced as the refused request was, sends it again rather than refusing itself');
       cm.close();
     });
   }
+
+  /** What the requests a store compiles with `overhead` send beside the window, on a twin at `multiplier`. */
+  async function besidesAt(name: string, multiplier: number, overhead: RequestOverhead) {
+    const twin = await seededAt(name, multiplier);
+    const stats = (await twin.cm.compile(BUDGET, INJECTIONS, { requestOverhead: overhead, dryRun: true })).renderStats!;
+    twin.cm.close();
+    return { besides: besidesOf(stats), overheadTokens: stats.request!.overheadTokens };
+  }
+
+  const leavesNoRoom = /what the request sends beside the window leaves it no room under the request limit, so the store learns nothing from it\.$/;
+
+  it('a count whose sample would set a multiplier at which what the request sends beside the window leaves it no room teaches nothing, and the store, reopened, still compiles', async () => {
+    const { besides } = await besidesAt('sample-no-room-twin', 1, BIG);
+    const limit = R + Math.floor(besides * 1.5);
+    const opts = { requestOverhead: BIG, requestLimitTokens: limit };
+    const { cm, strategy } = await openManager('sample-no-room');
+    const sent = await cm.compile(BUDGET, INJECTIONS, opts);
+    const first = sent.renderStats!;
+    assert.equal(first.calibration!.provisional, true, 'premise: provisional, so a sample in the band would replace the multiplier outright');
+    const estimated = cm.getChannelTokenStats();
+    const count = countFor(first, 1, 1.75);
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(count, BIG), {
+      changed: false,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)}, and at the rate of ${rateOf(count, first, 1).toFixed(2)} that it teaches, what the request sends beside the window leaves it no room under the request limit, so the store learns nothing from it.`,
+    });
+    assert.deepStrictEqual(cm.getChannelTokenStats(), estimated, 'the store estimates its messages as it did');
+    const retry = await cm.compile(BUDGET, INJECTIONS, opts);
+    assert.ok(!differs(sent, retry), 'the retry sends the refused request rather than refusing itself');
+    assert.equal(retry.renderStats!.calibration!.multiplier, 1, 'the multiplier is as it was');
+    assert.equal(retry.renderStats!.calibration!.provisional, true, 'and still provisional');
+    cm.close();
+    const reopened = await openManager('sample-no-room');
+    const after = (await reopened.cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(after.calibration!.multiplier, 1, 'reopened, the store holds no multiplier from the refusal');
+    reopened.cm.close();
+  });
+
+  it('a refusal that would leave the window no room leaves the multiplier\'s average as it was', async () => {
+    const { besides } = await besidesAt('average-no-room-twin', 1, BIG);
+    const limit = R + Math.floor(besides * 1.5);
+    const opts = { requestOverhead: BIG, requestLimitTokens: limit };
+    const { cm, strategy, internals } = await seededAt('average-no-room', 1);
+    for (let i = 0; i < 2; i++) {
+      const stats = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+      strategy.reportRealInputTokens(countFor(stats, 1, 1), BIG);
+    }
+    const record = (internals.store as unknown as { getStateJson(id: string): { declaredOverhead?: boolean } | null })
+      .getStateJson(internals.calibrationStateId);
+    assert.equal(record?.declaredOverhead, true, 'premise: two agreeing samples that declare their overhead mark the store, so the next one steps its average');
+    const sent = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(sent.calibration!.multiplier, 1, 'premise: at 1');
+    const answer = strategy.reportRefusedAsTooLong(countFor(sent, 1, 1.75), BIG);
+    assert.match(answer.why, leavesNoRoom);
+    const next = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    strategy.reportRealInputTokens(countFor(next, 1, 1), BIG);
+    const after = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(after.calibration!.multiplier, 1,
+      'a sample at 1 leaves the multiplier at 1: the average the refusal would have stepped to 1.15 is still at 1, so the step stays inside the dead band');
+    cm.close();
+  });
+
+  it('a refusal that would leave the window no room leaves the multiplier and a held sample as they were', async () => {
+    const { besides } = await besidesAt('held-no-room-twin', 1, BIG);
+    const limit = R + Math.floor(besides * 1.5);
+    const opts = { requestOverhead: BIG, requestLimitTokens: limit };
+    const { cm, strategy } = await seededAt('held-no-room', 1);
+    const heldFrom = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    strategy.reportRealInputTokens(countFor(heldFrom, 1, 1.1), BIG);
+    const sent = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(sent.calibration!.multiplier, 1, 'premise: the first sample that declares its overhead is held, not learned');
+    const answer = strategy.reportRefusedAsTooLong(countFor(sent, 1, 1.75), BIG);
+    assert.equal(answer.changed, false);
+    assert.match(answer.why, leavesNoRoom);
+    const next = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(next.calibration!.multiplier, 1, 'the refusal stepped no multiplier');
+    strategy.reportRealInputTokens(countFor(next, 1, 1.1), BIG);
+    const paired = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.ok(Math.abs(paired.calibration!.multiplier - 1.1) < 0.01,
+      `the held sample still pairs with the next one that agrees, and their mean replaces the multiplier: ${paired.calibration!.multiplier}`);
+    cm.close();
+  });
+
+  it('a usage sample keeps no rate at which what the request sends beside the window leaves it no room under the limit', async () => {
+    const { besides } = await besidesAt('usage-no-room-twin', 1, BIG);
+    const limit = R + Math.floor(besides * 2.2);
+    const opts = { requestOverhead: BIG, requestLimitTokens: limit };
+    const { cm, strategy } = await seededAt('usage-no-room', 1);
+    await cm.compile(BUDGET, INJECTIONS, opts);
+    strategy.reportRefusedAsTooLong(undefined, BIG);
+    const priced = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(priced.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, priced), 'premise: the refusal kept the ceiling as the rate');
+    strategy.reportRealInputTokens(countFor(priced, 1, 2.5), BIG);
+    const next = (await cm.compile(BUDGET, INJECTIONS, opts)).renderStats!;
+    assert.equal(next.calibration!.multiplier, 1, 'premise: the band rejected the sample, so the multiplier stays');
+    assert.equal(next.request!.allowanceTokens, allowanceAt(limit, 1 / 1.8, next), 'and the rate stays at the ceiling');
+    cm.close();
+  });
+
+  it('decides room by pricing each block at the multiplier a refusal would set, as the compile does', async () => {
+    const TINY: RequestOverhead = { ...OVERHEAD, messages: [Array.from({ length: 400 }, () => ({ type: 'text', text: 'ab' }) as ContentBlock)] };
+    const at1 = (await besidesAt('tiny-at-1', 1, TINY)).besides;
+    const at152 = (await besidesAt('tiny-at-152', 1.52, TINY)).besides;
+    assert.ok(at152 - Math.round(at1 * 1.52) >= 100, `premise: rounded per block, 1.52 prices the overhead well past 1.52 times its price at 1 (${at1} at 1, ${at152} at 1.52)`);
+    const limit = R + Math.floor((at1 * 1.52 + at152) / 2);
+    const opts = { requestOverhead: TINY, requestLimitTokens: limit };
+    const { cm, strategy } = await openManager('tiny-rounding');
+    const sent = await cm.compile(BUDGET, INJECTIONS, opts);
+    assert.equal(sent.renderStats!.calibration!.provisional, true, 'premise: provisional, so the count would set the multiplier outright');
+    const answer = strategy.reportRefusedAsTooLong(countFor(sent.renderStats!, 1, 1.52), TINY);
+    assert.equal(answer.changed, false);
+    assert.match(answer.why, leavesNoRoom);
+    assert.ok(!differs(sent, await cm.compile(BUDGET, INJECTIONS, opts)), 'and the retry sends the refused request rather than refusing itself');
+    cm.close();
+  });
+
+  it('decides room by what the refused compile sends beside the window, not by the overhead its report names', async () => {
+    const big = await besidesAt('report-overhead-twin', 1, BIG);
+    const small = await besidesAt('report-overhead-small', 1, OVERHEAD);
+    const limit = R + Math.floor(big.besides * 1.5);
+    const opts = { requestOverhead: BIG, requestLimitTokens: limit };
+    const { cm, strategy } = await seededAt('report-overhead', 1);
+    const sent = await cm.compile(BUDGET, INJECTIONS, opts);
+    const first = sent.renderStats!;
+    const reported = first.total.tokens + first.request!.injectedTokens + small.overheadTokens;
+    assert.ok(limit - R > reported * 1.7 - first.total.tokens * 1.7, 'premise: priced by the report\'s overhead, the rate would leave the window room');
+    const answer = strategy.reportRefusedAsTooLong(Math.round(reported * 1.7), OVERHEAD);
+    assert.equal(answer.changed, false);
+    assert.match(answer.why, leavesNoRoom);
+    const retry = await cm.compile(BUDGET, INJECTIONS, opts);
+    assert.ok(!differs(sent, retry), 'and the retry sends the refused request rather than refusing itself');
+    assert.equal(retry.renderStats!.request!.allowanceTokens, first.request!.allowanceTokens, 'priced as it was');
+    cm.close();
+  });
+
+  it('where a retry\'s select would refuse at the plan\'s check, a count is no change, and says that refusal', async () => {
+    const base = await uncappedOn('plan-check-base', () => openManager('plan-check-base'));
+    const limit = requestTokens(base) * 3;
+    const { cm, strategy } = await openManager('plan-check', {}, 60, false, OverstatingStrategy);
+    const sent = await sentUnder(cm, limit);
+    const first = sent.renderStats!;
+    assert.equal(first.calibration!.provisional, true, 'premise: provisional, so the sample sets the multiplier outright');
+    (strategy as OverstatingStrategy).overstate = true;
+    const count = countFor(first, 1, 1.25);
+    const answer = strategy.reportRefusedAsTooLong(count, OVERHEAD);
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: limit, dryRun: true });
+    let refusal = '';
+    await assert.rejects(sentUnder(cm, limit), (e: Error) => {
+      refusal = e.message;
+      return e.name === 'OverBudgetError' && e.message.startsWith('Adaptive picker exhausted');
+    });
+    assert.deepStrictEqual(answer, {
+      changed: false,
+      why: `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(first)} but within the request limit less the reply's reserve, so the request limit, or the reply's reserve against max_tokens, is above what the provider takes; the sample moves the multiplier to 1.25. A retry's select now refuses: ${refusal}`,
+    });
+    cm.close();
+  });
+
+  it('reports the allowance of the attempt a compile returns: a drop\'s retry that the limit doesn\'t bind reports none', async () => {
+    const shape = { overBudgetGraceRatio: 0 };
+    const target = BUDGET.maxTokens - R;
+    const first = await openManager('drop-allowance', shape, 0);
+    first.cm.addMessage('User', [{ type: 'text', text: 'one message, most of the target on its own, '.repeat(Math.floor(target * 0.85 * 2.9 / 44)) }]);
+    const besides = besidesOf((await first.cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, dryRun: true })).renderStats!);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.4, at: 1 });
+    first.cm.close();
+    const { cm } = await openManager('drop-allowance', shape, 0);
+    const stats = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: BIG, requestLimitTokens: R + target + besides + 50 })).renderStats!;
+    assert.equal(stats.calibration!.multiplier, 1, 'premise: the limit refused the compile at 1.4, and the store dropped the multiplier to 1 and compiled again');
+    assert.equal(stats.request!.allowanceTokens, undefined, 'the retry, which the limit doesn\'t bind, reports no allowance');
+    cm.close();
+  });
+
+  it('names an own refusal\'s pricing inside its list, so a refusal that names pins still ends with what clears them', async () => {
+    const { besides } = await besidesAt('pins-limit-twin', 1, OVERHEAD);
+    const { cm } = await seededAt('pins-limit', 1);
+    const all = cm.getAllMessages();
+    cm.pinRange(all[10]!.id, all[40]!.id, { name: 'a long stretch' });
+    await assert.rejects(cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: R + besides + 2_000 }), (e: Error) => {
+      assert.equal(e.name, 'OverBudgetError', e.message);
+      assert.ok(e.message.includes(', priced at the store\'s multiplier of 1.00)'), e.message);
+      assert.ok(e.message.endsWith('whoever sets the hard budget can raise it if the model\'s window allows.'), e.message);
+      return true;
+    });
+    cm.close();
+  });
+
+  it('without a request limit, a count that a held sample pairs with to lower the multiplier says the next compile prices at the lower one', async () => {
+    const { cm, strategy } = await seededAt('no-limit-lowered', 1);
+    const heldFrom = (await sentFree(cm)).renderStats!;
+    strategy.reportRealInputTokens(countFor(heldFrom, 1, 0.92), OVERHEAD);
+    const sent = (await sentFree(cm)).renderStats!;
+    assert.equal(sent.calibration!.multiplier, 1, 'premise: the first sample that declares its overhead is held');
+    const count = countFor(sent, 1, 1.01);
+    const answer = strategy.reportRefusedAsTooLong(count, OVERHEAD);
+    const next = (await sentFree(cm)).renderStats!;
+    assert.ok(next.calibration!.multiplier < 1, `premise: the pair's mean lowered the multiplier: ${next.calibration!.multiplier}`);
+    assert.equal(answer.why, `The provider counted ${count} input tokens, more than the store's price of ${pricedOf(sent)}, so the next compile prices the request at a rate of ${next.calibration!.multiplier.toFixed(2)}.`);
+    cm.close();
+  });
 
   it('a usage sample the calibration\'s band rejects as below it leaves the provider\'s rate as it is', async () => {
     const { cm, strategy, limit } = await bound('rejected-sample', 1, 1.8);
