@@ -256,7 +256,7 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
-      'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
+      'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
       "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
     ].join('\n');
   }
@@ -264,15 +264,15 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the strategy reads the store through a view without `onBranch`, which can't tell a removal or a filter from a broken chain.",
-      'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
+      'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
       'Fix: give the strategy a view with `onBranch`, as MessageStore and the views built on it have; each rebuild checks again.',
     ].join('\n');
   }
   return [
     'Compression of new conversation has stopped.',
-    `Cause: the store couldn't read its messages chain to check the chunk records that name no message in view (${causeText(cause.chainUnread)}).`,
-    'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
-    'Fix: fix the cause, whole in the FAIL-CLOSED log line; it retries.',
+    `Cause: the store couldn't read its messages chain to check the emptied chunk records (${causeText(cause.chainUnread)}).`,
+    'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
+    'Fix: fix the cause, whole in the FAIL-CLOSED log line; a rebuild retries.',
   ].join('\n');
 }
 
@@ -289,7 +289,9 @@ function chunkRecordsFailClosedLine(emptied: number, total: number): string {
     `broken under chronicle before 0.5.0, or a store rebuilt under new ids. Chunk compression halted to ` +
     `prevent duplicate memory formation. Before resuming, check the store was opened with every message ` +
     `slot it was written with (auxiliaryMessageViews), then read the emptied records' messages by id ` +
-    `(a broken chain leaves them readable; a store rebuilt elsewhere leaves nothing to read) and compare ` +
+    `(change nothing if a message read isn't the one its record's summary covers: a store rebuilt in a ` +
+    `fresh chronicle can give the old ids to other messages, or leave nothing to read; a broken chain ` +
+    `leaves them readable) and compare ` +
     `their content with the messages on this branch's chain; branch the chronicle before any removal or ` +
     `re-key. If that history isn't on this chain again, remove only the emptied chunk records and keep ` +
     `their summaries. If it is, under new ids, restore the chain the records were written against, or ` +
@@ -8854,7 +8856,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The merge checks the chain-break guard held back are work too while no
     // chunk is queued: the tick runs them before anything else, and they can
     // queue a merge. With chunks queued, the preflight decides as before, and
-    // the next tick that can send a chunk runs them first.
+    // the next tick that can send a chunk runs them first. A compression
+    // pause holds them as it holds a chunk: the tick returns at the pause,
+    // the drain stops, and they run at the first tick after it.
     const hasOwedChecks = !hasCompression && this._mergeCheckOwed && !this.chunkRecordsOrphaned;
     if (!hasCompression && !hasMerges && !hasOwedChecks) return;
     // Only bail when the *sole* available work is L1 compression that the
@@ -19787,7 +19791,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.error(typeof cause === 'object'
           ? `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +
             `records that name no message in the view (${oneLine(failureMessage(cause.chainUnread))}). Chunk compression ` +
-            `halted for this rebuild; the next rebuild asks again.`
+            `halted for this rebuild; the next rebuild asks again, such as the next compile that isn't a dry run.`
           : cause === 'off-branch'
             ? chunkRecordsFailClosedLine(orphaned, n)
             : `[autobiographical] FAIL-CLOSED: ${orphaned}/${n} chunk records name no message in the view, ` +

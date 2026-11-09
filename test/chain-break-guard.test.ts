@@ -106,7 +106,7 @@ const halts = async (cm: ContextManager, s: AutobiographicalStrategy, label: str
   assert.strictEqual(debt.state, 'critical', `${label}: the debt report is critical`);
   assert.strictEqual(debt.failure, 'chunk-records', label);
   assert.match(debt.error ?? '', /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/, `${label}: the off-chain cause`);
-  assert.match(debt.error ?? '', /\nEffect: no chunk is sent to be summarized; queued merges still run and can queue the next level\.\n/, `${label}: what waits`);
+  assert.match(debt.error ?? '', /\nEffect: no new chunk is sent to be summarized; queued merges still run and can queue the next level\.\n/, `${label}: what waits`);
   assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step\.$/, `${label}: the fix's first step`);
 };
 const offBranch = (cm: ContextManager, ids: string[], label: string): void => {
@@ -775,12 +775,12 @@ describe('how the chain-break guard asks', () => {
       const debt = s.getCompressionDebt();
       assert.strictEqual(debt.state, 'critical');
       assert.strictEqual(debt.failure, 'chunk-records');
-      assert.match(debt.error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in view \(a read of the messages state failed \(test\)\)\./);
-      assert.match(debt.error ?? '', /\nFix: fix the cause, whole in the FAIL-CLOSED log line; it retries\.$/);
+      assert.match(debt.error ?? '', /\nCause: the store couldn't read its messages chain to check the emptied chunk records \(a read of the messages state failed \(test\)\)\./);
+      assert.match(debt.error ?? '', /\nFix: fix the cause, whole in the FAIL-CLOSED log line; a rebuild retries\.$/);
       assert.doesNotMatch(debt.error ?? '', /chronicle before 0\.5\.0|onBranch|change nothing/, 'it names no broken chain or view');
       const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
       assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
-      assert.match(failClosed[0]!, /couldn't read its messages chain[^\n]*\(a read of the messages state failed \(test\)\)[^\n]*the next rebuild asks again/);
+      assert.match(failClosed[0]!, /couldn't read its messages chain[^\n]*\(a read of the messages state failed \(test\)\)[^\n]*the next rebuild asks again, such as the next compile that isn't a dry run\./);
       fail = false;
       await laterMessagesCompress(cm, s, `once the ${end} end's read succeeds`);
       await cm.close();
@@ -908,6 +908,7 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
     const line = failClosed[0]!;
     assert.match(line, /4\/4 chunk records name no message in the view, and the oldest or newest of them names a message that isn't on this branch's messages chain/);
     assert.match(line, /Before resuming, check the store was opened with every message slot it was written with \(auxiliaryMessageViews\), then read the emptied records' messages by id/);
+    assert.match(line, /read the emptied records' messages by id \(change nothing if a message read isn't the one its record's summary covers: a store rebuilt in a fresh chronicle can give the old ids to other messages, or leave nothing to read; a broken chain leaves them readable\)/);
     assert.match(line, /branch the chronicle before any removal or re-key/);
     assert.match(line, /If that history isn't on this chain again, remove only the emptied chunk records and keep their summaries\./);
     assert.match(line, /If it is, under new ids, restore the chain the records were written against, or re-key/);
@@ -990,6 +991,7 @@ describe('MessageStore.onBranch and the views', () => {
     assert.strictEqual(store.onBranch(onFork!), false, "the fork's message, from main");
     assert.strictEqual(store.onBranch('900000'), false, 'a number it never assigned');
     assert.strictEqual(store.onBranch('ghost-0-a'), false, 'an id of another form');
+    assert.strictEqual(store.onBranch(`0${ids[0]!}`), false, 'a live id spelled with a leading zero');
     await cm.close();
   });
 
@@ -1004,6 +1006,7 @@ describe('MessageStore.onBranch and the views', () => {
 
     const aux = await ContextManager.open({ store: cm.getStore(), namespace: 'aux', strategy: new PassthroughStrategy(), isolate: true });
     const [auxId] = add(aux, 1);
+    assert.strictEqual(messageStoreOf(cm).onBranch(auxId!), false, 'the primary slot, for a message the auxiliary slot wrote');
     const merged = mergeMessageStoreViews(messageStoreOf(cm).createView(), [messageStoreOf(aux).createView()]);
     assert.strictEqual(merged.onBranch?.(auxId!), true, "an auxiliary source's message, on its branch");
     assert.strictEqual(merged.onBranch?.(shown!), true, "the primary's, on its branch");
