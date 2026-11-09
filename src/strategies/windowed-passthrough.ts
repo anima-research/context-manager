@@ -575,6 +575,27 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     return (message) => (ordinals.get(message.id) ?? Infinity) >= from;
   }
 
+  /**
+   * Where the window starts in `messages`, the stripped view, for select
+   * and renderAsNewest alike: at the first row at or after the anchor
+   * (atOrAfterAnchor), then back to the latest clean start (cleanStarts), so
+   * a tool_result it holds goes with its tool_use. The view lists rows in
+   * record order while the window is the record, and in window order, the
+   * order of their ordinals, once rows are presented, so the rows before the
+   * anchor come first in both.
+   */
+  private windowStart(
+    messages: readonly StoredMessage[],
+    clean: readonly boolean[],
+    presented: { ordinals: ReadonlyMap<MessageId, number>; from: number } | null,
+  ): number {
+    const shown = this.atOrAfterAnchor(presented);
+    let start = 0;
+    while (start < messages.length && !shown(messages[start]!)) start++;
+    while (!clean[start]) start--;
+    return start;
+  }
+
   // --------------------------------------------------------------------------
   // Branch-scoped state
   // --------------------------------------------------------------------------
@@ -702,18 +723,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     const messages = stripUnpairedToolBlocks(store.getAll(), { keepCalls: true });
     const clean = cleanStarts(messages);
     const presented = this.presentedAnchor(opts?.dryRun === true);
-    const shown = this.atOrAfterAnchor(presented);
-
-    // The window: everything at or after the anchor. The view lists rows in
-    // record order while the window is the record, and in window order, the
-    // order of their ordinals, once rows are presented, so the rows before
-    // the anchor come first in both. It starts back at the latest clean
-    // start, so a tool_result it holds goes with its tool_use.
-    let start = 0;
-    while (start < messages.length && !shown(messages[start]!)) {
-      start++;
-    }
-    while (!clean[start]) start--;
+    let start = this.windowStart(messages, clean, presented);
 
     // Per-message shaping BEFORE pricing, so the window is sized on what
     // will actually be sent: the live-image policy's verdicts, decided once
@@ -899,10 +909,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     const messages = stripUnpairedToolBlocks(store.getAll(), { keepCalls: true });
     const clean = cleanStarts(messages);
     const at = new Map(messages.map((m, i) => [m.id, i] as const));
-    const atOrAfter = this.atOrAfterAnchor(this.presentedAnchor());
-    let first = 0;
-    while (first < messages.length && !atOrAfter(messages[first]!)) first++;
-    while (!clean[first]) first--;
+    const first = this.windowStart(messages, clean, this.presentedAnchor());
     const shown = (i: number): boolean => i >= first;
     let from = messages.length;
     for (const id of ids) {

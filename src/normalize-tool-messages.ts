@@ -165,6 +165,7 @@ export function stripUnpairedToolBlocks<T extends { participant: string; content
   messages: readonly T[],
   options: { keepCalls: true },
 ): readonly T[];
+// Last, since Parameters<> and ReturnType<> read the last overload: the one-argument form stays what they give.
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }>;
