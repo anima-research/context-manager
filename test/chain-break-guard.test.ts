@@ -419,7 +419,10 @@ describe('merges while the chain-break guard holds', () => {
     await cm.close();
   });
 
-  it('the open\'s merge check, which waited while the guard held, runs at the first tick after it clears', async (t) => {
+  // A store whose guard held at open, its chain read failing, with the merge
+  // check the open skipped owed: six L1s, the two whose messages remain a run
+  // at this threshold. `added` messages arrive once the read succeeds.
+  const clearedAfterOpen = async (t: { after(fn: () => void): void }, added: number) => {
     const path = freshPath();
     {
       const s = queueing(99);
@@ -438,20 +441,34 @@ describe('merges while the chain-break guard holds', () => {
       return onBranch.call(this, id);
     });
     t.after(() => failing.mock.restore());
-    // The two L1s whose messages remain are a run at this threshold.
     const s = queueing(2);
     const cm = await ContextManager.open({ path, strategy: s, membrane });
     assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds at open, its read failing');
     assert.deepStrictEqual(s.queuedLevels(), [], 'setup: the open queued no merge');
     fail = false;
-    add(cm, 1);
-    assert.strictEqual(records(cm).length, 6, 'setup: no chunk closed');
+    add(cm, added);
     assert.notStrictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard cleared');
+    return { cm, s };
+  };
+
+  it('the open\'s merge check, which waited while the guard held, runs at the first tick after it clears', async (t) => {
+    const { cm, s } = await clearedAfterOpen(t, 1);
+    assert.strictEqual(records(cm).length, 6, 'setup: no chunk closed');
     await cm.tick();
     assert.ok(
       s.queuedLevels().includes(2) || cm.getSummariesInRange({ level: 2 }).length > 0,
       `a level-2 merge is queued or ran (queued ${JSON.stringify(s.queuedLevels())})`,
     );
+    await cm.close();
+  });
+
+  it('a tick that sends a chunk runs the owed merge checks before it', async (t) => {
+    const { cm, s } = await clearedAfterOpen(t, 30);
+    assert.ok(records(cm).length > 6, 'setup: chunks closed, so the tick sends one');
+    const owed = () => (s as unknown as { _mergeCheckOwed: boolean })._mergeCheckOwed;
+    assert.strictEqual(owed(), true, 'setup: the checks are owed');
+    await cm.tick();
+    assert.strictEqual(owed(), false, 'the first tick ran them');
     await cm.close();
   });
 });

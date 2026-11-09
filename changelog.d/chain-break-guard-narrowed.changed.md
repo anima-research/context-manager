@@ -15,9 +15,9 @@
   store rebuilt under new ones.
 - While the guard halts, no chunk, waiting or new, is sent to be
   summarized. Merges already queued still run and can queue the next level;
-  only the open's merge check and the one after a drop wait, and the first
-  tick after the guard clears runs them. `getCompressionDebt()` reads
-  `critical` with `failure: 'chunk-records'`.
+  only the open's merge check and the one after a drop wait, and once the
+  guard clears, the next tick that can send a chunk runs them first.
+  `getCompressionDebt()` reads `critical` with `failure: 'chunk-records'`.
   Its `error` gives the cause and the first step, which changes nothing. The `FAIL-CLOSED` log line gives every step.
   `scripts/drain-autobiographical.ts` then stops before any step, with
   `stopped: 'chunk-records'`, and exits 1.

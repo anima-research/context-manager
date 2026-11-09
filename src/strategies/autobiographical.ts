@@ -2350,11 +2350,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summarized — duplicate memories are strictly worse than delayed
    * compression. Merges combine summaries that already exist, so they go
    * on: merges already queued still run and can queue the next level; only
-   * the open's merge check and the one after a drop wait, and the first
-   * tick after the latch clears runs them (_mergeCheckOwed).
+   * the open's merge check and the one after a drop wait, and once the
+   * latch clears, the next tick that can send a chunk runs them first
+   * (_mergeCheckOwed).
    */
   protected chunkRecordsOrphaned = false;
-  /** Whether the latch has cleared since it last held, so the merge checks it held back are owed to the next tick. */
+  /** Whether the latch has cleared since it last held, so the merge checks it held back are owed to the next tick that can send a chunk. */
   private _mergeCheckOwed = false;
   /** Why the latch is set (chunkRecordsMessage). */
   private _orphanCause: ChunkRecordsCause = 'off-branch';
@@ -8981,6 +8982,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // no queue item consumed until the pause ends (see pauseCompressionLane).
     if (this.activeCompressionPause(ctx)) return;
 
+    // The merge checks the chain-break guard held back, before any chunk goes, as at open.
+    if (this._mergeCheckOwed && !this.chunkRecordsOrphaned) {
+      this._mergeCheckOwed = false;
+      this.sweepPaidOffMergeQuarantine();
+      this.checkMergeThreshold();
+    }
+
     // Priority 1: Compress raw chunks → L1. Skipped while the speculative cap
     // (maxSpeculativeL1s) holds production, so we don't pile up more unmerged
     // L1s: past the cap with an L1 merge queued, which the merge priority below
@@ -9204,11 +9212,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    if (this._mergeCheckOwed && !this.chunkRecordsOrphaned) {
-      this._mergeCheckOwed = false;
-      this.sweepPaidOffMergeQuarantine();
-      this.checkMergeThreshold();
-    }
     if (this.mergePicksDeferred) {
       this.mergePicksDeferred = false;
       this.checkMergeThreshold();
