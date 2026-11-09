@@ -1,14 +1,17 @@
 /**
  * System changes: membrane's `system_change` block (SystemChangeContent), a
- * change to the tools and system text the model is offered from its place in
- * the conversation on. One stands alone in its message
- * (well-formed-content.ts), and membrane sends such a message as a system
- * message of its own, at the first point at or after its place that follows
- * a user turn, so always before the reply the request asks for. So one
- * stored between a tool call and its result would go out after the result,
- * and the store refuses that write where a write can see it
+ * change from its place in the conversation on to the tools and system text
+ * the model is offered, or to the effort it answers with. One stands alone in
+ * its message (well-formed-content.ts), and membrane sends a change of tools
+ * or system text as a system message of its own at the first point at or
+ * after its place that follows a user turn, so always before the reply the
+ * request asks for, and an effort-only one at its place, or right after the
+ * turn its place falls inside where membrane merges turns. So a change of
+ * tools or system text stored between a tool call and its result would go out
+ * after the result, and the store refuses that write where a write can see it
  * (MessageStore.refuseToolPairSplit): kept raw there, it would part the call
- * from its result.
+ * from its result. An effort-only change is refused there as well: kept raw,
+ * it would part them the same way.
  *
  * Every strategy compiles such a message unaltered, in its place among the
  * raw messages. A fold or a window that left one out would take its change
