@@ -10,18 +10,27 @@ const types = (m: { content: ContentBlock[] }): string[] => m.content.map((b) =>
 const recall = (): string => '';
 
 describe('ingress keeps a reply\'s blocks from its first call on with its last part', () => {
+  const picture = (): ContentBlock => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } }) as unknown as ContentBlock;
   const SHAPES: Record<string, { content: ContentBlock[]; first: string[]; last: string[]; joined: string[] }> = {
     'thinking, text and a call': {
       content: [thinking('T'), text(long('A')), call('c1')],
-      first: ['text', 'thinking'], last: ['text', 'tool_use'], joined: ['thinking', 'tool_use', 'text'],
+      first: ['text'], last: ['text', 'thinking', 'tool_use'], joined: ['thinking', 'tool_use', 'text'],
     },
     'a reply answering its own call': {
       content: [thinking('T'), text(long('A')), call('c1'), result('c1', 'r'), text('after')],
-      first: ['text', 'thinking'], last: ['text', 'tool_use', 'tool_result'], joined: ['thinking', 'tool_use', 'tool_result', 'text'],
+      first: ['text'], last: ['text', 'thinking', 'tool_use', 'tool_result'], joined: ['thinking', 'tool_use', 'tool_result', 'text'],
     },
     'two calls with text between': {
       content: [thinking('T'), text(long('A')), call('c1'), text('and'), call('c2')],
-      first: ['text', 'thinking'], last: ['text', 'tool_use', 'tool_use'], joined: ['thinking', 'tool_use', 'tool_use', 'text'],
+      first: ['text'], last: ['text', 'thinking', 'tool_use', 'tool_use'], joined: ['thinking', 'tool_use', 'tool_use', 'text'],
+    },
+    'thinking, an image, text and a call': {
+      content: [thinking('T'), picture(), text(long('A')), call('c1')],
+      first: ['text'], last: ['text', 'thinking', 'image', 'tool_use'], joined: ['thinking', 'image', 'tool_use', 'text'],
+    },
+    'an image, thinking, text and a call': {
+      content: [picture(), thinking('T'), text(long('A')), call('c1')],
+      first: ['text', 'image'], last: ['text', 'thinking', 'tool_use'], joined: ['image', 'thinking', 'tool_use', 'text'],
     },
     'thinking and text, no call': {
       content: [thinking('T'), text(long('A'))],

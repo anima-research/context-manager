@@ -77,7 +77,7 @@ describe("a message stored in parts goes out with every block it was stored with
             const last = parts[s.reply.at(-1)!]!.content.map((b) => b.type);
             assert.ok(s.reply.length >= 6, `premise: the reply is stored in ${s.reply.length} parts`);
             assert.deepEqual([first, last], layout === 'new'
-              ? [['text', 'thinking'], ['text', 'tool_use']]
+              ? [['text'], ['text', 'thinking', 'tool_use']]
               : [['text', 'thinking', 'tool_use'], ['text']], 'premise: where the reply\'s blocks are stored');
             set(s);
             assert.equal(premise(s, layout), undefined, 'premise: where the parts render');

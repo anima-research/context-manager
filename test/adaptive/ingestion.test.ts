@@ -322,7 +322,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
-  it('flag on: a tool_use and every non-text block after it go on the last shard, the blocks before it on the first', async () => {
+  it('flag on: a tool_use, every non-text block after it and the thinking before it go on the last shard', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
       compressionModel: 'mock',      adaptiveResolution: true,
@@ -342,8 +342,8 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     const all = manager.getAllMessages();
     assert.ok(all.length > 2, 'should be sharded');
     const nonText = (idx: number) => all[idx].content.filter((b: any) => b.type !== 'text');
-    assert.deepEqual(nonText(0), [thinking], 'the first shard carries the blocks before the call');
-    assert.deepEqual(nonText(all.length - 1), [toolUse, toolResult], 'the last shard carries the call and what follows it');
+    assert.deepEqual(nonText(0), [], 'the first shard carries text alone');
+    assert.deepEqual(nonText(all.length - 1), [thinking, toolUse, toolResult], 'the last shard carries the call, the thinking before it and what follows it');
     for (let idx = 1; idx < all.length - 1; idx++) {
       assert.equal(nonText(idx).length, 0, `shard ${idx} carries text alone`);
     }

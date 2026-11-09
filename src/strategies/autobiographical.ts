@@ -3072,12 +3072,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Multi-block content: text blocks are concatenated for chunking, then
    * the resulting shards are emitted as text blocks. Non-text blocks are
    * passed through unchanged, after their shard's text: every one from the
-   * message's first tool_use on goes on the last shard, and those before it
-   * on the first, so a reply's call sits on the shard next to the message
-   * holding its result. Joining the shards (joinBodyParts) sends the
-   * non-text blocks in the order the message held them. A body stored
-   * before this held every non-text block on its first shard (see
-   * turnStart).
+   * message's first tool_use on goes on the last shard, or, in a message
+   * that holds a tool_use, from its first thinking on, and the others on
+   * the first, so a reply's call sits on the shard next to the message
+   * holding its result, with the thinking that led to it. Joining the
+   * shards (joinBodyParts) sends the non-text blocks in the order the
+   * message held them. A body stored before this held every non-text block
+   * on its first shard (see turnStart).
    *
    * See `docs/adaptive-resolution-design.md` §3.6.
    */
@@ -3085,15 +3086,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.config.adaptiveResolution) return null;
     if (content.some(carriesRawItem)) return null;
 
-    // Separate text and non-text blocks, the latter by whether they come
-    // before the first tool_use.
+    // Separate text and non-text blocks, the latter by whether they go with
+    // the message's call.
     const textParts: string[] = [];
     const leading: ContentBlock[] = [];
     const fromCall: ContentBlock[] = [];
+    const holdsCall = content.some((block) => block.type === 'tool_use');
     for (const block of content) {
       if (block.type === 'text') {
         textParts.push(block.text);
-      } else if (block.type === 'tool_use' || fromCall.length > 0) {
+      } else if (block.type === 'tool_use' || fromCall.length > 0
+        || (holdsCall && (block.type === 'thinking' || block.type === 'redacted_thinking'))) {
         fromCall.push(block);
       } else {
         leading.push(block);
@@ -15281,10 +15284,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // structural repair refuses a compile to leave out. For a body split
       // into shards at ingress, its newest shard is all that must stay raw,
       // since the earlier shards can close into chunks and fold, unless the
-      // body holds a tool_result: ingress puts a split message's results on
-      // its first shard (chunkIngressMessage), and a result whose call isn't
-      // raw just before it is blanked as an orphan (enforceToolPairing),
-      // without a refusal. So when the newest body holds a tool_result, the
+      // body holds a tool_result: ingress puts a split message's results
+      // before its first call on its first shard (chunkIngressMessage), and a
+      // result whose call isn't raw just before it is blanked as an orphan
+      // (enforceToolPairing), without a refusal. So when the newest body holds a tool_result, the
       // turn is the whole body and the call before it, from the call's turn
       // start (turnStart), as holdBoundary counts it. A hold inside the head leaves every window's
       // tail starting at the head's end, so a floor counted from the hold
@@ -19871,10 +19874,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return seen && seen.id === listing[k]?.id ? seen.start : undefined;
     };
     let start = known(at);
-    if (start === undefined) {
-      start = at > 0 && continuesBody(listing[at - 1], listing[at]) ? known(at - 1) ?? bodyStart((k) => listing[k], at) : at;
-      starts.set(at, { id: last.id, start });
+    for (let k = at; start === undefined;) {
+      if (k > 0 && continuesBody(listing[k - 1], listing[k])) start = known(--k);
+      else start = k;
     }
+    starts.set(at, { id: last.id, start });
     return start < at && this.hasToolUse(listing[start]!);
   }
 
@@ -21027,20 +21031,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Where an edge at `b` moves so that it doesn't part a tool_use from its
    * tool_result: back one, onto the call, from a message holding a result;
    * then, if that message is a later shard of a body whose first shard holds
-   * a tool_use, back to that first shard. Ingress puts a split reply's call
-   * on its last shard (chunkIngressMessage), so only a body stored with its
-   * call on its first shard moves whole. The recent window's start, the hold
-   * boundary and the refusal's newest-turn floor read it.
+   * a tool_use, back to that first shard. Then again from there while the
+   * message it lands on holds a result whose call is in another message, so
+   * a run of messages that each answer the call before them moves back to
+   * its first, and one that answers its own call doesn't move it further.
+   * Ingress puts a split reply's call on its last shard
+   * (chunkIngressMessage), so only a body stored with its call on its first
+   * shard moves whole. The recent window's start, the hold boundary and the
+   * refusal's newest-turn floor read it.
    */
   protected turnStart(messages: readonly StoredMessage[], b: number): number {
-    for (;;) {
+    for (let first = true; ; first = false) {
       if (b <= 0 || b >= messages.length) return b;
-      const at = this.hasToolResult(messages[b]!) ? b - 1 : b;
+      const at = (first ? this.hasToolResult(messages[b]!) : this.answersElsewhere(messages[b]!)) ? b - 1 : b;
       const start = bodyStart((k) => messages[k], at);
       const next = start < at && this.hasToolUse(messages[start]!) ? start : at;
       if (next === b) return b;
       b = next;
     }
+  }
+
+  private answersElsewhere(message: StoredMessage): boolean {
+    const calls = new Set(message.content.flatMap((block) => (block.type === 'tool_use' ? [block.id] : [])));
+    return message.content.some((block) => block.type === 'tool_result' && !calls.has(block.toolUseId));
+  }
+
+  private callsElsewhere(message: StoredMessage): boolean {
+    const results = new Set(message.content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : [])));
+    return message.content.some((block) => block.type === 'tool_use' && !results.has(block.id));
   }
 
   /**
@@ -21230,10 +21248,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // predecessor has tool_use, pull back by one so the pair stays
         // together; if it is a later shard of a body whose first shard has
         // one (as turnStart reads it), pull back to that first shard. Then
-        // again from there, until the message before holds no call.
-        while (boundary > startIdx) {
+        // again from there, until the message before holds no call answered
+        // after it.
+        for (let first = true; boundary > startIdx; first = false) {
+          const calls = (m: StoredMessage): boolean => (first ? this.hasToolUse(m) : this.callsElsewhere(m));
           const body = Math.max(startIdx, bodyStart((k) => messages[k], boundary - 1));
-          const back = this.hasToolUse(messages[body]) ? body : this.hasToolUse(messages[boundary - 1]) ? boundary - 1 : boundary;
+          const back = calls(messages[body]) ? body : calls(messages[boundary - 1]) ? boundary - 1 : boundary;
           if (back === boundary) break;
           for (; boundary > back; boundary--) tokens -= store.estimateTokens(messages[boundary]);
         }
