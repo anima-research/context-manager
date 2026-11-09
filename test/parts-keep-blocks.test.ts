@@ -328,8 +328,8 @@ describe('a Responses reply whose reasoning item comes before its call is stored
     return adapter.getLastRequest()!.messages as Array<Record<string, unknown>>;
   }
   const SHAPES: Record<string, { content: () => ContentBlock[]; between: number }> = {
-    'reasoning, then its call, then text': { content: () => [reasoning(), functionCall(), text(long('RESP'))], between: 0 },
-    'reasoning, then text, then its call': { content: () => [reasoning(), text(long('RESP')), functionCall()], between: 1 },
+    'reasoning, then its call, then text': { content: () => [reasoning(), functionCall(), text(`${long('RESP')} RESP-END`)], between: 0 },
+    'reasoning, then text, then its call': { content: () => [reasoning(), text(`${long('RESP')} RESP-END`), functionCall()], between: 1 },
   };
   for (const [shape, { content, between }] of Object.entries(SHAPES)) {
     it(`${shape}: one stored message, and the wire carries its items in its own order`, async () => {
@@ -346,7 +346,7 @@ describe('a Responses reply whose reasoning item comes before its call is stored
         const at = (id: string) => sent.findIndex((item) => item.id === id);
         assert.ok(at('rs_1') >= 0 && at('fc_1') >= 0, 'both items go out with their ids');
         assert.equal(at('fc_1') - at('rs_1') - 1, between, 'with only the message\'s own text between them');
-        if (between) assert.ok(JSON.stringify(sent[at('rs_1') + 1]).includes(long('RESP').slice(-200)), 'the whole text, in one item');
+        if (between) assert.ok(JSON.stringify(sent[at('rs_1') + 1]).includes('RESP-END'), 'the whole text, in one item');
         assert.equal(reply.length, 1, 'stored as one message');
       } finally {
         await o.close();
