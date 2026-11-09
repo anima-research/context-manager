@@ -21786,10 +21786,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * `msg` as this strategy sends it before any cut: each `tool_result`
    * toolPruning replaces carries its marker, and each `tool_use` input over
-   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys, _whole }`,
-   * unless that stub would be no shorter than the input (its first five keys as stored: in the order written on chronicle 0.5.1
+   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys, _whole }`
+   * (its first five keys as stored: in the order written on chronicle 0.5.1
    * or later, sorted for an input chronicle before 0.5.1 stored or reads
-   * back). `msg` itself when
+   * back), unless that stub would be no shorter than the input. `msg` itself when
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive

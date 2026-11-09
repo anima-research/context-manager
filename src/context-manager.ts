@@ -3820,7 +3820,8 @@ export class ContextManager {
    * kept after them. They index the text as the compile that wrote the
    * marker sent it. Where tool pruning has since replaced a result of that
    * message, the text read now differs, so a reader whose text's length
-   * isn't the marker's M doesn't page it.
+   * isn't the marker's M doesn't page it. A replacement of the same length
+   * passes that check.
    */
   capMeasuredText(at: { id: string; toolUseId?: string }): string | null {
     this.requireInitialized('capMeasuredText');

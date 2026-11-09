@@ -218,10 +218,11 @@ function cutAt(content: readonly ContentBlock[], headEnd: number, tailStart: num
  * - Otherwise it keeps the largest head and tail whose kept blocks and
  *   marker, estimated alone, fit `maxTokens`: the head 60% of what it keeps
  *   and the tail 40%, each end moved to a line break within half its share,
- *   neither inside a surrogate pair. A cap the marker alone passes keeps
- *   neither, and where that marker estimates at least as much as the
- *   measured blocks it stands for, the content comes back whole: the cut is
- *   never longer than the whole.
+ *   neither inside a surrogate pair. A cap the least cut, the marker and a
+ *   notice for each later string tool result, passes keeps neither, and
+ *   where that cut estimates at least as much as the measured blocks
+ *   it stands for, the content comes back whole: the cut is never longer
+ *   than the whole.
  * - The marker says which characters of the measured text it elided, and,
  *   with `opts.whole`, where the whole is stored, then the clause
  *   `opts.hint` gives, if any (`guardedHint`): `[truncated — chars H to T of M elided here; the

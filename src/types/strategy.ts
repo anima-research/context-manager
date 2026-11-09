@@ -2044,12 +2044,13 @@ export interface AutobiographicalConfig {
    *  stored message whose whole holds them (`capContent`). Each summary in a
    *  recall answer is cut so too, its marker naming the summary, so the
    *  combined recall answer of `positionedRecallPairs: false` can pass the
-   *  limit as a whole. A message comes back whole where its marker alone
+   *  limit as a whole. A message comes back whole where its cut at the
+   *  least, the marker and a notice for each later string tool result,
    *  would cost at least as much as the text it stands for, and loses only
    *  its text blocks that hold nothing where that alone brings it under the
    *  limit. Blocks the cut passes through, such as thinking, can keep a
-   *  message over it, and so can a marker on a limit smaller than the
-   *  marker. A value that isn't a positive number, such as 0 or NaN, means
+   *  message over it, and so can the least cut, the marker and a notice
+   *  for each later string tool result, on a limit smaller than that. A value that isn't a positive number, such as 0 or NaN, means
    *  no limit. */
   maxMessageTokens: number;
 

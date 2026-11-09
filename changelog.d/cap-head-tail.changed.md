@@ -45,11 +45,11 @@
   Text blocks that hold nothing are still left out at no loss: where
   leaving them out brings a message under the cap, it comes back without
   them and nothing else is cut, as `main` left them out past the cap. A cap
-  smaller than the marker sends the marker, over the cap, with any block
-  the cut passes through, such as thinking, and a notice for each later
-  string tool result, except that the cut is never longer than the whole: where the marker alone
-  estimates at least as much as the text it would stand for, the message
-  goes whole. A text
+  smaller than the least cut, the marker and a notice for each later
+  string tool result, sends that cut, over the cap, with any block the cut
+  passes through, such as thinking, except that the cut is never longer
+  than the whole: where the marker and those notices estimate at least as
+  much as the text they would stand for, the message goes whole. A text
   block that holds nothing, or an opaque carrier, at the end is now kept in
   the tail, where past the cap it was left out. A strategy's
   `truncateContent` override gains a `whole` argument naming the stored
