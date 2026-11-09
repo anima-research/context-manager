@@ -124,30 +124,33 @@ export interface WaitingWork {
  * An injection into the compiled context.
  * Source-agnostic: may come from MCPL servers, local strategies, or application code.
  *
- * @deprecated Context injection is deprecated
- * (anima-research/agent-framework#171). Injections are never stored: each
- * `compile()` splices `beforeUser` and `afterUser` injections in fresh,
- * re-anchored to the latest message whose participant is `user` (ignoring
- * case), so the rendered prefix changes each time a newer one arrives and
- * prompt caches stop hitting past that point (head-only hits on OpenAI
- * Responses/Codex). After a mid-activation recompile a `beforeUser`
- * injection can also land between a tool call and its result. `system`
- * injections are not spliced: they come back in
- * `CompileResult.systemInjections` for the caller's system prompt, and are
- * passed again with every compile, so when one's content changes the system
- * prompt itself changes, and the prompt cache misses from there, ahead of
- * every message. Prefer content that is stored once at its own position —
- * system prompt for durable instructions, ordinary messages for changing
- * state. Still accepted by `compile()` for now.
+ * Injections are never stored: `compile()` places them afresh each time it
+ * runs. What each position costs is on `position`, where `beforeUser` is
+ * deprecated (anima-research/agent-framework#171); `system` and `afterUser`
+ * are supported.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
   namespace: string;
 
   /**
-   * Where to inject: `beforeUser` and `afterUser` go into the message array,
-   * placed as `compile()` describes, and `system` comes back in
-   * `CompileResult.systemInjections` instead.
+   * Where to inject:
+   * - `system`: comes back in `CompileResult.systemInjections`, for the
+   *   caller's system prompt, and isn't stored. A change to its text changes
+   *   the system prompt, so the request misses the prompt cache from the
+   *   system prompt on.
+   * - `afterUser`: placed again after the last user message at every compile
+   *   (at the end when there is none), so it moves as newer user messages
+   *   arrive: the request misses the cache from its old place on, and on a
+   *   model that binds a reply's thinking to everything before it, every
+   *   reply after its old place loses its thinking (`thinkingBinding`). It's
+   *   for text that must stay near the end, such as instructions.
+   * - `beforeUser`: deprecated (anima-research/agent-framework#171). It's
+   *   placed again before the last user message at every compile, so it moves
+   *   as `afterUser` does, at the same costs, and since a tool's result is
+   *   carried in a user message, after a tool call it lands between the call
+   *   and its result. Store the content as an ordinary message
+   *   (`ContextManager.addMessage`) instead, where it stays.
    */
   position: 'system' | 'beforeUser' | 'afterUser';
 
@@ -190,9 +193,7 @@ export interface CompileResult {
    * order given; their namespaces aren't kept.
    * Caller should append these to the system prompt.
    * Separated because the system prompt is outside context-manager's scope.
-   *
-   * @deprecated Only populated by deprecated `system`-position
-   * {@link ContextInjection}s; empty when no injections are passed.
+   * Empty when no `system`-position injection is passed.
    */
   systemInjections: ContentBlock[];
 

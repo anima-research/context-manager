@@ -3172,13 +3172,13 @@ export class ContextManager {
    *
    * It awaits nothing, so it doesn't wait for the strategy's background work.
    *
-   * The `injections` parameter is DEPRECATED (see {@link ContextInjection}
-   * and anima-research/agent-framework#171): injected blocks are not stored.
-   * `beforeUser` and `afterUser` blocks are re-placed on every compile, so
-   * they move as newer user messages arrive and break prompt-cache prefixes,
-   * and when a `system` block's content changes, the caller's system prompt
-   * changes with it, so the cache misses ahead of every message. New callers
-   * should pass `undefined`.
+   * The `beforeUser` position is DEPRECATED (anima-research/agent-framework#171):
+   * placed again before the last user message at every compile, it moves as
+   * newer user messages arrive, and after a tool call it lands between the
+   * call and its result, which is carried in a user message. Store such
+   * content as an ordinary message (`addMessage`) instead. `system` and
+   * `afterUser` injections are supported, at the costs
+   * {@link ContextInjection.position} gives.
    */
   async compile(
     budget?: TokenBudget,
