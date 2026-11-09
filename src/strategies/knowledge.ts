@@ -183,7 +183,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
       const shouldClose =
         currentChunk.length >= 2 &&
         (phaseChanged || sizeExceeded) &&
-        !this.lastMessageContainsToolUse(currentChunk);
+        !this.chunkEndsOnCall(currentChunk, all, position);
 
       if (shouldClose) closeAt(i);
 

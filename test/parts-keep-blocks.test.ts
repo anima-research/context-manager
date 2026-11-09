@@ -238,6 +238,29 @@ describe("each image keeps or loses its place by its own part's verdict", () => 
   }
 });
 
+describe("an image in a result pairing repair moves out of a joined entry keeps its own part's verdict", () => {
+  for (const kind of KINDS) {
+    it(`${kind}: a result stored on a long message's first part, a message after its call, goes up beside the call with its image`, async () => {
+      const o = await open({ kind, config: { headWindowTokens: 0, recentWindowTokens: 300, maxLiveImages: 2 } });
+      try {
+        o.add('u', [text('intro')]);
+        o.add('a', [call('call-7')]);
+        o.add('u', [text('meanwhile')]);
+        const res = o.add('u', [result('call-7', [image('CCCC'), text('shot')]), text(long('RES'))]);
+        o.add('a', [text('ok')]);
+        o.add('u', [text('next')]);
+        assert.ok(res.length > 1 && o.all()[res[0]!]!.content.some(isResult('call-7')), 'premise: the result is on its body\'s first part');
+        const sent = (await o.manager.compile(BIG)).messages as Sent[];
+        const at = sent.findIndex((m) => m.content.some(isCall('call-7')));
+        assert.ok(sent[at + 1]?.content.some(isResult('call-7')), 'premise: pairing repair moved the result up beside its call');
+        assert.equal(images(sent, 'CCCC'), 1, 'its image goes out');
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
 describe("a body's bytes stay put while its parts stay in their region", () => {
   for (const kind of KINDS) {
     it(`${kind}: one compile a turn while the recent window's edge crosses a reply with a call`, async () => {
@@ -260,9 +283,16 @@ describe("a body's bytes stay put while its parts stay in their region", () => {
           const sent = (await o.manager.compile(BIG)).messages as Sent[];
           const at = sent.findIndex((m) => m.content.some(isCall('call-1')));
           assert.ok(sent[at + 1]?.content.some(isResult('call-1')), `turn ${turn}: the call's result follows it`);
-          const bytes = JSON.stringify(sent.filter((m) => textOf(m).includes('REPLY') || m.content.some(isCall('call-1')) || m.content.some(isResult('call-1'))));
+          // What the provider reads: each entry's participant and content.
+          const bytes = JSON.stringify(sent
+            .filter((m) => textOf(m).includes('REPLY') || m.content.some(isCall('call-1')) || m.content.some(isResult('call-1')))
+            .map((m) => ({ participant: m.participant, content: m.content })));
           if (before && before.regions === regions) {
-            assert.equal(bytes, before.bytes, `turn ${turn}: the body's bytes are unchanged while its parts stay put (${regions})`);
+            let at = 0;
+            while (at < bytes.length && bytes[at] === before.bytes[at]) at++;
+            assert.ok(at === bytes.length && at === before.bytes.length,
+              `turn ${turn}: the body's bytes are unchanged while its parts stay put (${regions}); they differ at ${at}: ` +
+              `${JSON.stringify(before.bytes.slice(Math.max(0, at - 80), at + 120))} became ${JSON.stringify(bytes.slice(Math.max(0, at - 80), at + 120))}`);
             compared++;
           }
           before = { regions, bytes };

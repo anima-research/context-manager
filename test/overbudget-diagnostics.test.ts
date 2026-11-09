@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
 import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
+import { Probe } from './body-parts-harness.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import type { ContentBlock, Membrane } from '@animalabs/membrane';
 
@@ -781,9 +782,13 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  for (const [callWords, expected] of [[200, []], [30, ['smaller-recent-window']]] as const) {
-    it(`counts a call split into shards from its first shard, which holds the tool_use, before the newest tool_result (${expected.length ? 'names a smaller window when the whole call and its result fit' : 'names nothing when only its last shard and the result would'})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+  for (const [layout, callWords, expected, when] of [
+    ['old', 200, [], 'names nothing when only its last shard and the result would'],
+    ['old', 30, ['smaller-recent-window'], 'names a smaller window when the whole call and its result fit'],
+    ['new', 200, ['smaller-recent-window'], 'names a smaller window when its last shard and the result fit'],
+  ] as const) {
+    it(`counts a call split into shards from the shard that holds the tool_use, ${layout === 'old' ? 'its first, as ingress stored it before' : 'its last'}, before the newest tool_result (${when})`, async () => {
+      const strategy = new Probe({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,
@@ -792,6 +797,7 @@ describe('OverBudgetError.clearedBy', () => {
         autoTickOnNewMessage: false,
         speculativeProduction: false,
       });
+      strategy.layout = layout;
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const before = manager.getAllMessages().length;
@@ -800,8 +806,9 @@ describe('OverBudgetError.clearedBy', () => {
         const stored = manager.getAllMessages();
         const shards = stored.slice(before, -1);
         assert.ok(shards.length > 1, `the call is stored as shards (got ${shards.length})`);
-        assert.ok(shards[0]!.content.some((block) => block.type === 'tool_use'), 'its first shard holds the tool_use');
-        assert.ok(!shards.at(-1)!.content.some((block) => block.type === 'tool_use'), 'its last shard holds none');
+        const [holder, other] = layout === 'old' ? [shards[0]!, shards.at(-1)!] : [shards.at(-1)!, shards[0]!];
+        assert.ok(holder.content.some((block) => block.type === 'tool_use'), `its ${layout === 'old' ? 'first' : 'last'} shard holds the tool_use`);
+        assert.ok(!other.content.some((block) => block.type === 'tool_use'), `its ${layout === 'old' ? 'last' : 'first'} shard holds none`);
         const error = await refusal(manager);
         assert.match(error.message, /^Head\/tail reservation exceeded budget/);
         assert.deepEqual(error.clearedBy, expected);
@@ -809,13 +816,14 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const [resultWords, callWords, expected, when] of [
-    [200, 0, [], 'names nothing when only its last shard would fit'],
-    [30, 0, ['smaller-recent-window'], 'names a smaller window when they fit'],
-    [30, 60, [], 'names nothing when its body alone would fit but not with its call'],
+  for (const [layout, resultWords, callWords, expected, when] of [
+    ['new', 200, 0, [], 'names nothing when only its last shard would fit'],
+    ['new', 30, 0, ['smaller-recent-window'], 'names a smaller window when they fit'],
+    ['old', 30, 60, [], 'names nothing when its body alone would fit but not with its call, stored with the tool_use on its first shard'],
+    ['new', 30, 60, ['smaller-recent-window'], "names a smaller window when its body and its call's last shard fit"],
   ] as const) {
     it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${when})`, async () => {
-      const strategy = new AutobiographicalStrategy({
+      const strategy = new Probe({
         adaptiveResolution: true,
         targetChunkTokens: 10,
         headWindowTokens: 0,
@@ -824,6 +832,7 @@ describe('OverBudgetError.clearedBy', () => {
         autoTickOnNewMessage: false,
         speculativeProduction: false,
       });
+      strategy.layout = layout;
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const beforeCall = manager.getAllMessages().length;

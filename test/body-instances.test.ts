@@ -252,10 +252,12 @@ describe('two copies of one document', () => {
   });
 
   it('hold back to the start of the copy a held tool result answers, not the copy before it', () => {
-    // Ingress puts a sharded message's tool_use on its first shard; a held
+    // A body stored with its tool_use on its first shard, as ingress stored
+    // a split message before it put a reply's call on its last shard: a held
     // tool_result after the second copy steps back over that copy alone.
+    const call = { type: 'tool_use', id: 't', name: 'look', input: {} } as unknown as ContentBlock;
     const shard = (id: string, shardIndex: number): StoredMessage =>
-      ({ id, sequence: 0, participant: 'user', content: text(`shard ${id}`), bodyGroupId: 'g', shardIndex, timestamp: new Date(0) }) as unknown as StoredMessage;
+      ({ id, sequence: 0, participant: 'user', content: [...text(`shard ${id}`), ...(shardIndex === 0 ? [call] : [])], bodyGroupId: 'g', shardIndex, timestamp: new Date(0) }) as unknown as StoredMessage;
     const messages = [
       { id: 'm0', sequence: 0, participant: 'user', content: text('before'), timestamp: new Date(0) } as unknown as StoredMessage,
       shard('a0', 0), shard('a1', 1), shard('a2', 2),

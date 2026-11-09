@@ -72,6 +72,8 @@ export class Probe extends AutobiographicalStrategy {
   holdStart(store: MessageStoreView): number { return this.holdBoundary(store); }
   /** Each message as the recent window's walk prices it. */
   walkPrices(store: MessageStoreView): number[] { return this.postStripEstimates(store); }
+  /** The messages a chunk may take now, as ids. */
+  compressibleIds(store: MessageStoreView): string[] { return this.getCompressibleMessages(store).map((m) => m.id); }
   /** The chunks a rebuild cuts now, as message ids. */
   chunkIds(store: MessageStoreView): string[][] {
     this.rebuildChunks(store);

@@ -501,12 +501,12 @@ describe("the cut asks about a stored message's own content through the message'
   }
 });
 
-describe("a body's raw shards go out uncut in the adaptive middle and cut in the head and recent windows, each priced as it's sent", () => {
+describe("a body's raw shards go out cut in the adaptive middle as in the head and recent windows, each priced as it's sent", () => {
   // Ingress splits a long text into shards of about targetChunkTokens at four
-  // characters a token, 12,000 characters by default. In the middle, the
-  // shard path joins a body's raw shards into one entry without the cap, so a
-  // cap smaller than a shard doesn't cut them there. The head and recent
-  // windows cut each shard as they emit it.
+  // characters a token, 12,000 characters by default. The middle, the head
+  // and the recent window each cut every shard at the cap as they send it,
+  // and the middle joins a body's raw shards into one entry, as the windows
+  // do.
   const body: Array<[string, ContentBlock[]]> = [
     ['u', [{ type: 'text', text: 'r'.repeat(80_000) }]],
     ['a', [{ type: 'text', text: 'ok' }]],
@@ -529,8 +529,10 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
   // estimate of what's sent, and the plan is what the emitter counted.
   // Shards of different densities are body-run-price's cases.
   const windows: Array<[string, Record<string, unknown>, (compiled: Sent, stats: Stats) => void]> = [
-    ['in the middle, uncut', { headWindowTokens: 0, recentWindowTokens: 2000 }, (compiled) =>
-      assert.equal(textOf(compiled.messages[0]).length, 80_000, 'premise: the middle sends the body uncut, its shards joined')],
+    ['in the middle, cut', { headWindowTokens: 0, recentWindowTokens: 2000 }, (compiled, stats) => {
+      assert.ok(stats.tail.messages < 7 && stats.head.messages === 0, 'premise: the shards are in the middle');
+      assert.equal(cutShards({ messages: [compiled.messages[0]!] }), 7, 'the middle sends each shard cut, joined into one entry');
+    }],
     ['in the recent window, cut', { headWindowTokens: 0 }, (compiled, stats) => {
       assert.ok(stats.tail.messages >= 7, `premise: the tail holds the seven shards: ${stats.tail.messages} messages`);
       assert.equal(cutShards(compiled), 7, 'premise: the recent window sends each shard cut');

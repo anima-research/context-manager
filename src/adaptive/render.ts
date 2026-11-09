@@ -14,20 +14,42 @@ import type { StoredMessage } from '../types/message.js';
 import { bodyEnd } from '../body-runs.js';
 
 /**
- * Join each body's consecutive shards into one composite message whose body
- * is the byte-faithful concatenation of the shards' text content. A body is
- * one ingestion: a later ingestion of the same text carries the same
+ * A body's parts joined into one message's content: every non-text block of
+ * the parts, in part order and each part's own order, then their text joined
+ * into one text block. Non-text blocks go first because a turn's tool results
+ * must lead it for the API to pair them with the call before, and a reply's
+ * thinking leads its turn. Each part is given as it is to be sent: a raw
+ * part's content, cut as its region cuts it, or a folded part's recall text
+ * as a text block. The adaptive strategy joins every run of a body's raw
+ * parts it sends with this, one part included.
+ */
+export function joinBodyParts(parts: readonly (readonly ContentBlock[])[]): ContentBlock[] {
+  const others: ContentBlock[] = [];
+  const text: string[] = [];
+  for (const part of parts) {
+    for (const block of part) {
+      if (block.type === 'text') text.push(block.text);
+      else others.push(block);
+    }
+  }
+  return [...others, { type: 'text', text: text.join('') } as ContentBlock];
+}
+
+/**
+ * Join each body's consecutive shards into one composite message, its
+ * content the shards joined by joinBodyParts: a raw shard as stored, a shard
+ * at non-zero currentResolution as `getRecallText(shard)`. A body is one
+ * ingestion: a later ingestion of the same text carries the same
  * bodyGroupId and is a body of its own (see body-runs.ts). Messages with a
  * null/undefined bodyGroupId pass through unchanged.
  *
- * For a shard at non-zero currentResolution, the shard's text in the
- * concatenation is replaced by `getRecallText(shard)`. The renderer is
- * responsible for providing recall content that's appropriate for the
- * level (an L_k recall pair, formatted however the deployment prefers).
+ * The renderer is responsible for providing recall content that's
+ * appropriate for the level (an L_k recall pair, formatted however the
+ * deployment prefers).
  *
  * Properties:
  *  - **Byte-faithful** when all shards in a group are at L0 and getRecallText
- *    is not called: the concatenated body equals the original message body
+ *    is not called: the composite's text equals the original message's text
  *    byte-for-byte. Verified by tests in test/adaptive/render.test.ts.
  *  - **One API message per body**, regardless of shard count. No turn
  *    markers between shards.
@@ -56,21 +78,15 @@ export function concatBodyGroups(
     // A body's shards are already in rising shard order (body-runs.ts).
     const sorted = messages.slice(groupStart, i);
 
-    const concatenated = sorted.map((shard) => {
-      const res = shard.currentResolution ?? 0;
-      if (res === 0) {
-        return extractTextContent(shard.content);
-      }
-      return getRecallText(shard);
-    }).join('');
-
     // Build the composite message. Inherit id/participant/timestamp from
-    // the first shard; combine metadata; build a single text content block.
+    // the first shard; combine metadata.
     const composite: StoredMessage = {
       id: sorted[0].id,
       sequence: sorted[0].sequence,
       participant: sorted[0].participant,
-      content: [{ type: 'text', text: concatenated } as ContentBlock],
+      content: joinBodyParts(sorted.map((shard) => ((shard.currentResolution ?? 0) === 0
+        ? shard.content
+        : [{ type: 'text', text: getRecallText(shard) } as ContentBlock]))),
       metadata: {
         ...(sorted[0].metadata ?? {}),
         bodyGroupId: groupId,
@@ -81,26 +97,6 @@ export function concatBodyGroups(
     out.push(composite);
   }
   return out;
-}
-
-/**
- * Extract text content from a message's content blocks. For shards we
- * expect (and require) all content to be text — they were produced by
- * the chunker, which only splits strings. If non-text blocks slip through,
- * they're stringified as best-effort.
- */
-function extractTextContent(blocks: ContentBlock[]): string {
-  const out: string[] = [];
-  for (const b of blocks) {
-    if (b.type === 'text') {
-      out.push(b.text);
-    } else {
-      // Non-text content in a sharded body shouldn't happen, but if it
-      // does, we serialize as a placeholder rather than crashing.
-      out.push(`[non-text content: ${b.type}]`);
-    }
-  }
-  return out.join('');
 }
 
 /**

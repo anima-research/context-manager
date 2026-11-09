@@ -199,22 +199,4 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
       await o.close();
     }
   });
-
-  it("raw in the adaptive middle, with an emitter that counts more than the plan: the run's own check refuses the compile", async () => {
-    // estimateTokens prices what the middle sends and, with no summaries yet,
-    // nothing the plan counts, so doubling it puts the run over a plan that
-    // fits its budget, and only the emission check stands between them.
-    class DoubleCountingEmitter extends AutobiographicalStrategy {
-      protected override estimateTokens(content: ContentBlock[]): number {
-        return 2 * super.estimateTokens(content);
-      }
-    }
-    const o = await open([{ type: 'text', text: PROSE + DENSE }], WINDOWS['raw in the adaptive middle'].config, DoubleCountingEmitter);
-    try {
-      const parts = o.parts();
-      await assert.rejects(o.manager.compile({ maxTokens: parts, reserveForResponse: 0 }), /Emission overran the plan/);
-    } finally {
-      await o.close();
-    }
-  });
 });

@@ -316,12 +316,13 @@ describe('compression holds', () => {
       manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text: filler(30) }]);
     }
     const before = manager.getAllMessages().length;
-    const useId = manager.addMessage('Claude', [
+    manager.addMessage('Claude', [
       { type: 'text', text: 'long reasoning sentence here. '.repeat(80) },
       { type: 'tool_use', id: 'tu-1', name: 'search', input: { q: 'x' } },
     ]);
     const shards = manager.getAllMessages().length - before;
     assert.ok(shards > 1, `setup: tool_use message was sharded (${shards})`);
+    const callShard = manager.getAllMessages().slice(before).find((m) => m.content.some((b) => b.type === 'tool_use'))!.id;
     manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu-1', content: PLACEHOLDER }],
       undefined, undefined, { holdCompression: true });
     for (let i = 0; i < 4; i++) {
@@ -330,7 +331,7 @@ describe('compression holds', () => {
     await drain(manager, strategy);
     const s = strategy as unknown as S;
     assert.ok(prompts.length > 0 && s.summaries.length > 0, 'setup: earlier history compressed');
-    assert.ok(!s.summaries.some((x) => x.sourceIds.includes(useId)), 'tool_use shard compressed without its held result');
+    assert.ok(!s.summaries.some((x) => x.sourceIds.includes(callShard)), 'tool_use shard compressed without its held result');
     manager.close();
   });
 

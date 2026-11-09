@@ -164,19 +164,28 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
     });
 
     it(`${label}: the chunks`, async () => {
-      const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 300 }, false);
+      // The chunker sizes by the store's estimates, as `estimates` reads them.
+      const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false }, false);
       try {
         const ids = o.all().map((m) => m.id);
         const prices = o.estimates();
         for (const k of o.reply.slice(1)) {
-          // A chunk from the first message reaches its size at part k.
-          o.strategy.set({ targetChunkTokens: sum(prices, 0, k + 1) });
+          // A chunk from the first message reaches its size at part k, half
+          // way through it, so a few tokens either way don't move the close.
+          o.strategy.set({ targetChunkTokens: sum(prices, 0, k) + Math.floor(prices[k]! / 2) });
           const chunks = o.strategy.chunkIds(o.view());
-          const callChunk = chunks.findIndex((c) => c.includes(ids[layout === 'new' ? o.reply.at(-1)! : o.reply[0]!]!));
-          assert.ok(callChunk >= 0, `premise, closing at ${k}: the call's part is chunked`);
-          assert.ok(chunks[callChunk]!.includes(ids[o.res]!), `closing at ${k}: the call's chunk holds its result`);
+          const ends = chunks.map((c) => ids.indexOf(c.at(-1)!));
+          const holder = ids[layout === 'new' ? o.reply.at(-1)! : o.reply[0]!]!;
+          const callChunk = chunks.findIndex((c) => c.includes(holder));
+          // The first chunk reaches its size inside the reply, so it holds the
+          // call stored on the first part, and the call stored on the last
+          // part where k is that part.
+          if (layout === 'old' || k === o.reply.at(-1)!) {
+            assert.ok(callChunk >= 0, `premise, closing at ${k}: the call's part is chunked; chunks end at ${ends}`);
+          }
+          if (callChunk >= 0) assert.ok(chunks[callChunk]!.includes(ids[o.res]!), `closing at ${k}: the call's chunk holds its result; chunks end at ${ends}`);
           if (layout === 'new' && k < o.reply.at(-1)!) {
-            assert.equal(chunks[0]!.at(-1), ids[k], `closing at ${k}: the first chunk closes there, as for a long message's parts`);
+            assert.equal(ends[0], k, `closing at ${k}: the first chunk closes there, as for a long message's parts; chunks end at ${ends}`);
           }
         }
       } finally {
