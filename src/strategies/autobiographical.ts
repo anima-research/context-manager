@@ -95,7 +95,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
-import { isReasoningItem, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { carriesRawItem, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -3064,6 +3064,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * StoredMessage, and the render path concatenates them back into one
    * API message at compile time (preserving KV cache structure).
    *
+   * A message with a block that carries a provider item (an object
+   * `rawItem`, as a Responses reply's message parts and reasoning do) is
+   * never split: it is stored whole, however long, with every item in its
+   * place.
+   *
    * Multi-block content: text blocks are concatenated for chunking, then
    * the resulting shards are emitted as text blocks. Non-text blocks are
    * passed through unchanged, after their shard's text: every one from the
@@ -3078,6 +3083,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   chunkIngressMessage(participant: string, content: ContentBlock[]): IngressChunkResult | null {
     if (!this.config.adaptiveResolution) return null;
+    if (content.some(carriesRawItem)) return null;
 
     // Separate text and non-text blocks, the latter by whether they come
     // before the first tool_use.
@@ -3094,15 +3100,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (textParts.length === 0) return null;
-    // raw-forms.ts pairs a Responses reasoning item with the next item that
-    // isn't reasoning; split across parts, the call could go out with its id
-    // but without its reasoning. Such a message is stored whole.
-    let reasoned = false;
-    for (const block of content) {
-      if (isReasoningItem(block)) reasoned = true;
-      else if (reasoned && block.type === 'tool_use' && typeof (block as { rawItem?: unknown }).rawItem === 'object' &&
-        (block as { rawItem?: unknown }).rawItem !== null) return null;
-    }
     const combined = textParts.join('');
 
     // Threshold and shard size derive from the strategy's existing
@@ -16112,25 +16109,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
-    // turn. A body's shards merge into one entry, so any surviving shard of the
-    // newest body proves the newest shard is present: a head or recent-window
-    // merge keeps its first shard's id as sourceMessageId, and a middle-region
-    // composite carries every shard's id in sourceMessageIds (its
-    // sourceMessageId is unset), which is where the newest body lands when its
-    // newest shard alone outgrows the recent window. Only that body's shards
-    // count: an earlier ingestion of the same text shares the group id, and its
-    // survival proves nothing about the newest turn.
+    // turn: some entry must carry the newest message's own id, as its source
+    // or among the parts it joins (sourceMessageIds, which a merge of a
+    // body's parts and a middle-region composite both carry).
     // A system change is no turn and always stays raw, so the newest turn is
     // the newest message that isn't one, as for the floor above.
     let newestAt = messages.length - 1;
     while (newestAt > 0 && holdsSystemChange(messages[newestAt].content)) newestAt--;
     const newest = messages[newestAt];
     if (newest) {
-      const newestBody = bodyBoundsIn(messages, newestAt);
-      const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
-        entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
-          (entry.sourceMessageIds ?? []).some(id => newestBodyIds.has(id)),
+        entry => entry.sourceMessageId === newest.id || (entry.sourceMessageIds ?? []).includes(newest.id),
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
@@ -21528,7 +21517,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? releaseEditedRawForms(entry.content, filtered)
+            ? this.releaseEdited(entry.content, filtered)
             : unitOf(entry) !== entry ? [] : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -21581,7 +21570,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const later = (b: ContentBlock, p: number): boolean =>
         b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id);
       prevRunIds = new Set(entry.content.flatMap((b, p) => (b.type === 'tool_use' && later(b, p) ? [b.id] : [])));
-      if (prevRunIds.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => !later(b, p)));
+      if (prevRunIds.size > 0) entry.content = this.releaseEdited(entry.content, entry.content.filter((b, p) => !later(b, p)));
       for (const b of entry.content) if (b.type === 'tool_use' && stubbed.delete(b.id)) prevRunIds.add(b.id);
 
       prevUseIds = new Set();
@@ -21685,6 +21674,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return end;
   }
 
+  private releaseEdited(before: readonly ContentBlock[], after: ContentBlock[]): ContentBlock[] {
+    const released = releaseEditedRawForms(before, after);
+    after.forEach((block, k) => {
+      const from = this._storedOn.get(block);
+      if (from !== undefined && released[k] !== block) this._storedOn.set(released[k]!, from);
+    });
+    return released;
+  }
+
   private moveResult(src: ContextEntry, bi: number, unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock {
     const source = src.content;
     const real = source[bi]!;
@@ -21693,7 +21691,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // <function_results> holding several) is true of neither side once
     // they're apart; each gives it up (see raw-forms.ts).
     src.content = rest.length > 0
-      ? releaseEditedRawForms(source, rest)
+      ? this.releaseEdited(source, rest)
       : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
     // The result still reaches the request, next to its tool_use:
     // provenance credits the source body with it there.

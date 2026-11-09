@@ -444,6 +444,9 @@ describe('live image accounting', () => {
     strip(entries: ContextEntry[], store: unknown, asEstimated = true): void {
       this.applyImageStripping(entries, store as never, { asEstimated });
     }
+    join(parts: Array<{ sourceMessageId: string; content: ContentBlock[] }>): ContentBlock[] {
+      return this.joinParts(parts);
+    }
   }
 
   for (const nested of [false, true]) {
@@ -587,7 +590,7 @@ describe('live image accounting', () => {
     assert.equal(stateOf(merged, 'tail'), 'image');
   });
 
-  it("the strip counts the images on a body's first shard where the middle region's composite sends the body's text only, as the estimate does", () => {
+  it("the strip counts the image on a body's first shard where the middle region's composite sends it ahead of the body's text, as the estimate does", () => {
     const messages = [
       { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
       { id: 's0', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'shard zero ' }, base64Image()] as ContentBlock[] },
@@ -597,16 +600,18 @@ describe('live image accounting', () => {
     const store = viewOf(messages);
     const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
     const estimates = strategy.estimates(store);
-    // The middle region renders a raw run of a body's shards as one entry of
-    // their text (selectAdaptive): it names both shards and sends no image.
     const entries: ContextEntry[] = [
       { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
-      { index: 1, sourceMessageIds: ['s0', 's1'], sourceRelation: 'copy', participant: 'User', content: [{ type: 'text', text: 'shard zero shard one' }] },
+      {
+        index: 1, sourceMessageIds: ['s0', 's1'], sourceRelation: 'copy', participant: 'User',
+        content: strategy.join([{ sourceMessageId: 's0', content: messages[1]!.content }, { sourceMessageId: 's1', content: messages[2]!.content }]),
+      },
       { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[3]!.content },
     ];
     strategy.strip(entries, store);
     assert.equal(estimates[0], 15, "the estimate gives the first shard's image the second live slot and prices the head's at the placeholder");
     assert.equal(stateOf(entries, 'head'), 'stripped', 'and the strip does the same');
+    assert.deepEqual(entries[1]!.content.map((b) => b.type), ['image', 'text'], "the first shard's image goes out ahead of the text");
     assert.equal(stateOf(entries, 'tail'), 'image');
   });
 
