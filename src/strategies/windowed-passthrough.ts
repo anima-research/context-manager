@@ -708,8 +708,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // plus what the cut adds to it as the store estimates the content sent
     // (cappedPriceExtra). The cut changes text and string results alone,
     // and the store prices the text the cap keeps at its own rates, so the
-    // difference holds the kept text, the suffix, the omission notices and
-    // the marker, and the message's other blocks keep their price, its
+    // difference holds the kept head and tail, the marker and what a string
+    // result in the middle says, and the message's other blocks keep their price, its
     // images at the policy's. A message the truncator leaves whole renders
     // whole and is priced at its estimate after the policy, even past the
     // cap. The two estimates differ: the store's counts every block,

@@ -42,9 +42,10 @@
   a token. So a long thinking block still doesn't shrink the text kept, the
   marker counts against the cap, and content whose text fits by characters
   but whose estimate, rounded up block by block, passes the cap is now cut.
-  Text blocks that hold nothing are still left out at no loss: where
-  leaving them out brings a message under the cap, it comes back without
-  them and nothing else is cut, as `main` left them out past the cap. A cap
+  Text blocks that hold nothing are left out at no loss: where leaving
+  them out brings a message under the cap, it comes back without them and
+  nothing else is cut. `main` left out such a block only once it passed
+  the cap's characters, and then cut away the text after it. A cap
   smaller than the cut that keeps nothing, the marker and a notice for each
   later string tool result, sends that cut, over the cap, with any block
   the cut passes through, such as thinking, though a cut keeping a short
@@ -86,7 +87,7 @@
   summary the answer holds, whole or partial by its own cut. A positioned
   recall answer keeps a summary its cut leaves as the marker alone, listed
   as partial, as it keeps any summary it cuts.
-- Prompt cache: every request that holds a capped message, a cut summary or
-  a cut tool input changes from the first of them on, once, the first
-  compile after upgrading, and again where a host starts supplying
-  `capReadHint`.
+- Prompt cache: a request changes from the first capped message, cut
+  summary or cut tool input this version renders differently from the
+  version before, once, the first compile after upgrading, and again from
+  the first marker or stub where a host starts supplying `capReadHint`.

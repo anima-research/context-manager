@@ -39,6 +39,7 @@ import type {
   DerivationManifest,
   DerivationManifestOptions,
   RenderedSummaryInfo,
+  CapReadHint,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -21796,8 +21797,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * middle's shard path, which sends a shard's text. A raw replay form an edit changes is released
    * (see raw-forms.ts). The store's own message is never written: chunking
    * and compression read it. Each message's form is kept with the
-   * replacements and input cap it was made for, so a later decision that
-   * leaves the message as it was gives the same form, with its estimates
+   * replacements, input cap and `capReadHint` it was made for, so a later
+   * decision that leaves the message as it was gives the same form, and a
+   * preview with another hint makes its own, with its estimates
    * cached as the message's own are, for as long as the store keeps the
    * message's object (across an append; an edit or a branch switch gives
    * every message a new one). An override must likewise give one
@@ -21809,7 +21811,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const results = pruning.replaced.get(msg.id);
     if (!results && !(pruning.inputCap > 0)) return msg;
     const kept = this._prunedForSend.get(msg);
-    if (kept && kept.inputCap === pruning.inputCap && sameMarkers(kept.results, results)) return kept.sent;
+    const hint = this.config.capReadHint;
+    if (kept && kept.inputCap === pruning.inputCap && kept.hint === hint && sameMarkers(kept.results, results)) return kept.sent;
     let content: ContentBlock[] | null = null;
     let inputs = false;
     for (let i = 0; i < msg.content.length; i++) {
@@ -21827,13 +21830,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sent = content ? { ...msg, content: releaseEditedRawForms(msg.content, content) } : msg;
     // A message with no tool call to measure and nothing replaced costs a
     // scan, so only the others are kept.
-    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, results, sent });
+    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, hint, results, sent });
     return sent;
   }
 
   private readonly _prunedForSend = new WeakMap<
     StoredMessage,
-    { inputCap: number; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
+    { inputCap: number; hint: CapReadHint | undefined; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
   >();
 
   /** Hold `store`'s decision while `fn` prices it. A selection and

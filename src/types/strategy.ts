@@ -1957,7 +1957,11 @@ export interface AutobiographicalConfig {
    * enveloped afterwards, so opener and closer survive every cap; the tags
    * themselves are not charged against that cap (they are priced in the
    * recall-pair budget instead), so a cap smaller than the tag text still
-   * renders intact tags around the few characters it bought.
+   * renders intact tags around what the cut kept. A positioned answer wraps
+   * whatever its cut leaves: the marker alone where the cap is smaller than
+   * the marker and the summary longer than it. The combined answer leaves out
+   * a summary whose cut keeps nothing that holds anything but the marker
+   * (`positionedRecallPairs`).
    */
   recallEnvelope?: RecallEnvelopeMode;
 
