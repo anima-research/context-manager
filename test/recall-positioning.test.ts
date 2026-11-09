@@ -50,6 +50,9 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.pushSummary(entry);
     return entry;
   }
+  pairCost(s: SummaryEntry): number {
+    return this.recallPairCost(s, this.buildRecallHeader(s));
+  }
 }
 
 function recallEntries(
@@ -234,13 +237,19 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
 
     // Each summary is ~400 chars (~100 tokens). Three pairs ≈ 300+ tokens of recall.
     const big = 'X'.repeat(400);
-    strategy.seedL1Against(big + ' first', m1, m1);
-    strategy.seedL1Against(big + ' second', m2, m2);
-    strategy.seedL1Against(big + ' third', m3, m3);
+    const seeded = [
+      strategy.seedL1Against(big + ' first', m1, m1),
+      strategy.seedL1Against(big + ' second', m2, m2),
+      strategy.seedL1Against(big + ' third', m3, m3),
+    ];
+    const pairs = seeded.map((s) => strategy.pairCost(s));
+    assert.ok(pairs[0]! <= 250, `premise: the first pair fits the budget (${pairs[0]!})`);
 
     await assert.rejects(
       manager.compile({ maxTokens: 250, reserveForResponse: 0 }),
-      (err: unknown) => (err as Error).name === 'OverBudgetError' && /attempted representation level=L1/.test((err as Error).message),
+      (err: unknown) => (err as Error).name === 'OverBudgetError'
+        && /attempted representation level=L1/.test((err as Error).message)
+        && (err as { diagnostics?: { middleTokens?: number } }).diagnostics?.middleTokens === pairs[0]! + pairs[1]!,
     );
     manager.close();
   });

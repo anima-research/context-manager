@@ -18703,10 +18703,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Emit summaries + pinned messages between head and recent windows.
     //
-    // Default (positionedRecallPairs=true): one Q/A pair per summary,
-    // interleaved with raw pinned messages, all sorted chronologically by
-    // source-range / message position. Each memory appears in its temporal
-    // place rather than as a wall of unrelated recollections.
+    // Default (positionedRecallPairs=true): one Q/A pair per summary, or
+    // its messages where they cost less and stand alone, interleaved with
+    // raw pinned messages, all sorted chronologically by source-range /
+    // message position. Each memory appears in its temporal place rather
+    // than as a wall of unrelated recollections.
     //
     // Legacy (positionedRecallPairs=false): summaries concatenated into one
     // Q/A pair between head and tail; pinned messages still emit raw, in
@@ -18856,12 +18857,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           items.push({ kind: 'pin', position: p.position, msg: p.msg });
         }
         items.sort((a, b) => a.position - b.position);
-        const sentRaw = new Map<string, StoredMessage[]>();
         // The middle's summaries and raw messages up to and including item k,
         // less a summary the loop below skips for having no content.
         const prefixOf = (k: number): { summaries: SummaryEntry[]; raw: StoredMessage[] } => ({
-          summaries: items.slice(0, k + 1).flatMap((it) => (it.kind === 'summary' && it.summary.content?.trim() && !sentRaw.has(it.summary.id) ? [it.summary] : [])),
-          raw: items.slice(0, k + 1).flatMap((it) => (it.kind === 'pin' ? [it.msg] : sentRaw.get(it.summary.id) ?? [])),
+          summaries: items.slice(0, k + 1).flatMap((it) => (it.kind === 'summary' && it.summary.content?.trim() ? [it.summary] : [])),
+          raw: items.slice(0, k + 1).flatMap((it) => (it.kind === 'pin' ? [it.msg] : [])),
         });
         let leafClaims: Map<string, number> | undefined;
         const claimsOf = (): Map<string, number> => {
@@ -18869,17 +18869,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           for (const s of selectedSummaries) for (const leaf of new Set(leavesOf(s))) claims.set(leaf, (claims.get(leaf) ?? 0) + 1);
           return claims;
         };
-        const aloneAt = (s: SummaryEntry): number[] | undefined => {
+        const aloneAt = (s: SummaryEntry, at: number): number[] | undefined => {
           const leaves = new Set(leavesOf(s));
           if (leaves.size === 0) return undefined;
           const positions: number[] = [];
           for (const id of leaves) {
-            const at = positionOf.get(id);
-            if (at === undefined || rawPlanned.has(id) || (leafClaims ??= claimsOf()).get(id) !== 1) return undefined;
-            positions.push(at);
+            const p = positionOf.get(id);
+            if (p === undefined || rawPlanned.has(id) || (leafClaims ??= claimsOf()).get(id) !== 1) return undefined;
+            positions.push(p);
           }
           positions.sort((a, b) => a - b);
-          return positions.every((at, i) => at === positions[0]! + i) ? positions : undefined;
+          return positions[0] === at && positions.every((p, i) => p === at + i) ? positions : undefined;
         };
         let unanswered: ReadonlySet<string> | undefined;
         const callsNothingAnswers = (): ReadonlySet<string> => (unanswered ??= this.callsNothingAnswers(messages));
@@ -18908,9 +18908,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               summaries: rendered.refs,
             };
             const pairTokens = this.recallPairCost(summary, headerText);
-            const positions = aloneAt(summary);
-            const swap = positions && this.rawInPlaceOfPair(store, messages, positions, pairTokens, msgCap, callsNothingAnswers);
-            if (swap) sentRaw.set(summary.id, swap.messages);
+            const pairSent = rendered.refs.some((ref) => ref.partial)
+              ? Math.min(pairTokens, this.estimateTokens(questionEntry.content) + this.estimateTokens(rendered.content))
+              : pairTokens;
+            const positions = aloneAt(summary, item.position);
+            const swap = positions && this.rawInPlaceOfPair(store, messages, positions, pairSent, msgCap, callsNothingAnswers);
             const tokens = swap ? swap.tokens : pairTokens;
             // Never silently drop a selected representation: everything in
             // this list either covers history (summaries) or IS uncovered

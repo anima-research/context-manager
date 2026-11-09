@@ -50,6 +50,16 @@ class Summaries extends AutobiographicalStrategy {
   rawPrice(ctx: StrategyContext, m: StoredMessage): number {
     return ctx.messageStore.estimateTokens(this.prunedForSend(ctx.messageStore, m));
   }
+  cappedPrice(ctx: StrategyContext, m: StoredMessage, cap: number): number {
+    return this.rawPrice(ctx, m) + this.cappedForSend(ctx.messageStore, m, cap).extra;
+  }
+  sentPair(ctx: StrategyContext, s: SummaryEntry, cap: number): number {
+    return ctx.messageStore.estimateTokens({ content: text(this.buildRecallHeader(s)) } as never)
+      + ctx.messageStore.estimateTokens({ content: this.renderSummaryAnswer(s, cap).content } as never);
+  }
+  cut(s: SummaryEntry, cap: number): boolean {
+    return this.renderSummaryAnswer(s, cap).refs.some((ref) => ref.partial);
+  }
   stubPrice(ctx: StrategyContext, id: string): number {
     const stub = { type: 'tool_result', toolUseId: id, content: (AutobiographicalStrategy as unknown as Record<string, string>).STUB_TOOL_RESULT_TEXT } as ContentBlock;
     return ctx.messageStore.estimateTokens({ content: [stub] } as never);
@@ -122,7 +132,9 @@ async function built(extra: Record<string, unknown> = {}, write: (manager: Conte
     const rawList = sources.flatMap((m) => (m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : []));
     const summaries = new Set(sources.flatMap((m) => (m.kind === 'summary' ? m.summaries.map((x) => x.id) : [])));
     const total = compiled.messages.reduce((sum, m) => sum + ctx.messageStore.estimateTokens({ content: m.content } as never), 0);
-    const tools = compiled.messages.flatMap((m) => (m.content as ContentBlock[]).flatMap((b) => keyOf(b) ?? []));
+    const keyed = compiled.messages.map((m) => (m.content as ContentBlock[]).flatMap((b) => keyOf(b) ?? []));
+    const first = keyed.findIndex((keys) => keys.length > 0);
+    const tools = keyed.flatMap((keys, i) => keys.map((key) => `${i - first} ${key}`));
     return { raw: new Set(rawList), rawList, summaries, total, tools, compiled, stats: compiled.renderStats };
   };
   const rawInOrder = (wide: Awaited<ReturnType<typeof sent>>, leaves: readonly string[]): void => {
@@ -130,15 +142,25 @@ async function built(extra: Record<string, unknown> = {}, write: (manager: Conte
     const order = leaves.map((id) => wide.rawList.indexOf(id));
     assert.deepEqual(order, [...order].sort((a, b) => a - b), `in store order (${order.join(',')})`);
   };
+  const whole = (wide: Awaited<ReturnType<typeof sent>>): void => {
+    const covered = new Set([...wide.summaries].flatMap((id) => strategy.leavesOf(id)));
+    for (const m of ctx.messageStore.getAll()) {
+      const times = wide.rawList.filter((x) => x === m.id).length;
+      assert.ok(times <= 1, `message ${position.get(m.id)} goes out raw once at most`);
+      assert.ok(times === 1 || covered.has(m.id), `message ${position.get(m.id)} goes out raw or under a summary that goes out`);
+    }
+  };
   const keeps = (wide: Awaited<ReturnType<typeof sent>>, s: SummaryEntry): void => {
+    whole(wide);
     assert.ok(wide.summaries.has(s.id), `${s.id} goes out`);
     for (const id of leavesOf(s)) assert.ok(!wide.raw.has(id), `message ${position.get(id)} doesn't go out raw`);
   };
   const swaps = (wide: Awaited<ReturnType<typeof sent>>, s: SummaryEntry): void => {
+    whole(wide);
     assert.ok(!wide.summaries.has(s.id), `no recall pair for ${s.id}`);
     rawInOrder(wide, leavesOf(s));
   };
-  return { manager, strategy, ctx, ids, position, byId, rawOf, leavesOf, l1s, dearer, sent, rawInOrder, keeps, swaps };
+  return { manager, strategy, ctx, ids, position, byId, rawOf, leavesOf, l1s, dearer, sent, rawInOrder, whole, keeps, swaps };
 }
 type Built = Awaited<ReturnType<typeof built>>;
 
@@ -149,7 +171,7 @@ const frontier = (write: (manager: ContextManager) => void, extra: Record<string
 });
 
 describe('a summary weighed against its messages sent raw, on the hierarchical select', () => {
-  it("#407: sends an L1's messages raw in its place where its pair costs more than they do, and fits the budget they need", async () => {
+  it("sends an L1's messages raw in its place, in a store shaped like #407's probe, where its pair costs more than they do, and fits the budget they need", async () => {
     const f = await built();
     const l1s = f.l1s();
     assert.ok(l1s.length >= 3, `premise: several L1s (${l1s.length})`);
@@ -215,6 +237,23 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     await f.manager.close();
   });
 
+  it("keeps an L2 whose first child isn't in the store, since its messages don't begin where it goes out, and sends every message in order", async () => {
+    const f = await frontier((manager) => {
+      for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'agent' : 'user', text(`middle ${i} ` + words(8)));
+    });
+    const leaves = f.ids.slice(4, 12);
+    const second = f.strategy.seed('L1-second', 1, leaves.slice(4), leaves[4]!, leaves[7]!);
+    const l2 = f.strategy.seed('L2-over-both', 2, ['L1-missing', second.id], leaves[0]!, leaves[7]!);
+    second.mergedInto = l2.id;
+    f.dearer(l2);
+
+    const wide = await f.sent(1_000_000);
+    for (const id of leaves.slice(0, 4)) assert.ok(wide.raw.has(id), `premise: message ${f.position.get(id)}, under the missing child, goes out raw`);
+    f.keeps(wide, l2);
+    f.rawInOrder(wide, wide.rawList);
+    await f.manager.close();
+  });
+
   it('keeps an L1 and the L2 that the select also sends over its messages, where either or both cost more than their messages', async () => {
     for (const bothDear of [false, true]) {
       const f = await frontier((manager) => {
@@ -236,14 +275,67 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     }
   });
 
-  it('keeps a summary that costs more than its messages in the combined answer with positionedRecallPairs false, with a cap or without', async () => {
-    for (const cap of [undefined, 1_000_000]) {
+  it('keeps a summary that costs more than its messages in the combined answer with positionedRecallPairs false, with a cap that cuts it or without one', async () => {
+    for (const cap of [undefined, 60]) {
       const f = await built({ positionedRecallPairs: false, ...(cap !== undefined ? { maxMessageTokens: cap } : {}) });
-      const dear = f.l1s()[1]!;
+      const dear = f.l1s().at(-1)!;
       f.dearer(dear);
-      f.keeps(await f.sent(1_000_000), dear);
+      const wide = await f.sent(1_000_000);
+      if (cap !== undefined) {
+        const cut = wide.compiled.provenance!.messages.some((m) => m.kind === 'summary' && m.summaries.some((x) => x.id === dear.id && x.partial));
+        assert.ok(cut, `premise: the cap cuts ${dear.id} in the combined answer`);
+      }
+      f.keeps(wide, dear);
       await f.manager.close();
     }
+  });
+
+  it('weighs a summary against its pair as it goes out, where maxMessageTokens cuts its answer: keeps it where its messages cost more, and sends them where they cost less', async () => {
+    for (const [turn, swapped] of [[words(40), false], [words(1), true]] as const) {
+      let ids: string[] = [];
+      const f = await frontier((manager) => {
+        ids = [0, 1, 2, 3].map((i) => manager.addMessage(i % 2 ? 'agent' : 'user', text(`turn ${i} ` + turn)));
+      }, { maxMessageTokens: 60 });
+      const s = f.strategy.seed('L1-capped', 1, ids, ids[0]!, ids[3]!);
+      f.dearer(s, 3);
+      const charge = f.strategy.charge(s);
+      const pair = f.strategy.sentPair(f.ctx, s, 60);
+      const raw = ids.reduce((sum, id) => sum + f.strategy.cappedPrice(f.ctx, f.byId.get(id)!, 60), 0);
+      assert.ok(pair < charge, `premise: the cap cuts the answer, so the pair goes out at ${pair} of its ${charge}`);
+      assert.ok(raw < charge, `premise: the messages as the cap cuts them (${raw}) cost less than the pair's charge (${charge})`);
+      assert.ok(swapped ? raw < pair : raw > pair, `premise: they cost ${swapped ? 'less' : 'more'} than the pair as it goes out (${raw}, ${pair})`);
+      const wide = await f.sent(1_000_000);
+      if (swapped) f.swaps(wide, s);
+      else f.keeps(wide, s);
+      await f.manager.close();
+    }
+  });
+
+  it("keeps a summary whose messages cost more than its pair's charge, where the cap cuts its answer so little that the pair goes out dearer than that", async () => {
+    let ids: string[] = [];
+    const f = await frontier((manager) => {
+      ids = [0, 1, 2, 3].map((i) => manager.addMessage(i % 2 ? 'agent' : 'user', text(`turn ${i} ` + words(1))));
+    });
+    const s = f.strategy.seed('L1-barely-cut', 1, ids, ids[0]!, ids[3]!);
+    await f.sent(1_000_000);
+    const raw = f.rawOf(ids);
+    const largest = Math.max(...ids.map((id) => f.strategy.rawPrice(f.ctx, f.byId.get(id)!)));
+    let found: { cap: number; n: number } | undefined;
+    for (let cap = largest; cap < raw && !found; cap++) {
+      for (let n = 1; !found; n++) {
+        s.content = 'word '.repeat(n);
+        s.tokens = n;
+        if (f.strategy.charge(s) >= raw) break;
+        if (f.strategy.cut(s, cap) && f.strategy.sentPair(f.ctx, s, cap) > raw) found = { cap, n };
+      }
+    }
+    assert.ok(found, 'premise: a cap and an answer the cap cuts, whose pair is charged less than the messages and goes out costing more');
+    s.content = 'word '.repeat(found.n);
+    s.tokens = found.n;
+    (f.strategy as unknown as { config: { maxMessageTokens: number } }).config.maxMessageTokens = found.cap;
+    assert.equal(ids.reduce((sum, id) => sum + f.strategy.cappedPrice(f.ctx, f.byId.get(id)!, found!.cap), 0), raw, 'premise: the cap cuts none of the messages');
+    f.keeps(await f.sent(1_000_000), s);
+    await f.manager.close();
   });
 
   it("keeps a summary one of whose messages is no longer in the store's view", async () => {
@@ -254,6 +346,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     f.manager.removeMessage(leaves[1]! as never);
     assert.equal((f.manager as unknown as { windowMode(): string }).windowMode(), 'legacy', 'premise: the removal leaves what folded the message');
     const wide = await f.sent(1_000_000);
+    f.whole(wide);
     assert.ok(wide.summaries.has(dear.id), `${dear.id} goes out`);
     for (const id of leaves) if (id !== leaves[1]) assert.ok(!wide.raw.has(id), `message ${f.position.get(id)} doesn't go out raw`);
     await f.manager.close();
@@ -270,7 +363,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     const wide = await f.sent(1_000_000);
     assert.ok(wide.raw.has(ids[1]!), 'premise: the pinned message goes out raw');
     assert.ok(wide.summaries.has(s.id), `${s.id} goes out`);
-    for (const id of ids) assert.ok(wide.rawList.filter((x) => x === id).length <= 1, `message ${f.position.get(id)} goes out raw once at most`);
+    f.whole(wide);
     await f.manager.close();
   });
 
@@ -361,7 +454,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
         manager.addMessage('user', result('call-b'))],
       seed: (f, ids) => f.strategy.seed('L1-cycle', 1, ids, ids[0]!, ids[2]!) },
     { shape: 'a call and its result, between a cycle before them and one after', swaps: true,
-      tools: ['call call-before', 'result call-before', 'call call-own', 'result call-own', 'call call-after', 'result call-after'],
+      tools: ['0 call call-before', '1 result call-before', '3 call call-own', '4 result call-own', '6 call call-after', '7 result call-after'],
       write: (manager) => {
         manager.addMessage('agent', call('call-before'));
         manager.addMessage('user', result('call-before'));
@@ -373,12 +466,12 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
       },
       seed: (f, ids) => f.strategy.seed('L1-cycle', 1, ids, ids[0]!, ids[3]!) },
     { shape: 'a call nothing in the view answers, with a message after it', swaps: true,
-      tools: ['call call-none', 'stub call-none'],
+      tools: ['0 call call-none', '1 stub call-none'],
       write: (manager) => [manager.addMessage('user', text('ask ' + words(8))), manager.addMessage('agent', call('call-none')),
         manager.addMessage('user', text('then ' + words(8)))],
       seed: (f, ids) => f.strategy.seed('L1-cycle', 1, ids, ids[0]!, ids[2]!) },
     { shape: 'a call nothing in the view answers, with the view going on after it', swaps: true,
-      tools: ['call call-none', 'stub call-none'],
+      tools: ['0 call call-none', '1 stub call-none'],
       write: (manager) => [manager.addMessage('user', text('ask ' + words(8))), manager.addMessage('agent', call('call-none'))],
       seed: (f, ids) => f.strategy.seed('L1-cycle', 1, ids, ids[0]!, ids[1]!) },
   ];
@@ -406,7 +499,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     f.dearer(s);
     const wide = await f.sent(1_000_000);
     f.swaps(wide, s);
-    assert.deepEqual(wide.tools, ['call call-last', 'stub call-last'], 'the call goes out with a stub after it');
+    assert.deepEqual(wide.tools, ['0 call call-last', '1 stub call-last'], 'the call goes out with a stub in the message after it');
     const last = wide.compiled.messages.at(-1)!.content as ContentBlock[];
     assert.equal(keyOf(last.at(-1)!), 'stub call-last', 'the request ends with the stub');
     await f.manager.close();
@@ -430,7 +523,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     await f.manager.close();
   });
 
-  it('weighs the stub result of a call nothing answers with its messages: it keeps a summary that costs less only without it', async () => {
+  it('weighs the stub result of a call nothing answers with its messages, at its own price: it keeps a summary that costs what they and the stub do, and sends one a token dearer as them', async () => {
     let ids: string[] = [];
     const f = await frontier((manager) => {
       ids = [manager.addMessage('user', text('ask ' + words(8))), manager.addMessage('agent', call('call-stubbed'))];
@@ -442,16 +535,12 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     const raw = f.rawOf(ids);
     const stub = f.strategy.stubPrice(f.ctx, 'call-stubbed');
     assert.ok(stub > 1, `premise: a stub costs tokens (${stub})`);
-    for (const [tokens, swapped] of [[raw - label + 1, false], [raw + stub - label + 1, true]] as const) {
+    for (const [tokens, swapped] of [[raw + stub - label, false], [raw + stub - label + 1, true]] as const) {
       s.tokens = tokens;
+      assert.equal(f.strategy.charge(s), raw + stub + (swapped ? 1 : 0), `premise: the pair costs ${swapped ? 'a token more than' : 'what'} the messages and the stub do`);
       const wide = await f.sent(1_000_000);
-      if (swapped) {
-        assert.equal(f.strategy.charge(s), raw + stub + 1, 'premise: the pair costs a token more than the messages and the stub');
-        f.swaps(wide, s);
-      } else {
-        assert.equal(f.strategy.charge(s), raw + 1, 'premise: the pair costs a token more than the messages, and less than them with the stub');
-        f.keeps(wide, s);
-      }
+      if (swapped) f.swaps(wide, s);
+      else f.keeps(wide, s);
     }
     await f.manager.close();
   });
@@ -482,11 +571,11 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     });
     const s = f.strategy.seed('L1-aside', 1, ids, ids[0]!, ids[7]!);
     const before = await f.sent(1_000_000);
-    assert.deepEqual(before.tools, ['call call-w', 'result call-w', 'moved'], "premise: with the pair between them, repair moves the result beside its call");
+    assert.deepEqual(before.tools, ['0 call call-w', '1 result call-w', '4 moved'], "premise: with the pair between them, repair moves the result beside its call");
     f.dearer(s);
     const wide = await f.sent(1_000_000);
     f.swaps(wide, s);
-    assert.deepEqual(wide.tools, ['call call-w', 'result call-w', 'moved'], 'the result still goes out beside its call');
+    assert.deepEqual(wide.tools, ['0 call call-w', '1 result call-w', '10 moved'], 'the result still goes out beside its call, and its place holds the placeholder after the eight messages');
     await f.manager.close();
   });
 
@@ -512,7 +601,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     f.dearer(s);
     const wide = await f.sent(1_000_000);
     assert.ok(wide.summaries.has(s.id), `${s.id} goes out`);
-    for (const id of f.leavesOf(s)) assert.ok(wide.rawList.filter((x) => x === id).length <= 1, `message ${f.position.get(id)} goes out raw once at most`);
+    f.whole(wide);
     await f.manager.close();
   });
 
@@ -526,7 +615,7 @@ describe('a summary weighed against its messages sent raw, on the hierarchical s
     const wide = await f.sent(1_000_000);
     f.swaps(wide, s);
     assert.deepEqual(wide.tools, before.tools, 'the request carries the same tool blocks as with the pair');
-    assert.deepEqual(wide.tools, ['call call-k', 'result call-k'], "premise: the head's cycle");
+    assert.deepEqual(wide.tools, ['0 call call-k', '1 result call-k'], "premise: the head's cycle");
     await f.manager.close();
   });
 
