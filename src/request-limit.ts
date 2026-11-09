@@ -24,10 +24,7 @@ export function refuseUnreadableRequestLimit(opts: Pick<SelectOptions, 'requestL
 
 export type RequestBesidesWindow = { limit: number; reserve: number; overhead: number; injected: number };
 
-const ceilingNote = (ceiling: number | undefined) =>
-  ceiling === undefined ? '' : ` (those two priced at the calibration's ceiling of ${ceiling}, since the multiplier is provisional)`;
-
-export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowance: number; ceiling?: number }): OverBudgetError {
+export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowance: number; pricedAt?: string }): OverBudgetError {
   const besides = parts.reserve + parts.overhead + parts.injected;
   const error = new OverBudgetError({
     budget: parts.limit,
@@ -40,7 +37,7 @@ export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowanc
   });
   error.message = `The request limit of ${parts.limit} tokens leaves the window no room: the reply's reserve of ` +
     `${parts.reserve}, the request overhead of ${parts.overhead} and the message injections of ${parts.injected}` +
-    `${ceilingNote(parts.ceiling)} come to ${besides}`;
+    `${parts.pricedAt === undefined ? '' : ` (those two priced at ${parts.pricedAt})`} come to ${besides}`;
   return error;
 }
 
