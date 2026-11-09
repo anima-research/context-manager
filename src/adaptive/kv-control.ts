@@ -1051,7 +1051,6 @@ export interface ControlPlanParams {
   /** Chunks forced to raw and never folded: the attended window (the flat
    *  zone), and any head and pins kept raw. */
   rawZone: ReadonlySet<ChunkId>;
-  /** How many chunks the attended window (the flat zone) holds: the unit a chunk's age is measured in. */
   attendedChunks: number;
   /**
    * Chunks kept at their carried resolution (locked), never folded or
