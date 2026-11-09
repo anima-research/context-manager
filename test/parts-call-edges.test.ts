@@ -4,7 +4,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '../src/types/index.js';
 import * as contextManager from '../src/index.js';
 import { concatBodyGroups, OverBudgetError } from '../src/index.js';
-import { call, long, open, Probe, result, sum, text, thinking, type Layout } from './body-parts-harness.js';
+import { call, freshObjects, long, open, Probe, result, sum, text, thinking, type Layout } from './body-parts-harness.js';
 
 const types = (m: { content: ContentBlock[] }): string[] => m.content.map((b) => b.type);
 const recall = (): string => '';
@@ -64,6 +64,7 @@ describe("the chunker closes a stored reply's parts before its last as it closes
       try {
         o.add('u', [text('intro')]);
         const reply = o.add('a', withCall ? [thinking('T'), text(long('A')), call('c1')] : [thinking('T'), text(long('A'))]);
+        if (withCall) assert.ok(o.all()[reply.at(-1)!]!.content.some((b) => b.type === 'tool_use'), 'premise: the call is on the reply\'s last part');
         const [res] = o.add('u', withCall ? [result('c1', 'what the tool said')] : [text('what the tool said')]);
         for (let k = 0; k < 3; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 8_000))]);
         const ids = o.all().map((m) => m.id);
@@ -98,6 +99,8 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
     const [res] = o.add('u', [result('c1', 'what the tool said')]);
     for (let k = 0; k < 2; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 6_000))]);
     assert.equal(reply.length, 19, `premise: the reply is stored in ${reply.length} parts`);
+    const holder = layout === 'new' ? reply.at(-1)! : reply[0]!;
+    assert.ok(o.all()[holder]!.content.some((b) => b.type === 'tool_use'), `premise: the ${layout === 'new' ? 'last' : 'first'} part holds the call`);
     return { ...o, reply, res: res! };
   }
 
@@ -228,4 +231,86 @@ describe("a subclass's lastMessageContainsToolUse still decides where the chunke
       }
     });
   }
+});
+
+describe('an edge moved to the first part of a body stored before, where that part holds a result', () => {
+  async function bundled() {
+    const o = await open({ layout: 'old', config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
+    o.add('u', [text('intro')]);
+    const [c1] = o.add('a', [call('c1')]);
+    const body = o.add('u', [result('c1', 'the first answer'), text(long('BODY', 60_000)), call('c2')]);
+    o.add('u', [result('c2', 'the second answer')]);
+    o.add('a', [text('ok')]);
+    assert.ok(body.length > 2, 'premise: the body is stored in parts');
+    const first = o.all()[body[0]!]!.content;
+    assert.ok(first.some((b) => b.type === 'tool_result') && first.some((b) => b.type === 'tool_use'), 'premise: its first part holds the result and the call');
+    return { ...o, c1: c1!, body };
+  }
+  it("the recent window's start moves on to the call that part's result answers", async () => {
+    const o = await bundled();
+    try {
+      o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), o.body[2]!) });
+      assert.equal(o.strategy.recentStart(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+  it('a compression hold does too', async () => {
+    const o = await bundled();
+    try {
+      o.manager.holdCompression([o.all()[o.body[2]!]!.id]);
+      assert.equal(o.strategy.holdStart(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+  it("the head window's end pulls back past that call", async () => {
+    const o = await bundled();
+    try {
+      o.strategy.set({ headWindowTokens: sum(o.estimates(), 0, o.body[2]!) });
+      assert.equal(o.strategy.headEnd(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe('a view whose listing gives fresh objects at each read', () => {
+  it('defers the chunker\'s close inside a body stored with its call on its first part, as the store\'s own view does', async () => {
+    const o = await open({ layout: 'old', persist: false, config: { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false } });
+    try {
+      for (const [who, what] of [['u', 'intro'], ['a', 'hello'], ['u', 'go']] as const) o.add(who, [text(what)]);
+      const reply = o.add('a', [thinking('T'), text(long('A', 6 * 12_000)), call('c1')]);
+      const [res] = o.add('u', [result('c1', 'what the tool said')]);
+      for (let k = 0; k < 2; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 6_000))]);
+      assert.ok(reply.length > 3 && o.all()[reply[0]!]!.content.some((b) => b.type === 'tool_use'), 'premise: the call is on the first of the reply\'s parts');
+      const prices = o.estimates();
+      o.strategy.set({ targetChunkTokens: sum(prices, 0, reply[2]!) + Math.floor(prices[reply[2]!]! / 2) });
+      const ids = o.all().map((m) => m.id);
+      const holding = (chunks: string[][]) => chunks.find((c) => c.includes(ids[reply[0]!]!)) ?? [];
+      assert.ok(holding(o.strategy.chunkIds(o.view())).includes(ids[res!]!), "premise: with the store's own view, the call's chunk holds its result");
+      assert.ok(holding(o.strategy.chunkIds(freshObjects(o.view()))).includes(ids[res!]!));
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe("the chunker's check of a long body", () => {
+  it('reads each of a body\'s 2,000 parts a bounded number of times as the chunker walks it', () => {
+    const p = new Probe({ adaptiveResolution: true, compressionModel: 'mock' } as never);
+    const N = 2_000;
+    const parts = Array.from({ length: N }, (_, k) =>
+      ({ id: `p${k}`, sequence: k, participant: 'u', content: [text(`part ${k}`)], timestamp: new Date(0), bodyGroupId: 'g', shardIndex: k }) as unknown as StoredMessage);
+    let reads = 0;
+    const listing = new Proxy(parts, {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const position = new Map(parts.map((m, k) => [m.id, k] as const));
+    for (let k = 0; k < N; k++) p.endsOnCall([parts[k]!], listing, position);
+    assert.ok(reads < 10 * N, `${reads} reads of the listing for ${N} parts`);
+  });
 });

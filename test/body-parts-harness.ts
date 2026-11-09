@@ -65,7 +65,18 @@ export class Probe extends AutobiographicalStrategy {
     this.rebuildChunks(store);
     return this.chunks.map((chunk) => chunk.messages.map((m) => m.id));
   }
+  endsOnCall(chunk: StoredMessage[], listing: readonly StoredMessage[], position: ReadonlyMap<string, number>): boolean {
+    return this.chunkEndsOnCall(chunk, listing, position);
+  }
 }
+
+export const freshObjects = (view: MessageStoreView): MessageStoreView => new Proxy(view, {
+  get(target, key, receiver) {
+    if (key === 'getAll') return () => target.getAll().map((m) => ({ ...m }));
+    const value = Reflect.get(target, key, receiver);
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
 
 export async function open(o: { layout?: Layout; kind?: Kind; config?: Record<string, unknown>; persist?: boolean; dir?: string; membrane?: unknown; Strategy?: typeof Probe } = {}) {
   const dir = o.dir ?? mkdtempSync(join(tmpdir(), 'cm-body-parts-'));

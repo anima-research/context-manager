@@ -137,8 +137,12 @@ describe('a part sent raw alone goes out with its other blocks ahead of its text
         o.strategy.set({ headWindowTokens: sum(o.estimates(), 0, reply[0]! + 1) });
         assert.equal(o.strategy.headEnd(o.view()), reply[0]! + 1, 'premise: the head ends after the reply\'s first part');
         assert.deepEqual(o.all()[reply[0]!]!.content.map((b) => b.type), ['text', 'thinking'], 'premise: the part is stored text first');
-        const sent = (await o.manager.compile(BIG)).messages as Sent[];
+        const compiled = await o.manager.compile(BIG);
+        const sent = compiled.messages as Sent[];
         assert.deepEqual(sent[1]!.content.map((b) => b.type), ['thinking', 'text'], 'the head\'s last entry is the part, thinking first');
+        const named = compiled.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : [])).filter((b) => b.messageId === o.all()[reply[0]!]!.id);
+        assert.ok(named.length > 0, 'premise: provenance names the reply\'s body');
+        assert.ok(named.every((b) => b.complete), `provenance finds every part carried whole: ${JSON.stringify(named)}`);
       } finally {
         await o.close();
       }
@@ -163,6 +167,9 @@ describe('a long string result on a part is cut alike wherever the part renders'
           o.add('a', [text('ok')]);
           o.add('u', [text('next')]);
           assert.ok(parts.length > 1 && o.all()[parts[0]!]!.content.some(isResult('call-9')), 'premise: the result is stored on the body\'s first part');
+          const [headEnd, recentStart] = [o.strategy.headEnd(o.view()), o.strategy.recentStart(o.view())];
+          const region = headEnd > parts[0]! ? 'head' : recentStart <= parts[0]! ? 'recent' : 'middle';
+          assert.equal(region, where, `premise: the result's part renders in the ${where} (head ends ${headEnd}, recent starts ${recentStart}, part ${parts[0]})`);
           const sent = (await o.manager.compile(BIG)).messages as Sent[];
           const answer = blocks(sent, isResult('call-9'));
           assert.equal(answer.length, 1, `${where}: the result goes out once`);
@@ -189,6 +196,7 @@ describe("each image keeps or loses its place by its own part's verdict", () => 
     o.add('u', [result('call-5', 'shot taken')]);
     o.add('a', [text('ok')]);
     o.add('u', [text('next')]);
+    assert.ok(doc.length > 1 && shot.length > 1, 'premise: both are stored in parts');
     assert.ok(o.all()[doc[0]!]!.content.some((b) => b.type === 'image'), 'premise: the document\'s image is on its first part');
     assert.ok(o.all()[shot.at(-1)!]!.content.some((b) => b.type === 'image'), 'premise: the reply\'s image is on its last part');
     return { ...o, doc, shot };
@@ -198,6 +206,8 @@ describe("each image keeps or loses its place by its own part's verdict", () => 
       it(`${kind}, ${where}: under maxLiveImages, both images keep their place`, async () => {
         const o = await images2(kind, { recentWindowTokens, maxLiveImages: 2 });
         try {
+          const recentStart = o.strategy.recentStart(o.view());
+          assert.ok(where === 'in the recent window' ? recentStart <= o.doc[0]! : recentStart > o.doc.at(-1)!, `premise: the document is ${where} (recent starts ${recentStart})`);
           const sent = (await o.manager.compile(BIG)).messages as Sent[];
           assert.deepEqual([images(sent, 'AAAA'), images(sent, 'BBBB')], [1, 1], 'both images go out');
         } finally {

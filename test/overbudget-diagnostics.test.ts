@@ -838,7 +838,12 @@ describe('OverBudgetError.clearedBy', () => {
         const beforeCall = manager.getAllMessages().length;
         manager.addMessage('agent', [{ type: 'text', text: 'calling ' + 'word '.repeat(callWords) }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
         const before = manager.getAllMessages().length;
-        if (callWords > 0) assert.ok(before - beforeCall > 1, 'the call is stored as shards too');
+        if (callWords > 0) {
+          assert.ok(before - beforeCall > 1, 'the call is stored as shards too');
+          const callShards = manager.getAllMessages().slice(beforeCall, before);
+          const holder = layout === 'new' ? callShards.at(-1) : callShards[0];
+          assert.ok(holder!.content.some((block) => block.type === 'tool_use'), `premise: the call is on the ${layout === 'new' ? 'last' : 'first'} shard`);
+        }
         // Over twice targetChunkTokens, so ingress splits the result into shards.
         manager.addMessage('user', [
           { type: 'tool_result', toolUseId: 't1', content: 'ok' },
