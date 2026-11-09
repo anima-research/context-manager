@@ -61,11 +61,12 @@ describe('image stripping × render stats', () => {
   beforeEach(cleanup);
 
   it('(a) total reflects the post-strip size, not the pre-strip image weight', async () => {
-    // Default live-image policy is ON (maxLiveImages: 6). 10 images => 4 stripped.
+    // No limit strips by default, so the count cap is set. 10 images => 4 stripped.
     const manager = await ContextManager.open({
       path: TEST_STORE_PATH,
       strategy: new AutobiographicalStrategy({
         adaptiveResolution: true,
+        maxLiveImages: 6,
         headWindowTokens: 0,
         recentWindowTokens: 1_000_000, // keep everything verbatim; isolate the count cap
       }),
@@ -75,7 +76,7 @@ describe('image stripping × render stats', () => {
 
     const live = compiled.messages.filter((m) => m.content.some((b) => b.type === 'image')).length;
     const stripped = compiled.messages.filter((m) => hasLabel(m.content, PLACEHOLDER)).length;
-    assert.equal(live, 6, 'default maxLiveImages keeps 6 images live');
+    assert.equal(live, 6, 'maxLiveImages keeps 6 images live');
     assert.equal(stripped, 4, 'the other 4 are stripped to placeholders');
 
     const rs = manager.getRenderStats();
