@@ -10,5 +10,6 @@
   still accepted and placed as before. `system` and `afterUser` injections
   remain supported, and `ContextInjection.position` now says what each costs:
   a `system` injection's changed text misses the cache from the system prompt
-  on, and an `afterUser` one moves as `beforeUser` does, which suits text
+  on and, on a model that binds thinking, drops the thinking of every earlier
+  reply, and an `afterUser` one moves as `beforeUser` does, which suits text
   that must stay near the end, such as instructions.

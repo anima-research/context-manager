@@ -138,7 +138,9 @@ export interface ContextInjection {
    * - `system`: comes back in `CompileResult.systemInjections`, for the
    *   caller's system prompt, and isn't stored. A change to its text changes
    *   the system prompt, so the request misses the prompt cache from the
-   *   system prompt on.
+   *   system prompt on, and on a model that binds a reply's thinking to
+   *   everything before it, every earlier reply loses its thinking
+   *   (`thinkingBinding`), since the system prompt comes before them all.
    * - `afterUser`: placed again after the last user message at every compile
    *   (at the end when there is none), so it moves as newer user messages
    *   arrive: the request misses the cache from its old place on, and on a
