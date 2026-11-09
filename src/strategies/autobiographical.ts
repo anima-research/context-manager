@@ -256,22 +256,22 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
-      'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
-      "Fix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
+      'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
+      "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
     ].join('\n');
   }
   if (cause === 'no-on-branch') {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the strategy reads the store through a view without `onBranch`, which can't tell a removal or a filter from a broken chain.",
-      'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
+      'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
       'Fix: give the strategy a view with `onBranch`, as MessageStore and the views built on it have; each rebuild checks again.',
     ].join('\n');
   }
   return [
     'Compression of new conversation has stopped.',
     `Cause: the store couldn't read its messages chain to check the chunk records that name no message in view (${causeText(cause.chainUnread)}).`,
-    'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
+    'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
     'Fix: fix what the cause names; the next rebuild asks again.',
   ].join('\n');
 }
@@ -287,7 +287,7 @@ function chunkRecordsFailClosedLine(emptied: number, total: number): string {
   return `[autobiographical] FAIL-CLOSED: ${emptied}/${total} chunk records name no message in the view, and ` +
     `the oldest or newest of them names a message that isn't on this branch's messages chain: a chain ` +
     `broken under chronicle before 0.5.0, or a store rebuilt under new ids. Chunk compression halted to ` +
-    `prevent duplicate memory formation. Before resuming, read the emptied records' first messages by id ` +
+    `prevent duplicate memory formation. Before resuming, read the emptied records' messages by id ` +
     `(a broken chain leaves them readable; a store rebuilt elsewhere leaves nothing to read) and compare ` +
     `their content with the messages on this branch's chain; branch the chronicle before any removal or ` +
     `re-key. If that history isn't on this chain again, remove only the emptied chunk records and keep ` +
@@ -2346,13 +2346,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Fail-closed latch: set when most persisted records resolve to zero live
    * messages and the oldest or newest of those names a message off this
    * branch's messages chain (the messages-chain-break signature), or the
-   * view can't say. While set, no chunk is summarized, waiting or new —
-   * duplicate memories are strictly worse than delayed compression. Merges
-   * combine summaries that already exist, so they go on: merges already
-   * queued still run and can queue the next level; only the open's merge
-   * check and the one after a drop wait.
+   * view can't say. While set, no chunk, waiting or new, is sent to be
+   * summarized — duplicate memories are strictly worse than delayed
+   * compression. Merges combine summaries that already exist, so they go
+   * on: merges already queued still run and can queue the next level; only
+   * the open's merge check and the one after a drop wait, and the first
+   * tick after the latch clears runs them (_mergeCheckOwed).
    */
   protected chunkRecordsOrphaned = false;
+  /** Whether the latch has cleared since it last held, so the merge checks it held back are owed to the next tick. */
+  private _mergeCheckOwed = false;
   /** Why the latch is set (chunkRecordsMessage). */
   private _orphanCause: ChunkRecordsCause = 'off-branch';
   private _orphanWarned = false;
@@ -3396,6 +3399,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.chunkIdCounter = 0;
     this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
+    this._mergeCheckOwed = false;
     this._orphanWarned = false;
     this._chainUnreadWarned = false;
     this._overlapBlocked.clear();
@@ -9200,6 +9204,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    if (this._mergeCheckOwed && !this.chunkRecordsOrphaned) {
+      this._mergeCheckOwed = false;
+      this.sweepPaidOffMergeQuarantine();
+      this.checkMergeThreshold();
+    }
     if (this.mergePicksDeferred) {
       this.mergePicksDeferred = false;
       this.checkMergeThreshold();
@@ -19632,10 +19641,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * before 0.5.0 leaves the records written against the lost chain as one
    * stretch at one end, the oldest where the new chain was kept and the
    * newest where a repair kept the old one, so the two ends answer for the
-   * records between. A view without `onBranch` can't tell, so it halts, as
-   * the guard did before it asked. Each record's answer is kept across
-   * rebuilds; a read that fails answers with its error and keeps nothing, so
-   * the next rebuild asks again.
+   * records between. A view without `onBranch` can't tell, so it halts. Each
+   * record's answer is kept across rebuilds; a read that fails answers with
+   * its error and keeps nothing, so the next rebuild asks again.
    */
   private emptiedEndsCause(records: readonly ChunkRecord[], store: MessageStoreView): ChunkRecordsCause | null {
     if (!store.onBranch) return 'no-on-branch';
@@ -19756,7 +19764,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this._chainUnreadWarned = true;
           this.diag.error(
             `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +
-            `records that name no message in the view (${causeText(cause.chainUnread)}). Chunk compression ` +
+            `records that name no message in the view (${oneLine(failureMessage(cause.chainUnread))}). Chunk compression ` +
             `halted for this rebuild; the next rebuild asks again.`,
           );
         }
@@ -19772,6 +19780,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
+    if (this.chunkRecordsOrphaned && this.config.hierarchical && !this.config.auditOnly) this._mergeCheckOwed = true;
     this.chunkRecordsOrphaned = false;
 
     // Queue uncompressed record-backed chunks (crash-recovery: record was
@@ -22631,6 +22640,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       compressionFailureRuns: new Map(this.compressionFailureRuns),
       mergeFailureRuns: new Map(this.mergeFailureRuns),
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      mergeCheckOwed: this._mergeCheckOwed,
       orphanCause: this._orphanCause,
       chainUnreadWarned: this._chainUnreadWarned,
       orphanWarned: this._orphanWarned,
@@ -22665,6 +22675,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionFailureRuns = saved.compressionFailureRuns;
       this.mergeFailureRuns = saved.mergeFailureRuns;
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._mergeCheckOwed = saved.mergeCheckOwed;
       this._orphanCause = saved.orphanCause;
       this._chainUnreadWarned = saved.chainUnreadWarned;
       this._orphanWarned = saved.orphanWarned;

@@ -106,8 +106,8 @@ const halts = async (cm: ContextManager, s: AutobiographicalStrategy, label: str
   assert.strictEqual(debt.state, 'critical', `${label}: the debt report is critical`);
   assert.strictEqual(debt.failure, 'chunk-records', label);
   assert.match(debt.error ?? '', /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/, `${label}: the off-chain cause`);
-  assert.match(debt.error ?? '', /\nEffect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level\.\n/, `${label}: what waits`);
-  assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step\.$/, `${label}: the fix's first step`);
+  assert.match(debt.error ?? '', /\nEffect: no chunk is sent to be summarized; queued merges still run and can queue the next level\.\n/, `${label}: what waits`);
+  assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step\.$/, `${label}: the fix's first step`);
 };
 const offBranch = (cm: ContextManager, ids: string[], label: string): void => {
   const store = messageStoreOf(cm);
@@ -266,8 +266,7 @@ describe('the chain-break guard still halts for a broken chain or a store rebuil
 
   // A model of a messages chain that restarted, as chronicle before 0.5.0 restarted one when its
   // state index was lost: the branch carries the strategy's states and not the messages, so the
-  // branch's messages chain doesn't hold the records' messages. Stores broken that way under
-  // chronicle 0.2.7 and 0.4.0, read under 0.6.0, gave those facts too; old releases don't run here.
+  // branch's messages chain doesn't hold the records' messages.
   it('a branch whose messages chain restarted, with its chunk records carried and the same content appended again, halts chunk compression', async () => {
     const s = strategy();
     const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
@@ -312,7 +311,7 @@ describe('the chain-break guard still halts for a broken chain or a store rebuil
     store.createBranchWithStates('restarted-then-removed', cm.currentBranch().name, { stateIds: carried });
     await cm.close();
     {
-      // as a release before the guard would have: records formed on the new chain, then a removal
+      // records formed on the new chain, then a removal
       const writer = await ContextManager.open({ path, strategy: new PassthroughStrategy(), membrane });
       await writer.switchBranch('restarted-then-removed');
       const fresh = add(writer, 6);
@@ -376,18 +375,18 @@ class MergeQueueing extends AutobiographicalStrategy {
 describe('merges while the chain-break guard holds', () => {
   before(() => cleanup());
   after(() => cleanup());
+  const queueing = (mergeThreshold: number) => new MergeQueueing({
+    compressionModel: 'test-compression-model',
+    targetChunkTokens: 100,
+    summaryTargetTokens: 20,
+    headWindowTokens: 0,
+    recentWindowTokens: 300,
+    l1HoldbackChunks: 0,
+    autoTickOnNewMessage: false,
+    mergeThreshold,
+  });
 
   it('merges queued before the guard tripped, and persisted, run at tick, and the one that lands last queues the next level', async () => {
-    const queueing = (mergeThreshold: number) => new MergeQueueing({
-      compressionModel: 'test-compression-model',
-      targetChunkTokens: 100,
-      summaryTargetTokens: 20,
-      headWindowTokens: 0,
-      recentWindowTokens: 300,
-      l1HoldbackChunks: 0,
-      autoTickOnNewMessage: false,
-      mergeThreshold,
-    });
     const path = freshPath();
     {
       // No merge queues by itself here: the two are queued by hand.
@@ -417,6 +416,42 @@ describe('merges while the chain-break guard holds', () => {
     assert.strictEqual(cm.getSummariesInRange({ level: 2 }).length, 2, 'the second queued merge ran');
     assert.deepStrictEqual(s.queuedLevels(), [3], 'the merge that landed queued the next level');
     assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'the guard still holds');
+    await cm.close();
+  });
+
+  it('the open\'s merge check, which waited while the guard held, runs at the first tick after it clears', async (t) => {
+    const path = freshPath();
+    {
+      const s = queueing(99);
+      const cm = await ContextManager.open({ path, strategy: s, membrane });
+      await growTo(cm, 6);
+      assert.strictEqual(cm.getSummariesInRange({ level: 1 }).length, 6, 'setup: six L1s');
+      for (const id of records(cm).slice(0, 4).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+      await cm.close();
+    }
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const onBranch = MessageStore.prototype.onBranch;
+    let fail = true;
+    const failing = mock.method(MessageStore.prototype, 'onBranch', function (this: MessageStore, id: string) {
+      if (fail) throw new Error('a read of the messages state failed (test)');
+      return onBranch.call(this, id);
+    });
+    t.after(() => failing.mock.restore());
+    // The two L1s whose messages remain are a run at this threshold.
+    const s = queueing(2);
+    const cm = await ContextManager.open({ path, strategy: s, membrane });
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds at open, its read failing');
+    assert.deepStrictEqual(s.queuedLevels(), [], 'setup: the open queued no merge');
+    fail = false;
+    add(cm, 1);
+    assert.strictEqual(records(cm).length, 6, 'setup: no chunk closed');
+    assert.notStrictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard cleared');
+    await cm.tick();
+    assert.ok(
+      s.queuedLevels().includes(2) || cm.getSummariesInRange({ level: 2 }).length > 0,
+      `a level-2 merge is queued or ran (queued ${JSON.stringify(s.queuedLevels())})`,
+    );
     await cm.close();
   });
 });
@@ -576,11 +611,34 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
     assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
     const line = failClosed[0]!;
     assert.match(line, /4\/4 chunk records name no message in the view, and the oldest or newest of them names a message that isn't on this branch's messages chain/);
+    assert.match(line, /Before resuming, read the emptied records' messages by id/);
     assert.match(line, /branch the chronicle before any removal or re-key/);
     assert.match(line, /If that history isn't on this chain again, remove only the emptied chunk records and keep their summaries\./);
     assert.match(line, /If it is, under new ids, restore the chain the records were written against, or re-key/);
     assert.match(line, /If it's unclear, or the messages can't be read, change nothing: the store stays halted, which discards nothing\. ns=default$/);
     assert.ok(line.indexOf('compare') < line.indexOf('remove only'), 'the comparison comes before any removal');
+    await cm.close();
+  });
+
+  it('a read of the chain that fails puts its whole error in the FAIL-CLOSED line, while the report cuts it to stay under 500 characters', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm).slice(0, 3).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    const store = messageStoreOf(cm);
+    const wrapped = `${'while reading the messages state under a long path, '.repeat(5)}EACCES: permission denied (test)`;
+    store.onBranch = () => { throw new Error(wrapped); };
+    add(cm, 40);
+    for (let i = 0; i < 5; i++) await cm.tick();
+    const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
+    assert.ok(failClosed[0]!.includes(`(${wrapped})`), failClosed[0]);
+    const debt = s.getCompressionDebt();
+    assert.strictEqual(debt.failure, 'chunk-records');
+    assert.ok((debt.error ?? '').length < 500, `${(debt.error ?? '').length} characters`);
+    assert.ok(!(debt.error ?? '').includes('EACCES'), 'the report cuts the cause');
     await cm.close();
   });
 
