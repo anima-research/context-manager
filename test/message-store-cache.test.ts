@@ -25,6 +25,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { registerStateIfAbsent } from '../src/state-registration.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-message-store-cache';
@@ -52,7 +53,11 @@ async function openManager(): Promise<ContextManager> {
   // resolutions, …) interleave with message appends — exactly the foreign
   // sequence bumps the revalidation path exists for.
   const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
-  return ContextManager.open({ path: TEST_STORE_PATH, strategy });
+  const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+  // The foreign slot the tests write, registered first, so the tests don't
+  // rely on a chronicle creating a slot on its first write.
+  registerStateIfAbsent(manager.getStore(), { id: 'test/foreign-slot', strategy: 'snapshot' });
+  return manager;
 }
 
 describe('MessageStore — materialized cache write-through & revalidation', () => {
@@ -91,6 +96,24 @@ describe('MessageStore — materialized cache write-through & revalidation', () 
     // And a subsequent append still lands correctly on the revalidated cache.
     manager.addMessage('user', textBlock('c'));
     assert.deepEqual(texts(manager), ['a', 'b', 'c'], 'append after revalidation');
+  });
+
+  it('foreign state-slot writes keep the mapped getAll() array; own writes replace it', async () => {
+    const manager = await openManager();
+    const store = manager.getStore();
+    manager.addMessage('user', textBlock('a'));
+    const id = manager.addMessage('user', textBlock('b'));
+    const warm = manager.getAllMessages();
+    store.setStateJson('test/foreign-slot', { tick: 1 });
+    assert.strictEqual(manager.getAllMessages(), warm, 'same array across a foreign write');
+    manager.addMessage('user', textBlock('c'));
+    const appended = manager.getAllMessages();
+    assert.notStrictEqual(appended, warm, 'append replaces the array');
+    assert.strictEqual(appended[0], warm[0], 'append keeps earlier message objects');
+    manager.editMessage(id, textBlock('B'));
+    const edited = manager.getAllMessages();
+    assert.notStrictEqual(edited, appended, 'edit replaces the array');
+    assert.deepEqual(texts(manager), ['a', 'B', 'c']);
   });
 
   it('edit write-through: edited content is visible without re-materialization', async () => {

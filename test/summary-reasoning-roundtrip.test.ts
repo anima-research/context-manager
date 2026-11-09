@@ -301,6 +301,79 @@ describe('Summary reasoning round-trip (Fable-5 signed thinking)', () => {
     await manager.close();
   });
 
+  it('compression honors level-0 pins by replacing the covered recall with raw source', async () => {
+    cleanup();
+
+    const requests: Array<{ messages: Array<{ participant: string; content: Array<Record<string, unknown>> }> }> = [];
+    let calls = 0;
+    const membrane = {
+      complete: async (req: (typeof requests)[number]) => {
+        requests.push(JSON.parse(JSON.stringify(req)));
+        calls++;
+        return {
+          stopReason: 'end_turn',
+          content: [{ type: 'text', text: `Summary #${calls}: ordinary events.` }],
+          usage: { inputTokens: 500, outputTokens: 100 },
+        };
+      },
+    };
+    const strategy = new AutobiographicalStrategy({
+      ...strategyConfig(),
+      targetChunkTokens: 200,
+      mergeThreshold: 1_000,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as never,
+    });
+
+    const textById = new Map<string, string>();
+    for (let i = 0; i < 20; i++) {
+      const text = `PIN-SOURCE-${i} ${filler(30)}`;
+      const id = manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [{ type: 'text', text }]);
+      textById.set(id, text);
+    }
+    await manager.compile();
+    await manager.tick();
+
+    const state = strategy as unknown as { summaries: SummaryEntry[] };
+    const pinnedSummary = state.summaries.find((entry) => entry.level === 1);
+    assert.ok(pinnedSummary, 'setup: an L1 exists to pin back to raw');
+    manager.pinAtLevel(
+      pinnedSummary!.sourceRange.first,
+      pinnedSummary!.sourceRange.last,
+      0,
+      { name: 'compression-raw-pin' },
+    );
+
+    requests.length = 0;
+    for (let i = 0; i < 20; i++) {
+      manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', [
+        { type: 'text', text: `NEW-CHUNK-${i} ${filler(30)}` },
+      ]);
+    }
+    await manager.compile();
+    await manager.tick();
+
+    assert.ok(requests.length >= 1, 'a later compression request was issued');
+    const requestText = requests
+      .flatMap((request) => request.messages)
+      .flatMap((message) => message.content)
+      .filter((block): block is Record<string, unknown> & { text: string } => typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n');
+    assert.ok(
+      !requestText.includes(`[CM] Recall memory ${pinnedSummary!.id}.`),
+      'the summary covering a raw-pinned span is not recalled',
+    );
+    for (const id of pinnedSummary!.sourceIds) {
+      assert.ok(requestText.includes(textById.get(id)!), `raw source message ${id} is present`);
+    }
+
+    await manager.close();
+  });
+
   it('leaves responseContent absent for reasoning-free responses (non-thinking models)', async () => {
     cleanup();
 

@@ -28,12 +28,14 @@
  * that prefix. `unitIndex === units.length` caches the whole render (the
  * pure-append breakpoint).
  *
- * Cache identity: two rendered units are byte-identical iff they share
- * (kind, key) — the same identity `render-offsets` uses — because a recall unit
- * keyed by a summary id renders that summary's fixed recall pair, a raw unit
- * keyed by a chunk id renders that chunk verbatim, and head/tail are fixed
- * blocks. So a content hash over the unit (kind,key) sequence is a faithful,
- * deterministic stand-in for the cached bytes.
+ * Cache identity: two rendered units match when they share (kind, key), the
+ * same identity `render-offsets` uses: a recall unit keyed by a summary id
+ * renders that summary's fixed recall pair, a raw unit keyed by a chunk id
+ * renders that chunk, and head/tail are fixed blocks. This simulator takes
+ * the (kind, key) sequence as the cached bytes. A raw or head unit's bytes
+ * can change in place under its key (an edit, an image stripped, a tool
+ * result replaced or moved, a cut), which it doesn't see; kv-unified's
+ * accepted cache reference records and checks those (CacheRenderRecord).
  *
  * Pure and deterministic (no Date/random; the store tracks a logical step clock
  * advanced by the caller).
@@ -162,7 +164,9 @@ export function evaluateCacheHit(
  * Deterministic prefix-hash chain over a layout's unit identities. Returns
  * `H[k]` = a 64-bit-ish hash (two 32-bit FNV/xorshift lanes, joined) of the
  * concatenation of the first `k` units' `(kind,key)`. `H[0]` is the empty
- * prefix. Two layouts share `H[k]` iff their first `k` units are byte-identical.
+ * prefix. Two layouts share `H[k]` iff their first `k` units share their
+ * identities, which this simulator takes as their bytes (see Cache identity
+ * above).
  */
 function prefixHashes(layout: RenderLayout): string[] {
   const H = new Array<string>(layout.units.length + 1);

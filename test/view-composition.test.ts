@@ -16,13 +16,15 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
+  AutobiographicalStrategy,
   ContextManager,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
   filterMessageStoreView,
   mergeMessageStoreViews,
+  OverBudgetError,
 } from '../src/index.js';
-import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import type { ContextStrategy, MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 const BASE = './test-view-composition';
 let storeSeq = 0;
@@ -90,9 +92,78 @@ describe('mergeMessageStoreViews', () => {
     assert.deepEqual(merged.getTail(2).map((m) => m.id), ['x2', 'p2']);
   });
 
+  it("answers a sequence through each view's sequenceOf, and through get where a view has none", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    const reads: string[] = [];
+    primary.sequenceOf = (id) => (id === 'p1' ? 1 : undefined);
+    const get = primary.get;
+    primary.get = (id) => {
+      reads.push(id);
+      return get(id);
+    };
+    const aux = fakeView([{ id: 'x1', sequence: 2 }]);
+    const merged = mergeMessageStoreViews(primary, [aux]);
+
+    assert.equal(merged.sequenceOf?.('p1'), 1);
+    assert.equal(merged.sequenceOf?.('x1'), 2, 'the auxiliary view, through its get');
+    assert.equal(merged.sequenceOf?.('nope'), undefined);
+    assert.deepEqual(reads, [], "the primary's messages were never read");
+  });
+
   it('returns the primary view untouched when there is nothing to merge', () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
     assert.equal(mergeMessageStoreViews(primary, []), primary);
+  });
+
+  it("reports the primary view's calibration multiplier", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    primary.getTokenCalibration = () => 1.1;
+    const auxiliary = fakeView([{ id: 'x1', sequence: 2 }]);
+    auxiliary.getTokenCalibration = () => 1.3;
+    const merged = mergeMessageStoreViews(primary, [auxiliary]);
+    assert.equal(merged.getTokenCalibration?.(), 1.1);
+  });
+
+  it('serves one merged listing while every source listing is the same array', () => {
+    // A store's getAll returns its cached array until a write; the memo
+    // keys on those arrays, so fresh view objects over unchanged sources
+    // share the merge and the listing keeps its identity.
+    let primaryListing: StoredMessage[] = fakeView([{ id: 'p1', sequence: 1 }, { id: 'p2', sequence: 4 }]).getAll();
+    let auxListing: StoredMessage[] = fakeView([{ id: 'x1', sequence: 2 }]).getAll();
+    const stable = (read: () => StoredMessage[]): MessageStoreView => ({
+      getAll: read,
+      get: (id) => read().find((m) => m.id === id) ?? null,
+      getFrom: (index) => read().slice(index),
+      getTail: (count) => read().slice(Math.max(0, read().length - count)),
+      length: () => read().length,
+      estimateTokens: () => 10,
+    });
+    const primary = stable(() => primaryListing);
+    const aux = stable(() => auxListing);
+
+    const first = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.deepEqual(first.map((m) => m.id), ['p1', 'x1', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), first, 'a fresh view over the same sources shares the merge');
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getTail(5), first);
+
+    // An append replaces the source array: the merge is rebuilt once and shared again.
+    const oldAuxListing = auxListing;
+    const oldAux = stable(() => oldAuxListing);
+    auxListing = [...auxListing, { id: 'x2', sequence: 3 } as StoredMessage];
+    const second = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(second, first);
+    assert.deepEqual(second.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), second);
+
+    // A view still holding the old auxiliary array is served the old merge.
+    assert.equal(mergeMessageStoreViews(primary, [oldAux]).getAll(), first);
+
+    // The primary moving on rebuilds against the current sources.
+    primaryListing = [...primaryListing];
+    const third = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(third, second);
+    assert.deepEqual(third.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), third);
   });
 });
 
@@ -167,13 +238,38 @@ describe('ContextManager auxiliaryMessageViews', () => {
     });
 
     await side.compile(); // prime any caches
-    main.addMessage('alice', text('after-prime'));
+    const appended = main.addMessage('alice', text('after-prime'));
     const result = await side.compile();
     const rendered = result.messages.map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(rendered, ['after-prime']);
+    // The merged listing is memoized on the source arrays; an edit on the
+    // other instance changes the aux slot's array as an append does.
+    main.editMessage(appended, text('after-edit'));
+    const edited = await side.compile();
+    assert.deepEqual(edited.messages.map((m) => (m.content[0] as { text: string }).text), ['after-edit']);
 
     await side.close();
     await main.close();
+  });
+});
+
+describe('PassthroughStrategy', () => {
+  it('sends a stored image as stored when every message fits', async () => {
+    const manager = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const image = {
+      type: 'image',
+      source: { type: 'url', url: 'https://example.com/a.png' },
+      sourceUrl: 'https://example.com/a.png',
+      tokenEstimate: 1600,
+    } as ContentBlock;
+    const ids = [manager.addMessage('u', [...text('look'), image]), manager.addMessage('u', text('done'))];
+    const result = await manager.compile();
+    assert.deepStrictEqual(manager.getMessage(ids[0]!)!.content, [...text('look'), image]);
+    assert.deepStrictEqual(
+      result.messages.map((m) => m.content),
+      ids.map((id) => manager.getMessage(id)!.content),
+    );
+    await manager.close();
   });
 });
 
@@ -255,6 +351,15 @@ describe('WindowedPassthroughStrategy', () => {
     );
     await manager2.close();
   });
+
+  it('refuses a reAnchorFraction outside (0, 1], and takes 1', () => {
+    for (const reAnchorFraction of [-0.5, 0, 1.5, NaN]) {
+      assert.throws(() => new WindowedPassthroughStrategy({ reAnchorFraction }), {
+        message: `reAnchorFraction must be in (0, 1], got ${reAnchorFraction}`,
+      });
+    }
+    assert.doesNotThrow(() => new WindowedPassthroughStrategy({ reAnchorFraction: 1 }));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -300,9 +405,37 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
     await manager.close();
 
     const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let manager2: ContextManager;
+    try {
+      manager2 = await ContextManager.open({ path, strategy: strategy2, namespace: 'agents/tern' });
+    } finally {
+      console.warn = warn;
+    }
+    assert.equal(strategy2.getAnchor(), 0);
+    // The reset is said, naming the strategy's namespace (#239).
+    assert.ok(warned.some((w) => w.startsWith('[windowed-passthrough] persisted anchor 1000000 is past the branch head') && w.endsWith(' ns=agents/tern')), warned.join('\n'));
+    assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
+    await manager2.close();
+  });
+
+  it('a persisted negative anchor, which names no position either, reads as 0 on load', async () => {
+    const path = freshPath();
+    const anchorStateId = 'test/windowed:anchor';
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ anchorStateId }),
+    });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    manager.getStore().setStateJson(anchorStateId, { anchor: -1 });
+    await manager.close();
+
+    const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
     const manager2 = await ContextManager.open({ path, strategy: strategy2 });
     assert.equal(strategy2.getAnchor(), 0);
-    assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
     await manager2.close();
   });
 });
@@ -346,7 +479,12 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const path = freshPath();
     const manager = await ContextManager.open({ path, strategy: new WindowedPassthroughStrategy() });
     manager.addMessage('u', text('x'.repeat(2000))); // ~500 tokens
-    await assert.rejects(manager.compile(budget), (err: Error) => err.name === 'OverBudgetError');
+    await assert.rejects(manager.compile(budget), (err: Error) => {
+      assert.ok(err instanceof OverBudgetError);
+      // No compression here: only a newer message that fits, or a larger budget, clears it.
+      assert.deepStrictEqual(err.clearedBy, ['newer-message']);
+      return true;
+    });
     await manager.close();
   });
 
@@ -361,6 +499,143 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     assert.match(t, /\[truncated — original was 500 tokens\]$/);
     assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
     await manager.close();
+  });
+
+  it('surfaces maxMessageTokens as the strategy property the framework reads', () => {
+    const strategy: ContextStrategy = new WindowedPassthroughStrategy({ maxMessageTokens: 100 });
+    assert.equal(strategy.maxMessageTokens, 100);
+  });
+
+  it('a tool result past the message\'s cap keeps its pairing and says the cap ran out', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const blocks = compiled.messages.flatMap((m) => m.content);
+    const result = blocks.find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1', 'the result still answers its call');
+    assert.ok(blocks.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 't1'), 'and the call is still there');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
+
+  it('autobiographical\'s message cap writes the same marker on a tool result past it', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const result = compiled.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
+
+  it('text past the cap is dropped with one marker where it began', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'text', text: 'second' },
+      { type: 'text', text: 'third' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const blocks = compiled.messages[0].content.map((b) => (b as { text: string }).text);
+    assert.equal(blocks.length, 2, 'the cut block and one marker for the two dropped ones');
+    assert.match(blocks[0], /\[truncated — original was 500 tokens\]$/);
+    assert.equal(blocks[1], '[content omitted: this message reached its token limit]');
+    await manager.close();
+  });
+});
+
+describe('the message cap\'s omission marker, in both strategies', () => {
+  // Room for the image the cap keeps, which a capped message's price counts
+  // as it renders (#223), at the store's 1,600 tokens.
+  const budget = { maxTokens: 3000, reserveForResponse: 50 };
+  const strategies = [
+    ['windowed passthrough', () => new WindowedPassthroughStrategy({ maxMessageTokens: 100 })],
+    ['autobiographical', () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 })],
+  ] as const;
+  for (const [name, make] of strategies) {
+    it(`${name}: goes where the first dropped text was, after a tool result and an image the cap keeps`, async () => {
+      const path = freshPath();
+      const manager = await ContextManager.open({ path, strategy: make() });
+      manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      manager.addMessage('u', [
+        { type: 'text', text: 'x'.repeat(2000) },
+        { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
+        { type: 'text', text: 'dropped' },
+      ]);
+      const compiled = await manager.compile(budget);
+      // The compile sends the result in a turn of its own, so read the
+      // message's blocks in order across the turns after the call.
+      const call = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
+      const blocks = compiled.messages.slice(call + 1).flatMap((m) => m.content);
+      assert.deepEqual(blocks.map((b) => b.type), ['text', 'tool_result', 'image', 'text']);
+      assert.match((blocks[0] as { text: string }).text, /\[truncated — original was 500 tokens\]$/);
+      assert.equal((blocks[1] as { content: unknown }).content, '[content omitted: this message reached its token limit before this result]');
+      assert.equal((blocks[3] as { text: string }).text, '[content omitted: this message reached its token limit]');
+      await manager.close();
+    });
+
+    it(`${name}: isn't written for text blocks past the cap that hold nothing, which are left out, since nothing was lost`, async () => {
+      const path = freshPath();
+      const manager = await ContextManager.open({ path, strategy: make() });
+      manager.addMessage('u', [
+        { type: 'text', text: 'x'.repeat(2000) },
+        { type: 'text', text: '' },
+        { type: 'text', text: '  ' },
+      ]);
+      const compiled = await manager.compile(budget);
+      const blocks = compiled.messages.flatMap((m) => m.content);
+      assert.equal(blocks.length, 1, `only the cut block is sent: ${JSON.stringify(blocks)}`);
+      assert.match(String((blocks[0] as { text?: string }).text), /\[truncated — original was 500 tokens\]$/);
+      await manager.close();
+    });
+  }
+});
+
+describe('WindowedPassthroughStrategy: the price of a message the cap leaves whole', () => {
+  it('is its full estimate, as it renders, though its estimate passed the cap', async () => {
+    // Eleven one-character blocks estimate at 11 tokens, rounded up per block, past the 10-token cap,
+    // but their 11 characters fit its 40, so nothing is cut. A tool call, which the cap doesn't read,
+    // makes the message far larger than the budget.
+    const priced = async (maxMessageTokens: number | undefined): Promise<number> => {
+      const manager = await ContextManager.open({ path: freshPath(), strategy: new WindowedPassthroughStrategy(maxMessageTokens === undefined ? {} : { maxMessageTokens }) });
+      manager.addMessage('a', [
+        ...Array.from({ length: 11 }, (): ContentBlock => ({ type: 'text', text: 'x' })),
+        { type: 'tool_use', id: 't1', name: 'zz_note', input: { note: 'y'.repeat(4000) } } as ContentBlock,
+      ]);
+      try {
+        await manager.compile({ maxTokens: 500, reserveForResponse: 0 });
+        assert.fail('premise: the message is over the budget');
+      } catch (error) {
+        assert.ok(error instanceof OverBudgetError, `premise: refused for its size: ${String(error)}`);
+        return (error as OverBudgetError & { actual: number }).actual;
+      } finally {
+        await manager.close();
+      }
+    };
+    const uncapped = await priced(undefined);
+    assert.ok(uncapped > 60, `premise: the full estimate passes cap + 50: ${uncapped}`);
+    assert.equal(await priced(10), uncapped, 'priced at its full estimate, as with no cap, not at min(estimate, cap + 50)');
   });
 });
 
@@ -383,8 +658,8 @@ describe('WindowedPassthroughStrategy: live-image policy', () => {
       m.content.map((b) => (b.type === 'image' ? 'image' : (b as { text: string }).text)),
     );
     assert.deepEqual(shape, [
-      ['i1', '[image dropped from live context]'],
-      ['i2', '[image dropped from live context]'],
+      ['i1', "[image not shown: this context keeps only some images]"],
+      ['i2', "[image not shown: this context keeps only some images]"],
       ['i3', 'image'],
     ]);
     await manager.close();
@@ -421,5 +696,47 @@ describe('WindowedPassthroughStrategy: cache markers', () => {
     assert.ok(strategy.getAnchor() > 0, 'anchor moved');
     assert.deepEqual(breakpoints(r), [r.messages.length - 1]);
     await manager.close();
+  });
+
+  it('after discardRenderingFrontier only the end is marked, as on a cold start', async () => {
+    const strategy = new WindowedPassthroughStrategy();
+    const manager = await ContextManager.open({ path: freshPath(), strategy });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    assert.deepEqual(breakpoints(await manager.compile()), [1]);
+    manager.addMessage('u', text('c'));
+    manager.addMessage('u', text('d'));
+    strategy.discardRenderingFrontier();
+    assert.deepEqual(breakpoints(await manager.compile()), [3]);
+    await manager.close();
+  });
+
+  it('takes over a frontier its own class exported, and ignores one the autobiographical strategy exported', async () => {
+    const path = freshPath();
+    const first = new WindowedPassthroughStrategy();
+    const manager = await ContextManager.open({ path, strategy: first });
+    manager.addMessage('u', text('a'));
+    manager.addMessage('u', text('b'));
+    await manager.compile();
+    const own = first.exportRenderingFrontier();
+    await manager.close();
+
+    const autobiographical = new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000 });
+    const other = await ContextManager.open({ path: freshPath(), strategy: autobiographical });
+    other.addMessage('u', text('a'));
+    other.addMessage('u', text('b'));
+    await other.compile();
+    const foreign = autobiographical.exportRenderingFrontier();
+    await other.close();
+
+    const strategy = new WindowedPassthroughStrategy();
+    const reopened = await ContextManager.open({ path, strategy });
+    strategy.adoptRenderingFrontier(own);
+    reopened.addMessage('u', text('c'));
+    assert.deepEqual(breakpoints(await reopened.compile()), [1, 2], 'the adopted frontier names the previous endpoint');
+    strategy.adoptRenderingFrontier(foreign);
+    reopened.addMessage('u', text('d'));
+    assert.deepEqual(breakpoints(await reopened.compile()), [2, 3], 'its own previous compile is still the one named');
+    await reopened.close();
   });
 });

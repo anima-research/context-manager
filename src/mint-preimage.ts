@@ -1,6 +1,8 @@
+import type { Diagnostics } from './diagnostics.js';
 import { createHash } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { NormalizedRequest } from '@animalabs/membrane';
+import { registerStateIfAbsent } from './state-registration.js';
 
 /**
  * Durable preimages for the requests that authored memories.
@@ -44,7 +46,7 @@ const MINT_REQUEST_PREIMAGE_CONTENT_TYPE = 'application/json';
  * preimages never touch it — they stay keyed by their own digest, exactly as
  * before, so the common path carries no envelope overhead at all.
  */
-const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
+export const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
 
 const MINT_PREIMAGE_ENVELOPE_VERSION = 1;
 
@@ -519,9 +521,7 @@ function readEnvelope(store: JsStore, requestHash: string): MintPreimageEnvelope
 function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHash: string): void {
   const bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
   const blobHash = store.storeBlob(bytes, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
-  try {
-    store.registerState({ id: MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, strategy: 'tree' });
-  } catch { /* already registered */ }
+  registerStateIfAbsent(store, { id: MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, strategy: 'tree' });
   store.treeSet(MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, requestHash, {
     blobHash,
     size: bytes.length,
@@ -538,7 +538,7 @@ function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHa
  * is indexed; a request whose envelope fails that check falls back to the
  * plain form, so a preimage is never left readable-but-wrong.
  *
- * Never throws. A memory outranks its receipt: a store that refuses the blob
+ * Never throws, unless `log` does. A memory outranks its receipt: a store that refuses the blob
  * (disk full, closed store) must not lose the summary the LLM just paid for,
  * so failures are loud on stderr and non-fatal — the same stance
  * `logCompressionCall` takes. A hash mismatch means the request object
@@ -550,13 +550,15 @@ export function persistMintRequestPreimage(
   store: JsStore,
   request: NormalizedRequest,
   requestHash: string,
+  /** Where its lines go: the minting strategy's, which name its namespace (#239). */
+  log: Diagnostics = console,
 ): void {
   try {
     const requestJson = JSON.stringify(request);
     const preimage = Buffer.from(requestJson, 'utf8');
     const trueHash = sha256(preimage);
     if (trueHash !== requestHash) {
-      console.error(
+      log.error(
         `[mint-preimage] preimage stored under ${trueHash} but provenance keys ${requestHash} — ` +
           'the authoring request changed between hashing and persistence; the preimage is readable ' +
           'under the STORED key only',
@@ -569,14 +571,14 @@ export function persistMintRequestPreimage(
         storeEnvelope(store, envelope, trueHash);
         return;
       }
-      console.error(
+      log.error(
         `[mint-preimage] envelope for ${trueHash} did not splice back to the request bytes — ` +
           'storing the whole request instead',
       );
     }
     store.storeBlob(preimage, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
   } catch (error) {
-    console.error(`[mint-preimage] failed to persist request preimage ${requestHash}:`, error);
+    log.error(`[mint-preimage] failed to persist request preimage ${requestHash}:`, error);
   }
 }
 

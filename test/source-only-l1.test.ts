@@ -177,7 +177,7 @@ describe('source-only L1 compression', () => {
   });
 
 
-  it('FINAL FALLBACK: canonical runs first; one source-only call runs only after refusal', async () => {
+  it('FINAL FALLBACK: canonical runs first; after its refusal one source-only call runs, with the chunk and no head or recall', async () => {
     const calls: NormalizedRequest[] = []; let n = 0;
     const membrane = { complete: async (request: NormalizedRequest) => {
       calls.push(structuredClone(request)); n++;

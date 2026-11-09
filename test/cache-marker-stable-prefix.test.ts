@@ -19,8 +19,8 @@ import { AutobiographicalStrategy } from '../src/strategies/autobiographical.js'
 import type { ContextEntry } from '../src/types/context.js';
 
 class Exposed extends AutobiographicalStrategy {
-  place(entries: ContextEntry[], head: Set<string>, tail: Set<string>): void {
-    this.placeCacheMarkers(entries, head, tail);
+  place(entries: ContextEntry[], head: Set<string>, tail: Set<string>): number | null {
+    return this.placeCacheMarkers(entries, head, tail);
   }
 }
 
@@ -106,6 +106,30 @@ test('total rewrite: no stable-prefix marker, no crash', () => {
   assert.deepEqual(marksOf(b.es), [b.es.length - 1]); // end only
 });
 
+test('returns where the entries first differ from the previous compile’s: null at first, an entry edited in place, the first appended one, the count when none differs', () => {
+  const s = new Exposed({});
+  const a = fixture();
+  assert.equal(s.place(a.es, a.head, a.tail), null, 'no earlier compile');
+  const edited = () => {
+    const f = fixture();
+    f.es[5] = entry('m3', 'fold-3, edited in place'); // same message, new bytes
+    return f;
+  };
+  const b = edited();
+  assert.equal(s.place(b.es, b.head, b.tail), 5);
+  const c = edited();
+  assert.equal(s.place(c.es, c.head, c.tail), c.es.length, 'nothing differs');
+  // Appended entries weren't in the previous request, so the first of them is
+  // where this one first differs, not the new count.
+  const d = edited();
+  d.es.push(entry('t3', 'raw-3'), entry('t4', 'raw-4'));
+  assert.equal(s.place(d.es, d.head, d.tail), c.es.length, 'the first appended entry');
+  // Entries only removed from the end: this request is a prefix of the last.
+  const e = edited();
+  e.es.splice(-2);
+  assert.equal(s.place(e.es, e.head, e.tail), e.es.length, 'a prefix of the previous request');
+});
+
 test('never more than 3 message-level markers', () => {
   const s = new Exposed({});
   for (let round = 0; round < 4; round++) {
@@ -114,4 +138,30 @@ test('never more than 3 message-level markers', () => {
     s.place(es, head, tail);
     assert.ok(marksOf(es).length <= 3, `round ${round}: ${marksOf(es)}`);
   }
+});
+
+test('with no deep band, a compile whose prefix changes inside the head marks no entry there but the first slot', () => {
+  const s = new Exposed({});
+  const a = fixture();
+  s.place(a.es, a.head, a.tail);
+  const b = fixture();
+  b.es[1] = entry('h1', 'sys-b, edited');
+  s.place(b.es, b.head, b.tail);
+  assert.deepEqual(marksOf(b.es), [1, 10]);
+
+  const longHead = (edited: boolean) => {
+    const es = [
+      entry('h0', 'sys-a'), entry('h1', 'sys-b'), entry('h2', edited ? 'sys-c, edited' : 'sys-c'), entry('h3', 'sys-d'),
+      entry('m0', 'fold-0'), entry('m1', 'fold-1'), entry('m2', 'fold-2'),
+      entry('m3', 'fold-3'), entry('m4', 'fold-4'), entry('m5', 'fold-5'),
+      entry('t0', 'raw-0'), entry('t1', 'raw-1'), entry('t2', 'raw-2'),
+    ];
+    return { es, head: new Set(['h0', 'h1', 'h2', 'h3']), tail: new Set(['t0', 't1', 't2']) };
+  };
+  const t = new Exposed({});
+  const c = longHead(false);
+  t.place(c.es, c.head, c.tail);
+  const d = longHead(true);
+  t.place(d.es, d.head, d.tail);
+  assert.deepEqual(marksOf(d.es), [3, 12], 'an edit inside a longer head, with entries before it unchanged, marks none of them');
 });

@@ -24,8 +24,11 @@
 
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { rmSync, existsSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { rmSync, existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-message-store-sequence';
@@ -96,6 +99,37 @@ describe('MessageStore — sequence semantics', () => {
       messages[messages.length - 1].sequence,
       'get() and query() must report the same sequence for the same message',
     );
+
+    manager.close();
+  });
+
+  it('sequenceOf answers as get(id)?.sequence does, after a listing, an edit and a branch switch (#273)', async () => {
+    const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    const store = (manager as unknown as { messageStore: MessageStore }).messageStore;
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      ids.push(manager.addMessage('user', textBlock(`m${i}`)));
+    }
+    const agrees = (when: string) => {
+      for (const id of ids) {
+        assert.equal(store.sequenceOf(id), store.get(id)?.sequence, `${id} ${when}`);
+      }
+      assert.equal(store.sequenceOf('no-such-message'), undefined, `an unknown id ${when}`);
+    };
+
+    agrees('before any listing');
+    store.getAll();
+    agrees('after a listing');
+    manager.editMessage(ids[2], textBlock('edited'));
+    agrees('after an edit');
+    const branch = manager.branchAt(ids[3]);
+    await manager.switchBranch(branch);
+    assert.equal(store.sequenceOf(ids[5]), undefined, 'a message past the fork is not on the branch');
+    assert.equal(store.sequenceOf(ids[3]), store.get(ids[3])?.sequence, 'the fork point after the switch');
 
     manager.close();
   });
@@ -216,5 +250,61 @@ describe('MessageStore — sequence semantics', () => {
     );
 
     manager.close();
+  });
+});
+
+describe('MessageStore.sequenceOf against the slot itself (#273)', () => {
+  function openSlot(t: { after(fn: () => void): void }) {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-sequence-of-'));
+    const js = JsStore.openOrCreate({ path: join(dir, 'store') });
+    t.after(() => {
+      js.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    MessageStore.register(js);
+    // The oracle reads the slot as chronicle holds it, so it shares no index
+    // or cache with the store under test.
+    const slotSequence = (id: string) =>
+      (js.getStateJson('messages') as Array<{ id: string; sequence: number }>).find((m) => m.id === id)?.sequence;
+    return { js, slotSequence };
+  }
+
+  it("follows a removal that shifts every later message, and a sibling's removal, edit and append", (t) => {
+    const { js, slotSequence } = openSlot(t);
+    const reader = new MessageStore(js);
+    const writer = new MessageStore(js);
+    const ids = ['a', 'b', 'c', 'd', 'e'].map((x) => reader.append('user', textBlock(x)).id);
+    const agrees = (when: string, known: string[]) => {
+      for (const id of known) assert.equal(reader.sequenceOf(id), slotSequence(id), `${id} ${when}`);
+    };
+    agrees('after the appends', ids);
+
+    reader.remove(ids[0]!);
+    assert.equal(reader.sequenceOf(ids[0]!), undefined, 'the removed message');
+    agrees('after a removal that shifts the rest', ids.slice(1));
+
+    writer.remove(ids[2]!);
+    assert.equal(reader.sequenceOf(ids[2]!), undefined, "the sibling's removed message");
+    agrees("after a sibling's removal", [ids[1]!, ids[3]!, ids[4]!]);
+
+    writer.edit(ids[3]!, textBlock('d, edited by a sibling'));
+    const appended = writer.append('user', textBlock('f')).id;
+    agrees("after a sibling's edit and append", [ids[1]!, ids[3]!, ids[4]!, appended]);
+  });
+
+  it("reads the item while the listing isn't cached, as on a chronicle without point lookup", (t) => {
+    const { js, slotSequence } = openSlot(t);
+    // Without point lookup an append can't write the listing through, so it
+    // drops the cache, and the next lookup reads the item.
+    const legacy = new Proxy(js, {
+      get(target, prop, receiver) {
+        if (prop === 'getStateItemJson') return undefined;
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as JsStore;
+    const messages = new MessageStore(legacy);
+    const ids = ['a', 'b'].map((x) => messages.append('user', textBlock(x)).id);
+    for (const id of ids) assert.equal(messages.sequenceOf(id), slotSequence(id), id);
   });
 });

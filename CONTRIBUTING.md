@@ -64,6 +64,8 @@ are the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   often a compile against a real store to see the token curve) and paste
   transcripts. Claims are checked, not trusted.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -159,13 +161,33 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches.
 
-Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
-ubuntu and macos, installing with `npm ci`. The lockfile is committed and
-strict: `npm install` on npm >= 11 will quietly re-resolve platform packages
-missing from the lock, so only `npm ci` fails loudly on a lock that is broken
-or out of sync. If you change dependencies, commit the regenerated lock — and
-note that a lock regenerated over an existing `node_modules` tree records
-only your platform's native binaries, which is why CI installs on both.
+CI's test step runs `bash scripts/test-each-file.sh`, which runs each compiled
+test file in a node process of its own, as many at once as node's
+`os.availableParallelism()` gives. `TEST_EACH_FILE_JOBS` sets that number
+instead: a whole number above 0, with no leading zero, and 1 runs the files
+one after another; empty or unset takes the default. Each file's output is
+printed under a line naming it, in the files' sorted order: the earliest file
+still running prints its output as it comes, and each later file's waits for
+its turn. So no two files' output mixes, and if a file never ends, the log
+shows what the earliest such file has written.
+
+Push-time CI (`ci.yml`) runs on every push to `main` and every PR. It
+typechecks, builds and tests on ubuntu at the engines floor (Node 22.12.0),
+first with the releases the lockfile holds. It does so again with each
+dependency, optional and peer ones included, at the lowest release its range
+admits, since a host's own lockfile can hold that one. A range that joins lines
+with `||` gets one more run for each of its lines' lowest releases other than
+the range's own, with every other dependency at its lowest
+(`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
+aren't tested in crossed combinations.
+Every other leg, on ubuntu and macos, installs with `npm ci`, packs
+the package, installs the tarball into an empty project and imports it. The
+lockfile is committed and strict: `npm install` on npm >= 11 will quietly
+re-resolve platform packages missing from the lock, so only `npm ci` fails
+loudly on a lock that is broken or out of sync. If you change dependencies,
+commit the regenerated lock — and note that a lock regenerated over an
+existing `node_modules` tree records only your platform's native binaries,
+which is why CI installs on both.
 
 `bench/` and `playground/` hold the harnesses for looking at real compression
 behavior rather than fixtures; `docs/` carries the design notes behind the

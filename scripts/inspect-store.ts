@@ -1,195 +1,85 @@
 /**
- * Inspect a migrated chronicle: dump messages, summaries, and the picker's
- * resolution state in a human-readable form.
+ * Inspect a chronicle store's autobiographical memory: its messages, the
+ * summary tree and lineage, and the adaptive resolutions, written as files
+ * under --output with an overview on stdout.
  *
  * Usage:
- *   node dist/scripts/inspect-store.js <store-path> [--summaries|--messages|--all]
+ *   node dist/scripts/inspect-store.js <store-path> [--namespace <ns>] [--message-slot isolated|shared] [--output <dir>] [--sample-compile <tokens>]
+ *
+ * The invocation is checked whole before anything is opened: the store path
+ * comes first, then only the options above, each at most once and each with
+ * its value. Anything else (an unknown or misspelled option, a stray
+ * argument, an option given twice, an option without its value) is refused,
+ * never read around, so a malformed selection can't fall back to a default.
+ *
+ * `--namespace` is the strategy namespace (default "default"; residents use
+ * e.g. agents/<Name>). `--ns` is accepted as its old name.
+ *
+ * `--message-slot` says where the resident keeps its messages: `isolated`
+ * for a ContextManager opened with `isolate: true` (the slot
+ * `{namespace}/messages`), `shared` for one opened without it (the slot
+ * `messages`). The store doesn't record which, and a registered slot is not
+ * proof the resident uses it: an isolated slot outlives a switch to shared
+ * messages. So a chosen slot must be registered; without a choice the sole
+ * registered slot is read, and when both are registered nothing is
+ * inspected until one is chosen. The overview, messages.md and the sample
+ * name the slot they read.
+ *
+ * Mutation-free strategy inspection: the store is opened with JsStore.open
+ * (it is never created), the strategy's persisted state is read as stored,
+ * and without --sample-compile no strategy or ContextManager is constructed.
+ * So inspection creates no strategy, chunk or namespace state and registers
+ * no strategy state; a namespace without strategy state is reported and
+ * nothing else is done. Messages are read through a MessageStore, whose
+ * construction re-registers the message slot's history indexes,
+ * idempotently, as every MessageStore construction does, rebuilding any that
+ * are missing or stale; for an isolated slot those are the namespace's own.
+ *
+ * Summaries and resolutions are read as stored, before the strategy's
+ * load-time repair (which drops empty summaries, dedupes ids and clears
+ * dangling parents), so a count can include entries a resident drops when it
+ * loads. A state that holds something other than what the strategy writes
+ * (a summaries state that isn't a list, a resolutions state that isn't a map
+ * of numbers) is reported on stderr and in the overview, never read as empty.
+ *
+ * Inspection is mutation-free logically, not byte-for-byte. Chronicle (as of
+ * 0.4.0) has no read-only open: opening takes the store's lock, so run this on
+ * a stopped resident's store or on a copy; a store whose lock is held is
+ * refused with exit 1. Every close rewrites state.bin,
+ * state-indexes.bin (where a rebuilt history index lands) and branches.bin,
+ * whose bytes can change even when what they hold doesn't. And when the
+ * store wasn't closed cleanly, opening may correct stale branch heads, which
+ * the close writes to branches.bin, and truncate a torn tail from
+ * records.log; a truncation is reported on stderr, even when the open then
+ * fails, since nothing records it afterwards. So to keep a store's files as
+ * they were, as forensics during an incident needs, copy the store before
+ * inspecting it.
+ *
+ * `--sample-compile <tokens>` additionally writes one compile at that
+ * budget from a live, audit-only open of the same message slot, using this
+ * tool's default strategy configuration (not the resident's own, so it is a
+ * sample, not a reproduction of the resident's view). That open writes: it
+ * registers the namespace's states, re-applies the message slot's
+ * registration (its snapshot cadence; the shared slot is store-global),
+ * may migrate legacy chunk records, and may rewrite the summaries state as the
+ * strategy repairs it on load. Use it on a copy. With no message slot there
+ * is no history to compile, so it is refused.
+ *
+ * Exit codes:
+ *   0 = inspected. With no message slot registered and no --sample-compile,
+ *       the summaries are inspected and the messages reported as none.
+ *   2 = nothing inspected, because the store doesn't settle the selection:
+ *       the namespace has no strategy state, a chosen message slot isn't
+ *       registered, both slots are registered and none was chosen, or a
+ *       sample compile was asked for with no message slot.
+ *   1 = a malformed invocation, a store that can't be opened (absent, not a
+ *       store, or locked), or a failure after inspection began; outputs
+ *       written before such a failure stay where they are.
  */
 
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { main } from './inspect-store-main.js';
 
-function makeMockMembrane() {
-  return {
-    complete: async () => ({
-      content: [{ type: 'text', text: '[mock]' }],
-    }),
-  };
-}
-
-interface SummaryEntry {
-  id: string;
-  level: number;
-  content: string;
-  tokens: number;
-  sourceLevel: number;
-  sourceIds: string[];
-  sourceRange: { first: string; last: string };
-  parentId?: string;
-  mergedInto?: string;
-  created: number;
-}
-
-async function main() {
-  const args = process.argv.slice(2);
-  if (args.length < 1) {
-    console.error('Usage: inspect-store <store-path> [--output <dir>]');
-    process.exit(1);
-  }
-  const storePath = args[0];
-  const outputDir = (() => {
-    const i = args.indexOf('--output');
-    return i >= 0 ? args[i + 1] : './inspection-output';
-  })();
-
-  if (!existsSync(storePath)) {
-    console.error(`Store not found: ${storePath}`);
-    process.exit(1);
-  }
-  mkdirSync(outputDir, { recursive: true });
-
-  const strategy = new AutobiographicalStrategy({
-    adaptiveResolution: true,
-    targetChunkTokens: 3000,
-    recentWindowTokens: 30000,
-    mergeThreshold: 6,
-  });
-  const nsIdx = args.indexOf('--ns');
-  const ns = nsIdx >= 0 ? args[nsIdx + 1] : undefined;
-  const manager = await ContextManager.open({
-    path: storePath,
-    strategy,
-    membrane: makeMockMembrane() as any,
-    ...(ns ? { namespace: ns } : {}),
-  });
-
-  const messages = manager.getAllMessages();
-  const summaries = (strategy as any).summaries as SummaryEntry[];
-  const resolutions = (strategy as any).resolutions as Map<string, number>;
-
-  // === Overview ===
-  const byLevel: Record<number, number> = {};
-  for (const s of summaries) byLevel[s.level] = (byLevel[s.level] ?? 0) + 1;
-
-  const bodyGroups = new Map<string, number>();
-  for (const m of messages) {
-    if (m.bodyGroupId) {
-      bodyGroups.set(m.bodyGroupId, (bodyGroups.get(m.bodyGroupId) ?? 0) + 1);
-    }
-  }
-
-  console.log('=== Overview ===');
-  console.log(`Messages: ${messages.length}`);
-  console.log(`Summaries: ${summaries.length} (${JSON.stringify(byLevel)})`);
-  console.log(`BodyGroups: ${bodyGroups.size}`);
-  for (const [gid, count] of Array.from(bodyGroups.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5)) {
-    console.log(`  ${gid}: ${count} shards`);
-  }
-  console.log(`Resolutions recorded: ${resolutions.size}`);
-  const resDist: Record<number, number> = {};
-  for (const lvl of resolutions.values()) resDist[lvl] = (resDist[lvl] ?? 0) + 1;
-  console.log(`Resolution distribution: ${JSON.stringify(resDist)}`);
-
-  // === Summary tree dump ===
-  const byId = new Map<string, SummaryEntry>();
-  for (const s of summaries) byId.set(s.id, s);
-  const getParent = (s: SummaryEntry) => s.parentId ?? s.mergedInto;
-
-  const summaryTreeLines: string[] = [];
-  summaryTreeLines.push('# Summary tree\n');
-  summaryTreeLines.push('Sorted by level (highest first), then by source order.\n');
-
-  const sortedByLevel = [...summaries].sort((a, b) => {
-    if (a.level !== b.level) return b.level - a.level;
-    // Within a level, sort by first source message id (rough source order)
-    return a.sourceRange.first.localeCompare(b.sourceRange.first);
-  });
-
-  for (const s of sortedByLevel) {
-    const parent = getParent(s);
-    const parentInfo = parent ? ` parent=${parent}` : '';
-    summaryTreeLines.push(`\n## ${s.id} (L${s.level}, ${s.tokens} tokens)${parentInfo}`);
-    summaryTreeLines.push(`sourceLevel=${s.sourceLevel} sources=${s.sourceIds.length} range=${s.sourceRange.first}…${s.sourceRange.last}`);
-    summaryTreeLines.push('');
-    summaryTreeLines.push(s.content);
-    summaryTreeLines.push('');
-    summaryTreeLines.push('---');
-  }
-
-  const treePath = `${outputDir}/summary-tree.md`;
-  writeFileSync(treePath, summaryTreeLines.join('\n'));
-  console.log(`\nWrote summary tree → ${treePath}`);
-
-  // === Per-summary lineage with leaf chunk ids ===
-  const lineageLines: string[] = [];
-  lineageLines.push('# Summary lineage\n');
-  lineageLines.push('For each summary: leaf message IDs it ultimately covers, and (for L1s) the chunk size.\n');
-
-  const collectLeafMessageIds = (s: SummaryEntry, visited = new Set<string>()): string[] => {
-    if (visited.has(s.id)) return [];
-    visited.add(s.id);
-    if (s.sourceLevel === 0) return [...s.sourceIds];
-    const out: string[] = [];
-    for (const sid of s.sourceIds) {
-      const child = byId.get(sid);
-      if (child) out.push(...collectLeafMessageIds(child, visited));
-    }
-    return out;
-  };
-
-  for (const s of sortedByLevel) {
-    const leaves = collectLeafMessageIds(s);
-    lineageLines.push(`\n## ${s.id} (L${s.level})`);
-    lineageLines.push(`Source range: ${s.sourceRange.first} … ${s.sourceRange.last}`);
-    lineageLines.push(`Leaf message ids (${leaves.length}): ${leaves.slice(0, 5).join(', ')}${leaves.length > 5 ? `, … ${leaves[leaves.length - 1]}` : ''}`);
-  }
-  writeFileSync(`${outputDir}/summary-lineage.md`, lineageLines.join('\n'));
-  console.log(`Wrote summary lineage → ${outputDir}/summary-lineage.md`);
-
-  // === Message listing (compact) ===
-  const messageLines: string[] = [];
-  messageLines.push('# Messages\n');
-  messageLines.push(`Total stored: ${messages.length}\n`);
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    const text = m.content
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('');
-    const preview = text.slice(0, 100).replace(/\n/g, '\\n');
-    const tokenEst = Math.ceil(text.length / 4);
-    const shard = m.bodyGroupId ? ` [shard ${m.shardIndex}/${bodyGroups.get(m.bodyGroupId)} of ${m.bodyGroupId.slice(0, 12)}…]` : '';
-    const res = resolutions.get(m.id) !== undefined ? ` res=L${resolutions.get(m.id)}` : '';
-    messageLines.push(`[${i.toString().padStart(3, '0')}] ${m.participant} ${tokenEst}t${shard}${res}: ${preview}`);
-  }
-  writeFileSync(`${outputDir}/messages.md`, messageLines.join('\n'));
-  console.log(`Wrote messages → ${outputDir}/messages.md`);
-
-  // === Sample compile output (50K budget for spot-check) ===
-  const compiled = await manager.compile({ maxTokens: 50000, reserveForResponse: 4000 });
-  const compileLines: string[] = [];
-  compileLines.push('# Sample compile output (50K budget)\n');
-  compileLines.push(`Entries: ${compiled.messages.length}\n`);
-  for (let i = 0; i < compiled.messages.length; i++) {
-    const m = compiled.messages[i];
-    const text = m.content
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('');
-    compileLines.push(`\n## [${i}] ${m.participant} (${Math.ceil(text.length / 4)} tokens)`);
-    compileLines.push('');
-    compileLines.push(text);
-    compileLines.push('');
-    compileLines.push('---');
-  }
-  writeFileSync(`${outputDir}/sample-compile-50k.md`, compileLines.join('\n'));
-  console.log(`Wrote sample compile → ${outputDir}/sample-compile-50k.md`);
-
-  manager.close();
-  console.log(`\nAll outputs in ${outputDir}/`);
-}
-
-main().catch((err) => {
-  console.error('FATAL:', err);
-  process.exit(1);
+main().then((code) => { process.exitCode = code; }, (error) => {
+  console.error('FATAL:', error);
+  process.exitCode = 1;
 });

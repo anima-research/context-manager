@@ -55,6 +55,10 @@ oracle-only and bucketed-R the production mode (§4.3-4.4); **C is per-leaf
 additive against a fixed reference ⇒ no continuation state** (§3.2, §4.3);
 K fitted on data, C set by welfare judgment (§13 0a); receipt state hash-
 chained (§5); stale `J` / branch-3 / T3-slack references cleaned.
+Revised 2026-10-18: a strategy built from a recipe reads the three age
+measures (fidelity age, continuity recency, stability) at the lower edge of
+a geometric band, `policy.ageBandSteps` bands per doubling (default 4; 0 is
+exact), so a leaf's weight moves only at band edges (§3.1, §3.2; #45).
 Successor proposal to the rev 5.0/5.1 single-path solve
 (`adaptive-resolution-design.md` §13); implements and generalizes the §12.4
 refinement ("budget-driven slope"). Nothing here is deployed. Validation
@@ -185,7 +189,14 @@ Binary x_v per node. Constraints:
   Group-atomicity interactions fall out automatically (a ≤L1 pin masks the
   covering L2). Pin admission control is the *caller's* job (memory-tools
   spec §5); the solver's job is to honor pins absolutely or report
-  infeasibility — **a pin is never silently violated.**
+  infeasibility — **a pin is never silently violated.** The one exception,
+  F4b's hold of a level pin whose level isn't produced yet, is logged. (A
+  pin over a message in the head or tail zone, the recent window included,
+  adds no restriction while the message is there: the zone keeps it raw, as
+  it did before #193, and the pin applies once the message is in the folded
+  middle. Nor does a pin over a message of system changes, which the
+  strategy keeps raw whatever the pins (#298): the hold never applies to it,
+  and its log doesn't count it.)
 - **F4b constraint composition: intersect, never pick a winner (review-3
   §1).** Pins and locks are absolute; precedence would silently violate one
   of them even if logged. Canonicalization builds, per live leaf,
@@ -194,9 +205,25 @@ Binary x_v per node. Constraints:
   compression quarantine → {0}; `lockedByAgent` → {carriedResolution}
   (a lock freezes at the *carried* level, not necessarily raw); exact pin
   `= p` → {p}; `≤ p` → produced levels ≤ p; `≥ p` → produced levels ≥ p.
+  A level pin `= p` whose p the chain doesn't produce yet is the one
+  exception (#193): the forest holds the leaf at the deepest level the
+  chain does produce below p (L0 when none), the strategy logs when it
+  starts and stops holding the pin, and the leaf moves to p once p is
+  produced. Produced means on the chain the forest builds: a summary it
+  leaves off a leaf's chain, such as one above a treeified summary, supplies
+  no level there. A pinned level is reached only as compression and merging
+  produce it, and refusing every compile until then made a pin able to stop
+  an agent. The hold relaxes only that, so it applies only while every other
+  restriction on the leaf allows both p and the level the leaf is held at: a
+  lock at another level conflicts with the pin whether or not p is produced
+  yet, rather than agreeing with the held level until a merge produces p, and
+  a floor above the held level and at or below p makes the pin strict again,
+  so the conflict names p as the level to produce.
   **Empty intersection = infeasible**: the certificate (§9) reports the
-  conflicting constraints and leaf ids. No constraint is weakened, clamped,
-  or selected inside the solver.
+  conflicting constraints and leaf ids. Apart from that hold, no constraint
+  is weakened, clamped, or selected inside the solver: a lock and every
+  other exact constraint stay strict, so a level pin that conflicts with a
+  lock is still infeasible.
   Restrictions on *different* sibling leaves may still yield a **protected-
   hole** emission (matches current partial-group rendering): the parent is
   selected for participating siblings while a restricted leaf is emitted at
@@ -211,7 +238,9 @@ Binary x_v per node. Constraints:
   Tests: compatible `≥`/`≤` intersect to an interval; exact pin + matching
   lock succeeds; exact pin + conflicting lock → infeasible; contradictory
   overlapping pins → infeasible; sibling constraints compile to the expected
-  protected-hole render; no solve result violates any original constraint.
+  protected-hole render; no solve result violates any original constraint
+  other than a held level pin, which renders below its level until the
+  level is produced.
 - **F5 budget wall** — R(x) = Σ x_v·tok_v ≤ W. The only hard resource.
   tok_v prices from the same estimator surface rev 5 uses (recallPairCost for
   summaries, calibrated estimates for raw), so estimator work is shared.
@@ -297,6 +326,10 @@ flat-band semantics. `B` never makes `R > W` admissible.
     Fidelity(x) = Σ_leaves i  w_i · u(ℓ_i)
     w_i = salience_i · age_i^(−α) · rawTokens_i
     u(ℓ) = (L_max − ℓ)          [linear v1; concave variants are a later knob]
+
+`age_i` is read at the lower edge of its geometric band when
+`policy.ageBandSteps > 0` (the recipe default is 4 bands per doubling), so
+`w_i` is constant between band edges; `ageBandSteps: 0` reads the exact age.
 
 The resolution-vs-age curve **emerges** from marginal-utility-per-token
 ordering under W. α is the single shape knob, decoupled from merge fanout.
@@ -608,7 +641,13 @@ model, or cached.
   historyEnd, changedLeaves: [{leafId, repHash, level, lastChangedSeq}]}`.
   Deltas carry only appended, removed, or changed leaves; a periodic full
   snapshot (configured cadence / max replay depth, tested) holds the whole
-  live-leaf representation map plus the current sequence. Stability clocks
+  live-leaf representation map plus the current sequence. On disk the
+  snapshot is `format: 2` (#148): the leaf map as runs of consecutive leaves
+  sharing a representative (raw leaves as runs of `{raw, level,
+  lastChangedSeq}` whose `raw:<id>` hashes are derived on load), ids
+  gap-coded inside a run, and the head's change list the same way, so a write
+  costs bytes in the number of summaries presented, not messages; the earlier
+  one-entry-per-leaf shape is still read. Stability clocks
   are not per-leaf counters: `τ_i = currentSeq − lastChangedSeq_i`, so only
   changed leaves are written. **Commit semantics — single flight.** AF
   serializes turns per agent, so at most one provider-bound stream-lane
@@ -641,7 +680,9 @@ model, or cached.
   cacheCreationTokens?})` — name is
   implementation-owned, but request identity must prevent a receipt for one
   compile being applied to another. The next solve reads the **newest valid
-  cache receipt**, not the newest compiled frontier. Cache fields may be
+  cache receipt**, not the newest compiled frontier. Under kv-unified the
+  receipt that sets the cache reference is a compile's first accepted call's;
+  a later call of the same compile leaves it (§5A.3). Cache fields may be
   absent while the accepted-presentation fields are still committed.
 - **Current immutable-prefix fingerprint is a required solve input.** Before
   cut selection, the host passes the hash of tools + system + context prefix
@@ -758,6 +799,25 @@ itself the main hazard; do not design from those numbers. After rev 6:
   system and tools blocks by construction. Caveat recorded: with the system
   slot moved, an idle expiry kills the tools entry together with the window;
   irrelevant with keepalives on, remember if they are ever off.
+- **That's a compile's own request.** On the native tool loop's later calls in
+  the same turn, membrane may float markers of its own under `cm-owned`;
+  membrane's `floatingCacheMarker` doc, as antra-tess/membrane#239 extends it
+  to `cm-owned`, says when, where, and that within one tool loop membrane
+  changes no message content before the turn's opening (context-manager#168).
+  Once one of the compile's calls is accepted, a later call's receipt leaves
+  the cache reference and the recorded wire receipt as they stood once that
+  call was accepted (§5). A compile's calls are those begun after it and
+  before the next compile; one still in flight when the next compile runs
+  stays its own compile's. Calls begun after the next compile are that
+  compile's: the first of them accepted before the compile's own request
+  begins is its first accepted call, so it takes the count check, its wire
+  receipt is the one recorded, and the compile's own request then leaves
+  both. A call whose
+  count differs, such as a floated one, then leaves that compile no
+  reference. One still in flight when the compile's own request begins is
+  superseded, so that request, once accepted, is the first accepted call.
+  agent-framework starts a stream only from `idle` (`src/agent.ts:2192` at
+  v0.32.0), so its tool loop's calls end before its next stream compiles.
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
@@ -865,7 +925,10 @@ prefix; **stale imported block-level markers are rejected at a named
 normalization boundary before request construction** (CM cannot optimize a
 slot budget containing hidden markers; the loud data-defect behavior stays
 in `membrane-system` mode); the raw request carries at most the provider
-limit; membrane returns the exact wire receipt.
+limit; membrane returns the exact wire receipt. These rules, and formatter
+parity's and the wire receipt's below, hold for a compile's own request: on
+the native tool loop's later calls, a membrane that floats under `cm-owned`
+places markers of its own (§5A.3).
 
 **Formatter parity** — the same normalized policy applies to native
 Anthropic, Anthropic XML/prefill, Bedrock (incl. its ttl rewrite), context-
@@ -969,7 +1032,13 @@ Demand therefore has an explicit **latent-candidate layer**:
    occupancy band, welfare policy, and approximation configuration, evaluated with **the same bounded Pareto
    solver used for cut selection** (not a separate "exact" solve). v1
    marginal values are individual (one candidate at a time), not conditional
-   on a production set — a documented approximation. Each evaluation reports:
+   on a production set — a documented approximation. Since 2026-10 the
+   recipe default is the *joint* measurement (`latentDemandMode`, #229):
+   one what-if solve holds every candidate at its conservative cost, and
+   the merges demanded are the ones the pool's best cut, scored in the
+   frame it shares with the live solve, uses, when that cut beats the live
+   one by more than `adoptEpsilon`; `'individual'` restores the
+   per-candidate rule below. Each evaluation reports:
    exact vs approximate mode; bucket parameters; the estimated recall-cost
    distribution; the improvement at the point estimate; and a **conservative
    improvement used for ranking** — v1 rule: cost at an upper quantile

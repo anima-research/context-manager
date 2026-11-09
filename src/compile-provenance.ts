@@ -1,0 +1,545 @@
+/**
+ * Compile provenance: what each compiled message is a copy of, and the
+ * rendered layout one compile produced.
+ *
+ * Both are derived from the entries the strategy actually emitted, never
+ * from a plan: a raw copy is an entry with `sourceRelation: 'copy'` naming
+ * its source ids, a summary is an entry naming its summaries, and a message
+ * of the strategy's view represented by neither was not rendered (omitted).
+ *
+ * Completeness of a raw copy is judged against the stored body: a copy is
+ * complete only when every shard of the body is present and every block
+ * arrived unaltered (no truncation, no stripped image, no block removed by a
+ * structural repair).
+ */
+
+import type { ContentBlock } from '@animalabs/membrane';
+import { bodyBoundsIn } from './body-runs.js';
+import type {
+  CompiledMessageSources,
+  ContextEntry,
+  LayoutUnit,
+  MessageId,
+  RawBodySource,
+  RenderedLayout,
+  RenderedSummaryInfo,
+  StoredMessage,
+} from './types/index.js';
+
+/** Per-body completeness, aggregated over every raw entry of one compile. */
+interface BodyState {
+  /** First shard (or the message itself). */
+  head: StoredMessage;
+  /** Every stored member of the body, in shard order. */
+  members: StoredMessage[];
+  /** Member ids present raw in this compile. */
+  present: Set<MessageId>;
+  /** False once any entry carrying part of the body altered it. */
+  contentOk: boolean;
+}
+
+export interface EntryProvenance {
+  /** Sources per entry, parallel to the strategy's entries. */
+  sources: CompiledMessageSources[];
+  /** Raw message id -> whether its body was complete in this compile. */
+  rawComplete: Map<MessageId, boolean>;
+  /**
+   * The body of every stored message the raw entries name, under each of
+   * its members: the body's members in shard order, head first (see
+   * rawBodiesOf).
+   */
+  bodies: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+}
+
+function isRawEntry(entry: ContextEntry): boolean {
+  if (entry.sourceRelation === 'derived' || entry.sourceRelation === 'referenced') return false;
+  return entry.sourceMessageId !== undefined || (entry.sourceMessageIds?.length ?? 0) > 0;
+}
+
+function entrySourceIds(entry: ContextEntry): MessageId[] {
+  if (entry.sourceMessageIds && entry.sourceMessageIds.length > 0) return [...entry.sourceMessageIds];
+  return entry.sourceMessageId !== undefined ? [entry.sourceMessageId] : [];
+}
+
+/**
+ * Finds stored messages by id, with their bodies, reading `stored` only
+ * around the messages asked for, so a compile's attribution costs what its
+ * raw entries name, not what is stored.
+ *
+ * A body is one ingestion, read by the rule every reader of a group id
+ * shares (body-runs.ts): a message continues the body before it only when
+ * it carries the same group id at a higher shard index, so a body is a run
+ * of consecutive messages, and the same text ingested twice, back to back or
+ * apart, is two bodies. A message outside any group is a body of its own. A
+ * body whose shard 0 was removed keeps its other shards, and its head is
+ * then the first of them.
+ *
+ * A message is looked for first right after the last body found, since a
+ * run of raw entries names consecutive messages, and otherwise at its
+ * position (`positionOf`, which the compile's view answers without reading
+ * the message: by its sequence while the view is the record, from the
+ * window's own positions once rows are presented in another order). So a
+ * run of consecutive stored messages costs one lookup, at its start, and a
+ * named message that doesn't follow the last body found costs one of its
+ * own, as one named out of order does, or one after a message the view
+ * filter hid: at most one lookup for each raw source, whatever the length
+ * of `stored`. An id that no message in `stored` has is not found, and
+ * neither is one whose lookup answers with a position where `stored` holds
+ * another message, or none.
+ */
+function storedBodyFinder(
+  stored: readonly StoredMessage[],
+  positionOf: (id: MessageId) => number | undefined,
+): { find: (id: MessageId) => StoredMessage | undefined; bodies: ReadonlyMap<MessageId, readonly StoredMessage[]> } {
+  const found = new Map<MessageId, StoredMessage>();
+  const bodies = new Map<MessageId, readonly StoredMessage[]>();
+  let next = 0;
+  const find = (id: MessageId): StoredMessage | undefined => {
+    const known = found.get(id);
+    if (known) return known;
+    let at = stored[next]?.id === id ? next : -1;
+    if (at === -1) {
+      const position = positionOf(id);
+      if (position === undefined || stored[position]?.id !== id) return undefined;
+      at = position;
+    }
+    const { from, to } = bodyBoundsIn(stored, at);
+    const body = stored.slice(from, to + 1);
+    for (const member of body) {
+      found.set(member.id, member);
+      bodies.set(member.id, body);
+    }
+    next = to + 1;
+    return stored[at];
+  };
+  return { find, bodies };
+}
+
+/**
+ * Attribute every entry of one compile. `stored` is every message the
+ * compile read, before any view filter, in the order its window lists them
+ * (the record's order until rows are presented to the agent in another): a
+ * body is judged as stored, so a shard the filter hid from the strategy
+ * still belongs to its body, whose head is shard 0 whether or not it was
+ * visible. A body is presented whole, so its shards are consecutive in
+ * either order, but for one a presentation cut short left partly in the
+ * window (in an index a pre-release build wrote one record per row: see
+ * ContextManager.presentRows) and a later presentRows completed after
+ * other rows entered: its
+ * shards are then two runs in `stored`, each read as a body of its own and
+ * neither complete (where the body declares `shardCount`; one stored before
+ * sizes were recorded is judged by the shards each run holds, so each run
+ * reads complete). `positionOf` resolves an id among those same messages
+ * to its position in `stored` (undefined when none has it).
+ */
+export function attributeEntries(
+  entries: readonly ContextEntry[],
+  stored: readonly StoredMessage[],
+  positionOf: (id: MessageId) => number | undefined,
+): EntryProvenance {
+  const lookup = storedBodyFinder(stored, positionOf);
+
+  // Keyed by the body's head: two ingestions of the same text are two bodies.
+  const bodies = new Map<MessageId, BodyState>();
+  const bodyOf = (msg: StoredMessage): BodyState => {
+    const members = lookup.bodies.get(msg.id)!;
+    const head = members[0]!;
+    let state = bodies.get(head.id);
+    if (!state) {
+      state = { head, members: [...members], present: new Set(), contentOk: true };
+      bodies.set(head.id, state);
+    }
+    return state;
+  };
+
+  // Pass 1: which members each raw entry carries, and whether it carried
+  // them unaltered.
+  let inRequest: ReadonlySet<ContentBlock> | undefined;
+  let placedByRepair: ReadonlySet<ContentBlock> | undefined;
+  const entryBodies: Array<BodyState[] | null> = [];
+  for (const entry of entries) {
+    if (!isRawEntry(entry)) {
+      entryBodies.push(null);
+      continue;
+    }
+    const sourceMessages = entrySourceIds(entry)
+      .map(lookup.find)
+      .filter((m): m is StoredMessage => m !== undefined);
+    const states: BodyState[] = [];
+    for (const msg of sourceMessages) {
+      const state = bodyOf(msg);
+      state.present.add(msg.id);
+      if (!states.includes(state)) states.push(state);
+    }
+    const unaltered = entry.relocatedResults?.length
+      ? carriesWithRelocated(
+        entry,
+        sourceMessages,
+        inRequest ??= new Set(entries.flatMap((e) => e.content)),
+        placedByRepair ??= new Set(entries.flatMap((e) => e.relocatedBlocks ?? [])),
+      )
+      : carries(entry.content, sourceMessages);
+    if (!unaltered) for (const state of states) state.contentOk = false;
+    entryBodies.push(states);
+  }
+
+  // Pass 2: per-entry sources with request-level completeness. A group that
+  // declared its size must hold exactly that many shards, indices 0..n-1: an
+  // interrupted write leaves immutable members that are not the whole body.
+  // A group without a declaration (written before it was recorded) can only
+  // be judged by the members stored for it: complete then means every one of
+  // them was carried, not that the group was written whole.
+  const wholeGroup = (state: BodyState): boolean => {
+    const declared = state.head.shardCount;
+    if (declared === undefined) return true;
+    const indices = new Set(state.members.map((m) => m.shardIndex));
+    return state.members.length === declared && indices.size === declared
+      && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
+  };
+  const allShards = (state: BodyState): boolean =>
+    wholeGroup(state) && state.members.every((m) => state.present.has(m.id));
+  const complete = (state: BodyState): boolean => state.contentOk && allShards(state);
+  const rawComplete = new Map<MessageId, boolean>();
+  for (const state of bodies.values()) {
+    const ok = complete(state);
+    for (const id of state.present) rawComplete.set(id, ok);
+  }
+
+  const sources: CompiledMessageSources[] = entries.map((entry, i) => {
+    const states = entryBodies[i];
+    if (states) {
+      const out: RawBodySource[] = states.map((state) => {
+        const ok = complete(state);
+        const missing: Array<'shards' | 'content'> = [];
+        if (!allShards(state)) missing.push('shards');
+        if (!state.contentOk) missing.push('content');
+        return {
+          messageId: state.head.id,
+          sequence: state.head.sequence,
+          complete: ok,
+          ...(ok ? {} : { missing }),
+        };
+      });
+      return { kind: 'raw', bodies: out };
+    }
+    if (entry.summaries && entry.summaries.length > 0) {
+      return {
+        kind: 'summary',
+        summaries: entry.summaries.map((s) => (s.partial ? { id: s.id, level: s.level, partial: true as const } : { id: s.id, level: s.level })),
+      };
+    }
+    return { kind: 'other' };
+  });
+
+  return { sources, rawComplete, bodies: lookup.bodies };
+}
+
+/**
+ * Build the rendered layout of one compile: the view's members, and one unit
+ * per raw message and per run of summarized or omitted messages, in view
+ * order. `view` is the strategy's view, in the manager's window order.
+ * Without `ordinalOf` the window is the record, in sequence order, and the
+ * members are the messages' sequences. With it the window is the manager's
+ * index, and the members are its ordinals, which ascend in window order
+ * whatever the sequences do; it must answer for every message of the view,
+ * as the window it lists does.
+ *
+ * `estimateBase` returns a base (calibration-free) token estimate for some
+ * rendered content. Raw message tokens are their entry's estimate, split
+ * evenly across the messages a composite entry carries; a summary's tokens
+ * are the estimates of the entries that render it, named in every unit the
+ * summary renders (comparisons count each summary once per side).
+ */
+export function buildRenderedLayout(opts: {
+  view: readonly StoredMessage[];
+  entries: readonly ContextEntry[];
+  rawComplete: ReadonlyMap<MessageId, boolean>;
+  summaryInfo: ReadonlyMap<string, RenderedSummaryInfo>;
+  estimateBase: (content: ContentBlock[]) => number;
+  /** Base tokens of rendered content that is not an entry (injections). */
+  extraTokens: number;
+  calibration: number;
+  cause?: string;
+  /** Each view message's window-index ordinal, once rows are presented (see RenderedLayout.keyedBy). */
+  ordinalOf?: (id: MessageId) => number | undefined;
+}): RenderedLayout {
+  const rawTokens = new Map<MessageId, number>();
+  const summaryTokens = new Map<string, number>();
+  const partialSummaries = new Set<string>();
+  let totalTokens = opts.extraTokens;
+
+  for (const entry of opts.entries) {
+    const tokens = opts.estimateBase(entry.content);
+    totalTokens += tokens;
+    if (isRawEntry(entry)) {
+      const ids = entrySourceIds(entry);
+      const share = ids.length > 0 ? tokens / ids.length : 0;
+      for (const id of ids) rawTokens.set(id, (rawTokens.get(id) ?? 0) + share);
+    } else if (entry.summaries && entry.summaries.length > 0) {
+      const share = tokens / entry.summaries.length;
+      for (const s of entry.summaries) {
+        summaryTokens.set(s.id, (summaryTokens.get(s.id) ?? 0) + share);
+        if (s.partial) partialSummaries.add(s.id);
+      }
+    }
+  }
+
+  // Which rendered summaries cover each message.
+  const coveredBy = new Map<MessageId, string[]>();
+  for (const [id, info] of opts.summaryInfo) {
+    for (const leaf of info.leaves) {
+      const list = coveredBy.get(leaf);
+      if (list) {
+        if (!list.includes(id)) list.push(id);
+      } else {
+        coveredBy.set(leaf, [id]);
+      }
+    }
+  }
+
+  const ordinalOf = opts.ordinalOf;
+  const members: number[] = [];
+  const memberIds: MessageId[] = [];
+  const memberSequences: number[] = [];
+  // The layout's units are read-only once returned; here each run grows.
+  const units: Array<Growing<LayoutUnit>> = [];
+  for (const msg of opts.view) {
+    if (ordinalOf) {
+      const ordinal = ordinalOf(msg.id);
+      if (ordinal === undefined) {
+        throw new Error(`the rendered layout can't name ${msg.id}: the compile's view holds it, and the window it lists has no ordinal for it`);
+      }
+      members.push(ordinal);
+    } else {
+      members.push(msg.sequence);
+    }
+    memberIds.push(msg.id);
+    memberSequences.push(msg.sequence);
+    if (rawTokens.has(msg.id)) {
+      const t = Math.round(rawTokens.get(msg.id)!);
+      units.push(opts.rawComplete.get(msg.id) === false ? { k: 'r', t, p: 1 } : { k: 'r', t });
+      continue;
+    }
+    const last = units[units.length - 1];
+    const covering = coveredBy.get(msg.id);
+    if (covering && covering.length > 0) {
+      const ids = [...covering].sort();
+      if (last && last.k === 's' && sameIds(last.sm.map((s) => s[0]), ids)) {
+        last.n++;
+        continue;
+      }
+      const sm: Array<[string, number, string, 0 | 1, number]> = [];
+      for (const id of ids) {
+        const info = opts.summaryInfo.get(id)!;
+        sm.push([id, info.level, info.method, partialSummaries.has(id) ? 1 : 0, Math.round(summaryTokens.get(id) ?? 0)]);
+      }
+      units.push({ k: 's', n: 1, sm });
+      continue;
+    }
+    if (last && last.k === 'o') {
+      last.n++;
+      continue;
+    }
+    units.push({ k: 'o', n: 1 });
+  }
+
+  return {
+    v: 3,
+    keyedBy: ordinalOf ? 'ordinal' : 'sequence',
+    members,
+    memberIds,
+    memberSequences,
+    units,
+    totalTokens: Math.round(totalTokens),
+    calibration: opts.calibration,
+    ...(opts.cause ? { cause: opts.cause } : {}),
+  };
+}
+
+/** A union's members with their properties writable, for a unit whose run is still growing. */
+type Growing<T> = T extends unknown ? { -readonly [K in keyof T]: T[K] } : never;
+
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/**
+ * The stored messages of every raw body an attribution's sources name, from
+ * the bodies it judged them by: for each body's head, the body's members in
+ * shard order, head first. Two ingestions of the same text are two bodies,
+ * each with only its own shards.
+ */
+export function rawBodiesOf(attribution: Pick<EntryProvenance, 'sources' | 'bodies'>): ReadonlyMap<MessageId, readonly StoredMessage[]> {
+  const heads = new Set<MessageId>();
+  for (const source of attribution.sources) {
+    if (source.kind === 'raw') for (const body of source.bodies) heads.add(body.messageId);
+  }
+  const out = new Map<MessageId, readonly StoredMessage[]>();
+  const bodies = attribution.bodies;
+  for (const head of heads) {
+    const members = bodies.get(head);
+    if (members) out.set(head, members);
+  }
+  return out;
+}
+
+/** Whether rendered content carries its source messages unaltered. */
+function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage[]): boolean {
+  if (sourceMessages.length === 1) return coversStoredContent(content, sourceMessages[0]!.content);
+  return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
+}
+
+function carriesWithRelocated(
+  entry: ContextEntry,
+  sourceMessages: readonly StoredMessage[],
+  inRequest: ReadonlySet<ContentBlock>,
+  placedByRepair: ReadonlySet<ContentBlock>,
+): boolean {
+  const moved = new Set(entry.relocatedResults);
+  const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
+  const rest = sourceMessages.map((m) => ({ ...m, content: m.content.filter((b) => !isMoved(b)) }));
+  if (!carries(entry.content, rest)) return false;
+  if (!entry.relocatedBlocks) {
+    const sent = [...inRequest].filter(isMoved);
+    return sourceMessages.every((m) => m.content.every((block) => !isMoved(block) || sent.some((result) => covers(result, block))));
+  }
+  const placed = entry.relocatedBlocks.filter((b) => inRequest.has(b));
+  const carriers = [...placed, ...entry.content.filter((b) => isMoved(b) && !placedByRepair.has(b))];
+  for (const m of sourceMessages) {
+    for (const block of m.content) {
+      if (!isMoved(block)) continue;
+      const k = carriers.findIndex((result) => covers(result, block));
+      if (k === -1) return false;
+      carriers.splice(k, 1);
+    }
+  }
+  return true;
+}
+
+/**
+ * A composite entry (the strategy merged several shards into one message)
+ * carries its members unaltered only when it carries their text,
+ * concatenated in shard order, intact, and every non-text block of theirs,
+ * unaltered and in their order, among its own non-text blocks. A composite
+ * gathers the text into one block, so where a non-text block sits relative
+ * to the text is not compared.
+ */
+function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boolean {
+  const ordered = [...members].sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));
+  const storedBlocks = ordered.flatMap((msg) => msg.content);
+  const textOf = (blocks: readonly ContentBlock[]): string =>
+    blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+  if (!textOf(content).includes(textOf(storedBlocks))) return false;
+  return coversStoredContent(
+    content.filter((b) => b.type !== 'text'),
+    storedBlocks.filter((b) => b.type !== 'text'),
+  );
+}
+
+/**
+ * Whether a rendered copy carries every block of the stored body intact, in
+ * order. Additions are allowed (a strategy may prefix a provenance header or
+ * merge it into the first text block); losses are not: a truncated text, a
+ * stripped image, or a block a structural repair removed makes the copy
+ * partial. Each stored block must be covered, in order, by a rendered block
+ * of the same kind: a text block by one that contains its whole text, where
+ * consecutive stored texts may share one rendered text block that joins
+ * them, each found after the one before.
+ */
+export function coversStoredContent(rendered: readonly ContentBlock[], stored: readonly ContentBlock[]): boolean {
+  if (rendered === stored) return true;
+  let j = 0;
+  // Within rendered[j], when it's text: where the next stored text may
+  // start, since a strategy can join several text blocks into one.
+  let from = 0;
+  for (const block of stored) {
+    if (block.type === 'text' && block.text === '') continue; // carries nothing
+    for (;;) {
+      if (j >= rendered.length) return false;
+      const r = rendered[j]!;
+      if (block.type === 'text' && r.type === 'text') {
+        const at = r.text.indexOf(block.text, from);
+        if (at !== -1) {
+          from = at + block.text.length;
+          break;
+        }
+      } else if (covers(r, block)) {
+        j++;
+        from = 0;
+        break;
+      }
+      j++;
+      from = 0;
+    }
+  }
+  return true;
+}
+
+function covers(rendered: ContentBlock, stored: ContentBlock): boolean {
+  if (rendered === stored) return true;
+  if (rendered.type === 'text' && stored.type === 'text') return rendered.text.includes(stored.text);
+  return sameBlock(rendered, stored);
+}
+
+function sameBlocks(a: readonly ContentBlock[], b: readonly ContentBlock[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!sameBlock(a[i]!, b[i]!)) return false;
+  }
+  return true;
+}
+
+function sameBlock(x: ContentBlock, y: ContentBlock): boolean {
+  if (x === y) return true;
+  if (x.type !== y.type) return false;
+  const a = x as unknown as Record<string, unknown>;
+  const b = y as unknown as Record<string, unknown>;
+  switch (x.type) {
+    case 'text':
+      return a.text === b.text;
+    case 'thinking':
+      return a.thinking === b.thinking && a.signature === b.signature;
+    case 'redacted_thinking':
+      return a.data === b.data;
+    case 'tool_use':
+      return a.id === b.id && a.name === b.name && JSON.stringify(a.input) === JSON.stringify(b.input);
+    case 'tool_result':
+      return a.toolUseId === b.toolUseId &&
+        (a.isError ?? false) === (b.isError ?? false) &&
+        (typeof a.content === 'string' && typeof b.content === 'string'
+          ? a.content === b.content
+          : sameNested(a.content, b.content));
+    case 'image':
+    case 'document':
+    case 'audio':
+    case 'video':
+      return sameMediaSource(a.source, b.source);
+    default:
+      return JSON.stringify(a) === JSON.stringify(b);
+  }
+}
+
+function sameNested(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return sameBlocks(a as ContentBlock[], b as ContentBlock[]);
+  }
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Media sources are equal only when every field that carries the payload is
+ * exactly equal: the kind, the media type, and the URL or the whole data.
+ * A sampled comparison could call different bytes the same, and the
+ * complete-body claim rests on this.
+ */
+function sameMediaSource(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const sa = a as Record<string, unknown>;
+  const sb = b as Record<string, unknown>;
+  if (sa.type !== sb.type) return false;
+  if ((sa.media_type ?? sa.mediaType) !== (sb.media_type ?? sb.mediaType)) return false;
+  if (typeof sa.url === 'string' || typeof sb.url === 'string') return sa.url === sb.url;
+  return sa.data === sb.data;
+}

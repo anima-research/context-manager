@@ -21,10 +21,7 @@ npx esbuild playground/entry.mjs --bundle --format=esm --platform=browser \
   --outfile=playground/solver.js
 
 # 3. Export a REAL agent's chronicle → playground/data/<name>.json
-#    Compile the script once (per scripts/README.md):
-npx tsc scripts/export-picker-inputs.ts --outDir dist --target ES2022 \
-  --module NodeNext --moduleResolution NodeNext --esModuleInterop \
-  --skipLibCheck --resolveJsonModule
+#    Step 1's `npm run build` already compiled the script to dist/scripts/.
 #    Snapshot the live store read-only (avoid touching the running agent's lock),
 #    then export with the deployment's namespace. For Lena (local lena-cm deploy):
 cp -R ~/lena-cm/data/sessions/<session-id> /tmp/lena-real && rm -f /tmp/lena-real/LOCK

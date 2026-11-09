@@ -1,4 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
+import { isOpaqueCarrier, releaseEditedRawForms, releaseTrailingReasoning } from './raw-forms.js';
 import type { RecallEnvelopeMode, SummaryEntry } from './types/strategy.js';
 
 /**
@@ -8,14 +9,15 @@ import type { RecallEnvelopeMode, SummaryEntry } from './types/strategy.js';
  * presented window marks where it stops: the Q-side label opens the memory and
  * the turn boundary is the only thing that closes it. Under
  * `recallEnvelope: 'xml'` each answer's prose is fenced by an XML-shaped tag
- * pair carrying the record's own identity, so a reader can see one memory end
- * before the next thing begins.
+ * pair carrying the record's own identity, and under `'bare'` by the same tag
+ * pair with no attributes, so a reader can see one memory end before the next
+ * thing begins.
  *
  * The envelope is a collision-tolerant delimiter convention, not parseable XML:
  * answer content is passed through unescaped, so prose containing `<`, `&` or
  * even a literal `</cm-recall>` renders verbatim.
  *
- * Q-side labels are untouched in both modes — surgery keys on them.
+ * The envelope never wraps a Q-side label — surgery keys on them.
  */
 const RECALL_ENVELOPE_TAG = 'cm-recall';
 
@@ -24,18 +26,25 @@ export interface RecallEnvelopeTags {
   close: string;
 }
 
+export function isRecallEnveloped(mode: RecallEnvelopeMode | undefined): mode is 'xml' | 'bare' {
+  return mode === 'xml' || mode === 'bare';
+}
+
 /**
- * Build the tag pair for one summary. Every attribute is sourced from the
- * record: an attribute the record cannot answer for is OMITTED rather than
- * filled with a placeholder, so a present attribute is always a true one.
+ * Build the tag pair for one summary. Under `'xml'`, every attribute is
+ * sourced from the record: an attribute the record cannot answer for is
+ * OMITTED rather than filled with a placeholder, so a present attribute is
+ * always a true one. Under `'bare'` the tags carry no attributes.
  */
-export function buildRecallEnvelopeTags(summary: SummaryEntry): RecallEnvelopeTags {
+export function buildRecallEnvelopeTags(summary: SummaryEntry, mode: 'xml' | 'bare' = 'xml'): RecallEnvelopeTags {
   const attributes: string[] = [];
-  if (summary.id) attributes.push(`id="${summary.id}"`);
-  if (Number.isFinite(summary.level)) attributes.push(`level="${summary.level}"`);
-  const first = summary.sourceRange?.first;
-  const last = summary.sourceRange?.last;
-  if (first && last) attributes.push(`span="${first}..${last}"`);
+  if (mode === 'xml') {
+    if (summary.id) attributes.push(`id="${summary.id}"`);
+    if (Number.isFinite(summary.level)) attributes.push(`level="${summary.level}"`);
+    const first = summary.sourceRange?.first;
+    const last = summary.sourceRange?.last;
+    if (first && last) attributes.push(`span="${first}..${last}"`);
+  }
   const open = attributes.length > 0
     ? `<${RECALL_ENVELOPE_TAG} ${attributes.join(' ')}>`
     : `<${RECALL_ENVELOPE_TAG}>`;
@@ -51,42 +60,55 @@ export function recallEnvelopeAddedText(
   summary: SummaryEntry,
   mode: RecallEnvelopeMode | undefined,
 ): string {
-  if (mode !== 'xml') return '';
-  const { open, close } = buildRecallEnvelopeTags(summary);
+  if (!isRecallEnveloped(mode)) return '';
+  const { open, close } = buildRecallEnvelopeTags(summary, mode);
   return `${open}\n\n${close}`;
 }
 
 /**
  * Wrap a recall answer's content blocks.
  *
- * The tags land on the FIRST and LAST text blocks, never on reasoning
+ * The tags land on the FIRST and LAST prose blocks, never on reasoning
  * carriers: `responseContent` replays signed thinking whose signatures only
  * verify on byte-identical blocks, and a text block prepended before them
- * would also break the provider's thinking-first turn shape. Blocks that are
- * not rewritten are passed through by reference; rewritten ones are copies, so
- * the stored entry is never mutated.
+ * would also break the provider's thinking-first turn shape. A zero-width
+ * carrier of an opaque Responses item is not prose either: its raw item is its
+ * whole content, so it is never rewritten. Blocks that are neither rewritten
+ * nor released are passed through by reference; the others are copies, so the
+ * stored entry is never mutated. A rewritten block gives up its raw replay
+ * form, along with every block that shares it and a Responses reasoning item
+ * paired with it, so the tags reach the wire (see raw-forms.ts). A released
+ * reasoning or message block keeps its content fields byte for byte; only its
+ * raw item goes.
+ *
+ * An answer with no prose gets the envelope as a block of its own, after the
+ * carriers. A Responses reasoning item at its end then gives up its id (or,
+ * without encrypted content, isn't sent at all), since the envelope would
+ * follow it on the wire as an item the provider never produced.
  */
 export function wrapRecallAnswerContent(
   content: ContentBlock[],
   summary: SummaryEntry,
   mode: RecallEnvelopeMode | undefined,
 ): ContentBlock[] {
-  if (mode !== 'xml') return content;
-  const { open, close } = buildRecallEnvelopeTags(summary);
+  if (!isRecallEnveloped(mode)) return content;
+  const { open, close } = buildRecallEnvelopeTags(summary, mode);
   const textPositions: number[] = [];
   content.forEach((block, position) => {
-    if (block.type === 'text') textPositions.push(position);
+    if (block.type === 'text' && !isOpaqueCarrier(block)) textPositions.push(position);
   });
   if (textPositions.length === 0) {
-    // Carriers but no prose: still delimit the memory, still touch nothing.
-    return [...content, { type: 'text', text: `${open}\n${close}` }];
+    // Carriers but no prose: still delimit the memory. No carrier's content is
+    // rewritten; the reasoning at the end gives up its raw item.
+    return [...releaseTrailingReasoning(content), { type: 'text', text: `${open}\n${close}` }];
   }
   const firstText = textPositions[0];
   const lastText = textPositions[textPositions.length - 1];
-  return content.map((block, position) => {
+  const wrapped = content.map((block, position) => {
     if (block.type !== 'text' || (position !== firstText && position !== lastText)) return block;
     const prefix = position === firstText ? `${open}\n` : '';
     const suffix = position === lastText ? `\n${close}` : '';
     return { ...block, text: `${prefix}${block.text}${suffix}` };
   });
+  return releaseEditedRawForms(content, wrapped);
 }

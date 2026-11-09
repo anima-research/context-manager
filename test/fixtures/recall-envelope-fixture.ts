@@ -25,7 +25,7 @@ import { join } from 'node:path';
 
 import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
-import type { AutobiographicalOptions, SummaryEntry } from '../../src/types/index.js';
+import type { AutobiographicalOptions, SelectOptions, SummaryEntry } from '../../src/types/index.js';
 
 export interface RenderedMessage {
   participant: string;
@@ -51,6 +51,9 @@ export interface FixtureRender {
    * Empty for fixtures that seed summaries instead of minting them.
    */
   compressionRequests: RenderedMessage[][];
+  /** The strategy's calibration estimate of the compiled request, where the
+   *  fixture reads it (renderAdaptiveFixture). */
+  estimate?: number;
 }
 
 /** Strategy subclass that can seed summaries without an LLM round trip. */
@@ -111,6 +114,7 @@ export const HIERARCHICAL_FIXTURE_SUMMARY_IDS = ['L2-100', 'L1-101', 'L1-102'] a
 export const HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE =
   'zz-memory-merged-level covering the first two turns';
 export const HIERARCHICAL_FIXTURE_PLAIN_PROSE = 'zz-memory-plain-prose';
+export const HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT = 'zz-turn-latest ' + 'Z'.repeat(60);
 
 /**
  * Render the default (`selectHierarchical`) path over a fixed set of seeded
@@ -132,7 +136,7 @@ export async function renderHierarchicalFixture(
     const zz2 = manager.addMessage('user', textContent('zz-turn-two'));
     const zz3 = manager.addMessage('user', textContent('zz-turn-three'));
     const zz4 = manager.addMessage('user', textContent('zz-turn-four'));
-    manager.addMessage('user', textContent('zz-turn-latest ' + 'Z'.repeat(60)));
+    manager.addMessage('user', textContent(HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT));
 
     // Two L1s merged away under the L2: anti-redundancy hides a merged L1,
     // so only the L2 renders for the zz-turn-one..zz-turn-two span.
@@ -237,6 +241,12 @@ function makeMockMembrane(
 export async function renderAdaptiveFixture(
   options: AutobiographicalOptions = {},
   responseContentForCall: (callCount: number) => ContentBlock[] = adaptiveTextResponseContent,
+  maxTokens = 900,
+  selectOptions?: SelectOptions,
+  /** Options for a committing compile before the one rendered, if any. */
+  firstSelectOptions?: SelectOptions,
+  /** Called with the manager after the rendered compile. */
+  inspect?: (manager: ContextManager) => void | Promise<void>,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
     const strategy = new AutobiographicalStrategy({
@@ -261,9 +271,12 @@ export async function renderAdaptiveFixture(
     // Drain compression to a fixed point: eight ticks take this workload
     // past L1 into merged L2s, so the adaptive render carries both levels.
     for (let tick = 0; tick < 8; tick++) await manager.tick();
-    const compiled = await manager.compile({ maxTokens: 900, reserveForResponse: 0 });
+    if (firstSelectOptions) await manager.compile({ maxTokens, reserveForResponse: 0 }, undefined, firstSelectOptions);
+    const compiled = await manager.compile({ maxTokens, reserveForResponse: 0 }, undefined, selectOptions);
     const summaries = summariesOf(strategy);
+    const estimate = (strategy as unknown as { _lastCompileEstimate: number })._lastCompileEstimate;
+    await inspect?.(manager);
     manager.close();
-    return { messages: project(compiled.messages), summaries, compressionRequests: mock.requests };
+    return { messages: project(compiled.messages), summaries, compressionRequests: mock.requests, estimate };
   });
 }

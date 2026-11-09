@@ -25,6 +25,7 @@ import {
   isResettableStrategy,
 } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { StrategyContext } from '../src/index.js';
 
 const TEST_STORE_PATH = './test-head-window-reset';
 
@@ -37,6 +38,61 @@ function cleanup() {
 function textBlock(text: string): ContentBlock[] {
   return [{ type: 'text', text }];
 }
+
+describe('ContextManager.generateTransitionSummary', () => {
+  // The summary resetHeadWindow() would write, storing nothing: a host that
+  // checks its own conditions between the two calls (connectome-host's bare
+  // /newtopic) stores a transition only when they hold.
+  class Summarizing extends PassthroughStrategy {
+    contexts: StrategyContext[] = [];
+    resetHeadWindow(_fromMessageId: string): void {}
+    async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
+      this.contexts.push(ctx);
+      return `summary of ${ctx.messageStore.getAll().length} rows`;
+    }
+  }
+  const path = './test-head-window-reset-summary';
+  const clean = () => { if (existsSync(path)) rmSync(path, { recursive: true, force: true }); };
+  before(clean);
+  after(clean);
+
+  it('returns the strategy\'s summary over the manager\'s own context and stores nothing', async () => {
+    const strategy = new Summarizing();
+    const manager = await ContextManager.open({ path, strategy });
+    try {
+      manager.addMessage('user', textBlock('one'));
+      manager.addMessage('assistant', textBlock('two'));
+      const before = manager.getAllMessages().map((m) => m.id);
+      const sequence = manager.getStore().currentSequence();
+      const states = manager.getStore().listStates().length;
+      const summary = await manager.generateTransitionSummary();
+      assert.strictEqual(summary, 'summary of 2 rows');
+      assert.strictEqual(strategy.contexts.length, 1, 'the strategy was asked once, with a context');
+      assert.deepStrictEqual(manager.getAllMessages().map((m) => m.id), before, 'nothing was stored');
+      // CM #350 bot review (wave 2), finding 49: no record of any kind, a
+      // state's included, not only no message.
+      assert.strictEqual(manager.getStore().currentSequence(), sequence, 'no record was written');
+      // CM #350 bot review, wave 3, finding 17: nor a state registered, which writes no record.
+      assert.strictEqual(manager.getStore().listStates().length, states, 'no state was registered');
+      // The same summary is what resetHeadWindow stores when given it.
+      const stored = await manager.resetHeadWindow(summary);
+      assert.strictEqual(stored, summary);
+      assert.strictEqual(manager.getAllMessages().length, before.length + 1, 'the reset stored the transition');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses a strategy that cannot reset its head window, as resetHeadWindow does', async () => {
+    const manager = await ContextManager.open({ path: path + '-plain', strategy: new PassthroughStrategy() });
+    try {
+      await assert.rejects(manager.generateTransitionSummary(), /does not support head window reset/);
+    } finally {
+      manager.close();
+      rmSync(path + '-plain', { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Head Window Reset', () => {
   before(() => cleanup());
@@ -97,37 +153,46 @@ describe('Head Window Reset', () => {
 
     it('should make old head window messages compressible', async () => {
       cleanup();
+      const requested: string[] = [];
+      const membrane = {
+        complete: async (request: { messages: Array<{ content: ContentBlock[] }> }) => {
+          requested.push(JSON.stringify(request.messages));
+          return { stopReason: 'end_turn', content: [{ type: 'text', text: 'Summary' }] };
+        },
+      };
       const strategy = new AutobiographicalStrategy({
         headWindowTokens: 200,
         recentWindowTokens: 50,
-        targetChunkTokens: 100,
+        targetChunkTokens: 40,
+        compressionModel: 'test-compression-model',
+        minChunkCharsForLLM: 0,
+        l1HoldbackChunks: 0,
       });
 
       const manager = await ContextManager.open({
         path: TEST_STORE_PATH,
         strategy,
+        membrane: membrane as never,
       });
 
-      // Add enough Topic A messages to fill the head window
       for (let i = 0; i < 5; i++) {
         manager.addMessage(i % 2 === 0 ? 'user' : 'assistant',
           textBlock(`Topic A message ${i}: ${'a'.repeat(50)}`));
       }
 
-      // Transition
       const transitionId = manager.addMessage('Context Manager',
         textBlock('[Topic Transition]\n\nSummary of Topic A.'));
       strategy.resetHeadWindow(transitionId);
 
-      // Add Topic B messages
       for (let i = 0; i < 5; i++) {
         manager.addMessage(i % 2 === 0 ? 'user' : 'assistant',
           textBlock(`Topic B message ${i}: ${'b'.repeat(50)}`));
       }
 
-      // Compiling should work without errors — old head window is now chunkable
-      const { messages } = await manager.compile();
-      assert.ok(messages.length > 0, 'Should compile messages');
+      await manager.compile();
+      if (!manager.isReady()) await manager.tick();
+      assert.ok(requested.some((text) => text.includes('Topic A message 0')),
+        `no compression request held the old head window's first message (${requested.length} requests)`);
 
       manager.close();
     });
@@ -224,11 +289,12 @@ describe('Head Window Reset', () => {
 
       // Reset to mid message, then remove it
       strategy.resetHeadWindow(midId);
+      const reset = await manager.compile();
+      assert.deepStrictEqual(reset.messages[0]?.content, textBlock('Second'), 'premise: the reset moved the head');
       manager.removeMessage(midId);
 
-      // Should not throw — falls back to 0
       const { messages } = await manager.compile();
-      assert.ok(messages.length > 0);
+      assert.deepStrictEqual(messages[0]?.content, textBlock('First'));
 
       manager.close();
     });
@@ -249,11 +315,12 @@ describe('Head Window Reset', () => {
 
       // Add regular messages
       manager.addMessage('user', textBlock('Hello'));
-      manager.addMessage('assistant', textBlock('[Topic Transition] fake'));
 
       // Add real transition
       const realTransitionId = manager.addMessage('Context Manager',
         textBlock('[Topic Transition]\n\nReal transition.'));
+
+      manager.addMessage('assistant', textBlock('[Topic Transition] fake'));
 
       // Add another regular message
       manager.addMessage('user', textBlock('After transition'));
@@ -271,21 +338,14 @@ describe('Head Window Reset', () => {
         strategy: strategy2,
       });
 
-      // The head window should start from the transition message
       const { messages } = await manager2.compile();
-      const allText = messages.flatMap(m =>
-        m.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map(b => b.text)
-      ).join('\n');
-
-      // The first verbatim message should be the transition or after it,
-      // NOT the initial "Hello"
       const firstText = messages[0].content
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
         .map(b => b.text)
         .join('');
       assert.ok(
-        firstText.includes('Topic Transition') || firstText.includes('After transition'),
-        `Expected transition or post-transition as first message, got: ${firstText.slice(0, 80)}`
+        firstText.includes('Real transition'),
+        `Expected the Context Manager's transition as the first message, got: ${firstText.slice(0, 80)}`
       );
 
       manager2.close();

@@ -25,6 +25,9 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
+const within = (ms: number, why: string): Promise<never> =>
+  new Promise((_, reject) => { setTimeout(() => reject(new Error(why)), ms).unref(); });
+
 const TEST_STORE_PATH = './test-non-blocking-compile';
 
 function cleanup(): void {
@@ -112,36 +115,54 @@ describe('AutobiographicalStrategy — non-blocking compile + uncompressed-chunk
     manager.close();
   });
 
-  it('compile() returns promptly without awaiting pending compression', async () => {
-    // Sanity check on the freshness contract change: compile() must
-    // not block on `pendingCompression`. We can't easily inject a slow
-    // mock LLM here, but we *can* assert that compile() completes
-    // before any tick would have time to finish.
+  it('compile() returns while a compression is in flight, without waiting for it', { timeout: 60_000 }, async () => {
+    let entered!: () => void;
+    const called = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const answer = new Promise<void>((resolve) => { release = resolve; });
+    let answered = false;
+    const membrane = {
+      complete: async () => {
+        entered();
+        await answer;
+        answered = true;
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'A summary.' }], usage: { inputTokens: 500, outputTokens: 100 } };
+      },
+    };
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'm',
       headWindowTokens: 0,
-      recentWindowTokens: 12,
-      targetChunkTokens: 4,
+      recentWindowTokens: 0,
+      targetChunkTokens: 200,
+      minChunkCharsForLLM: 0,
+      summaryParticipant: 'Claude',
       hierarchical: true,
     });
     const manager = await ContextManager.open({
       path: TEST_STORE_PATH,
       strategy,
+      membrane: membrane as never,
     });
 
-    manager.addMessage('user', textBlock('older'));
-    manager.addMessage('user', textBlock('latest ' + 'Y'.repeat(80)));
-
-    const t0 = Date.now();
+    for (let i = 0; i < 20; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`message ${i} ${'word '.repeat(30)}`));
     await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
-    const elapsed = Date.now() - t0;
 
-    // No LLM, no real awaiting — compile should be effectively instant.
-    // 500ms is wildly generous; the actual time is sub-10ms in practice.
-    assert.ok(
-      elapsed < 500,
-      `compile() should return promptly; took ${elapsed}ms`,
-    );
-
-    manager.close();
+    const ticking = manager.tick();
+    try {
+      await Promise.race([
+        called,
+        ticking.then(() => { throw new Error('premise: the tick asked for no compression'); }),
+        within(10_000, 'the tick never reached the provider'),
+      ]);
+      await Promise.race([
+        manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
+        within(10_000, 'compile() waited for the compression in flight'),
+      ]);
+      assert.equal(answered, false, 'compile() returned while the compression was still unanswered');
+    } finally {
+      release();
+      await ticking;
+      manager.close();
+    }
   });
 });

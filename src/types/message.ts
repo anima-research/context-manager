@@ -29,6 +29,38 @@ export interface MessageMetadata {
 }
 
 /**
+ * Options for ContextManager.addMessage.
+ */
+export interface AddMessageOptions {
+  /**
+   * Place a transient compression hold on the new message before strategies
+   * are notified. See ContextManager.holdCompression.
+   */
+  holdCompression?: boolean | CompressionHoldOptions;
+}
+
+/**
+ * Options for a compression hold (ContextManager.holdCompression).
+ */
+export interface CompressionHoldOptions {
+  /**
+   * Release the hold automatically this many milliseconds after it is
+   * placed (positive, finite). Expiry is checked lazily — on tick(),
+   * compile() and hold queries — and releases through the same path as
+   * releaseCompression. Omitted: the hold is never released automatically.
+   */
+  timeoutMs?: number;
+}
+
+/** A live compression hold, as reported by getCompressionHoldDetails. */
+export interface CompressionHoldInfo {
+  /** When the hold was placed (or last re-placed), per the manager's clock. */
+  heldAt: number;
+  /** When it expires; absent for holds without a timeout. */
+  expiresAt?: number;
+}
+
+/**
  * A message stored in the message store.
  * This is the source of truth for all conversation history.
  */
@@ -64,6 +96,15 @@ export interface StoredMessage {
    * order at render time.
    */
   shardIndex?: number;
+
+  /**
+   * How many shards its bodyGroup was written with, declared on every shard
+   * when the group is written. Only meaningful when `bodyGroupId` is set.
+   * Members are immutable, but an interrupted write can leave a group short;
+   * this lets a reader tell a whole group from a partial one, after a reopen
+   * too. Absent on groups written before it was recorded.
+   */
+  shardCount?: number;
 
   /**
    * Current display resolution for this chunk:
@@ -124,6 +165,8 @@ export interface StoredMessageInternal {
   bodyGroupId?: string;
   /** See StoredMessage.shardIndex */
   shardIndex?: number;
+  /** See StoredMessage.shardCount */
+  shardCount?: number;
   /** See StoredMessage.currentResolution */
   currentResolution?: number;
   /** See StoredMessage.lockedByAgent */

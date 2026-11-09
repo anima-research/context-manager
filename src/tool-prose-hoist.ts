@@ -1,4 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
+import { releaseEditedRawForms } from './raw-forms.js';
 
 /**
  * Tool-prose hoist (2026-09-19, sill).
@@ -117,7 +118,10 @@ export function hoistToolProse<T extends WireMessage>(
       out.push(message);
       continue;
     }
-    out.push(...rounds, { ...message, content });
+    // The edited calls give up their raw replay forms (and every block sharing
+    // them), or the XML and Responses formatters would replay the original
+    // prose in place of the stub (see raw-forms.ts).
+    out.push(...rounds, { ...message, content: releaseEditedRawForms(message.content, content) });
   }
   return { messages: out, hoisted };
 }

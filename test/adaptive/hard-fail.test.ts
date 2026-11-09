@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 
 import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
-import { OverBudgetError } from '../../src/adaptive/index.js';
+import { OverBudgetError, UncoveredDropError } from '../../src/adaptive/index.js';
+import type { ContextEntry } from '../../src/types/context.js';
+import type { MessageStoreView } from '../../src/types/index.js';
 
 const TEST_STORE_PATH = './test-adaptive-hard-fail-store';
 
@@ -74,6 +76,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
         const e = err as OverBudgetError;
         assert.ok(e.actual > e.budget, `actual ${e.actual} should exceed budget ${e.budget}`);
         assert.ok(e.diagnostics.tailTokens > 0, 'diagnostics should include tail tokens');
+        assert.deepEqual(e.clearedBy, ['smaller-recent-window'], 'the newest message alone fits');
         return true;
       }
     );
@@ -118,7 +121,11 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
 
     await assert.rejects(
       () => manager.compile({ maxTokens: 500, reserveForResponse: 100 }),
-      OverBudgetError,
+      (err: unknown) => {
+        assert.ok(err instanceof OverBudgetError, `expected OverBudgetError, got ${String(err)}`);
+        assert.deepEqual(err.clearedBy, [], 'the produce op has no chunk to make it from');
+        return true;
+      },
     );
     manager.close();
   });
@@ -173,6 +180,7 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
         assert.ok(err instanceof OverBudgetError, `expected OverBudgetError, got ${String(err)}`);
         assert.ok(err.diagnostics.tailTokens > 0, 'recent tail must be reserved in the failing plan');
         assert.ok(err.actual > err.budget, 'reported overage must exceed the budget');
+        assert.deepEqual(err.clearedBy, [], 'the plan has no summaries to produce');
         return true;
       },
     );
@@ -288,8 +296,79 @@ describe('AutobiographicalStrategy — adaptive OverBudgetError', () => {
     assert.equal(typeof caught.diagnostics.middleTokens, 'number');
     assert.equal(typeof caught.diagnostics.deepestLevel, 'number');
     // The error message should be informative
-    assert.ok(caught.message.includes('exhausted'));
+    assert.ok(caught.message.includes('Head/tail reservation exceeded budget'));
+    assert.ok(caught.message.includes('fold plan=not computed'));
     assert.ok(caught.message.includes('hard budget'));
+    assert.deepEqual(caught.clearedBy, ['smaller-recent-window'], 'the recent window holds every message, and the newest alone fits');
     manager.close();
+  });
+});
+
+describe('AutobiographicalStrategy — adaptive budget line and coverage', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+  beforeEach(() => cleanup());
+
+  const fill = (manager: ContextManager): string[] => {
+    const ids: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      ids.push(manager.addMessage('User', [{ type: 'text', text: `Msg ${i}. ` + 'word '.repeat(10) }]));
+    }
+    return ids;
+  };
+
+  it('reads a negative overBudgetGraceRatio as 0: a plan that fits the input budget is sent, and one over it with nothing to fold is refused, even by less than the default grace', async () => {
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock',
+      adaptiveResolution: true,
+      targetChunkTokens: 200,
+      recentWindowTokens: 200,
+      autoTickOnNewMessage: false,
+      overBudgetGraceRatio: -0.5,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: makeMockMembrane() as any });
+    try {
+      fill(manager);
+      const budget = { maxTokens: 100_000, reserveForResponse: 0 };
+      const planned = manager.previewContext(budget)!.finalTokens;
+      const fitting = { maxTokens: Math.ceil(planned / 0.85), reserveForResponse: 0 };
+      await assert.doesNotReject(() => manager.compile(fitting));
+      const over = { maxTokens: Math.floor(planned / 1.01), reserveForResponse: 0 };
+      assert.ok(planned > over.maxTokens && planned <= Math.floor(over.maxTokens * 1.02), 'the premise: over the budget, by less than the default grace of 0.02');
+      await assert.rejects(() => manager.compile(over), OverBudgetError);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses with UncoveredDropError, naming the message, when the entries it emits leave a stored message neither raw nor under a summary, as when a subclass drops one', async () => {
+    class DroppingStrategy extends AutobiographicalStrategy {
+      dropFirst = false;
+      protected mergeAdjacentBodyGroupRaw(entries: ContextEntry[], store: MessageStoreView, messages?: ReturnType<MessageStoreView['getAll']>): ContextEntry[] {
+        const merged = super.mergeAdjacentBodyGroupRaw(entries, store, messages);
+        return this.dropFirst ? merged.slice(1) : merged;
+      }
+    }
+    const strategy = new DroppingStrategy({
+      compressionModel: 'mock',
+      adaptiveResolution: true,
+      targetChunkTokens: 200,
+      recentWindowTokens: 200,
+      autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: makeMockMembrane() as any });
+    try {
+      const ids = fill(manager);
+      const budget = { maxTokens: 100_000, reserveForResponse: 0 };
+      await assert.doesNotReject(() => manager.compile(budget), 'premise: with nothing dropped, the request is sent');
+      strategy.dropFirst = true;
+      await assert.rejects(() => manager.compile(budget), (error: unknown) => {
+        assert.ok(error instanceof UncoveredDropError, String(error));
+        assert.deepEqual(error.droppedIds, [ids[0]]);
+        return true;
+      });
+    } finally {
+      manager.close();
+    }
   });
 });

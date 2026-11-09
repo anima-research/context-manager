@@ -10,19 +10,24 @@
  *
  * `renderLayout` produces the ordered sequence of rendered units (head,
  * per-chunk raw/recall in source order, tail) with cumulative token offsets,
- * matching the picker's `accountFrontier` exactly:
+ * matching the picker's `accountFrontier` wherever each chunk's level has a
+ * summary that lists it, as on every frontier kv-stable and the greedy
+ * solvers plan:
  *  - head/tail are fixed blocks;
  *  - pinned chunks render raw (L0) regardless of resolution;
  *  - a folded chunk emits its L_k ancestor's recall pair, once per distinct
  *    ancestor (siblings share one recall pair);
- *  - a resolution whose ancestor summary is missing falls back to raw.
+ *  - a resolution whose ancestor summary is missing, or doesn't list the
+ *    chunk (`SummaryTree.ancestorAt`), falls back to raw. `accountFrontier`
+ *    and the renderer's walk don't check listing, so at a level whose summary
+ *    doesn't list the chunk they take that summary.
  *
  * Pure and deterministic.
  */
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
-import type { PickerInputs } from './picker.js';
-import type { SummaryTree } from './summary-tree.js';
+import type { PickerChunk, PickerInputs } from './picker.js';
+import type { SummaryNode, SummaryTree } from './summary-tree.js';
 
 /** Resolution map: chunkId → display level (0 = raw). */
 export type Frontier = ReadonlyMap<ChunkId, number>;
@@ -30,9 +35,13 @@ export type Frontier = ReadonlyMap<ChunkId, number>;
 export interface RenderedUnit {
   kind: 'head' | 'raw' | 'recall' | 'tail';
   /**
-   * Stable identity for prefix comparison. Two units are byte-identical iff
-   * they share (kind, key): 'head'/'tail' for the fixed blocks, the chunk id
-   * for a raw shard, the summary id for a recall pair.
+   * Stable identity for prefix comparison: 'head'/'tail' for the fixed
+   * blocks, the chunk id for a raw shard, the summary id for a recall pair.
+   * Two units that share (kind, key) are the same part of the conversation,
+   * but what they render can still change in place under the key (an edit,
+   * an image stripped, a tool result replaced or moved, a cut, a recall's
+   * envelope), which kv-unified's accepted cache reference records and checks
+   * (CacheRenderRecord).
    */
   key: string;
   tokens: number;
@@ -46,8 +55,27 @@ export interface RenderLayout {
 }
 
 /**
+ * The summary `c` renders through under `frontier`, or null when it renders
+ * raw: pinned, at level 0, or with no summary at its level that lists it
+ * (`SummaryTree.ancestorAt`). The renderer makes the same call wherever the
+ * summary the chunk's lineage reaches lists it, as at every level kv-stable
+ * and the greedy solvers plan; `computeTokens` falls back the same way. The
+ * one rule for the form a chunk takes, which `renderLayout` and the fold diff
+ * share.
+ */
+export function renderedAncestor(
+  c: PickerChunk,
+  tree: SummaryTree,
+  frontier: Frontier,
+): SummaryNode | null {
+  const level = c.pinned ? 0 : frontier.get(c.id) ?? 0;
+  return level > 0 ? tree.ancestorAt(c.id, level) : null;
+}
+
+/**
  * Build the ordered rendered-unit layout for a frontier. `totalTokens` equals
- * `accountFrontier` for the same resolutions.
+ * `accountFrontier` for the same resolutions wherever each chunk's level has
+ * a summary that lists it.
  */
 export function renderLayout(
   inputs: PickerInputs,
@@ -67,15 +95,8 @@ export function renderLayout(
   const renderedSummaries = new Set<SummaryId>();
   for (const c of ordered) {
     if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id)) continue;
-    const effective = c.pinned ? 0 : frontier.get(c.id) ?? 0;
-    if (effective === 0) {
-      push('raw', c.id, c.rawTokens);
-      continue;
-    }
-    const ancestor = tree.ancestorAt(c.id, effective);
+    const ancestor = renderedAncestor(c, tree, frontier);
     if (!ancestor) {
-      // Resolution set but summary missing — render raw (renderer makes the
-      // same call). Matches computeTokens' fallback.
       push('raw', c.id, c.rawTokens);
       continue;
     }

@@ -4,10 +4,12 @@ import { tailUnits } from './render-offsets.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import { PackedDagSolver } from './kv-unified-packed.js';
+import { SubtreeMemoSolver, type SubtreeSolveStats } from './kv-unified-subtree.js';
 import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
   type ExactCutCandidate,
+  orderedChunks,
 } from './kv-unified.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -104,7 +106,9 @@ export type ParetoSolveOptions = ExactPolicySolveOptions & {
   tokenBucketSize?: number;
   continuityBucketSize?: number;
   fidelityBucketSize?: number;
-  engine?: 'auto' | 'leaf' | 'dag';
+  /** `auto` (absent) and `subtree` run the subtree-memoized engine, `dag`
+   * the packed DAG engine; `leaf` is the exact reference path. */
+  engine?: 'auto' | 'leaf' | 'dag' | 'subtree';
   /** Opt-in prototype: prove the hysteresis selection before propagating labels. */
   hysteresisCertificate?: boolean;
   /** Diagnostic reference path; the normal DAG path uses packed storage. */
@@ -121,41 +125,74 @@ export class ParetoKvUnifiedPolicySolver {
   readonly forest: CanonicalSummaryForest;
 
   private readonly leaves: ReturnType<CanonicalSummaryForest['orderedLeaves']>;
-  private readonly chunksById: ReadonlyMap<ChunkId, PickerInputs['chunks'][number]>;
-  private readonly indexById: ReadonlyMap<ChunkId, number>;
-  private readonly midpointAge = new Map<ChunkId, number>();
+  private readonly chunks: readonly PickerInputs['chunks'][number][];
+  private readonly midpointAge: Float64Array;
   private summaryMetricCache = new WeakMap<readonly ChunkId[], { continuity: number; fidelity: number }>();
   private readonly newestSequence: number;
   private bufferGapEmissions = false;
+  /** Wall time of the last certificate attempt, succeeded or not. */
+  lastCertificateMs = 0;
+  /** Set when the last solve ran the subtree-memoized engine; null when
+   * another engine (or the certificate) decided. */
+  lastSubtreeStats: SubtreeSolveStats | null = null;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
     this.leaves = this.forest.orderedLeaves();
-    this.chunksById = new Map(inputs.chunks.map((chunk) => [chunk.id, chunk]));
-    this.indexById = new Map(this.leaves.map((leaf, index) => [leaf.id, index]));
+    // A forest built from these inputs already holds this sort of them; any
+    // other forest prices with the caller's current chunks (same as the exact
+    // scorer and the terminal evaluator).
+    this.chunks = this.forest.builtFrom(inputs) ? this.forest.orderedChunks() : orderedChunks(inputs.chunks);
+    this.midpointAge = new Float64Array(this.leaves.length);
     this.newestSequence = inputs.chunks.reduce((newest, chunk) => Math.max(newest, chunk.sequence), 0);
     let age = 0;
     for (let i = this.leaves.length - 1; i >= 0; i--) {
       const leaf = this.leaves[i];
-      this.midpointAge.set(leaf.id, age + leaf.rawTokens / 2);
+      this.midpointAge[i] = age + leaf.rawTokens / 2;
       age += leaf.rawTokens;
     }
   }
 
   solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
+    // The options object is the scope of the per-solve caches (the accepted
+    // presentation read per leaf position, shared by the certificate and the
+    // evaluators). A caller reusing one object across solves, with its
+    // presentation map edited in between, must not be served the old read.
+    options = { ...options };
     this.summaryMetricCache = new WeakMap();
-    const internalHoles = this.hasInternalProtectedHoles();
+    this.lastSubtreeStats = null;
+    const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
+      const started = performance.now();
       const certified = certifyCarriedLayout(this.inputs, this.forest, options);
+      this.lastCertificateMs = performance.now() - started;
       if (certified) return certified;
     }
     if (options.engine !== 'leaf') {
       if (options.storage !== 'objects') {
         const feasibility = this.forest.minimumTokens(options.maxTokens);
         if (!feasibility.feasible) return { feasible: false, feasibility };
-        return new PackedDagSolver(this.inputs, this.forest, options, gapBearingOwnership || internalHoles,
-          (error) => this.approximationBound(options, normalizePolicy(options.policy), error), feasibility).solve();
+        const buffered = gapBearingOwnership || internalHoles;
+        const bound = (error: ApproximationEnvelope) => this.approximationBound(options, normalizePolicy(options.policy), error);
+        if (options.engine !== 'dag') {
+          const subtree = new SubtreeMemoSolver(this.inputs, this.forest, options, buffered, bound, feasibility);
+          try {
+            const result = subtree.solve();
+            this.lastSubtreeStats = subtree.lastStats;
+            return result;
+          } catch (error) {
+            // A subtree's sets are pruned against the wall from the subtree's
+            // own origin, so a forest whose prefix fills most of the wall can
+            // need more labels than the ceiling where the packed engine,
+            // pruning from the absolute prefix, needs few. Asked for no engine
+            // in particular, the solve runs once more on the packed engine.
+            if (!(error instanceof SparseLabelCeilingError) || options.engine === 'subtree') throw error;
+            subtree.dropDeparted();
+            this.lastSubtreeStats = { ...subtree.stats, ceilingFallback: true };
+          }
+        }
+        return new PackedDagSolver(this.inputs, this.forest, options, buffered, bound, feasibility).solve();
       }
       this.bufferGapEmissions = gapBearingOwnership || internalHoles;
       try {
@@ -266,7 +303,7 @@ export class ParetoKvUnifiedPolicySolver {
         let mask = 0n;
         let overlap = false;
         for (const id of summary.leafIds) {
-          const index = this.indexById.get(id)!;
+          const index = this.forest.leaf(id)!.index;
           const candidateBit = bit(index);
           const allowed = this.forest.leaf(id)!.allowedLevels.includes(summary.level);
           if ((label.remaining & candidateBit) === 0n && allowed) { overlap = true; break; }
@@ -371,7 +408,7 @@ export class ParetoKvUnifiedPolicySolver {
         const previousLevel = options.presentation?.leaves.get(leaf.id)?.level ?? 0;
         maxContinuity += leaf.rawTokens * Math.max(1, previousLevel, Math.abs(maxLevel - previousLevel));
         if (!leaf.externallyAccounted) maxFidelity += fidelityLeafLoss(
-          this.chunksById.get(leaf.id)!, maxLevel, this.newestSequence, policy,
+          this.chunks[leaf.index], maxLevel, this.newestSequence, policy,
         );
       }
       continuityBins = Math.ceil(maxContinuity / continuityBucketSize) + 2;
@@ -449,7 +486,9 @@ export class ParetoKvUnifiedPolicySolver {
             ));
         const covered = coverApproximationPool(pool, representatives, cacheRelevant);
         labelsDominated += pool.length - covered.length;
-        result.push(...covered);
+        // Appended one by one: a group can hold more labels than a call takes
+        // as spread arguments (about 125,000), below the label ceiling (#255).
+        for (const label of covered) result.push(label);
       }
       labelsCreated += result.length;
       maxLabelsPerState = Math.max(maxLabelsPerState, result.length);
@@ -637,15 +676,6 @@ export class ParetoKvUnifiedPolicySolver {
     };
   }
 
-  private hasInternalProtectedHoles(): boolean {
-    for (const summary of this.forest.allSummaries()) {
-      const live = summary.leafIds.filter((id) => !this.forest.leaf(id)!.externallyAccounted);
-      const allowed = live.filter((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level));
-      if (allowed.length > 0 && allowed.length < live.length) return true;
-    }
-    return false;
-  }
-
   private approximationBound(
     options: ExactPolicySolveOptions,
     policy: KvUnifiedWelfarePolicy,
@@ -703,8 +733,8 @@ export class ParetoKvUnifiedPolicySolver {
     let fidelityLoss = label.fidelityLoss;
     const presentation = options.presentation;
     for (const id of ids) {
-      remaining &= ~(1n << BigInt(this.indexById.get(id)!));
-      const chunk = this.chunksById.get(id)!;
+      remaining &= ~(1n << BigInt(this.forest.leaf(id)!.index));
+      const chunk = this.chunks[this.forest.leaf(id)!.index];
       fidelityLoss += fidelityLeafLoss(chunk, level, this.newestSequence, policy);
       const previous = presentation?.leaves.get(id);
       continuityLoss += continuityLeafLoss(
@@ -713,7 +743,7 @@ export class ParetoKvUnifiedPolicySolver {
         level === 0 ? `raw:${id}` : `summary:${this.forest.leaf(id)!.summaryIds.find((sid) => this.forest.summary(sid)!.level === level)!}`,
         previous,
         presentation?.currentSeq ?? 0,
-        this.midpointAge.get(id)!,
+        this.midpointAge[this.forest.leaf(id)!.index],
         policy,
       );
     }
@@ -752,7 +782,7 @@ export class ParetoKvUnifiedPolicySolver {
       let continuity = 0;
       let fidelity = 0;
       for (const id of ids) {
-        const chunk = this.chunksById.get(id)!;
+        const chunk = this.chunks[this.forest.leaf(id)!.index];
         fidelity += fidelityLeafLoss(chunk, level, this.newestSequence, policy);
         const previous = options.presentation?.leaves.get(id);
         const repHash = `summary:${summaryId}`;
@@ -762,7 +792,7 @@ export class ParetoKvUnifiedPolicySolver {
           repHash,
           previous,
           options.presentation?.currentSeq ?? 0,
-          this.midpointAge.get(id)!,
+          this.midpointAge[this.forest.leaf(id)!.index],
           policy,
         );
       }
@@ -869,14 +899,14 @@ export class ParetoKvUnifiedPolicySolver {
     if (knownContinuity !== undefined) continuityLoss += knownContinuity;
     else if (options.presentation) {
       for (const id of ids) {
-        const chunk = this.chunksById.get(id)!;
+        const chunk = this.chunks[this.forest.leaf(id)!.index];
         continuityLoss += continuityLeafLoss(
           chunk,
           0,
           `raw:${id}`,
           options.presentation.leaves.get(id),
           options.presentation.currentSeq,
-          this.midpointAge.get(id)!,
+          this.midpointAge[this.forest.leaf(id)!.index],
           policy,
         );
       }
@@ -933,12 +963,12 @@ export class ParetoKvUnifiedPolicySolver {
     let extensionTokens = 0;
     let continuity = 0;
     for (const id of ids) {
-      const chunk = this.chunksById.get(id)!;
+      const chunk = this.chunks[this.forest.leaf(id)!.index];
       tokens += chunk.rawTokens;
       const previous = options.presentation?.leaves.get(id);
       if (options.presentation && !previous) extensionTokens += chunk.rawTokens;
       continuity += continuityLeafLoss(chunk, 0, `raw:${id}`, previous,
-        options.presentation?.currentSeq ?? 0, this.midpointAge.get(id)!, policy);
+        options.presentation?.currentSeq ?? 0, this.midpointAge[this.forest.leaf(id)!.index], policy);
     }
     return { tokens, extensionTokens, continuity };
   }
@@ -1010,7 +1040,17 @@ const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
  * component envelopes are one-sided: how much worse the representative may
  * be than an exact path it stands in for.  Subsequent actions add the same
  * component costs at the same structural/cache state, so the envelope carries
- * forward unchanged until another prune. */
+ * forward unchanged until another prune.
+ *
+ * A path is attached only to a representative with no more rendered tokens
+ * than its own. A later action adds the same tokens to both, so a
+ * representative the wall prunes takes with it only paths the wall would
+ * have pruned too, and the error it carries for them is never owed. Attached
+ * to a representative with more tokens, a path whose own continuation fits
+ * could lose its error when that representative crosses the wall, and the
+ * bound read from the surviving labels would miss its cut (#254). The
+ * fewest-tokens representative always qualifies, so every path is attached.
+ * The packed and subtree engines apply the same rule. */
 function coverApproximationPool(
   pool: readonly ParetoLabel[],
   representatives: readonly ParetoLabel[],
@@ -1025,6 +1065,7 @@ function coverApproximationPool(
     let chosenCost = Number.POSITIVE_INFINITY;
     for (let i = 0; i < covered.length; i++) {
       const candidate = covered[i];
+      if (candidate.renderedTokens > source.renderedTokens) continue;
       const cost =
         Math.abs(candidate.renderedTokens - source.renderedTokens) +
         Math.max(0, candidate.continuityLoss - source.continuityLoss) +

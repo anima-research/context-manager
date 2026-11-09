@@ -7,7 +7,11 @@
  * rendering or resolution state. Pure and deterministic.
  *
  * Structure mirrors the model the picker already uses:
- *  - `chunk.l1Id` + the `SummaryEntry.parentId` chain define the upward path.
+ *  - `chunk.l1Id` + the `SummaryEntry.parentId` chain define the upward path
+ *    (a chunk's lineage), followed while each parent sits above its summary.
+ *    A chunk's summary at a level is the one its lineage reaches there, and
+ *    only where that summary lists the chunk: a parent pointer can name a
+ *    summary written again without the chunk's branch.
  *  - `SummaryEntry.sourceLevel === 0` means `sourceIds` are leaf (message) ids;
  *    otherwise they are child summary ids.
  *  - A folded node's token cost is its recall-pair size
@@ -19,7 +23,7 @@
  */
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
-import type { PickerInputs } from './picker.js';
+import type { PickerChunk, PickerInputs } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
 import { getSummaryParentId } from '../types/strategy.js';
 
@@ -63,19 +67,53 @@ export function nodeTokens(node: TreeNode): number {
 }
 
 export class SummaryTree {
-  private readonly leaves = new Map<ChunkId, LeafNode>();
-  private readonly nodes = new Map<SummaryId, SummaryNode>();
+  private readonly leaves: Map<ChunkId, LeafNode> = new Map();
+  private readonly nodes: Map<SummaryId, SummaryNode> = new Map();
   private readonly summaries: ReadonlyMap<SummaryId, SummaryEntry>;
   private readonly recallPairTokens: ReadonlyMap<SummaryId, number>;
-  private readonly leafSeq = new Map<ChunkId, number>();
   private rootCache: TreeNode[] | null = null;
+  /** Source ids that no chunk or summary resolved when a node was built. A
+   *  node's coverage depends on them: should one arrive later, `derive`
+   *  declines instead of keeping nodes computed without it. */
+  private readonly unresolved: Set<string>;
+  /** The chunks this tree was built from, for `derive`. */
+  private readonly sourceChunks: readonly PickerChunk[];
+  /** Each summary's leaves as a set, built the first time a chunk's lineage
+   *  reaches it (`ancestorAt`, `maxLevel`). */
+  private readonly leafSets = new Map<SummaryId, ReadonlySet<ChunkId>>();
+  /** Each chunk's answers from `ancestorAt`, by level, kept as they're
+   *  asked. The tree doesn't change once built, and a greedy solve asks the
+   *  same ones on every step. */
+  private readonly ancestorMemo = new Map<ChunkId, (SummaryNode | null)[]>();
 
-  constructor(inputs: PickerInputs) {
+  constructor(inputs: PickerInputs, previous?: SummaryTree, rebuild?: readonly SummaryEntry[]) {
     this.summaries = inputs.summaries;
     this.recallPairTokens = inputs.recallPairTokens ?? new Map();
+    this.sourceChunks = inputs.chunks;
+    if (previous) {
+      // `derive` verified what changed: share the (immutable) summary nodes
+      // except the ones listed for rebuilding, and copy the leaf map,
+      // patching only what moved, so the previous tree stays a coherent
+      // snapshot.
+      this.leaves = new Map(previous.leaves);
+      this.unresolved = new Set(previous.unresolved);
+      for (const c of inputs.chunks) {
+        const leaf = this.leaves.get(c.id);
+        if (leaf && leaf.rawTokens === c.rawTokens && leaf.sequence === c.sequence && leaf.l1Id === c.l1Id) continue;
+        this.leaves.set(c.id, { kind: 'leaf', chunkId: c.id, sequence: c.sequence, rawTokens: c.rawTokens, l1Id: c.l1Id });
+      }
+      if (!rebuild || rebuild.length === 0) {
+        this.nodes = previous.nodes;
+        return;
+      }
+      this.nodes = new Map(previous.nodes);
+      const collected = new Map<SummaryId, LeafCollection>();
+      for (const s of rebuild) this.nodes.set(s.id, this.buildNode(s, collected));
+      return;
+    }
 
+    this.unresolved = new Set();
     for (const c of inputs.chunks) {
-      this.leafSeq.set(c.id, c.sequence);
       this.leaves.set(c.id, {
         kind: 'leaf',
         chunkId: c.id,
@@ -84,9 +122,56 @@ export class SummaryTree {
         l1Id: c.l1Id,
       });
     }
+    const collected = new Map<SummaryId, LeafCollection>();
     for (const [, s] of this.summaries) {
-      this.nodes.set(s.id, this.buildNode(s));
+      this.nodes.set(s.id, this.buildNode(s, collected));
     }
+  }
+
+  /**
+   * Build the tree for `inputs` from `previous` when no summary changed and
+   * every previous leaf is still present with the same sequence and L1 link;
+   * new leaves must be ownerless. Chunk order may differ. Returns null when a
+   * full build is needed.
+   */
+  static derive(previous: SummaryTree, inputs: PickerInputs): SummaryTree | null {
+    // Entries are compared with the previous tree's own nodes: the strategy
+    // updates a child's parent link on the entry object itself when an
+    // upper summary arrives. A new summary, or one whose parent link
+    // changed, gets a new node; any other difference is a full build.
+    if (inputs.summaries.size < previous.nodes.size) return null;
+    const recall = inputs.recallPairTokens ?? new Map<SummaryId, number>();
+    const rebuild: SummaryEntry[] = [];
+    for (const [id, s] of inputs.summaries) {
+      const node = previous.nodes.get(id);
+      if (!node) {
+        if (previous.unresolved.has(id)) return null;
+        rebuild.push(s);
+        continue;
+      }
+      if (
+        node.level !== s.level || node.childrenAreLeaves !== (s.sourceLevel === 0) ||
+        node.recallTokens !== (recall.get(id) ?? s.tokens) ||
+        node.sourceRange.first !== s.sourceRange.first || node.sourceRange.last !== s.sourceRange.last ||
+        node.childIds.length !== s.sourceIds.length
+      ) return null;
+      for (let i = 0; i < s.sourceIds.length; i++) if (node.childIds[i] !== s.sourceIds[i]) return null;
+      if (node.parentId !== getSummaryParentId(s)) rebuild.push(s);
+    }
+    if (inputs.summaries.size !== previous.nodes.size + rebuild.filter((s) => !previous.nodes.has(s.id)).length) return null;
+    let matched = 0;
+    for (const c of inputs.chunks) {
+      const leaf = previous.leaves.get(c.id);
+      if (leaf) {
+        if (leaf.sequence !== c.sequence) return null;
+        // A leaf may become owned (its node is replaced); losing or changing
+        // an owner is a full build.
+        if (leaf.l1Id !== c.l1Id && leaf.l1Id !== undefined) return null;
+        matched++;
+      } else if (previous.unresolved.has(c.id)) return null;
+    }
+    if (matched !== previous.leaves.size) return null;
+    return new SummaryTree(inputs, previous, rebuild);
   }
 
   // ---- node access ----
@@ -137,33 +222,55 @@ export class SummaryTree {
   }
 
   /**
-   * The L_level ancestor summary of a chunk, or null if not present. Matches
-   * the picker's `accountFrontier` ancestor walk (parentId chain from l1Id).
+   * The chunk's summary at `level`, the one it renders through there: the
+   * L_level summary its lineage (`l1Id`, then each parent above) reaches,
+   * when that summary lists the chunk. Null when the lineage has no summary
+   * there, or has one that doesn't list the chunk, whose recall wouldn't hold
+   * it. Where every summary on the lineage lists the chunk, as the strategy's
+   * load repair leaves a store it opens, this is the walk the picker's
+   * `accountFrontier` and the renderer make.
    */
   ancestorAt(chunkId: ChunkId, level: number): SummaryNode | null {
     if (level <= 0) return null;
+    let known = this.ancestorMemo.get(chunkId);
+    const cached = known?.[level];
+    if (cached !== undefined) return cached;
     const leaf = this.leaves.get(chunkId);
-    if (!leaf || !leaf.l1Id) return null;
-    let cur = this.nodes.get(leaf.l1Id);
-    while (cur && cur.level < level) {
-      if (!cur.parentId) return null;
-      cur = this.nodes.get(cur.parentId);
+    let found: SummaryNode | null = null;
+    if (leaf?.l1Id) {
+      let cur = this.nodes.get(leaf.l1Id);
+      while (cur && cur.level < level) cur = this.parentOf(cur);
+      if (cur && cur.level === level && this.leafSet(cur).has(chunkId)) found = cur;
     }
-    return cur && cur.level === level ? cur : null;
+    if (!known) this.ancestorMemo.set(chunkId, (known = []));
+    known[level] = found;
+    return found;
   }
 
-  /** Highest level k for which a summary covering this chunk exists (0 = none). */
+  /** The highest level at which the chunk has a summary (`ancestorAt`), or 0
+   *  when it has none. */
   maxLevel(chunkId: ChunkId): number {
     const leaf = this.leaves.get(chunkId);
     if (!leaf || !leaf.l1Id) return 0;
-    let cur = this.nodes.get(leaf.l1Id);
     let max = 0;
-    while (cur) {
-      max = cur.level;
-      if (!cur.parentId) break;
-      cur = this.nodes.get(cur.parentId);
+    for (let cur = this.nodes.get(leaf.l1Id); cur; cur = this.parentOf(cur)) {
+      if (this.leafSet(cur).has(chunkId)) max = cur.level;
     }
     return max;
+  }
+
+  /**
+   * The highest level at or below `level` at which the chunk has a summary
+   * (`ancestorAt`), or 0 when there's none. A level held for the chunk, such
+   * as a pin's or a lock's, renders at the level this returns: above the top
+   * of the chunk's lineage, at a level the lineage skips (a parent more than
+   * one level up), or at one whose summary doesn't list the chunk, the chunk
+   * has no summary, and the next level down where it has one comes nearest.
+   */
+  renderableLevel(chunkId: ChunkId, level: number): number {
+    let k = Math.min(level, this.maxLevel(chunkId));
+    while (k > 0 && !this.ancestorAt(chunkId, k)) k--;
+    return Math.max(k, 0);
   }
 
   /**
@@ -191,16 +298,22 @@ export class SummaryTree {
 
   // ---- internals ----
 
-  private buildNode(s: SummaryEntry): SummaryNode {
-    const leafChunkIds = this.collectLeafIds(s);
-    let firstSequence = Infinity;
-    let lastSequence = -Infinity;
-    for (const id of leafChunkIds) {
-      const seq = this.leafSeq.get(id);
-      if (seq === undefined) continue;
-      if (seq < firstSequence) firstSequence = seq;
-      if (seq > lastSequence) lastSequence = seq;
-    }
+  /** The summary's parent in the tree, when it sits above the summary: a
+   *  lineage climbs, so a walk along it ends. */
+  private parentOf(node: SummaryNode): SummaryNode | undefined {
+    const parent = node.parentId === undefined ? undefined : this.nodes.get(node.parentId);
+    return parent && parent.level > node.level ? parent : undefined;
+  }
+
+  /** A summary's leaves as a set. */
+  private leafSet(node: SummaryNode): ReadonlySet<ChunkId> {
+    let set = this.leafSets.get(node.id);
+    if (!set) { set = new Set(node.leafChunkIds); this.leafSets.set(node.id, set); }
+    return set;
+  }
+
+  private buildNode(s: SummaryEntry, collected?: Map<SummaryId, LeafCollection>): SummaryNode {
+    const leaves = this.collectLeaves(s, collected);
     return {
       kind: 'summary',
       id: s.id,
@@ -208,9 +321,9 @@ export class SummaryTree {
       recallTokens: this.recallPairTokens.get(s.id) ?? s.tokens,
       childIds: [...s.sourceIds],
       childrenAreLeaves: s.sourceLevel === 0,
-      leafChunkIds,
-      firstSequence: firstSequence === Infinity ? -1 : firstSequence,
-      lastSequence: lastSequence === -Infinity ? -1 : lastSequence,
+      leafChunkIds: leaves.sorted,
+      firstSequence: leaves.first === Infinity ? -1 : leaves.first,
+      lastSequence: leaves.last === -Infinity ? -1 : leaves.last,
       sourceRange: s.sourceRange,
       parentId: getSummaryParentId(s),
     };
@@ -230,7 +343,21 @@ export class SummaryTree {
    *  coverage is its LIVE sources — `children()` already applies the same
    *  filter. */
   private collectLeafIds(summary: SummaryEntry): ChunkId[] {
-    const out: ChunkId[] = [];
+    return this.collectLeaves(summary).sorted;
+  }
+
+  /** The walk above, with a per-build memo (`collected`): a child summary
+   *  walked earlier is replayed from its record (its live leaves in first-
+   *  visit order, minus those already seen; its first/last sequence) when
+   *  none of the summaries under it has been visited by this walk, which is
+   *  exactly when the walk would have produced the same visit. Otherwise the
+   *  child is walked as before. */
+  private collectLeaves(summary: SummaryEntry, collected?: Map<SummaryId, LeafCollection>): LeafCollection {
+    const kept = collected?.get(summary.id);
+    if (kept) return kept;
+    const visited: ChunkId[] = [];
+    let first = Infinity;
+    let last = -Infinity;
     const seenLeaves = new Set<ChunkId>();
     const seenSummaries = new Set<SummaryId>();
     const visit = (s: SummaryEntry): void => {
@@ -238,23 +365,62 @@ export class SummaryTree {
       seenSummaries.add(s.id);
       if (s.sourceLevel === 0) {
         for (const mid of s.sourceIds) {
-          if (!this.leafSeq.has(mid)) continue; // ghost of a surgically removed chunk
+          const leaf = this.leaves.get(mid);
+          if (!leaf) { this.unresolved.add(mid); continue; } // ghost of a surgically removed chunk
           if (!seenLeaves.has(mid)) {
             seenLeaves.add(mid);
-            out.push(mid);
+            visited.push(mid);
+            if (leaf.sequence < first) first = leaf.sequence;
+            if (leaf.sequence > last) last = leaf.sequence;
           }
         }
       } else {
         for (const sid of s.sourceIds) {
           const child = this.summaries.get(sid);
-          if (child) visit(child);
+          if (!child) { this.unresolved.add(sid); continue; }
+          const known = collected?.get(child.id);
+          if (known && known.summaries.every((id) => !seenSummaries.has(id))) {
+            for (const id of known.summaries) seenSummaries.add(id);
+            for (const mid of known.visited) {
+              if (seenLeaves.has(mid)) continue;
+              seenLeaves.add(mid);
+              visited.push(mid);
+            }
+            // A leaf skipped here was counted when it was first seen.
+            if (known.first < first) first = known.first;
+            if (known.last > last) last = known.last;
+            continue;
+          }
+          visit(child);
         }
       }
     };
     visit(summary);
-    out.sort((a, b) => (this.leafSeq.get(a) ?? 0) - (this.leafSeq.get(b) ?? 0));
-    return out;
+    // Sources usually arrive in sequence order already; a stable sort of an
+    // ordered list returns it unchanged, so it is only run when needed.
+    let ordered = true;
+    for (let i = 1, previous = this.leaves.get(visited[0])?.sequence ?? 0; ordered && i < visited.length; i++) {
+      const sequence = this.leaves.get(visited[i])?.sequence ?? 0;
+      ordered = previous <= sequence;
+      previous = sequence;
+    }
+    const sorted = ordered ? visited : visited.slice().sort(
+      (a, b) => (this.leaves.get(a)?.sequence ?? 0) - (this.leaves.get(b)?.sequence ?? 0),
+    );
+    const result: LeafCollection = { visited, sorted, first, last, summaries: [...seenSummaries] };
+    collected?.set(summary.id, result);
+    return result;
   }
+}
+
+/** One summary's leaf walk: live leaves in first-visit order and sorted by
+ *  sequence, the sequence span, and the summaries the walk visited. */
+interface LeafCollection {
+  visited: ChunkId[];
+  sorted: ChunkId[];
+  first: number;
+  last: number;
+  summaries: SummaryId[];
 }
 
 function sequenceOf(n: TreeNode): number {

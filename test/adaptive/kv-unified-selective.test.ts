@@ -35,6 +35,28 @@ test('selective scoring refines the winner and carried contender, preserving the
   assert.ok(result.candidates.includes(result.selected));
 });
 
+test('bestUnder breaks a tie in the caller\'s frame on tokens then signature, not on the pool-frame score', () => {
+  // A = (fidelity 300, continuity 10, 100 tokens), B = (0, 20, 200 tokens),
+  // continuity lambda and scale 1. The pool's continuity floor is 10, so in
+  // the pool's frame B scores 100 to A's 300; under a caller's floor of 0
+  // both score 400, and the tie goes to A, the smaller cut, as the
+  // selection would break it.
+  const a: UnscoredCandidate = { ...row(0, 300, 10), renderedTokens: 100 };
+  const b: UnscoredCandidate = { ...row(1, 0, 20), renderedTokens: 200 };
+  const options: ExactPolicySolveOptions = { maxTokens: 400, policy: { continuityScale: 1, continuityLambda: 1, cacheLambda: 0 } };
+  for (const order of [[a, b], [b, a]]) {
+    const result = scoreBoundedCandidates(order.map((value) => bounds(value, new Set())), options, stats, false, ['x']);
+    assert.equal(result.continuityFloor, 10);
+    assert.equal(result.selected, result.candidates.find((c) => c.renderedTokens === 200), 'premise: B wins in the pool frame');
+    assert.ok(result.bestUnder, 'the hooks are present');
+    assert.equal(result.bestScoreUnder(0, 0), 400);
+    assert.equal(result.bestUnder(0, 0).renderedTokens, 100, 'the tie goes to the smaller cut');
+    const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(order, options, stats, false);
+    assert.equal(reference.bestUnder!(0, 0).renderedTokens, 100, 'the exact scorer agrees');
+    assert.equal(reference.bestScoreUnder!(0, 0), 400);
+  }
+});
+
 test('a welfare loser still establishes an exact normalization floor', () => {
   const values = [row(0, 10, 10, 5), row(1, 12, 4, 8), row(2, 10000, 2, 0)];
   const refined = new Set<UnscoredCandidate>();
@@ -73,13 +95,12 @@ test('positive-sum intervals cover differently grouped sums across binary64 magn
   assert.deepEqual(nonnegativeSumInterval(0, 100000), { lower: 0, upper: 0 });
 });
 
-test('non-finite score arithmetic uses the complete original sort instead of interval decisions', () => {
+test('with non-finite score arithmetic, the selection and candidate list match the exact solver', () => {
   const values = [row(0, 0, 1e308), row(1, 1), row(2, 2)];
   const options = { maxTokens: 200, continuityMultiplier: 0, policy: { continuityScale: 1 } };
   const refined = new Set<UnscoredCandidate>();
   const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, options, stats, false);
   const result = scoreBoundedCandidates(values.map((value) => bounds(value, refined)), options, stats, false, ['x']);
-  assert.equal(refined.size, values.length);
   assert.deepEqual(result.selected, reference.selected);
   assert.deepEqual(result.candidates, reference.candidates);
 });
@@ -92,5 +113,49 @@ test('a candidate whose lower bound equals the best upper bound is still evaluat
   const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, options, stats, false);
   const result = scoreBoundedCandidates(values.map((value) => bounds(value, new Set(), 0)), options, stats, false, ['x']);
   assert.equal(result.selected.frontier.get('x'), 0);
+  assert.deepEqual(result.selected, reference.selected);
+});
+
+test('exact scoring takes more candidates than a call takes as spread arguments', () => {
+  // A full terminal evaluation scores every terminal label, which only the
+  // label ceiling bounds: the forest from #231's regression test (52 L1 pairs
+  // under an L2 with a pinned hole, no buckets) leaves 205,320 of them. A call
+  // takes about 125,000 spread arguments on node 22 and 24, so the scorer's
+  // floors are taken in a loop (#255).
+  // Each floor is unique, non-zero and away from the first candidate, so a
+  // floor that never moved from its start, or read another field, fails.
+  const values = Array.from({ length: 200_000 }, (_, index) => row(index, index, 200_000 - index, Math.abs(index - 123_456) + 3));
+  // A failure of this premise means the runtime takes more spread arguments,
+  // as with a larger stack (`node --stack-size`) or a newer V8, not that the
+  // scorer changed: raise the count until the old spread throws again.
+  assert.throws(() => Math.min(...values.map((value) => value.continuityLoss)), RangeError,
+    'premise: this runtime takes fewer spread arguments than there are candidates');
+  const result = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, { maxTokens: 200 }, stats, true);
+  assert.equal(result.candidates.length, 200_000);
+  assert.equal(result.continuityFloor, 1);
+  assert.equal(result.cacheFloor, 3);
+});
+
+test('the continuity floor is the least exact loss, though the candidate with the lowest upper bound has more', () => {
+  const w = row(0, 1, 10);
+  const x = row(1, 1, 9);
+  const candidates = [bounds(w, new Set(), 0), bounds(x, new Set(), 2)];
+  const options: ExactPolicySolveOptions = { maxTokens: 200, policy: { continuityScale: 1, continuityLambda: 1 } };
+  const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates([w, x], options, stats, false);
+  assert.equal(reference.continuityFloor, 9, 'premise: the exact floor');
+  const result = scoreBoundedCandidates(candidates, options, stats, false, ['x']);
+  assert.equal(result.continuityFloor, 9);
+  assert.deepEqual(result.selected, reference.selected);
+});
+
+test('the carried presentation is the best matching candidate, not the first one scored', () => {
+  const b = row(0, 10);
+  const m1 = row(1, 12, 0, 0, true);
+  const m2 = row(2, 11, 0, 0, true);
+  const options: ExactPolicySolveOptions = { maxTokens: 200, adoptEpsilon: 100, presentation: { currentSeq: 1, leaves: new Map() } };
+  const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates([b, m1, m2], options, stats, false);
+  assert.equal(reference.selected.frontier.get('x'), 2, 'premise: the exact solver carries M2');
+  const result = scoreBoundedCandidates([b, m1, m2].map((value) => bounds(value, new Set(), 5)), options, stats, false, ['x']);
+  assert.equal(result.selected.frontier.get('x'), 2);
   assert.deepEqual(result.selected, reference.selected);
 });

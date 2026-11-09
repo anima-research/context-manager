@@ -91,18 +91,11 @@ describe('merge adjacency is judged in store order (issue #122)', () => {
     const picked = p.pick([...six, stray], 6);
     assert.deepEqual(picked?.map((s) => s.id), six.map((s) => s.id));
   });
-
-  test('without a store listing the index degrades to chunk-record order', () => {
-    const p = probe();
-    p.setChunks([ids(0, 9), ids(10, 19)]);
-    const picked = p.pick([l1('a', 0, 9), l1('b', 10, 19)], 2);
-    assert.deepEqual(picked?.map((s) => s.id), ['a', 'b']);
-  });
 });
 
 /** A Probe bound to a real store: branch-guarded entrypoints need one. */
-async function openProbe(path: string, membrane: unknown, count = 40): Promise<{ manager: ContextManager; p: Probe; ids: string[]; ctx: StrategyContext }> {
-  const p = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+async function openProbe(path: string, membrane: unknown, count = 40, mergeThreshold = 6): Promise<{ manager: ContextManager; p: Probe; ids: string[]; ctx: StrategyContext }> {
+  const p = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold, compressionModel: 'test-compression-model' });
   const manager = await ContextManager.open({ path, strategy: p, membrane: membrane as never });
   const out: string[] = [];
   for (let i = 0; i < count; i++) out.push(manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i} ` + 'w '.repeat(20) }]));
@@ -114,7 +107,9 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
   return { id, level, content: `s ${id}`, tokens: 100, sourceLevel: level - 1, sourceIds: src,
     sourceRange: { first: src[0], last: src[src.length - 1] }, created: 1 } as SummaryEntry;
 }
-const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store'];
+const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
+  './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off',
+  './test-topology-guard-gone', './test-topology-guard-damaged', './test-topology-guard-empty-group'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -159,6 +154,141 @@ describe('a crossed merge is refused at mint time', () => {
     assert.equal(debt.topologyRefusals, 1);
     assert.equal(debt.state, 'critical');
     assert.equal(p.allSummaries().filter((x) => x.level === 2).length, 0, 'nothing was minted');
+    manager.close();
+  });
+
+  /** A refused crossed merge over L1s a, b, c and d, which the store also holds, so a restart loads them.
+   *  With `both`, the crossed group b+d is refused too. */
+  async function refusedCrossedMerge(path: string, both = false) {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'merged' }] }) };
+    const { manager, p, ids: all, ctx } = await openProbe(path, membrane);
+    const s = real(all);
+    p.setChunks([s(0, 9), s(10, 19), s(20, 29), s(30, 39)]);
+    const summaries = [l1r('a', s(0, 9)), l1r('b', s(10, 19)), l1r('c', s(20, 29)), l1r('d', s(30, 39))];
+    p.setSummaries(summaries);
+    const internals = p as unknown as { store: { setStateJson(id: string, v: unknown): void }; summariesStateId: string };
+    internals.store.setStateJson(internals.summariesStateId, summaries);
+    for (const group of both ? [['a', 'c'], ['b', 'd']] : [['a', 'c']]) {
+      p.setQueue([{ level: 2, sourceIds: group }]);
+      await p.merge(2, group, ctx);
+    }
+    assert.equal(p.getCompressionDebt().state, 'critical', 'setup: the refusal is critical');
+    return { manager, p, membrane };
+  }
+
+  test('each refused group counts, and critical lifts once an operator has cleared them all', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[4], true);
+    assert.equal(p.getCompressionDebt().topologyRefusals, 2);
+    const [first, second] = [...p.quarantine().keys()];
+    p.clearMergeQuarantine(first);
+    let debt = p.getCompressionDebt();
+    assert.equal(debt.topologyRefusals, 1);
+    assert.equal(debt.state, 'critical', 'one refused group still stands');
+    p.clearMergeQuarantine(second);
+    debt = p.getCompressionDebt();
+    assert.equal(debt.topologyRefusals, 0);
+    assert.notEqual(debt.state, 'critical', 'nothing crossed is left standing');
+    manager.close();
+  });
+
+  test('a restart keeps critical while the refused group\'s record stands', async () => {
+    const { manager, membrane } = await refusedCrossedMerge(STORES[5]);
+    manager.close();
+    const again = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+    const reopened = await ContextManager.open({ path: STORES[5], strategy: again, membrane: membrane as never });
+    try {
+      assert.deepEqual([...again.quarantine().values()].map((r) => r.lastOutcome), ['topology_violation'], 'setup: the record survived the restart');
+      const debt = again.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 1);
+      assert.equal(debt.state, 'critical');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test('a restart leaves out a damaged record beside a standing one, says so, and reads critical from the one that stands', async () => {
+    const { manager, p, membrane } = await refusedCrossedMerge(STORES[8], true);
+    const internals = p as unknown as { store: { setStateJson(id: string, v: unknown): void }; mergeQuarantineStateId: string };
+    const [standing, damaged] = [...p.quarantine().values()] as Array<Record<string, unknown>>;
+    internals.store.setStateJson(internals.mergeQuarantineStateId, [standing, { ...damaged, sourceIds: undefined }]);
+    manager.close();
+    const again = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let reopened: ContextManager | undefined;
+    try {
+      reopened = await ContextManager.open({ path: STORES[8], strategy: again, membrane: membrane as never });
+    } finally {
+      console.warn = warn;
+    }
+    try {
+      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes("can't read"));
+      assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key, and sourceIds a list whose ids are all non-empty strings\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
+      assert.equal(again.quarantine().size, 1, 'the standing record loaded');
+      const stored = (again as unknown as { store: { getStateJson(id: string): unknown }; mergeQuarantineStateId: string });
+      assert.deepEqual(stored.store.getStateJson(stored.mergeQuarantineStateId), [standing], 'written back with the standing record alone');
+      const debt = again.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 1, 'only the standing record counts');
+      assert.equal(debt.state, 'critical');
+    } finally {
+      reopened?.close();
+    }
+  });
+
+  test('at mergeThreshold 0 the empty group is refused once, and its record stands, holding the threshold pass back (#285)', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'merged' }] }) };
+    const { manager, p, ids: all, ctx } = await openProbe(STORES[9], membrane, 40, 0);
+    const s = real(all);
+    p.setChunks([s(0, 9), s(10, 19)]);
+    p.setSummaries([l1r('a', s(0, 9)), l1r('b', s(10, 19))]);
+    const internals = p as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[] }>; checkMergeThreshold(): void; sweepPaidOffMergeQuarantine(): void };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      internals.checkMergeThreshold();
+      assert.deepEqual(internals.mergeQueue.map((m) => m.sourceIds), [[]], 'setup: the threshold pass queues the empty group');
+      const states: string[] = [];
+      for (let cycle = 0; cycle < 3; cycle++) {
+        // A drain passes the queue's head, with its own array; then the alarm's sweep, which runs the threshold pass after it removes anything.
+        const head = internals.mergeQueue[0];
+        if (head) await p.merge(head.level, head.sourceIds, ctx);
+        internals.sweepPaidOffMergeQuarantine();
+        states.push(p.getCompressionDebt().state);
+      }
+      assert.deepEqual(p.getMergeQuarantineStatus().records.map((r) => [r.lastOutcome, r.sourceIds]), [['topology_violation', []]]);
+      assert.deepEqual(internals.mergeQueue, [], 'not queued again while its record stands');
+      assert.deepEqual(states, ['critical', 'critical', 'critical']);
+      assert.equal(p.getCompressionDebt().topologyRefusals, 1);
+      assert.equal(errors.filter((line) => /refus/i.test(line)).length, 1, `refused once: ${JSON.stringify(errors)}`);
+    } finally {
+      console.error = error;
+      manager.close();
+    }
+  });
+
+  test('a refused group paid off since reads as paid off before a sweep removes its record', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[6]);
+    // a merges validly with b afterwards, which parents a source of the refused group a+c.
+    for (const summary of p.allSummaries()) if (summary.id === 'a' || summary.id === 'b') summary.mergedInto = 'ab';
+    const debt = p.getCompressionDebt();
+    assert.equal(p.quarantine().size, 1, 'setup: no sweep has removed the record');
+    assert.equal(debt.topologyRefusals, 0, 'the record no longer stands as a refusal');
+    assert.notEqual(debt.state, 'critical');
+    manager.close();
+  });
+
+  test('a refused group whose source is gone counts no refusal before a sweep removes its record', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[7]);
+    // c leaves the summaries, as a repair at load can drop one.
+    const self = p as unknown as { summaries: SummaryEntry[] };
+    self.summaries = self.summaries.filter((summary) => summary.id !== 'c');
+    const debt = p.getCompressionDebt();
+    assert.equal(p.quarantine().size, 1, 'setup: no sweep has removed the record');
+    assert.equal(debt.topologyRefusals, 0, 'a group with a source gone no longer stands as a refusal');
+    assert.notEqual(debt.state, 'critical');
     manager.close();
   });
 
@@ -212,6 +342,29 @@ describe('load-time topology audit', () => {
     assert.deepEqual(p.audit(ids(0, 40)), []);
   });
 
+  test('a summary whose child covers more messages than a call takes as spread arguments is audited (#258)', () => {
+    // A call takes about 125,000 spread arguments on node 22 and 24. The
+    // audit collects each summary's messages from its children's, so an L3
+    // over an L2 of 199,990 messages took them in one spread, which threw at
+    // load. A failure of this premise means the runtime takes more spread
+    // arguments, as with a larger stack (`node --stack-size`) or a newer V8,
+    // not that the audit changed: raise the count until a spread throws again.
+    const count = 200_000;
+    assert.throws(() => Math.max(...new Array<number>(count).fill(0)), RangeError,
+      'premise: this runtime takes fewer spread arguments than the L2 has messages');
+    const p = probe();
+    const groups = Array.from({ length: count / 10 }, (_, k) => ids(10 * k, 10 * k + 9));
+    p.setChunks(groups);
+    const l1s = groups.map((_, k) => l1(`a${k}`, 10 * k, 10 * k + 9));
+    // One L1 left out of the L2 leaves a 10-message hole in the L2 and the L3
+    // over it, which the audit reports only if it collected all their messages.
+    const l2 = { ...l1('L2', 0, count - 1, 2), sourceIds: l1s.filter((_, k) => k !== 10_000).map((s) => s.id) } as SummaryEntry;
+    const l3 = { ...l1('L3', 0, count - 1, 3), sourceIds: ['L2'] } as SummaryEntry;
+    p.setSummaries([...l1s, l2, l3]);
+    const found = p.audit(ids(0, count - 1)).map((v) => [v.id, v.leafCount, v.holes]);
+    assert.deepEqual(found, [['L2', count - 10, 10], ['L3', count - 10, 10]]);
+  });
+
   test("never-chunked messages inside a span are not holes", () => {
     const p = probe();
     // m-10 is unowned (e.g. a message the chunker skipped): it occupies no position.
@@ -224,6 +377,10 @@ describe('load-time topology audit', () => {
   test("'reject' throws StoreTopologyError; 'report' records and goes critical", () => {
     const { p, store } = crossedFixture();
     assert.throws(() => p.gate(store), (e: unknown) => e instanceof StoreTopologyError && e.violations.length === 1 && /L2-x/.test(e.message));
+    // Wave 2, finding 31: the message says the open that threw has written already
+    // (wave 4, finding 4: the demote and the let-go only where it isn't audit-only).
+    assert.throws(() => p.gate(store), (e: unknown) => e instanceof StoreTopologyError &&
+      e.message.includes('this open has already written its load-time repairs (and, unless it is audit-only, once a host presents, what it demoted and let go of)'));
     const r = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, topologyPolicy: 'report' });
     const { p: fixture } = crossedFixture();
     r.setChunks((fixture as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.map((c) => c.messages.map((m) => m.id)));
@@ -297,7 +454,7 @@ describe('auditOnly opens never mutate the store', () => {
   const wipe = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
   before(wipe);
   after(wipe);
-  test('a plain open chunks the frontier; an audit-only open leaves records and queue untouched', async () => {
+  test('a plain open chunks the frontier; an audit-only open leaves the records untouched', async () => {
     const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) };
     const cfg = { adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 50, recentWindowTokens: 0, targetChunkTokens: 200 };
     const seed = new AutobiographicalStrategy(cfg);
@@ -318,5 +475,25 @@ describe('auditOnly opens never mutate the store', () => {
     const b = await ContextManager.open({ path: STORE, strategy: again, membrane: membrane as never });
     assert.equal(records(again), plainRecords, 'audit-only reads what the plain open wrote and adds nothing');
     b.close();
+  });
+
+  test('an audit-only open enqueues no merges, where a plain open under the same config does', async () => {
+    wipe();
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'a summary' }] }) };
+    const cfg = { compressionModel: 'm', hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 0, recentWindowTokens: 0, targetChunkTokens: 200, minChunkCharsForLLM: 0, l1HoldbackChunks: 0 };
+    const seed = new AutobiographicalStrategy({ ...cfg, mergeThreshold: 1000 });
+    const manager = await ContextManager.open({ path: STORE, strategy: seed, membrane: membrane as never });
+    for (let i = 0; i < 60; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [{ type: 'text', text: `message ${i} ` + 'w '.repeat(30) }]);
+    await manager.compile();
+    for (let ticks = 0; !manager.isReady() && ticks < 200; ticks++) await manager.tick();
+    assert.ok(seed.getStats().l1 >= 2, `premise: the store holds L1s to merge (${seed.getStats().l1})`);
+    manager.close();
+    const pending = async (auditOnly: boolean): Promise<number> => {
+      const strategy = new AutobiographicalStrategy({ ...cfg, mergeThreshold: 2, auditOnly });
+      const m = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+      try { return strategy.getStats().pendingMerges; } finally { m.close(); }
+    };
+    assert.equal(await pending(true), 0);
+    assert.ok(await pending(false) > 0, 'premise: a plain open under the same config enqueues merges');
   });
 });

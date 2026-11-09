@@ -98,7 +98,7 @@ describe('AutobiographicalStrategy: long-context invariants', () => {
           targetChunkTokens: 500,
           recentWindowTokens: 600,
           headWindowTokens: 0,
-          // Disable merges so L1s stay visible. Merging would hide
+          // Merging would hide
           // overlapping L1s behind a `parentId`, masking the bug class
           // this test exists to catch.
           mergeThreshold: 999,
@@ -115,6 +115,8 @@ describe('AutobiographicalStrategy: long-context invariants', () => {
     // --- Per-turn invariants. Fail on first violation; the assertion
     // message names the turn so the repro is one workload-seed away. ---
     for (const turn of result.perTurn) {
+      const merged = turn.snapshot.summaries.find((s) => s.level > 1);
+      assert.equal(merged, undefined, `turn ${turn.turnIndex + 1}: premise: no merge ran, so no L1 is hidden behind a parent`);
       const overlap = findActiveL1Overlap(turn.snapshot);
       if (overlap) {
         assert.fail(

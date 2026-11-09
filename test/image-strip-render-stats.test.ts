@@ -2,9 +2,11 @@
  * Regression: image stripping must run BEFORE the render-stats snapshot is
  * committed and BEFORE cache markers are placed, so that
  *
- *   (a) RenderStats.total reflects the POST-strip context — the real bytes the
- *       agent receives — not the pre-strip size that still counts full image
- *       weight (≈1600 tok) for images replaced by a short text placeholder.
+ *   (a) under adaptive resolution, RenderStats.total reflects the POST-strip
+ *       context — the real bytes the agent receives — not the pre-strip size
+ *       that still counts full image weight (≈1600 tok) for images replaced by
+ *       a short text placeholder. (The hierarchical selection counts a
+ *       stripped image at its full price: see RenderStats.total.)
  *       Pre-fix, getRenderStats() over-reported by ~1592 tok per stripped image
  *       (and image stripping is on by default: maxLiveImages = 6).
  *
@@ -21,7 +23,7 @@ import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-image-strip-render-stats';
-const PLACEHOLDER = 'image dropped from live context';
+const PLACEHOLDER = "image not shown: this context keeps only some images";
 
 function cleanup(): void {
   if (existsSync(TEST_STORE_PATH)) rmSync(TEST_STORE_PATH, { recursive: true, force: true });
@@ -98,7 +100,7 @@ describe('image stripping × render stats', () => {
     }
 
     // And total must be strictly below the pre-strip size — proves the credit bites.
-    const preStrip = expected + stripped * (1600 - Math.ceil('[image dropped from live context]'.length / 4));
+    const preStrip = expected + stripped * (1600 - Math.ceil("[image not shown: this context keeps only some images]".length / 4));
     assert.ok(rs!.total.tokens < preStrip, 'total is the stripped size, not the pre-strip size');
 
     manager.close();

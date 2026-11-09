@@ -1,5 +1,6 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import type { MessageId, StoredContentBlock } from './message.js';
+import type { MessageId, Sequence, StoredContentBlock, StoredMessage } from './message.js';
+import type { RenderStats, RequestIdentity } from './strategy.js';
 
 /**
  * Describes how a context entry relates to its source message.
@@ -40,6 +41,37 @@ export interface ContextEntry {
   /** Internal cache-layout identity when this entry ends one atomic rendered
    * unit. Used to reconcile message markers with accepted solver receipts. */
   cacheLayoutKey?: string;
+  /**
+   * The summaries this entry renders, for a `derived` entry that stands for
+   * folded history (both halves of a recall pair carry it; a combined recall
+   * answer names every summary it concatenates). Strategies that report
+   * their rendered layout (`ContextStrategy.renderedForms`) must set
+   * it on every entry that represents history through a summary: the
+   * compile's layout derives each message's rendered form from it.
+   */
+  summaries?: Array<{ id: string; level: number; partial?: true }>;
+  /**
+   * The tool_use ids whose results a structural repair moved out of this
+   * entry into the entry that answers their tool_use. The request still
+   * carries each result, in that other entry: attribution looks for it by
+   * its tool_use id among every result in the request, so moving a result
+   * is not a loss, while a moved result that was later altered, or is
+   * missing from the request, still is. Where `relocatedBlocks` is set,
+   * attribution looks for those blocks instead, and for a result with the
+   * id still in this entry.
+   */
+  relocatedResults?: string[];
+  /**
+   * The result blocks that repair placed for `relocatedResults`, as it
+   * placed them, one block of its own for each move. Where it's set,
+   * attribution credits a moved result only through one of these blocks
+   * still in the request, unaltered, or through a result with its id still
+   * in this entry that isn't among the blocks repair recorded as placed for
+   * any entry. A stub repair generated, or a copy that releasing a raw form
+   * made of a block it placed, isn't recorded, so either counts as a carrier
+   * wherever it covers the moved result.
+   */
+  relocatedBlocks?: ContentBlock[];
 }
 
 /**
@@ -59,9 +91,9 @@ export interface ContextEntryInternal {
  * Token budget for context compilation.
  */
 export interface TokenBudget {
-  /** Maximum tokens for the context window */
+  /** Total token window, including reserveForResponse. Strategies target maxTokens - reserveForResponse input tokens. */
   maxTokens: number;
-  /** Reserve this many tokens for model response */
+  /** Response tokens withheld from maxTokens before fitting the input context. */
   reserveForResponse: number;
 }
 
@@ -75,6 +107,17 @@ export interface PendingWork {
   estimatedMs?: number;
   /** When the work started */
   started: Date;
+}
+
+/**
+ * Background work that waits on something only the host can give, which
+ * `isReady()` and `getPendingWork()` don't count.
+ */
+export interface WaitingWork {
+  /** 'tools' until the host declares its tool definitions. */
+  waitingOn: 'tools';
+  /** Human-readable description, naming what waits */
+  description: string;
 }
 
 /**
@@ -129,8 +172,12 @@ export interface PlanVsActual {
   delta: number;
   budgetMet: boolean;
   exhausted: boolean;
-  /** Chunks whose resolution the applied frontier changed vs the carried
-   *  state. (Replaced the op-walk's `iterations` when the walk was retired.) */
+  /** Chunks whose saved fold level this compile changed, which is what it
+   *  commits, or for a dry run what it would commit. A locked chunk keeps its
+   *  saved level, so it isn't counted even while a classic pin renders it at
+   *  another. A chunk whose saved level's summary is gone is counted, since
+   *  the compile saves the level it presents. (Replaced the op-walk's
+   *  `iterations` when the walk was retired.) */
   moves: number;
 }
 
@@ -148,7 +195,300 @@ export interface CompileResult {
    * {@link ContextInjection}s; empty when no injections are passed.
    */
   systemInjections: ContentBlock[];
+
+  /**
+   * What each compiled message is a copy of, and the rendered layout this
+   * compile produced. Always set by `ContextManager.compile`; optional in the
+   * type so callers that build a CompileResult by hand (test doubles) still
+   * typecheck. Hand the whole object back to `ContextManager.acceptRound`
+   * once a provider round that carried these messages has succeeded.
+   */
+  provenance?: CompileProvenance;
+
+  /**
+   * The stored messages of every raw body in `provenance`, as this compile
+   * read them, keyed by the body's head (`RawBodySource.messageId`): the
+   * body's members in shard order, head first — one message for an unsharded
+   * body; for a sharded one, every shard of that ingestion, including any the
+   * view filter hid from the strategy. Two ingestions of the same text are
+   * two bodies, each with only its own shards (a group id names content, not
+   * an ingestion). The view may merge auxiliary stores (another namespace's
+   * slot), whose messages `getMessage` cannot resolve, so callers that need
+   * a body's metadata or content read it here. The map is bound to this
+   * compile: a later edit doesn't show through it. Its messages are the
+   * store's own objects, which later compiles read too, so treat them as
+   * read-only. It's transient and isn't part of the persisted provenance.
+   */
+  rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+
+  /**
+   * Where this compile's messages first differ from the last committing
+   * compile's, for every strategy: the index of the first message, injections
+   * included, whose participant or content bytes differ from that compile's
+   * message at the same index, or that has none there. So when this compile
+   * only appended to that one's messages it is the first appended index, and
+   * it equals `messages.length` when these messages are that compile's or a
+   * prefix of them. An injection placed beside the newest user message moves
+   * with each new user message, so after one it's that injection's old index
+   * rather than the first appended one. Null only for the manager's first
+   * committing compile, since the comparison is with what this manager last
+   * compiled, held in memory: a manager opened again, as after a restart,
+   * starts with none. The comparison is by bytes, so it holds across a
+   * branch switch or a new strategy, whichever way the switch was made. The
+   * store's content is taken as the same bytes where it's the same array, so
+   * a block a caller changed in place after storing it, which the store's
+   * contract rules out, isn't seen.
+   * Cache markers don't count, and neither do `systemInjections`, which the
+   * caller adds to the system prompt itself. A dry compile leaves it out and
+   * doesn't move the comparison; a committing compile that returns moves it
+   * whether or not its request is sent, and one that throws doesn't. A
+   * caller can tell from it whether a compile rewrote what the last
+   * committing compile gave, such as a system change it wrote. It's compared
+   * when read, so a compile whose caller never reads it serializes only its
+   * injections, whose bytes a committing compile takes since a caller may
+   * change its own array: read it only where it's used.
+   * Read after later compiles, it still compares this compile with the one
+   * before it. Until it's read, the result keeps this compile's compiled
+   * messages and the last committing compile's, by reference; once read, it
+   * holds the number.
+   */
+  firstChanged?: number | null;
+
+  /**
+   * This compile's render stats, as its select tallied them while emitting
+   * entries: the same accounting `getRenderStats()` gives a live compile.
+   * They describe the selection rather than the exact request: injections
+   * merged in afterwards aren't counted in its buckets or `total` (`request`
+   * prices them when the compile is given the request's overhead), an entry
+   * that mixes tool calls and results counts once though the compile splits
+   * it into several messages,
+   * and the select's last structural passes, which can trim an orphaned tool
+   * call or add a stub tool result, aren't counted either. A live compile's
+   * are the object `ContextManager.getRenderStats()` then returns, so treat
+   * them as read-only. A dry compile's
+   * (`dryRun`) are its own, which `getRenderStats()` never returns, so a host
+   * can show the composition of the request a dry compile built without
+   * sending it. Absent when the strategy records none.
+   */
+  renderStats?: RenderStats;
+
+  /**
+   * Set on a compile with `thinkingBinding.binds` that newly leaves out a
+   * stored reply's thinking, other than one a host noted, after the compile
+   * that wrote the branch's record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`): what, and why (see
+   * `SelectOptions.thinkingBinding`).
+   */
+  thinkingStrip?: ThinkingStrip;
+
+  /**
+   * On every compile with `thinkingBinding.binds`: the branch's sequence
+   * (`JsStore.currentSequence`) when its binding record began, at or above
+   * every message stored before then. A branch that inherits its parent's
+   * record keeps its value, which is at most the branch point; a dry compile
+   * with no record reports what the first record would hold. A reply at or
+   * below it was stored before the context manager recorded what the branch
+   * sent, so the provider may refuse or set aside its thinking without any
+   * strip having missed. Sequences are branch-global across slots, so a
+   * stored message's `sequence` compares with it directly.
+   */
+  thinkingRecordedAfter?: Sequence;
 }
+
+/** What a compile with `thinkingBinding.binds` newly leaves out. */
+export interface ThinkingStrip {
+  /**
+   * The stored bodies (`RawBodySource.messageId`) of the participant's
+   * replies whose thinking this compile leaves out and the compile that
+   * wrote the branch's record didn't, whether or not its request went out:
+   * that compile sent them with their thinking, they were stored since, or
+   * it didn't send them as stored replies at all. A record is written by a
+   * committing compile with `binds`, so a compile without it is passed
+   * over. A reply a host noted, after the compile that wrote the branch's
+   * record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`) is never among them: the
+   * provider's report of that request already told the host.
+   * So a reply can be reported again: one whose thinking went, that a later
+   * compile didn't send, and that renders again. A host that tells each
+   * loss once keeps its own set of what it has told.
+   */
+  newly: MessageId[];
+  /**
+   * `'head'`: an `identity` digest changed, and every message goes without
+   * its thinking. `'first'`: a reply stored before the branch's record
+   * began, which only the drop control lets keep its thinking, goes without
+   * it, as every reply does at a branch's first compile without the control.
+   * `'messages'`: a compiled message differs from the record, and every
+   * message from it on goes without. When a compile has more than one,
+   * `'head'` is given before `'first'`, and `'first'` before `'messages'`.
+   */
+  cause: 'messages' | 'head' | 'first';
+  /** With `'head'`: which digests changed. */
+  changed?: Array<keyof RequestIdentity>;
+}
+
+/** A branch as a compile or receipt saw it: native id, name, creation time. */
+export interface BranchRef {
+  readonly id: string;
+  readonly name: string;
+  /** Chronicle's creation timestamp; with `id`, the branch's identity. */
+  readonly created: number;
+}
+
+/**
+ * A stored body a compiled message carries as a raw copy. For a body stored
+ * as shards (bodyGroupId), `messageId` is the first shard's id — the id
+ * `addMessage` returned — and the body is described as a whole, as stored:
+ * a shard the view filter hid from the strategy still belongs to it.
+ */
+export interface RawBodySource {
+  messageId: MessageId;
+  sequence: number;
+  /**
+   * True only when the whole stored body is in this request unaltered:
+   * every shard present, nothing truncated, no image stripped, no block
+   * removed by a structural repair. A shard the view filter hid is not
+   * present. A group that declared its size (StoredMessage.shardCount) must
+   * also hold all of its declared shards, so one an interrupted write left
+   * short is missing `shards`.
+   *
+   * For a group without a declaration (written before sizes were recorded),
+   * `complete` is weaker: every member stored for it was carried unaltered.
+   * It does not show that the group was ever written whole; an interrupted
+   * write can leave such a group short with nothing to tell it apart.
+   */
+  complete: boolean;
+  /**
+   * Why the body is not complete in this request (absent when complete):
+   * like `complete`, it describes the whole body across the request, not
+   * the copy in one entry, so an entry carrying an intact copy of one shard
+   * still names `content` when another shard arrived altered.
+   */
+  missing?: Array<'shards' | 'content'>;
+}
+
+/** What one compiled message stands for. */
+export type CompiledMessageSources =
+  | { kind: 'raw'; bodies: RawBodySource[] }
+  | { kind: 'summary'; summaries: Array<{ id: string; level: number; partial?: true }> }
+  | { kind: 'injection'; namespace: string }
+  | { kind: 'other' };
+
+/**
+ * One compile's provenance: the per-message sources (parallel to
+ * `CompileResult.messages`) and the rendered layout. Callers carry it with
+ * the request it describes. Everything but `messages` is read-only:
+ * acceptance reads and records what it says, and the mark steers its search
+ * for an earlier acceptance, so a write to any of it before accepting changes
+ * what the journal records. The journal keeps its own copies, so nothing
+ * here is shared with it. The per-message sources are this compile's alone.
+ */
+export interface CompileProvenance {
+  /** Unique per compile. */
+  readonly compileId: string;
+  /** The context manager's namespace (its agent's state scope). */
+  readonly namespace: string;
+  /** The branch this compile read. Acceptance binds to it. */
+  readonly branch: BranchRef;
+  /** Parallel to `CompileResult.messages`. */
+  messages: CompiledMessageSources[];
+  /**
+   * The rendered layout, or null when the strategy does not report one
+   * (see `ContextStrategy.renderedForms`). Opaque to callers.
+   */
+  readonly layout: RenderedLayout | null;
+  /** The active strategy's name. */
+  readonly strategy: string;
+  /**
+   * Where the store's fold journal stood when this compile ran, so that
+   * accepting it again finds its first acceptance without reading the whole
+   * journal (see JournalMark). Absent or null, every record is read. Pass
+   * the provenance back as you got it.
+   */
+  readonly journalMark?: JournalMark | null;
+}
+
+/**
+ * The newest accepted-layout record known durable when a compile ran, and
+ * the compile that record accepted. Any acceptance of the compile was
+ * written after it. A durable record outlives a crash with its id, unless it
+ * is the log's last record and rots: open drops it, and its id can go to a
+ * later record. So only the records after the mark need reading, and a mark
+ * that is gone, or whose id now names another compile, proves nothing, and
+ * every record is read.
+ */
+export interface JournalMark {
+  readonly recordId: string;
+  readonly compileId: string;
+}
+
+/**
+ * A rendered layout: the form every message of the strategy's view took in
+ * one compile. Membership and form are kept apart: `members` names the
+ * view's messages in view order, each by a number it keeps while it stays
+ * in the window, ascending, and `units` partition them in that order, each
+ * covering its `n` next members (a raw unit, one). A message the view
+ * lacked (removed, taken out of the window, filtered out) is in no unit,
+ * however near a range it lies, and every other member keeps its number.
+ * Token estimates are base estimates (before the store's calibration
+ * multiplier), so they compare across compiles.
+ *
+ * What the numbers are depends on the manager's window on the compile's
+ * branch (`keyedBy`, agent-framework #291). While the window is the record
+ * (legacy mode, see ContextManager.windowMode) they are the messages'
+ * store sequences, which ascend in the record's order. Once rows are
+ * presented the window can list them in another order, and they are the
+ * messages' window-index ordinals (ContextManager.ordinalOf), which ascend
+ * in the window's. Before this, a layout was `v: 2`, without `keyedBy` or
+ * `memberSequences`, and its members were store sequences: acceptRound
+ * reads a `v: 2` layout that way, so a provenance an earlier release's
+ * compile returned, carried across the upgrade, is still accepted. A
+ * layout of any other version without `keyedBy` says nothing of what its
+ * members count, and acceptRound refuses it, writing nothing.
+ */
+export interface RenderedLayout {
+  readonly v: 3;
+  /** What `members` count: store sequences while the window is the record, window-index ordinals once rows are presented. */
+  readonly keyedBy: 'sequence' | 'ordinal';
+  /** The view's messages, by `keyedBy`, ascending: the layout's exact membership. */
+  readonly members: readonly number[];
+  /** The members' message ids, parallel to `members`. In memory only: an
+   *  accepted layout persists members, and receipts take ids from the
+   *  compile being accepted. */
+  readonly memberIds: readonly MessageId[];
+  /** The members' store sequences, parallel to `members`: what a receipt
+   *  names a message by (`FoldSpanBound.sequence`), whatever `keyedBy` is.
+   *  Keyed by sequence, the same as `members`; keyed by ordinal, in window
+   *  order, which need not ascend. In memory only, as `memberIds`. */
+  readonly memberSequences: readonly number[];
+  readonly units: readonly LayoutUnit[];
+  /** Base-estimate tokens of everything this compile rendered. */
+  readonly totalTokens: number;
+  /** The store calibration multiplier when the compile ran. */
+  readonly calibration: number;
+  /** Why the strategy says this compile's layout changed, when it knows. */
+  readonly cause?: string;
+}
+
+/**
+ * One unit of a rendered layout: a form and how many consecutive members it
+ * covers. Units carry no membership, so their size follows what was
+ * rendered, not how much history lies behind it. Field names are short:
+ * units persist.
+ */
+export type LayoutUnit =
+  /** One message rendered raw: its rendered tokens; `p` when the copy was partial. */
+  | { readonly k: 'r'; readonly t: number; readonly p?: 1 }
+  /**
+   * `n` members rendered through these summaries, each as
+   * `[id, level, method, partial, tokens]` (partial 1 when the summary's
+   * text was cut; tokens: the summary's rendered tokens in this compile),
+   * sorted by id. A summary that renders several units names its tokens in
+   * each; comparisons count it once per side.
+   */
+  | { readonly k: 's'; readonly n: number; readonly sm: ReadonlyArray<readonly [string, number, string, 0 | 1, number]> }
+  /** `n` members not rendered at all. */
+  | { readonly k: 'o'; readonly n: number };
 
 /**
  * Branch information.

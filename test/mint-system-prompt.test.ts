@@ -32,12 +32,12 @@
  * that both mint families carry the set prompt, that it leads the request
  * rather than being spliced into the replayed messages, that an undeclared
  * host leaves the pre-threading request shape untouched, and that
- * KnowledgeStrategy inherits it. One pins the SLOT — 'an empty or undefined
- * later call never downgrades a recorded prompt' — which is last-value-wins
- * behaviour, not history: it asserts that a later push replaces the recorded
- * value and that an empty push does not blank it. No case here asserts that a
- * mint receives the prompt that was in force during the span it compresses,
- * because the mechanism does not retain one.
+ * KnowledgeStrategy inherits it. Two pin the SLOT, which is last-value-wins
+ * behaviour, not history: 'a later non-empty call replaces the recorded
+ * prompt' and 'an empty or undefined later call never downgrades a recorded
+ * prompt'. No case here asserts that a mint receives the prompt that was in
+ * force during the span it compresses, because the mechanism does not retain
+ * one.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -223,6 +223,17 @@ describe('Mint requests: the host system prompt', () => {
     const calls = await runWorkload({
       systemPrompt: ZZ_SYSTEM_PROMPT,
       laterSystemPrompts: ['', undefined],
+    });
+    assert.ok(calls.length > 0, 'expected mint calls');
+    for (const request of calls) {
+      assert.strictEqual(request.system, ZZ_SYSTEM_PROMPT);
+    }
+  });
+
+  it('a later non-empty call replaces the recorded prompt', async () => {
+    const calls = await runWorkload({
+      systemPrompt: 'You are zz-predecessor, whose prompt a later push replaces.',
+      laterSystemPrompts: [ZZ_SYSTEM_PROMPT],
     });
     assert.ok(calls.length > 0, 'expected mint calls');
     for (const request of calls) {

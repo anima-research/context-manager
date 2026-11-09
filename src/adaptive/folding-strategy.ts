@@ -55,6 +55,13 @@ export interface FoldingBudget {
   targetBudget: number;
   /** Slack ratio (e.g., 0.1 for 10%). */
   slack: number;
+  /** The plan size above which the caller refuses the compile, which
+   *  AutobiographicalStrategy passes as floor(totalBudget × (1 +
+   *  overBudgetGraceRatio)). totalBudget when absent. Solvers still fold
+   *  toward targetBudget within totalBudget; the greedy solvers read it
+   *  only to return the plan their earlier rule gives wherever the caller
+   *  accepts that plan (runGreedy). */
+  rejectionBudget?: number;
 }
 
 /** The complete result of one solve. */
@@ -67,6 +74,13 @@ export interface FoldingSolution {
    * silently absorbed).
    */
   frontier: ReadonlyMap<ChunkId, number>;
+  /**
+   * The same assignment as `frontier`, as the level per chunk sequence, when
+   * the live chunks' sequences are exactly 0..n-1 (one per index). Lets the
+   * picker and the strategy read a level by position without building or
+   * probing a map per chunk; `frontier` stays the contract.
+   */
+  levelsBySequence?: ArrayLike<number>;
   /** Summaries the solver wanted but that don't exist yet. */
   produced: ProduceRequest[];
   /**

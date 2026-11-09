@@ -47,6 +47,7 @@ import { readdirSync, statSync, writeFileSync, createReadStream } from 'node:fs'
 import { createGunzip } from 'node:zlib';
 import { join, basename } from 'node:path';
 import { createInterface } from 'node:readline';
+import { storedJson } from '../src/stored-json.js';
 
 interface ReasoningBlock {
   type: 'thinking' | 'redacted_thinking' | 'text';
@@ -326,7 +327,7 @@ let edited = 0;
 for (const [slot, blocks] of matchedSlots) {
   const s = stored[slot] as SummaryEntry;
   const updated = { ...s, responseContent: blocks };
-  store.editStateItem(SUMS, slot, Buffer.from(JSON.stringify(updated)));
+  store.editStateItem(SUMS, slot, storedJson(updated));
   edited++;
 }
 store.close();

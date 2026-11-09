@@ -20,6 +20,8 @@ import { replaySession } from '../../src/adaptive/kv-replay.js';
 import { replayControlled } from '../../src/adaptive/kv-control.js';
 import { buildChronicleWithChain, type MockChronicle } from './harness.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
+import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.js';
+import type { FoldingBudget } from '../../src/adaptive/folding-strategy.js';
 
 function inputsOf(ch: MockChronicle): PickerInputs {
   return {
@@ -123,4 +125,20 @@ test('controller (kv-stable) is no worse than the flat baseline on average per-t
     kv.rmsPerturbation <= flatRms * 1.05,
     `controller RMS perturbation ${kv.rmsPerturbation.toFixed(0)} ≤ flat ${flatRms.toFixed(0)} (×1.05)`,
   );
+});
+
+test('the baseline hands its solver the line a compile refuses above, the budget plus the default grace', () => {
+  const seen: Array<FoldingBudget['rejectionBudget']> = [];
+  const solve = FlatProfileStrategy.prototype.solve;
+  FlatProfileStrategy.prototype.solve = function (this: FlatProfileStrategy, ...args: Parameters<typeof solve>) {
+    seen.push(args[1].rejectionBudget);
+    return solve.apply(this, args);
+  };
+  try {
+    replaySession(session(), { budgetTokens: 10000, targetSteps: 3 });
+  } finally {
+    FlatProfileStrategy.prototype.solve = solve;
+  }
+  assert.ok(seen.length > 0, 'premise: the baseline solved');
+  assert.deepEqual([...new Set(seen)], [10200]);
 });

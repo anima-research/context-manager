@@ -1,0 +1,632 @@
+/**
+ * Content that matches `ContentBlock` where its readers read it. Content is
+ * an array, every block in it an object, not an array, whose `type` is a
+ * string, and the field that carries a block's content has its type:
+ *   - a `text` block's `text` and a `thinking` block's `thinking` are strings;
+ *   - a `tool_use`'s `input` is an object, not null and not an array;
+ *   - a `tool_result`'s `content` is a string, or an array of such blocks,
+ *     at any depth;
+ *   - an `image`, `document`, `audio` or `video` block's `source` is an
+ *     object, and a `generated_image`'s `data` and `mimeType` are strings.
+ * A write also refuses inline media the store can't keep as a blob, by the
+ * store's own rules (stored-media.ts): data its read of base64 can't take,
+ * which only data that isn't a string can be, since any string reads as
+ * base64, or no media type, neither a declared one nor, for an image, one
+ * its data's signature names. The store keeps a block of the content as a
+ * blob, not media inside a `tool_result`, which it keeps as given.
+ * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
+ * still refuse a block without, and nothing else of a media source, such as
+ * a URL image's URL, which the formatters and the providers read. A
+ * `system_change` (membrane's SystemChangeContent) carries its content in
+ * `removeTools` and `addSystem`, arrays of strings, and `defineTools`, an
+ * array of tool definitions, each where present. A definition has the
+ * fields membrane's ToolDefinition types and sends to the provider with every
+ * later request: a non-empty string `name`, a string `description` and an
+ * object `inputSchema` whose `type` is `'object'`, which the API requires.
+ * Or it carries `effort`, one of the levels membrane's type and the API name
+ * (`low`, `medium`, `high`, `xhigh`, `max`), beside no change of tools or
+ * system text (an empty array changes nothing). One stands alone in its
+ * message, at its top level, and one carrying effort holds its message
+ * alone: membrane sends such a message as a system message of its own, and
+ * refuses one that mixes it with other blocks, and an effort change beside
+ * another change, in its block or its message. A write refuses one that
+ * doesn't, and a read leaves it out. A
+ * block of a type none of these names passes as it is, since membrane adds
+ * types: whether a provider can take one is the provider's to say. One type is the
+ * store's own: a `blob_ref`, which the store writes in place of inline media.
+ * A write can't give one, and a read takes one whose `ref` is an object with
+ * a string `hash` and an `originalType` of image, document, audio or video,
+ * which is what a read turns the blob back into, and, but for an image, a
+ * string `mediaType`: a read gives an image the type its bytes' signature
+ * names, where they carry one, and nothing else names a document's, audio's
+ * or video's. The rule holds at any depth, as the read's other checks do.
+ * Three shapes a read gives still meet a write's refusal, each in a record
+ * the store's writes don't make: inline media at the top of the content,
+ * where the store keeps a blob, whose source it can't keep as one
+ * (unstorableSource: data it can't read, or no media type it can give it); a
+ * `blob_ref` the read takes inside a `tool_result`, which resolution leaves
+ * as it is, since it resolves the content's own blocks; and an image's
+ * `blob_ref` without a string `mediaType` whose bytes carry no signature
+ * (refHasMediaType). Leaving out the first two would take a read that knows
+ * where a block sits, which these walks don't.
+ *
+ * Every reader of stored content, from the token estimators to compression
+ * and the formatters, is written against `ContentBlock`, and a reader that
+ * meets content that doesn't match it can throw. A stored message holding a
+ * block that isn't an object, or a `blob_ref` without a `ref` or whose
+ * `originalType` isn't image, document, audio or video, made every compile
+ * throw under the passthrough and windowed strategies, after a reopen too,
+ * and made opening the store throw under the autobiographical one, until
+ * someone edited the store by hand. Under the autobiographical strategy,
+ * whose token estimate reads the field's length, opening a store holding a
+ * text or thinking block missing its text or thinking threw too.
+ *
+ * So a write mends what released providers produce, and refuses the rest
+ * ({@link contentForWrite}). A read leaves out or mends what doesn't match
+ * ({@link wellFormedContent}), for a store written before the refusal, which
+ * keeps the content as written. The mend both share is a `tool_use` whose
+ * `input` isn't an object, as membrane 0.5.87's adapters can give it: `input`
+ * becomes `{}`, and `unparseableInput`, where membrane keeps arguments whose
+ * JSON didn't parse, keeps the value as JSON (mendedToolUse). A read also
+ * mends media in MCP's form, which carries its `data` and `mimeType` on the
+ * block and has no `source`: they become its base64 source, as
+ * agent-framework converts it (mendedMedia). A write refuses that form,
+ * naming where it is, since it isn't a `ContentBlock`.
+ *
+ * Content is walked with index loops throughout: a hole in an array reads as
+ * undefined, so it is named and refused like any other. (A stored record has
+ * no holes, since JSON writes a hole as null.) The walks recurse once per
+ * `tool_result` level, so content nested deeper than the call stack allows
+ * throws a RangeError instead of being named. Content that contains itself,
+ * through a `tool_result`'s content, always does, and JSON can't produce it.
+ */
+
+import type { Diagnostics } from './diagnostics.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredContentBlock } from './types/index.js';
+import { releaseEditedRawForms } from './raw-forms.js';
+import { unstorableSource } from './stored-media.js';
+
+/** A write, which mends only a `tool_use`'s input and refuses the rest, or a read of stored content. */
+type Side = 'write' | 'read';
+
+/** An object that isn't an array: what a block, a `tool_use`'s `input` and a media `source` must be. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** What a value is, for the line that names it: "null", "undefined", "an array", "a string", "an object". */
+function kindOf(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (Array.isArray(value)) return 'an array';
+  const type = typeof value;
+  return `${/^[aeiou]/.test(type) ? 'an' : 'a'} ${type}`;
+}
+
+/** The block types whose `source` carries their media. */
+const MEDIA_TYPES: ReadonlySet<string> = new Set(['image', 'document', 'audio', 'video']);
+
+/** Whether a value is a system change (membrane's `system_change` block, SystemChangeContent). */
+function isSystemChange(value: unknown): boolean {
+  return isRecord(value) && value.type === 'system_change';
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+/**
+ * Whether a value is a tool definition as membrane reads one (ToolDefinition):
+ * a non-empty string `name`, a string `description` and an object
+ * `inputSchema` whose `type` is `'object'`. Membrane sends each to the
+ * provider with every request from the change on, so one without them would
+ * be refused on every request: the API refuses a definition whose schema has
+ * no `type`, or another, with a 400.
+ */
+function isToolDefinition(value: unknown): boolean {
+  return isRecord(value) && typeof value.name === 'string' && value.name !== '' &&
+    typeof value.description === 'string' && isRecord(value.inputSchema) && value.inputSchema.type === 'object';
+}
+
+function stringPlaces(value: unknown, at: string, places: string[], what: string): void {
+  if (typeof value !== 'string') places.push(`${at} is ${kindOf(value)}, not ${what}`);
+}
+
+function toolDefinitionPlaces(value: unknown, at: string, places: string[]): void {
+  if (!isRecord(value)) {
+    places.push(`${at} is ${kindOf(value)}, not a tool definition (an object)`);
+    return;
+  }
+  if (value.name === '') places.push(`${at}.name is an empty string, not a tool name`);
+  else stringPlaces(value.name, `${at}.name`, places, 'a tool name (a string)');
+  stringPlaces(value.description, `${at}.description`, places, 'a string');
+  if (!isRecord(value.inputSchema)) places.push(`${at}.inputSchema is ${kindOf(value.inputSchema)}, not a JSON Schema (an object)`);
+  else if (value.inputSchema.type !== 'object') places.push(`${at}.inputSchema.type is ${kindOf(value.inputSchema.type)}, not 'object'`);
+}
+
+/**
+ * Whether every element of the content is a system change. An index loop, so
+ * a hole counts as an element that isn't one, as every walk here names a hole
+ * and refuses it like any other.
+ */
+function standsAlone(content: readonly unknown[]): boolean {
+  for (let i = 0; i < content.length; i++) if (!isSystemChange(content[i])) return false;
+  return true;
+}
+
+/** Whether any element of the content is a system change (a hole isn't one). */
+function holdsChange(content: readonly unknown[]): boolean {
+  for (let i = 0; i < content.length; i++) if (isSystemChange(content[i])) return true;
+  return false;
+}
+
+/** Whether a value is absent, or an array whose every element passes `each`. */
+function absentOrArrayOf(value: unknown, each: (element: unknown) => boolean): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  for (let i = 0; i < value.length; i++) if (!each(value[i])) return false;
+  return true;
+}
+
+/**
+ * The fields of a system change that carry its content, as membrane reads
+ * them when it sends the change: names to withdraw and system texts as arrays
+ * of strings, and definitions as an array of tool definitions
+ * (isToolDefinition), each where present. Each with the places an element
+ * that fails names.
+ */
+const SYSTEM_CHANGE_FIELDS: ReadonlyArray<readonly [
+  field: string,
+  each: (element: unknown) => boolean,
+  what: string,
+  elementPlaces: (element: unknown, at: string, places: string[]) => void,
+]> = [
+  ['removeTools', isString, 'an array of tool names', (v, at, places) => stringPlaces(v, at, places, 'a tool name (a string)')],
+  ['defineTools', isToolDefinition, 'an array of tool definitions', toolDefinitionPlaces],
+  ['addSystem', isString, 'an array of strings', (v, at, places) => stringPlaces(v, at, places, 'a string')],
+];
+
+/**
+ * The levels membrane's SystemChangeContent takes for `effort`, which the API
+ * lists for `output_config.effort`. Kept here, not read from membrane, since
+ * the membrane releases this package's range admits have no such list.
+ */
+const EFFORT_LEVELS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function carriesEffort(value: unknown): boolean {
+  return isSystemChange(value) && (value as Record<string, unknown>).effort !== undefined;
+}
+
+/**
+ * The fields of a change that change tools or system text and hold something,
+ * in SYSTEM_CHANGE_FIELDS' order: membrane counts such a field as a change
+ * beside `effort` only when it holds something.
+ */
+function changesBesideEffort(block: Record<string, unknown>): string[] {
+  return SYSTEM_CHANGE_FIELDS.map(([field]) => field)
+    .filter((field) => Array.isArray(block[field]) && (block[field] as unknown[]).length > 0);
+}
+
+function systemChangeWellFormed(block: Record<string, unknown>): boolean {
+  for (const [field, each] of SYSTEM_CHANGE_FIELDS) if (!absentOrArrayOf(block[field], each)) return false;
+  return block.effort === undefined || (EFFORT_LEVELS.has(block.effort as string) && changesBesideEffort(block).length === 0);
+}
+
+function systemChangePlaces(block: Record<string, unknown>, at: string, places: string[]): void {
+  for (const [field, each, what, elementPlaces] of SYSTEM_CHANGE_FIELDS) {
+    const value = block[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value)) {
+      places.push(`${at}.${field} is ${kindOf(value)}, not ${what}`);
+      continue;
+    }
+    for (let i = 0; i < value.length; i++) {
+      if (!each(value[i])) elementPlaces(value[i], `${at}.${field}[${i}]`, places);
+    }
+  }
+  const effort = block.effort;
+  if (effort === undefined) return;
+  if (!EFFORT_LEVELS.has(effort as string)) {
+    places.push(`${at}.effort is ${typeof effort === 'string' ? JSON.stringify(effort) : kindOf(effort)}, not low, medium, high, xhigh or max`);
+  }
+  const beside = changesBesideEffort(block);
+  if (beside.length > 0) {
+    const named = beside.length === 1 ? beside[0] : `${beside.slice(0, -1).join(', ')} and ${beside.at(-1)}`;
+    places.push(`${at} carries effort beside ${named}; a system change carrying effort changes nothing else`);
+  }
+}
+
+/** Whether a block matches where its readers read it, without allocating: each side's common case. */
+function wellFormed(block: unknown, side: Side): boolean {
+  if (!isRecord(block)) return false;
+  const type = block.type;
+  if (typeof type !== 'string') return false;
+  switch (type) {
+    case 'text':
+      return typeof block.text === 'string';
+    case 'thinking':
+      return typeof block.thinking === 'string';
+    case 'tool_use':
+      return isRecord(block.input);
+    case 'tool_result': {
+      const inner = block.content;
+      if (typeof inner === 'string') return true;
+      if (!Array.isArray(inner)) return false;
+      for (let i = 0; i < inner.length; i++) {
+        if (!wellFormed(inner[i], side) || isSystemChange(inner[i])) return false;
+      }
+      return true;
+    }
+    case 'system_change':
+      return systemChangeWellFormed(block);
+    case 'generated_image':
+      return typeof block.data === 'string' && typeof block.mimeType === 'string';
+    case 'blob_ref':
+      return (
+        side === 'read' &&
+        isRecord(block.ref) &&
+        typeof block.ref.hash === 'string' &&
+        MEDIA_TYPES.has(block.ref.originalType as string) &&
+        refHasMediaType(block.ref)
+      );
+    default:
+      return MEDIA_TYPES.has(type) ? isRecord(block.source) : true;
+  }
+}
+
+/**
+ * Whether a blob reference of a known `originalType` names the media type it
+ * reads back with: a string `mediaType`, which nothing else names for a
+ * document, audio or video, and without which a write refuses the media it
+ * reads back as. An image's reference passes whatever its `mediaType` holds,
+ * since a read gives an image the type its bytes' signature names
+ * (blockFromBlob), and only the blob's bytes can say whether they carry one:
+ * an image whose bytes carry no png, jpeg, gif or webp signature still reads
+ * back with the reference's `mediaType`, which a write refuses unless it's a
+ * string.
+ */
+function refHasMediaType(ref: Record<string, unknown>): boolean {
+  return typeof ref.mediaType === 'string' || ref.originalType === 'image';
+}
+
+/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource). */
+function storeRefuses(block: unknown): boolean {
+  return (
+    isRecord(block) &&
+    MEDIA_TYPES.has(block.type as string) &&
+    isRecord(block.source) &&
+    unstorableSource(block as unknown as ContentBlock) !== null
+  );
+}
+
+function allWellFormed(content: readonly unknown[], side: Side): boolean {
+  let changes = 0;
+  let effort = false;
+  for (let i = 0; i < content.length; i++) {
+    if (!wellFormed(content[i], side) || (side === 'write' && storeRefuses(content[i]))) return false;
+    if (isSystemChange(content[i])) changes++;
+    if (carriesEffort(content[i])) effort = true;
+  }
+  // A message holding a system change holds nothing else, and one holding an effort change holds only it.
+  return changes === 0 || (changes === content.length && (!effort || content.length === 1));
+}
+
+/**
+ * A `tool_use` whose `input` isn't an object, mended so that it can't pass
+ * for the model's arguments: `input` is `{}`, and `unparseableInput`, where
+ * membrane keeps arguments whose JSON didn't parse, keeps the value as JSON.
+ * No value at all is a call with no arguments, and isn't marked. A string
+ * marker the block already carries is kept. Undefined for a value with no
+ * JSON form (a bigint, a function, an array that contains itself), which a
+ * write then refuses by name.
+ */
+function mendedToolUse(block: Record<string, unknown>): ContentBlock | undefined {
+  const value = block.input;
+  if (value === undefined || typeof block.unparseableInput === 'string') {
+    return { ...block, input: {} } as unknown as ContentBlock;
+  }
+  let kept: string | undefined;
+  try {
+    kept = JSON.stringify(value);
+  } catch {
+    kept = undefined;
+  }
+  if (kept === undefined) return undefined;
+  return { ...block, input: {}, unparseableInput: kept } as unknown as ContentBlock;
+}
+
+/**
+ * Media in MCP's form, an image, document, audio or video block with no
+ * `source` object whose `data` and `mimeType` are strings, mended to
+ * `ContentBlock`'s form: they become its base64 source, as agent-framework
+ * converts MCP's media, and the block keeps its other fields. Undefined for
+ * media without the data or media type to make a source.
+ */
+function mendedMedia(block: Record<string, unknown>): ContentBlock | undefined {
+  const { data, mimeType, ...rest } = block;
+  if (typeof data !== 'string' || typeof mimeType !== 'string') return undefined;
+  return { ...rest, source: { type: 'base64', data, mediaType: mimeType } } as unknown as ContentBlock;
+}
+
+/**
+ * Each place in `block` that doesn't match on `side`, as a phrase naming its
+ * path from `at` ("content[2] is a string, not a content block",
+ * "content[0].content is null, not a string or an array of content blocks"),
+ * added to `places` in content order. On a write, a `tool_use` input it
+ * mends isn't a place.
+ */
+function placesIn(block: unknown, at: string, places: string[], side: Side): void {
+  if (!isRecord(block)) {
+    places.push(`${at} is ${kindOf(block)}, not a content block`);
+    return;
+  }
+  const type = block.type;
+  if (typeof type !== 'string') {
+    places.push(`${at}.type is ${kindOf(type)}, not a string`);
+    return;
+  }
+  switch (type) {
+    case 'text':
+      if (typeof block.text !== 'string') places.push(`${at}.text is ${kindOf(block.text)}, not a string`);
+      return;
+    case 'thinking':
+      if (typeof block.thinking !== 'string') places.push(`${at}.thinking is ${kindOf(block.thinking)}, not a string`);
+      return;
+    case 'tool_use':
+      if (isRecord(block.input)) return;
+      if (side === 'write' && mendedToolUse(block)) return;
+      places.push(`${at}.input is ${kindOf(block.input)}, not an object`);
+      return;
+    case 'tool_result': {
+      const inner = block.content;
+      if (typeof inner === 'string') return;
+      if (!Array.isArray(inner)) {
+        places.push(`${at}.content is ${kindOf(inner)}, not a string or an array of content blocks`);
+        return;
+      }
+      for (let i = 0; i < inner.length; i++) {
+        if (isSystemChange(inner[i])) {
+          places.push(`${at}.content[${i}] is a system_change inside a tool_result; a system change goes in a message of its own`);
+        } else {
+          placesIn(inner[i], `${at}.content[${i}]`, places, side);
+        }
+      }
+      return;
+    }
+    case 'system_change':
+      systemChangePlaces(block, at, places);
+      return;
+    case 'generated_image':
+      if (typeof block.data !== 'string') places.push(`${at}.data is ${kindOf(block.data)}, not a string`);
+      if (typeof block.mimeType !== 'string') places.push(`${at}.mimeType is ${kindOf(block.mimeType)}, not a string`);
+      return;
+    case 'blob_ref':
+      if (side === 'write') {
+        places.push(`${at} is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write)`);
+      } else if (!isRecord(block.ref) || typeof block.ref.hash !== 'string') {
+        places.push(`${at}.ref is ${isRecord(block.ref) ? 'an object without a string hash' : kindOf(block.ref)}, not a blob reference`);
+      } else if (!MEDIA_TYPES.has(block.ref.originalType as string)) {
+        const originalType = block.ref.originalType;
+        places.push(
+          `${at}.ref.originalType is ${typeof originalType === 'string' ? JSON.stringify(originalType) : kindOf(originalType)}, ` +
+            'not image, document, audio or video',
+        );
+      } else if (!refHasMediaType(block.ref)) {
+        places.push(`${at}.ref.mediaType is ${kindOf(block.ref.mediaType)}, not a string`);
+      }
+      return;
+    default:
+      if (MEDIA_TYPES.has(type) && !isRecord(block.source)) places.push(`${at}.source is ${kindOf(block.source)}, not an object`);
+  }
+}
+
+/** The places of inline media in `block`, a block of the content, that the store can't keep, as phrases from `at`. */
+function storePlacesIn(block: unknown, at: string, places: string[]): void {
+  if (!storeRefuses(block)) return;
+  const { type, source } = block as { type: string; source: Record<string, unknown> };
+  const unstorable = unstorableSource(block as unknown as ContentBlock)!;
+  if (unstorable.data) places.push(`${at}.source.data is ${kindOf(source.data)}, not base64 data`);
+  if (unstorable.mediaType) {
+    places.push(
+      `${at}.source.mediaType is ${kindOf(source.mediaType)}, not a string` +
+        (type === 'image' && !unstorable.data ? ", and the image's data has no png, jpeg, gif or webp signature" : ''),
+    );
+  }
+}
+
+function malformedPlaces(content: readonly unknown[], side: Side, at = 'content'): string[] {
+  const places: string[] = [];
+  const mixed = !standsAlone(content) && holdsChange(content);
+  for (let i = 0; i < content.length; i++) {
+    placesIn(content[i], `${at}[${i}]`, places, side);
+    if (side === 'write') storePlacesIn(content[i], `${at}[${i}]`, places);
+    if (mixed && isSystemChange(content[i])) {
+      places.push(`${at}[${i}] is a system_change beside other blocks; a system change goes in a message of its own`);
+    } else if (content.length > 1 && carriesEffort(content[i])) {
+      places.push(`${at}[${i}] carries effort beside other blocks; a system change carrying effort goes in a message of its own`);
+    }
+  }
+  return places;
+}
+
+/** The place naming content that isn't an array. */
+function notAnArray(content: unknown): string {
+  return `content is ${kindOf(content)}, not an array of content blocks`;
+}
+
+/**
+ * Where `content` doesn't match `ContentBlock`, as this boundary refuses it
+ * on write: one phrase per place, naming its path ("content[2] is a string,
+ * not a content block"), in content order, or the one place "content is
+ * null, not an array of content blocks". A `tool_use` whose input isn't an
+ * object is a place only when a write can't mend it (contentForWrite): when
+ * the input has no JSON form. Non-throwing for content nested no deeper
+ * than the call stack allows, which content that contains itself never is
+ * (JSON can't produce it), for a host that checks content before it queues
+ * it.
+ */
+export function malformedContentPlaces(content: unknown): string[] {
+  if (!Array.isArray(content)) return [notAnArray(content)];
+  return allWellFormed(content, 'write') ? [] : malformedPlaces(content, 'write');
+}
+
+/** A write refused because its content doesn't match `ContentBlock`; `places` is malformedContentPlaces' answer for it. */
+export class MalformedContentError extends Error {
+  readonly places: readonly string[];
+
+  constructor(what: string, places: readonly string[]) {
+    super(`${what}: ${places.join('; ')}.`);
+    this.name = 'MalformedContentError';
+    this.places = places;
+  }
+}
+
+/**
+ * Content as a write stores it. Content that matches is returned as it is.
+ * A `tool_use` whose input isn't an object is mended (mendedToolUse), at any
+ * depth, and every block that shares a raw replay form with one mended gives
+ * that form up (raw-forms.ts), as a read's mend does, so a write stores what
+ * a read of the unmended content would give. Anything else that doesn't
+ * match is refused before anything of it is stored, with a
+ * MalformedContentError whose `places` are malformedContentPlaces'. `what`
+ * opens its message ("Message refused", "Edit of m-12 refused").
+ */
+export function contentForWrite(content: ContentBlock[], what: string): ContentBlock[] {
+  if (!Array.isArray(content)) throw new MalformedContentError(what, [notAnArray(content)]);
+  if (allWellFormed(content, 'write')) return content;
+  const places = malformedContentPlaces(content);
+  if (places.length > 0) throw new MalformedContentError(what, places);
+  return transformed(content, 'write');
+}
+
+/** As contentForWrite, for one block, whose places are named from `block`. */
+export function blockForWrite(block: ContentBlock, what: string): ContentBlock {
+  if (wellFormed(block, 'write') && !storeRefuses(block)) return block;
+  const places: string[] = [];
+  placesIn(block, 'block', places, 'write');
+  storePlacesIn(block, 'block', places);
+  if (places.length > 0) throw new MalformedContentError(what, places);
+  return transformed([block], 'write')[0]!;
+}
+
+/**
+ * One level of content as `side` gives it (writeBlock, readBlock). Every
+ * block that shares a raw replay form with a block changed or left out gives
+ * that form up, as after any edit (raw-forms.ts), since replaying it would
+ * carry what was left out. A `tool_result`'s content goes through here too,
+ * so each level is reconciled on its own, and a block mended inside a
+ * `tool_result` gives up its form like one at the top.
+ */
+function transformed(content: readonly unknown[], side: Side, nested = false): ContentBlock[] {
+  // A system change that doesn't stand alone in its message, at its top
+  // level, or carries effort beside another block there, is left out by a
+  // read, and a write has refused it already.
+  const changesStand = !nested && standsAlone(content);
+  const before: ContentBlock[] = [];
+  const after: ContentBlock[] = [];
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i];
+    // A value that isn't an object, or is an array, carries no raw form. A
+    // read leaves it out, and a write has refused it already.
+    if (!isRecord(block)) continue;
+    before.push(block as unknown as ContentBlock);
+    const out = isSystemChange(block) && (!changesStand || (content.length > 1 && carriesEffort(block)))
+      ? undefined
+      : side === 'write' ? writeBlock(block) : readBlock(block);
+    if (out) after.push(out);
+  }
+  return releaseEditedRawForms(before, after);
+}
+
+/** A block as a write stores it, once nothing in it is refused: the block itself, or with its `tool_use` inputs mended. */
+function writeBlock(block: Record<string, unknown>): ContentBlock {
+  if (wellFormed(block, 'write')) return block as unknown as ContentBlock;
+  if (block.type === 'tool_use') return mendedToolUse(block)!;
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    return { ...block, content: transformed(block.content, 'write', true) } as unknown as ContentBlock;
+  }
+  return block as unknown as ContentBlock;
+}
+
+/**
+ * A block as a read gives it: the block itself when it matches. Otherwise a
+ * `tool_use` is mended (mendedToolUse, or `{}` alone), a signed thinking
+ * block keeps its signature with `thinking: ''`, as membrane gives a
+ * signature-only block, media in MCP's form gets its base64 source
+ * (mendedMedia), and a `tool_result` keeps its content blocks that match, so
+ * that the pair they make survives: its content as a read gives an array of
+ * them, a lone block as an array of that block when the read keeps it, and a
+ * number as its text; anything else is an empty array. Anything else is left
+ * out (undefined): a value that isn't an object, an array, a block without a
+ * string `type`, a text block without its string, unsigned thinking without
+ * its string, media without a source or the data and media type to make
+ * one, a generated image without its data or media type, a `blob_ref`
+ * that doesn't reference a blob, whose `originalType` isn't image, document,
+ * audio or video, or, for a document, audio or video, without a string
+ * `mediaType`, and a `system_change` whose `removeTools`, `defineTools` or
+ * `addSystem` isn't the array its content needs (one element of
+ * `defineTools` that isn't a tool definition leaves the whole change out),
+ * whose `effort` isn't one of membrane's levels or sits beside a change of
+ * tools or system text, or that doesn't stand alone in its message, at its
+ * top level, or carries effort beside another block there (transformed).
+ */
+function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
+  if (wellFormed(block, 'read')) return block as unknown as ContentBlock;
+  switch (block.type) {
+    case 'tool_use':
+      return mendedToolUse(block) ?? ({ ...block, input: {} } as unknown as ContentBlock);
+    case 'thinking':
+      return typeof block.signature === 'string' ? ({ ...block, thinking: '' } as unknown as ContentBlock) : undefined;
+    case 'image':
+    case 'document':
+    case 'audio':
+    case 'video':
+      return mendedMedia(block);
+    case 'tool_result': {
+      const inner = block.content;
+      const content = Array.isArray(inner)
+        ? transformed(inner, 'read', true)
+        : isRecord(inner)
+          ? transformed([inner], 'read', true)
+          : typeof inner === 'number'
+            ? String(inner)
+            : [];
+      return { ...block, content } as unknown as ContentBlock;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Stored content as a read gives it: what doesn't match is left out or
+ * mended (readBlock), at any depth, and the store keeps the content as
+ * written. Content that isn't an array reads as empty. Content that matches
+ * is returned as it is. The first read of a
+ * record logs one line naming where it doesn't match, once per instance.
+ * `logged` keys it by `where` and those places, so a record that comes to
+ * have another's label, such as a context entry at an index that a
+ * replacement or another branch gives another entry, logs its own line
+ * unless the same places are wrong in it. `where` names the record
+ * ("message m-12", "context entry 3").
+ */
+export function wellFormedContent(
+  content: StoredContentBlock[],
+  where: string,
+  logged: Set<string>,
+  /** Where the line goes: a namespace's diagnostics, for a record of its own state (#239). */
+  log: Diagnostics = console,
+): StoredContentBlock[] {
+  const array = Array.isArray(content);
+  if (array && allWellFormed(content, 'read')) return content;
+  const places = array ? malformedPlaces(content, 'read').join('; ') : notAnArray(content);
+  const key = `${where}\u0000${places}`;
+  if (!logged.has(key)) {
+    logged.add(key);
+    log.error(
+      `[context-manager] ${where}: reads leave out or mend what doesn't match ContentBlock (${places}); ` +
+        'the store keeps it as written',
+    );
+  }
+  return array ? (transformed(content, 'read') as StoredContentBlock[]) : [];
+}

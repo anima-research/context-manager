@@ -1,3 +1,4 @@
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -18,6 +19,40 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
+import { contentForWrite, wellFormedContent } from './well-formed-content.js';
+import { storedJson } from './stored-json.js';
+
+/** Whether content, written or stored, holds a top-level block of `type`; content that isn't an array holds none. */
+function holdsBlock(content: unknown, type: string): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: unknown } | null)?.type === type);
+}
+
+/**
+ * Each call content holds, by id, and whether it's still open after the
+ * content's own later blocks: a result after its call in the same content,
+ * as in a bundled cycle (splitMixedToolMessages), answers it.
+ */
+function callsInOrder(content: unknown): Map<string, boolean> {
+  const calls = new Map<string, boolean>();
+  if (!Array.isArray(content)) return calls;
+  for (const block of content as Array<{ type?: unknown; id?: unknown; toolUseId?: unknown } | null>) {
+    if (block?.type === 'tool_use' && typeof block.id === 'string') calls.set(block.id, true);
+    else if (block?.type === 'tool_result' && typeof block.toolUseId === 'string' && calls.has(block.toolUseId)) calls.set(block.toolUseId, false);
+  }
+  return calls;
+}
+
+/** The ids of content's top-level calls (`tool_use`), or of the calls its results (`tool_result`) answer, in block order. */
+function toolIds(content: unknown, type: 'tool_use' | 'tool_result'): string[] {
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as Array<{ type?: unknown; id?: unknown; toolUseId?: unknown } | null>) {
+    const id = type === 'tool_use' ? block?.id : block?.toolUseId;
+    if (block?.type === type && typeof id === 'string') ids.push(id);
+  }
+  return ids;
+}
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -116,7 +151,15 @@ interface NativeIndexEqOpts {
  */
 const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
 
-function bumpWriteVersion(store: object, stateId: string): number {
+/**
+ * Its `[cm-cache]` line goes through `log`, the bumping store's diagnostics (#239).
+ *
+ * An append moves the version by one and adds one record; every other
+ * mutation moves it and adds no record. getAllInternal reads "only appends
+ * since" from that: a slot grown by exactly the versions moved. That holds
+ * only while the slot is written through MessageStore alone.
+ */
+function bumpWriteVersion(store: object, stateId: string, log: Diagnostics): number {
   let m = sharedWriteVersions.get(store);
   if (!m) {
     m = new Map();
@@ -126,7 +169,7 @@ function bumpWriteVersion(store: object, stateId: string): number {
   m.set(stateId, next);
   if (typeof process !== 'undefined' && process.env?.CM_CACHE_DIAG) {
     const site = (new Error().stack ?? '').split('\n')[2]?.trim();
-    console.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
+    log.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
   }
   return next;
 }
@@ -135,13 +178,139 @@ function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
 }
 
+/**
+ * The window the counter can't see (nissa-seru, #238): a write the counter
+ * doesn't count — through another handle on the branch, or a chronicle call
+ * outside MessageStore — between two counted writes. Every counted write
+ * records the revision it leaves (`sharedLastRevisions`); the next counted
+ * write compares the revision it finds with that, and a difference is a gap:
+ * `sharedGapCounts` moves, and a cache built before the move can't be
+ * extended, only rebuilt. Keyed by the JsStore object, as the counter is.
+ */
+const sharedLastRevisions = new WeakMap<object, Map<string, number>>();
+const sharedGapCounts = new WeakMap<object, Map<string, number>>();
+
+function currentGapCount(store: object, stateId: string): number {
+  return sharedGapCounts.get(store)?.get(stateId) ?? 0;
+}
+
+/** Before a counted write: a revision the last counted write didn't leave means an uncounted write happened since. */
+function noteRevisionBeforeCountedWrite(store: JsStore, stateId: string): void {
+  const last = sharedLastRevisions.get(store)?.get(stateId);
+  if (last !== undefined && last !== slotRevision(store, stateId)) {
+    let m = sharedGapCounts.get(store);
+    if (!m) { m = new Map(); sharedGapCounts.set(store, m); }
+    m.set(stateId, (m.get(stateId) ?? 0) + 1);
+  }
+}
+
+/** The revision the last counted write left, or undefined before any. A read
+ *  that finds another revision has an uncounted write since, whoever made it. */
+function revisionLeftByLastCountedWrite(store: object, stateId: string): number | undefined {
+  return sharedLastRevisions.get(store)?.get(stateId);
+}
+
+/** At a MessageStore's construction, before its cache is built: the slot's
+ *  revision, as the baseline the first counted write on this handle compares
+ *  with, where no counted write has left one. Every cache on a handle and
+ *  slot belongs to a MessageStore, so none exists before the baseline, and
+ *  an uncounted write after it moves the revision away from the baseline for
+ *  the first counted write to see (nissa-seru's fourth case on #238: a
+ *  handle just opened, with no counted write yet). */
+function recordBaselineRevision(store: JsStore, stateId: string): void {
+  if (revisionLeftByLastCountedWrite(store, stateId) === undefined) recordRevisionAfterCountedWrite(store, stateId);
+}
+
+/** After a counted write: the revision it leaves, for the next one to compare with. */
+function recordRevisionAfterCountedWrite(store: JsStore, stateId: string): void {
+  let m = sharedLastRevisions.get(store);
+  if (!m) { m = new Map(); sharedLastRevisions.set(store, m); }
+  m.set(stateId, slotRevision(store, stateId));
+}
+
+/** Bumped by every mutation except append (main's token for a cache of
+ *  per-message facts that survives appends). On this branch getAll's mapped
+ *  view is memoised per internal record (storedViews), which an edit or
+ *  removal misses by construction, so nothing reads this yet; the bumps are
+ *  kept where main makes them so a reader can be added without hunting. */
+const sharedEditVersions = new WeakMap<object, Map<string, number>>();
+function bumpEditVersion(store: object, stateId: string): void {
+  let m = sharedEditVersions.get(store);
+  if (!m) {
+    m = new Map();
+    sharedEditVersions.set(store, m);
+  }
+  m.set(stateId, (m.get(stateId) ?? 0) + 1);
+}
+
+/**
+ * The slot's revision: current exactly while this number is unchanged.
+ *
+ * With a chronicle that exposes `stateHeadOffset` (branch-bound handles,
+ * 2026-10), this is the log offset of the slot's newest chain record on the
+ * handle's branch — changed by every write to the slot on that branch
+ * (append, edit, redact, set, the store's own snapshots) and by nothing
+ * else. It is the same number for every handle on the same branch, which
+ * is what the process-local write version above cannot be: that map is
+ * keyed by handle object, so a write through a second handle to the same
+ * branch (a hospital tool holding `root.view('main')` while the resident
+ * runs on the root) left the first handle's cache serving the old value
+ * when the edit preserved the item count — the count-and-tail
+ * revalidation could not see it. Field indexes already key freshness on
+ * this offset for the same reason.
+ *
+ * On an older chronicle the write version is the best available token.
+ */
+function slotRevision(store: JsStore, stateId: string): number {
+  const s = store as { stateHeadOffset?: (id: string) => number | null };
+  if (typeof s.stateHeadOffset === 'function') return s.stateHeadOffset(stateId) ?? -1;
+  return currentWriteVersion(store, stateId);
+}
+
+function hasSlotRevision(store: JsStore): boolean {
+  return typeof (store as { stateHeadOffset?: unknown }).stateHeadOffset === 'function';
+}
+
 /** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
  *  cost, every invalidating mutation, and every write-through fallback. The
  *  full rebuild is ~20s of CPU on a large store on production hardware —
  *  a silent cache miss IS the latency incident (mythos, 2026-07-26). */
 const CACHE_DIAG = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-function cacheDiag(msg: string): void {
-  if (CACHE_DIAG) console.error(`[cm-cache] ${msg}`);
+/** Through `log`, the store's diagnostics, so an isolated slot's lines name its namespace (#239). */
+function cacheDiag(msg: string, log: Diagnostics): void {
+  if (CACHE_DIAG) log.error(`[cm-cache] ${msg}`);
+}
+
+/**
+ * Memo of the caller-facing view of each materialized message, keyed by the
+ * identity of its internal (chronicle round-trip) object.
+ *
+ * `getAll()` maps every internal to a StoredMessage — a wrapper object, a
+ * Date, and blob-resolved content. That mapping used to be redone for the
+ * whole history after every append, and it is redone per MessageStore
+ * instance. Keying on the internal object makes it once per message per
+ * materialization: an append converts only the new message, and two stores
+ * holding the SAME internal objects — a store and the derived stores seeded
+ * from it (see deriveOnto) — share one wrapper and one resolved copy of
+ * every inherited message instead of each holding their own.
+ *
+ * Safe because the wrapper depends only on the internal's own fields, an
+ * edit replaces the internal object rather than mutating it, and both the
+ * internals and the mapped messages are immutable to callers (see
+ * allCache). WeakMap: entries die with the materialization that owns them.
+ */
+const storedViews = new WeakMap<object, StoredMessage>();
+
+/**
+ * Internal: what a derived MessageStore starts from instead of
+ * re-materializing its slot. See MessageStore.deriveOnto.
+ */
+interface MessageStoreSeed {
+  namespace: string | undefined;
+  stateId: string;
+  internals: unknown[];
+  blobManager: BlobManager;
+  tokenCalibration: number;
 }
 
 /**
@@ -205,25 +374,109 @@ export interface TokenEstimatorOptions {
  */
 export class MessageStore {
   private blobManager: BlobManager;
+  /** Messages whose malformed content a read has already logged (wellFormedContent). */
+  private malformedLogged = new Set<string>();
   private listeners: Set<MessageStoreListener> = new Set();
   private idToIndex: Map<MessageId, number> = new Map();
   private tokenEstimator: (text: string) => number;
   private stateId: string;
+  /** The slot's namespace as configured (undefined = the shared slot). */
+  private namespace: string | undefined;
+
+  /**
+   * Where its stderr lines go, its `[cm-cache]` lines included: a slot of one
+   * namespace (an isolated manager's, or an auxiliary slot named by its
+   * namespace) names it; the shared slot is no one namespace's, and its lines
+   * name none (#239).
+   */
+  private readonly log: Diagnostics;
 
   constructor(
     private store: JsStore,
     options: TokenEstimatorOptions & {
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/messages` */
       namespace?: string;
+      /** @internal Seed for a derived store; use {@link deriveOnto}. */
+      seed?: MessageStoreSeed;
     } = {}
   ) {
+    this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
+    const seed = options.seed;
+    // A derived store's diagnostics name the namespace it shares with its parent.
+    const namespace = seed ? seed.namespace : options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
+    if (seed) {
+      this.namespace = seed.namespace;
+      this.stateId = seed.stateId;
+      // Blobs are content-addressed and global to the store, so the parent's
+      // resolve cache is valid here and must not be rebuilt per child.
+      this.blobManager = seed.blobManager;
+      this.tokenCalibration = seed.tokenCalibration;
+      recordBaselineRevision(store, this.stateId);
+      this.allCache = {
+        branchId: store.currentBranch().id,
+        sequence: store.currentSequence(),
+        internals: seed.internals as StoredMessageInternal[],
+        writeVersion: slotRevision(store, this.stateId),
+        writeCount: currentWriteVersion(store, this.stateId),
+        gapCount: currentGapCount(store, this.stateId),
+      };
+      // The id index is rebuilt from the seeded array on first lookup
+      // (indexBranchId starts unset), and the native history indexes are
+      // registered on first query (queryIndexOrHeal). Neither is paid for a
+      // child that never asks.
+      return;
+    }
+    this.namespace = options.namespace;
     this.stateId = options.namespace
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
     this.blobManager = new BlobManager(store);
-    this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
+    recordBaselineRevision(store, this.stateId);
     this.rebuildIndex();
     this.registerHistoryIndexes();
+  }
+
+  /**
+   * A MessageStore over `view`, a branch-bound handle on a branch forked from
+   * this store's branch AT ITS CURRENT HEAD, for the same message slot.
+   *
+   * The derived store starts from this instance's already-materialized
+   * messages instead of asking chronicle to rebuild and re-parse the slot:
+   * an array of references is copied, the message objects themselves are
+   * shared, and so are their caller-facing views and resolved blobs. Reads
+   * are shared; writes go to `view`'s branch and are never seen here.
+   *
+   * Call synchronously after creating the branch — the seed is this store's
+   * state right now, which is the branch's state only until either side
+   * writes. If the seed does not match the branch (it was not forked at
+   * this store's head), the derived store falls back to a cold load.
+   */
+  deriveOnto(view: JsStore): MessageStore {
+    const internals = this.getAllInternal();
+    const length = view.getStateLen(this.stateId) ?? 0;
+    let coherent = length === internals.length;
+    if (coherent && length > 0) {
+      const last = (view as { getStateItemJson?: (id: string, index: number) => unknown })
+        .getStateItemJson?.(this.stateId, length - 1) as StoredMessageInternal | null | undefined;
+      const mine = internals[length - 1]!;
+      coherent = !!last && last.id === mine.id && last.sequence === mine.sequence;
+    }
+    if (!coherent) {
+      const cold = new MessageStore(view, { estimator: this.tokenEstimator, namespace: this.namespace });
+      cold.tokenCalibration = this.tokenCalibration;
+      return cold;
+    }
+    return new MessageStore(view, {
+      estimator: this.tokenEstimator,
+      seed: {
+        namespace: this.namespace,
+        stateId: this.stateId,
+        internals: internals.slice(),
+        blobManager: this.blobManager,
+        tokenCalibration: this.tokenCalibration,
+      },
+    });
   }
 
   /**
@@ -312,7 +565,7 @@ export class MessageStore {
 
 
   private indexWriteVersion = -1;
-  private indexBranch = '';
+  private indexBranchId = '';
 
   /**
    * Id→index lookup that survives both sibling-instance writes and Chronicle
@@ -320,24 +573,35 @@ export class MessageStore {
    * stamp indexWriteVersion at their bump; a version the stamp hasn't seen
    * means a SIBLING MessageStore on this JsStore wrote. Branches can expose
    * different append-log shapes without changing that process-local version,
-   * so branch name is an independent freshness key. Rebuild once, then
+   * so native branch ID is an independent freshness key. Names can be reused
+   * after deletion, including through direct Chronicle calls with no observed
+   * intermediate switch (issue #92). Rebuild once, then
    * resolve. O(1) on every same-instance, same-branch path (2026-07-25 review
    * class: a stale index previously threw "Message not found" or, after
    * shifts, would have mutated or branched from the wrong item).
    */
   private lookupIndex(messageId: MessageId): number | undefined {
     if (
-      this.indexBranch !== this.store.currentBranch().name ||
-      this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
+      this.indexBranchId !== this.store.currentBranch().id ||
+      this.indexWriteVersion !== slotRevision(this.store, this.stateId)
     ) {
       this.rebuildIndex();
     }
     return this.idToIndex.get(messageId);
   }
 
+  /** Whether the materialized cache reflects every write made so far on this branch. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === slotRevision(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
-    this.indexBranch = this.store.currentBranch().name;
-    this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
+    this.indexBranchId = this.store.currentBranch().id;
+    this.indexWriteVersion = slotRevision(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
     for (let i = 0; i < messages.length; i++) {
@@ -349,15 +613,16 @@ export class MessageStore {
    * Memo of the fully-materialized internal state (2026-07-18, sonn5 OOM /
    * CPU-churn class, companion to the BlobManager resolve cache).
    *
-   * `getAllInternal()` is a full chronicle `getStateJson` — serde
-   * serialize + JS parse of the ENTIRE message state. Compile calls it
-   * ~6× per pass (postStripEstimates, getRecentWindowStart,
-   * getHeadWindowEnd, getCompressibleMessages, selectAdaptive,
-   * rebuildChunks), and compression catch-up repeats those passes
+   * A miss in `getAllInternal()` is a full chronicle `getStateJson` — serde
+   * serialize + JS parse of the ENTIRE message state — unless only appends
+   * happened since the cache was built, which it reads by point lookup
+   * (#251). Compile calls it ~6× per pass (postStripEstimates,
+   * getRecentWindowStart, getHeadWindowEnd, getCompressibleMessages,
+   * selectAdaptive, rebuildChunks), and compression catch-up repeats those passes
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
-   * Freshness tokens: (branch, head sequence) — with a cheap same-slot
+   * Freshness tokens: (native branch ID, head sequence) — with a cheap same-slot
    * revalidation for foreign-state writes — PLUS the process-wide
    * per-(store, stateId) write version (sharedWriteVersions above), which
    * makes edits/removals through SIBLING MessageStore instances visible:
@@ -372,10 +637,17 @@ export class MessageStore {
    * spreads; image cap/strip replace blocks rather than mutating).
    */
   private allCache: {
-    branch: string;
+    branchId: string;
     sequence: number;
     internals: StoredMessageInternal[];
+    /** Freshness: slotRevision at the last point the cache was known current. */
     writeVersion: number;
+    /** Main's in-process write counter at that point (currentWriteVersion):
+     *  how many writes through a MessageStore on this store moved since,
+     *  which is how many appends an appends-only extension expects. */
+    writeCount: number;
+    /** sharedGapCounts at that point: an uncounted write seen since makes the cache rebuild-only. */
+    gapCount: number;
   } | null = null;
 
   /**
@@ -383,14 +655,15 @@ export class MessageStore {
    * adaptive-resolution metadata (bodyGroupId for shards, initial
    * resolution state, etc.) at ingestion time.
    */
-  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'shardCount', 'currentResolution', 'lockedByAgent'] as const;
 
   /**
    * Append a new message to the store.
    *
    * `extra` is an optional bag of adaptive-resolution metadata
-   * (bodyGroupId / shardIndex / currentResolution / lockedByAgent) that
-   * callers may set at ingestion. Field semantics match StoredMessage.
+   * (bodyGroupId / shardIndex / shardCount / currentResolution /
+   * lockedByAgent) that callers may set at ingestion. Field semantics match
+   * StoredMessage.
    */
   append(
     participant: string,
@@ -400,10 +673,13 @@ export class MessageStore {
     extra?: {
       bodyGroupId?: string;
       shardIndex?: number;
+      shardCount?: number;
       currentResolution?: number;
       lockedByAgent?: boolean;
     }
   ): StoredMessage {
+    content = contentForWrite(content, 'Message refused');
+    this.refuseToolPairSplit(content, 'Message refused');
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
@@ -419,15 +695,36 @@ export class MessageStore {
     // Single atomic op: chronicle peeks the next record id+sequence under its
     // write lock, splices them into the payload as `id` and `sequence`, and
     // writes one record. The reconstructed state sees a fully-populated
-    // StoredMessageInternal, and `branchAt(messageId)` forks at this
-    // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    // StoredMessageInternal, and a branch cut at this message's own
+    // sequence holds it: exactly the post-fork-visible point. That is where
+    // `branchAt(messageId)` forks in legacy mode and for a row the window
+    // doesn't hold. Once a host presents rows, it forks at the write that
+    // presented a row the window holds, and at the last shard of a body the
+    // write-down entered, and never before its body's last shard's own
+    // sequence, so the new branch's record holds the whole body (see
+    // ContextManager.branchAt).
+    //
+    // Whether this instance's caches reflected every write to the slot
+    // BEFORE this append, including writes made through other handles to
+    // the same branch. A local write may re-certify only state that was
+    // current going in: a stale id index or materialized cache stays
+    // stale and is rebuilt on the next lookup (Astra's reproducer,
+    // 2026-10-07 — another handle removed an earlier message, this one
+    // appended, and the stamped-but-stale index returned the wrong
+    // message under the right id).
+    const indexWasCurrent =
+      this.indexBranchId === this.store.currentBranch().id &&
+      this.indexWriteVersion === slotRevision(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
+    const version = bumpWriteVersion(this.store, this.stateId, this.log);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
       'id',
       'sequence',
     );
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     const index = this.length() - 1;
 
     const message: StoredMessage = {
@@ -449,9 +746,10 @@ export class MessageStore {
     // messages, event loop starved for hours by ambient traffic + backfill).
     //
     // The cached entry MUST be the chronicle round-trip (serde) form, not a
-    // hand-built object: serde reorders keys and drops undefined fields, and
-    // downstream request hashing stringifies message content — a shape that
-    // differs between a warm cache and a fresh rebuild breaks hash-keyed
+    // hand-built object: the round trip drops undefined fields, gives a lone
+    // surrogate back as U+FFFD and, on chronicle before 0.5.1, sorts keys,
+    // and downstream request hashing stringifies message content — a shape
+    // that differs between a warm cache and a fresh rebuild breaks hash-keyed
     // dedup (compression in-flight registry, quarantine keys). Fetch the
     // just-written record back through the point lookup; on chronicle
     // versions without it, fall back to plain invalidation (old behavior).
@@ -460,8 +758,9 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
     ) {
       this.allCache.internals.push(canonical);
@@ -470,19 +769,163 @@ export class MessageStore {
       // and the cache now reflects it. Without this, the next getAllInternal
       // sees a version mismatch and full-rebuilds on EVERY append — the
       // quadratic ingest this write-through exists to prevent.
-      this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+      this.allCache.writeVersion = slotRevision(this.store, this.stateId);
+      this.allCache.writeCount = currentWriteVersion(this.store, this.stateId);
+    } else if (!cacheWasCurrent && this.allCache && this.allCache.branchId === this.store.currentBranch().id) {
+      // The cache wasn't current before this append: a sibling wrote since
+      // it was built. Where the counted writes since then explain the slot's
+      // growth — siblings' appends, and now this one — the cache is extended
+      // by point lookup here, so a sibling's append costs no reload; where
+      // they don't (an edit or removal, or a write through another handle,
+      // which moves slotRevision but no counter), it is dropped, and the next
+      // read rebuilds it. Main deferred this to the next read, which on this
+      // branch could extend past an uncounted edit (derive.test's surgeon).
+      const added = currentWriteVersion(this.store, this.stateId) - 1 - this.allCache.writeCount; // minus this write's own bump
+      // Only counted sibling writes can explain the revision's move; none
+      // counted, or a gap a counted write saw since the cache was built
+      // (noteRevisionBeforeCountedWrite), means an uncounted writer.
+      const gapFree = this.allCache.gapCount === currentGapCount(this.store, this.stateId);
+      const appended = added > 0 && gapFree ? this.appendedSince(this.allCache.internals, added + 1) : null;
+      if (appended) {
+        for (const record of appended) this.allCache.internals.push(record);
+        this.allCache.sequence = this.store.currentSequence();
+        this.allCache.writeVersion = slotRevision(this.store, this.stateId);
+        this.allCache.writeCount = currentWriteVersion(this.store, this.stateId);
+        this.allCache.gapCount = currentGapCount(this.store, this.stateId);
+        cacheDiag(`append write-through extended (cache wasn't current before the append) stateId=${this.stateId} — ${appended.length} appended record(s), this one included, read by point lookup`, this.log);
+      } else {
+        cacheDiag(`append write-through dropped (cache wasn't current before the append) stateId=${this.stateId} — the writes since don't explain the slot; the next read rebuilds`, this.log);
+        this.allCache = null;
+      }
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branch !== this.store.currentBranch().name ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
+          this.log,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
+    if (indexWasCurrent) {
+      // This instance made the write and the index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = slotRevision(this.store, this.stateId);
+    }
+    // Else: leave the index stale; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
+  }
+
+  /**
+   * Refuses a write that would put a system change between a tool call and
+   * a result that answers it: a message of changes while one of the nearest
+   * calls before it has no result between it and the change, a tool result
+   * answering a call that a change already follows, or an edit giving a
+   * message a `tool_use` that a change follows before the call's results.
+   * The API takes a system message with content only after a user turn, or an
+   * assistant turn ending in a server tool result, so membrane sends a change
+   * of tools or system text stored after a call after the call's result
+   * anyway, and one written after the result goes out the same. An
+   * effort-only change, which membrane sends at its place, is refused
+   * there as well. Stored between them, a change parts them: the
+   * autobiographical and Knowledge strategies keep a change raw and close a
+   * chunk at it, so the call and its result would be folded into different
+   * summaries, and a compile's pairing repair (enforceToolPairing) would drop
+   * the result once the call was folded.
+   *
+   * It reads back from `index` over changes and messages holding results but
+   * no call, to the nearest message that holds a call, reading each message
+   * whole, every shard of its body, since ingress sharding puts a message's
+   * calls and results on its body's first shard. It checks that message's
+   * calls, by id: those a result in a later message answers, as parallel
+   * calls' results in messages of their own do, and those its own later
+   * blocks answer, as in a bundled cycle (splitMixedToolMessages), are
+   * answered. The walk stops at a message of any other kind, so a call no
+   * result answered, further back, refuses nothing. `index` is where the
+   * content goes: the end for an append, the message's place for an edit.
+   *
+   * It leaves alone what a write can't see, as main does: a message of
+   * another kind between a call and its result, which is already off the
+   * API's shape; a call in an earlier message than the nearest one holding
+   * a call; a shape that exists only in a view, filtered or merged from
+   * several stores; and a removal, or an edit, that takes away a result or a
+   * message between. Each parts the pair once the call is folded.
+   */
+  refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
+    const length = this.length();
+    const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
+    // A body is one step of either walk, read whole: ingress sharding puts a
+    // message's non-text blocks, its calls and results, on its first shard.
+    const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
+      const from = bodyStart(at, i);
+      const to = bodyEnd(length, at, i);
+      const shards: StoredMessageInternal[] = [];
+      for (let k = from; k <= to; k++) shards.push(at(k)!);
+      return { from, to, shards };
+    };
+    const holds = (shards: StoredMessageInternal[], type: string): boolean => shards.some((shard) => holdsBlock(shard.content, type));
+    const idsIn = (shards: StoredMessageInternal[], type: 'tool_use' | 'tool_result'): string[] =>
+      shards.flatMap((shard) => toolIds(shard.content, type));
+    const change = holdsBlock(content, 'system_change');
+    const answers = change ? [] : toolIds(content, 'tool_result');
+    if (change || answers.length > 0) {
+      // Back over changes and results, to the nearest body holding a call.
+      const answered = new Set<string>();
+      let changeBetween: StoredMessageInternal | undefined;
+      const calls = new Map<string, MessageId>();
+      for (let i = index - 1; i >= 0; ) {
+        const { from, shards } = bodyAt(i);
+        if (holds(shards, 'tool_use')) {
+          // The body's calls left open by its own blocks, read in order
+          // across its shards, each by the shard that holds it.
+          const holder = new Map<string, MessageId>();
+          for (const shard of shards) for (const id of toolIds(shard.content, 'tool_use')) holder.set(id, shard.id);
+          for (const [id, open] of callsInOrder(shards.flatMap((shard) => shard.content))) if (open) calls.set(id, holder.get(id)!);
+          break;
+        }
+        if (holds(shards, 'system_change')) changeBetween ??= shards[0];
+        else if (holds(shards, 'tool_result')) for (const id of idsIn(shards, 'tool_result')) answered.add(id);
+        else break;
+        i = from - 1;
+      }
+      if (calls.size > 0) {
+        if (change) {
+          const open = [...calls].filter(([id]) => !answered.has(id));
+          if (open.length > 0) {
+            throw new Error(
+              `${what}: a system change can't go between a tool call and its result, and message ${open[0]![1]} holds a tool_use ` +
+                `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.`,
+            );
+          }
+        } else if (changeBetween) {
+          const id = answers.find((answer) => calls.has(answer));
+          if (id !== undefined) {
+            throw new Error(
+              `${what}: a tool_result can't follow a system change (message ${changeBetween.id}) that follows its tool call ` +
+                `(${id}, message ${calls.get(id)}). Remove the change and write it after the result.`,
+            );
+          }
+        }
+      }
+    }
+    if (index < length && holdsBlock(content, 'tool_use')) {
+      // Forward over changes and results, while a call here is unanswered.
+      const open = new Set([...callsInOrder(content)].filter(([, stillOpen]) => stillOpen).map(([id]) => id));
+      for (let i = index + 1; i < length && open.size > 0; ) {
+        const { to, shards } = bodyAt(i);
+        if (holds(shards, 'tool_use')) break;
+        if (holds(shards, 'system_change')) {
+          throw new Error(
+            `${what}: a tool_use (${[...open].join(', ')}) can't go before a system change (message ${shards[0]!.id}) that comes before its result; ` +
+              "a change goes after the call's result.",
+          );
+        }
+        if (!holds(shards, 'tool_result')) break;
+        for (const id of idsIn(shards, 'tool_result')) open.delete(id);
+        i = to + 1;
+      }
+    }
   }
 
   /**
@@ -494,6 +937,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
+    newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);
     const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
@@ -510,8 +954,13 @@ export class MessageStore {
           `Sharded messages are immutable — remove the whole bodyGroup and re-append instead.`,
       );
     }
+    this.refuseToolPairSplit(newContent, `Edit of ${messageId} refused`, index);
 
-    const oldContent = this.blobManager.resolveBlobs(oldMessage.content);
+    // The old content as a read gives it, so an edit can replace a message
+    // whose stored content doesn't match ContentBlock.
+    const oldContent = this.blobManager.resolveBlobs(
+      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged, this.log),
+    );
     const storedContent = this.blobManager.extractBlobs(newContent);
 
     // Update the stored message
@@ -520,8 +969,13 @@ export class MessageStore {
       content: storedContent,
     };
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId, this.log);
+    bumpEditVersion(this.store, this.stateId);
+    this.store.editStateItem(this.stateId, index, storedJson(updated));
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
+    this.indexWriteVersion = slotRevision(this.store, this.stateId);
 
     // Write-through the materialized cache (see append — the cached entry
     // must be the chronicle round-trip form, so re-fetch it canonically).
@@ -532,11 +986,19 @@ export class MessageStore {
     if (
       canonicalEdit &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals[index]
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the new write version, as append does. Otherwise the next read sees
+      // a version mismatch and re-materializes the whole slot for a
+      // one-message edit — and a store sharing its messages with others
+      // (see deriveOnto) would stop sharing them. Only when the cache was
+      // current before the write: a sibling instance's earlier edit must
+      // still force the rebuild it is owed.
+      if (cacheWasCurrent) { this.allCache.writeVersion = slotRevision(this.store, this.stateId); this.allCache.writeCount = currentWriteVersion(this.store, this.stateId); }
     } else {
       this.allCache = null;
     }
@@ -566,17 +1028,23 @@ export class MessageStore {
       );
     }
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId, this.log);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
     if (
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === this.length() + 1
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full rebuild.
+      if (cacheWasCurrent) { this.allCache.writeVersion = slotRevision(this.store, this.stateId); this.allCache.writeCount = currentWriteVersion(this.store, this.stateId); }
     } else {
       this.allCache = null;
     }
@@ -586,9 +1054,10 @@ export class MessageStore {
   }
 
   /**
-   * Remove every shard of the bodyGroup containing `messageId`. If the
-   * message is not part of a bodyGroup, falls back to single-message
-   * remove. Atomic from the caller's perspective.
+   * Remove every shard of the body containing `messageId`: one ingestion,
+   * so another copy of the same text, under the same group id, stays (see
+   * body-runs.ts). If the message is not part of a body, falls back to
+   * single-message remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
     const index = this.lookupIndex(messageId);
@@ -599,26 +1068,28 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
-    this.store.redactStateItems(this.stateId, index, index + 1);
+      noteRevisionBeforeCountedWrite(this.store, this.stateId);
+      bumpWriteVersion(this.store, this.stateId, this.log);
+      bumpEditVersion(this.store, this.stateId);
+      this.store.redactStateItems(this.stateId, index, index + 1);
+      recordRevisionAfterCountedWrite(this.store, this.stateId);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
       return;
     }
-    // Find the contiguous run of shards with this bodyGroupId. Shards are
-    // stored consecutively (they're appended one after the other at
-    // ingestion), so we can scan outward from `index`.
-    const groupId = target.bodyGroupId;
+    // Find this body's shards: stored consecutively, one ingestion at a
+    // time. Another ingestion of the same text carries the same group id
+    // and is another body (see body-runs.ts), so the run stops there.
     const all = this.getAllInternal();
-    let from = index;
-    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
-    let to = index;
-    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId, this.log);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
     this.emit({ type: 'removeRange', fromId: firstId, toId: lastId });
@@ -627,9 +1098,11 @@ export class MessageStore {
   /**
    * Remove a range of messages from the store.
    *
-   * If the range starts or ends in the middle of a bodyGroup, throws —
-   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
-   * to remove an entire group, then call `removeRange` over plain messages.)
+   * If the range starts or ends in the middle of a body, throws: removeRange
+   * must align to body boundaries. A boundary between two bodies of one
+   * group id (two copies of one text) is a body boundary. (Use
+   * `removeBodyGroup` to remove one whole body, then call `removeRange` over
+   * plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
     const fromIndex = this.lookupIndex(fromId);
@@ -642,23 +1115,26 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a bodyGroup.
+    // Verify the range doesn't bisect a body: neither edge may sit between
+    // two shards of one body. The boundary between two ingestions of the
+    // same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    const startGroup = all[fromIndex].bodyGroupId;
-    const endGroup = all[toIndex].bodyGroupId;
-    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+    if (fromIndex > 0 && continuesBody(all[fromIndex - 1], all[fromIndex])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+        `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+    if (toIndex + 1 < all.length && continuesBody(all[toIndex], all[toIndex + 1])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+        `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
     }
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
+    bumpWriteVersion(this.store, this.stateId, this.log);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
 
@@ -680,6 +1156,19 @@ export class MessageStore {
     }
 
     return this.internalToStored(internal, messageId, index);
+  }
+
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it. While the
+   * materialized cache is current (a compile has just listed the slot), it
+   * answers from there instead of reading the item through chronicle, which
+   * get() does even to report one field (#273).
+   */
+  sequenceOf(messageId: MessageId): number | undefined {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return undefined;
+    const internal = this.cacheIsCurrent() ? this.allCache!.internals[index] : this.getInternal(index);
+    return internal?.sequence;
   }
 
   /**
@@ -713,34 +1202,45 @@ export class MessageStore {
     // view (internalToStored + resolveBlobs + new Date() per message) each time
     // dominated large moves:0 compiles (Sol, 2026-07-31). Key on the same
     // freshness tokens as allCache: appends bump sequence, edits/redacts bump
-    // the shared writeVersion, branch switches change branch — any of which
+    // the shared writeVersion, branch switches change branch ID — any of which
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
-    const branch = this.store.currentBranch().name;
-    const sequence = this.store.currentSequence();
-    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const branchId = this.store.currentBranch().id;
+    const writeVersion = slotRevision(this.store, this.stateId);
     const c = this.allStoredCache;
+    // getAllInternal already revalidates across foreign state writes (the
+    // store-global sequence moves on every receipt or resolution write) and
+    // hands back the same array; keying on that array, not the sequence,
+    // keeps this view alive across them too. Same-instance mutators bump
+    // writeVersion (edits in place, appends by push), so both still miss.
     if (
       c &&
-      c.branch === branch &&
-      c.sequence === sequence &&
+      c.branchId === branchId &&
+      c.internals === internals &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
     ) {
       return c.stored;
     }
-    const stored = internals.map((internal, i) =>
-      this.internalToStored(internal, internal.id, i)
-    );
-    this.allStoredCache = { branch, sequence, writeVersion, stored };
+    // Per-message memo (see storedViews): after an append only the new
+    // message is converted, and stores sharing internals share the views.
+    const stored = internals.map((internal, i) => {
+      let view = storedViews.get(internal);
+      if (!view) {
+        view = this.internalToStored(internal, internal.id, i);
+        storedViews.set(internal, view);
+      }
+      return view;
+    });
+    this.allStoredCache = { branchId, internals, writeVersion, stored };
     return stored;
   }
 
   /** Cached mapped view for getAll(), invalidated by the same freshness tokens
    *  as allCache (see getAll). */
   private allStoredCache: {
-    branch: string;
-    sequence: number;
+    branchId: string;
+    internals: StoredMessageInternal[];
     writeVersion: number;
     stored: StoredMessage[];
   } | null = null;
@@ -762,25 +1262,13 @@ export class MessageStore {
     }
 
     if (opts.alignToBodyGroups) {
-      // Shards of a bodyGroup are contiguous by construction (removeRange
-      // refuses to bisect a group). Walk edges outward with O(item) point
-      // lookups until the group boundary.
-      const first = this.getInternal(start);
-      if (first?.bodyGroupId !== undefined) {
-        while (start > 0) {
-          const prev = this.getInternal(start - 1);
-          if (prev?.bodyGroupId !== first.bodyGroupId) break;
-          start--;
-        }
-      }
-      const last = this.getInternal(end - 1);
-      if (last?.bodyGroupId !== undefined) {
-        while (end < totalCount) {
-          const next = this.getInternal(end);
-          if (next?.bodyGroupId !== last.bodyGroupId) break;
-          end++;
-        }
-      }
+      // A body's shards are contiguous by construction (removeRange refuses
+      // to bisect one). Walk the edges outward with O(item) point lookups to
+      // the body boundary, which falls between two ingestions of the same
+      // text too (see body-runs.ts).
+      const at = (i: number) => this.getInternal(i);
+      start = bodyStart(at, start);
+      end = bodyEnd(totalCount, at, end - 1) + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);
@@ -824,9 +1312,41 @@ export class MessageStore {
    * Estimate tokens for a message.
    */
   estimateTokens(message: StoredMessage): number {
+    const content = message.content;
+    const hit = this._messageTokens.get(message);
+    if (hit && hit.calibration === this.tokenCalibration && hit.blocks.length === content.length) {
+      let same = true;
+      for (let i = 0; same && i < content.length; i++) same = hit.blocks[i] === content[i];
+      if (same) return hit.tokens;
+    }
     let tokens = 0;
-    for (const block of message.content) {
+    for (const block of content) {
       tokens += this.estimateBlockTokens(block);
+    }
+    this._messageTokens.set(message, { blocks: content.slice(), calibration: this.tokenCalibration, tokens });
+    return tokens;
+  }
+
+  /** Whole-message estimate per mapped message object. Guarded by the
+   *  identity of every block (a caller may replace one inside the same
+   *  content array) and by the calibration factor, so a changed block or a
+   *  recalibration never serves a stale sum. Entries die with the message
+   *  objects. */
+  private _messageTokens = new WeakMap<StoredMessage, {
+    blocks: readonly ContentBlock[]; calibration: number; tokens: number;
+  }>();
+
+  /**
+   * Base token estimate of some content: the sum of each block's raw
+   * estimate, before the calibration multiplier and its per-block rounding
+   * (which `estimateTokens` applies, so dividing its result by the
+   * calibration does not recover this). Identical content estimates the same
+   * at any calibration.
+   */
+  estimateBaseTokens(content: readonly ContentBlock[]): number {
+    let tokens = 0;
+    for (const block of content) {
+      tokens += this.estimateBlockTokensRaw(block);
     }
     return tokens;
   }
@@ -919,6 +1439,40 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -965,12 +1519,22 @@ export class MessageStore {
         return 0;
       case 'image':
         return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+      // A generated image goes to the provider as an image (membrane converts
+      // it), so it is priced as an image without a stamp: membrane's
+      // GeneratedImageContent carries no tokenEstimate. Priced at 0, a layout
+      // holding one ran larger than its estimate.
+      case 'generated_image':
+        return 1600;
       case 'document':
       case 'audio':
       case 'video':
         return 1000; // Default estimate for media
+      case 'system_change':
+        // Its tool definitions and system text go out whole, so it's priced
+        // from its JSON, as a tool call's input is.
+        return jsonTokenEstimator(JSON.stringify(block));
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
@@ -981,6 +1545,7 @@ export class MessageStore {
     return {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
+      sequenceOf: (id) => this.sequenceOf(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
@@ -1600,20 +2165,27 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const branch = this.store.currentBranch().name;
+    const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
-    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const writeVersion = slotRevision(this.store, this.stateId);
     let missReason = 'no-cache';
     if (this.allCache) {
       missReason =
-        this.allCache.branch !== branch
-          ? `branch ${this.allCache.branch}→${branch}`
+        this.allCache.branchId !== branchId
+          ? `branch ${this.allCache.branchId}→${branchId}`
           : this.allCache.writeVersion !== writeVersion
             ? `writeVersion ${this.allCache.writeVersion}→${writeVersion}`
             : 'revalidate-fail';
     }
-    if (this.allCache && this.allCache.branch === branch && this.allCache.writeVersion === writeVersion) {
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
+        return this.allCache.internals;
+      }
+      // With a slot revision from the store, an unchanged revision IS
+      // currency: no write to this slot on this branch happened through
+      // any handle. The sequence moved because other states were written.
+      if (hasSlotRevision(this.store)) {
+        this.allCache.sequence = sequence;
         return this.allCache.internals;
       }
       // The store-global sequence moved, but that may be writes to OTHER
@@ -1652,13 +2224,70 @@ export class MessageStore {
         missReason = `revalidate-fail count (cached ${this.allCache.internals.length} live ${count}${canPointLookup ? '' : ', no point lookup'})`;
       }
     }
+    // Only appends since the cache was built, through any MessageStore on
+    // this store: the slot grew by exactly the write versions moved
+    // (bumpWriteVersion). The appended records are then read by point lookup
+    // and added, rather than the slot re-materialized for a sibling's append
+    // (#251). The cached records aren't looked up to confirm them: on
+    // chronicle 0.4.0, a point lookup of any record but the newest after a
+    // write rebuilds chronicle's per-item cache, which a read after one
+    // append then avoids. Like the count-and-tail check above, this relies
+    // on the slot being written only through MessageStore. A write outside
+    // it moves no version, so where it adds a record beside a sibling's edit
+    // or removal, the length comes out as the versions predict: the cache is
+    // extended stale, and an edit or removal through its index can reach
+    // another record.
+    // On this branch the freshness token is slotRevision (chronicle's log
+    // offset, which any writer moves), so the number of writes since the
+    // cache was built comes from main's in-process counter beside it. A
+    // revision that moved with no counted write is a write from outside this
+    // process's MessageStores, which may be anything: reload.
+    const writeCount = currentWriteVersion(this.store, this.stateId);
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion !== writeVersion) {
+      const added = writeCount - this.allCache.writeCount;
+      // Two tells of an uncounted write: a counted write since the cache saw a
+      // gap (gapCount), or the slot's revision isn't the one the last counted
+      // write left (an uncounted write after it). Either way, rebuild.
+      const gapFree = this.allCache.gapCount === currentGapCount(this.store, this.stateId)
+        && revisionLeftByLastCountedWrite(this.store, this.stateId) === writeVersion;
+      const appended = added > 0 && gapFree ? this.appendedSince(this.allCache.internals, added) : null;
+      if (appended) {
+        for (const record of appended) this.allCache.internals.push(record);
+        this.allCache.writeVersion = writeVersion;
+        this.allCache.writeCount = writeCount;
+        this.allCache.gapCount = currentGapCount(this.store, this.stateId);
+        this.allCache.sequence = sequence;
+        return this.allCache.internals;
+      }
+      missReason = `${missReason}, not appends only (cached ${this.allCache.internals.length} + ${added} writes, live ${this.length()})`;
+    }
     const _t = CACHE_DIAG ? Date.now() : 0;
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branch, sequence, internals, writeVersion };
-    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
+    this.allCache = { branchId, sequence, internals, writeVersion, writeCount, gapCount: currentGapCount(this.store, this.stateId) };
+    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`, this.log);
     return internals;
+  }
+
+  /**
+   * The `added` records appended to the slot after `cached`, an earlier
+   * materialization of it, by point lookup; null where they can't be read
+   * that way: a slot whose length isn't `cached`'s plus `added`, a record
+   * that won't read, or a chronicle without point lookup, where getInternal
+   * falls back to getAllInternal itself.
+   */
+  private appendedSince(cached: readonly StoredMessageInternal[], added: number): StoredMessageInternal[] | null {
+    if (typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson !== 'function') return null;
+    const count = this.length();
+    if (count !== cached.length + added) return null;
+    const appended: StoredMessageInternal[] = [];
+    for (let i = cached.length; i < count; i++) {
+      const record = this.getInternal(i);
+      if (!record) return null;
+      appended.push(record);
+    }
+    return appended;
   }
 
   private getSliceInternal(offset: number, limit: number): StoredMessageInternal[] {
@@ -1700,6 +2329,9 @@ export class MessageStore {
     _index: number,
     resolveBlobs: boolean = true,
   ): StoredMessage {
+    // What doesn't match ContentBlock is left out before anything reads it,
+    // blob resolution included (well-formed-content.ts).
+    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged, this.log);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
@@ -1719,8 +2351,8 @@ export class MessageStore {
       // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
       // ContentBlock for viewer purposes).
       content: resolveBlobs
-        ? this.blobManager.resolveBlobs(internal.content)
-        : (internal.content as unknown as ContentBlock[]),
+        ? this.blobManager.resolveBlobs(content)
+        : (content as unknown as ContentBlock[]),
       metadata: internal.metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,
@@ -1728,6 +2360,7 @@ export class MessageStore {
     // Carry adaptive-resolution fields through unchanged.
     if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
     if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
+    if (internal.shardCount !== undefined) stored.shardCount = internal.shardCount;
     if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
     if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
     return stored;

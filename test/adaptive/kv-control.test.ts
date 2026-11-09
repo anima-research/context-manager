@@ -67,13 +67,11 @@ test('flat zone and pins are never folded', () => {
   assert.ok(r.foldEvents > 0, 'fixture should force folding');
 
   // foldDepthCap must report 0 for the pin and for the flat zone, at any age.
-  const tree = new SummaryTree(inputs);
   const flat = new Set<string>([ch.chunks[89].id]);
   assert.equal(foldDepthCap(ch.chunks[3], 89, new Set(), 6, 6), 0, 'pinned chunk cap 0');
   assert.equal(foldDepthCap(ch.chunks[89], 89, flat, 6, 6), 0, 'flat-zone chunk cap 0');
   // An old un-pinned chunk should be allowed to fold.
   assert.ok(foldDepthCap(ch.chunks[10], 89, new Set(), 6, 6) >= 1, 'old chunk foldable');
-  void tree;
 });
 
 test('W is the only hard wall: escalates instead of exceeding it', () => {
@@ -109,6 +107,25 @@ test('trust region P never distorts the outcome â€” only the payment schedule (Â
     shallow.totalRecomputed, deep.totalRecomputed,
     'P does not change what gets folded at these settings',
   );
+});
+
+test('within the trust region P the ideal is adopted outright, with no override, even where it overruns W', () => {
+  const inputs = inputsOf(buildChronicleWithChain({ chunkCount: 48, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 }));
+  const tree = new SummaryTree(inputs);
+  let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
+  const turn = {
+    previous: new Map(inputs.chunks.map((c) => [c.id, 0])), foldAtTokens: 10_000, expandAtTokens: 9_000, targetTokens: 9_000,
+    windowTokens: 10_000, rawZone: new Set(inputs.chunks.slice(-12).map((c) => c.id)), now, mergeThreshold: 6,
+  };
+  const ideal = planControlledFrontier(inputs, tree, { ...turn, reachTokens: Number.MAX_SAFE_INTEGER });
+  const P = ideal.perturbation;
+  assert.ok(ideal.escalated && ideal.override === undefined && P > 0,
+    `premise: an ideal over W, adopted, that moves the carried frontier (${JSON.stringify({ escalated: ideal.escalated, override: ideal.override, P })})`);
+
+  const within = planControlledFrontier(inputs, tree, { ...turn, reachTokens: P });
+  assert.deepEqual(within.resolutions, ideal.resolutions);
+  assert.deepEqual([within.override, within.perturbation, within.escalated], [undefined, P, true]);
+  assert.equal(planControlledFrontier(inputs, tree, { ...turn, reachTokens: P - 1 }).override, 'infeasible');
 });
 
 test('bidirectional: under budget with a folded F_prev, un-folds to use headroom', () => {

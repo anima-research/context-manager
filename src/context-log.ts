@@ -1,3 +1,4 @@
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -9,6 +10,8 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
+import { MalformedContentError, contentForWrite, malformedContentPlaces, wellFormedContent } from './well-formed-content.js';
+import { storedJson } from './stored-json.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -21,9 +24,17 @@ const DEFAULT_CONTEXT_STATE_ID = 'context';
  */
 export class ContextLog {
   private blobManager: BlobManager;
+  /** Entries whose malformed content a read has already logged (wellFormedContent). */
+  private malformedLogged = new Set<string>();
   private sourceToIndices: Map<MessageId, Set<number>> = new Map();
   private tokenEstimator: (text: string) => number;
   private stateId: string;
+
+  /**
+   * Where its stderr lines go: a log of one namespace names it; the log with
+   * no namespace names none (#239).
+   */
+  private readonly log: Diagnostics;
 
   constructor(
     private store: JsStore,
@@ -33,9 +44,9 @@ export class ContextLog {
       namespace?: string;
     } = {}
   ) {
-    this.stateId = options.namespace
-      ? `${options.namespace}/context`
-      : DEFAULT_CONTEXT_STATE_ID;
+    const namespace = options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
+    this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildSourceIndex();
@@ -49,13 +60,18 @@ export class ContextLog {
    * @param namespace Optional namespace for multi-agent support
    */
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
+    const stateId = ContextLog.stateIdFor(namespace);
     store.registerState({
       id: stateId,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
     });
+  }
+
+  /** The context log's slot id for a namespace. */
+  static stateIdFor(namespace?: string): string {
+    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
   }
 
   private rebuildSourceIndex(): void {
@@ -81,6 +97,7 @@ export class ContextLog {
     sourceRelation?: SourceRelation,
     cacheMarker?: boolean
   ): ContextEntry {
+    content = contentForWrite(content, 'Context entry refused');
     const storedContent = this.blobManager.extractBlobs(content);
     const index = this.length();
 
@@ -116,6 +133,7 @@ export class ContextLog {
    * Edit an entry's content at a specific index.
    */
   edit(index: number, content: ContentBlock[]): void {
+    content = contentForWrite(content, `Edit of context entry ${index} refused`);
     const internal = this.getInternal(index);
     if (!internal) {
       throw new Error(`Context entry not found at index: ${index}`);
@@ -127,7 +145,7 @@ export class ContextLog {
       content: storedContent,
     };
 
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    this.store.editStateItem(this.stateId, index, storedJson(updated));
   }
 
   /**
@@ -162,6 +180,15 @@ export class ContextLog {
     sourceRelation?: SourceRelation;
     cacheMarker?: boolean;
   }>): ContextEntry[] {
+    // An entry that doesn't match, or holds inline media the store can't
+    // keep, is refused before the log is cleared, so that refusal leaves the
+    // log as it was rather than half replaced. What a write mends, append
+    // mends. An index loop, as the write loop below meets every index: a
+    // hole is an entry with no content.
+    for (let i = 0; i < entries.length; i++) {
+      const places = malformedContentPlaces(entries[i]?.content);
+      if (places.length > 0) throw new MalformedContentError(`Context entry ${i} of the replacement refused`, places);
+    }
     // Clear existing entries
     const len = this.length();
     if (len > 0) {
@@ -309,12 +336,20 @@ export class ContextLog {
         return block.content.reduce((sum, b) => sum + this.estimateBlockTokens(b), 0);
       case 'image':
         return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+      case 'generated_image': // as MessageStore prices it: an image without a stamp
+        return 1600;
       case 'document':
       case 'audio':
       case 'video':
         return 1000;
+      case 'system_change':
+        // Mirrors MessageStore.computeBlockTokensRaw: priced from its JSON.
+        return this.tokenEstimator(JSON.stringify(block));
       default:
-        return 0;
+        // Mirrors MessageStore.computeBlockTokensRaw: membrane's XML-history
+        // carriers (tool_attempt, tool_notice) are priced as the markup they
+        // replay as; any other unknown block stays at 0.
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
@@ -361,7 +396,9 @@ export class ContextLog {
       sourceMessageId: internal.sourceMessageId,
       sourceRelation: internal.sourceRelation,
       participant: internal.participant,
-      content: this.blobManager.resolveBlobs(internal.content),
+      content: this.blobManager.resolveBlobs(
+        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged, this.log),
+      ),
       cacheMarker: internal.cacheMarker,
     };
   }
