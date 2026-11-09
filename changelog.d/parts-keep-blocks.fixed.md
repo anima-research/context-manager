@@ -15,10 +15,13 @@
 - Ingress puts a split message's non-text blocks from its first `tool_use` on
   on its last part, and the others on its first, where it used to put them
   all on its first. A reply's call then sits next to its result, and the
-  reply's earlier parts can fold apart from it. For a body stored before,
-  with its call on its first part, the recent window's start, a compression
-  hold, the head window's end and the chunker each keep the call's result
-  with the whole body, as they keep a result with a call stored whole.
+  reply's earlier parts can fold apart from it. A Responses reply whose
+  reasoning item comes before a call carrying its own item is stored whole,
+  since the provider checks the reasoning and the call as a pair. For a body
+  stored before, with its call on its first part, the recent window's
+  start, a compression hold, the head window's end and the chunker each
+  keep the call's result with the whole body, as they keep a result with a
+  call stored whole.
 - **Hosts upgrading a store:** such a body keeps more tokens raw for a
   while. While the recent window's start, or a compression hold, falls
   inside it or on its result, that window or hold takes the whole body
@@ -31,3 +34,11 @@
   tokens more raw, and a compile at a 70,000-token budget was refused where
   the release without the rule compiled. A body stored after the upgrade
   doesn't pay this.
+- **Hosts upgrading a store that holds split messages:** the first compile
+  after the upgrade sends them differently. The provider's cached prefix
+  then misses once, from the first message that changed; with thinking
+  binding, thinking from that message on is left out, as after any change
+  to history already sent; and kv-unified credits no cache marker past it. A
+  calibration multiplier learned before the upgrade, in a store holding a
+  split message with another block or a part the cap cuts, is set aside and
+  learned again from the next sample.

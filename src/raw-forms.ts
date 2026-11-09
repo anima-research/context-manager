@@ -70,7 +70,7 @@ function xmlKey(block: ContentBlock): string | undefined {
   return typeof raw === 'string' && raw.length > 0 ? `xml:${raw}` : undefined;
 }
 
-function isReasoningItem(block: ContentBlock): boolean {
+export function isReasoningItem(block: ContentBlock): boolean {
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type === 'reasoning';
 }

@@ -1,14 +1,3 @@
-/**
- * A reply ingress splits into parts keeps its call on its last part, next to
- * the result after it, so the windows' edges and the chunker keep a call
- * with its result by the rules they keep for a message stored whole: the
- * recent window steps back from a result onto the part holding the call,
- * the head pulls back from it, and a chunk doesn't close on it. The reply's
- * earlier parts are free to fold, as a long message's parts are. A reply
- * stored before, with its call on its first part, is bound whole to its
- * result at each of those edges instead, since any part of it left on the
- * other side would leave the call there without its result.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -91,7 +80,6 @@ describe("the chunker closes a stored reply's parts before its last as it closes
     assert.ok(reference.chunks.some((chunk) => chunk.at(-1) === refLastPart),
       'premise: without the call, a chunk closes on the reply\'s last part');
     assert.equal(chunkOf(stored, lastPart), chunkOf(stored, stored.res), 'the call\'s part closes with its result');
-    // Every part before the last is in a chunk that starts where the reference's does.
     for (let k = 0; k < stored.reply.length - 1; k++) {
       const mine = stored.chunks[chunkOf(stored, stored.reply[k]!)]!;
       const theirs = reference.chunks[chunkOf(reference, reference.reply[k]!)]!;
@@ -101,7 +89,6 @@ describe("the chunker closes a stored reply's parts before its last as it closes
 });
 
 describe('the edges around a reply stored in 19 parts, swept across every part', () => {
-  /** A 19-part reply with thinking and a call, and its result, between short messages. */
   async function nineteen(layout: Layout, config: Record<string, unknown>, persist = true) {
     const o = await open({ layout, persist, config });
     o.add('u', [text('intro')]);
@@ -132,7 +119,6 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
     });
 
     it(`${label}: the head window's end`, async () => {
-      // No chunk owns anything, so the head's coverage anchor leaves the end where the walk puts it.
       const o = await nineteen(layout, { headWindowTokens: 10_000_000, recentWindowTokens: 0 });
       try {
         const prices = o.estimates();
@@ -164,22 +150,16 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
     });
 
     it(`${label}: the chunks`, async () => {
-      // The chunker sizes by the store's estimates, as `estimates` reads them.
       const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false }, false);
       try {
         const ids = o.all().map((m) => m.id);
         const prices = o.estimates();
         for (const k of o.reply) {
-          // A chunk from the first message reaches its size at part k, half
-          // way through it, so a few tokens either way don't move the close.
           o.strategy.set({ targetChunkTokens: sum(prices, 0, k) + Math.floor(prices[k]! / 2) });
           const chunks = o.strategy.chunkIds(o.view());
           const ends = chunks.map((c) => ids.indexOf(c.at(-1)!));
           const holder = ids[layout === 'new' ? o.reply.at(-1)! : o.reply[0]!]!;
           const callChunk = chunks.findIndex((c) => c.includes(holder));
-          // The first chunk reaches its size inside the reply, so it holds the
-          // call stored on the first part, and the call stored on the last
-          // part where k is that part.
           if (layout === 'old' || k === o.reply.at(-1)!) {
             assert.ok(callChunk >= 0, `premise, closing at ${k}: the call's part is chunked; chunks end at ${ends}`);
           }

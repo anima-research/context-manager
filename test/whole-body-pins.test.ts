@@ -499,7 +499,6 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       assert.ok(raw, 'a refusal named the mark');
       assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
       const parts = raw.pins[0]!.parts ?? 0;
-      // Each part cut at 300 by the cut's own estimate, which the store prices a little higher; uncut, a part is about 2,000.
       assert.ok(parts > 1 && raw.tokens > 300 * parts && raw.tokens < 600 * parts, `priced cut: ${raw.tokens} for ${parts} parts`);
       await cm.close();
     });

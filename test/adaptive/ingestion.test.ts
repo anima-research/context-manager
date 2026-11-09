@@ -333,8 +333,6 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
       strategy,
       membrane: mock as any,
     });
-    // A big text payload between a thinking block and a tool_use, with a
-    // result the reply carries itself after the call.
     const bigText = 'paragraph. '.repeat(2000);
     const thinking = { type: 'thinking', thinking: 'pondering', signature: 'sig' } as any;
     const toolUse = { type: 'tool_use', id: 'tool-1', name: 'search', input: { q: 'test' } } as any;

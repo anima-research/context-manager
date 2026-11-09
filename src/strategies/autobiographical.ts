@@ -95,7 +95,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { isReasoningItem, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
@@ -3094,6 +3094,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (textParts.length === 0) return null;
+    // A Responses reasoning item and the call it led to are checked as a
+    // pair by the provider (raw-forms.ts); split across parts, the call can
+    // go out without its reasoning. Such a message is stored whole.
+    let reasoned = false;
+    for (const block of content) {
+      if (isReasoningItem(block)) reasoned = true;
+      else if (reasoned && block.type === 'tool_use' && typeof (block as { rawItem?: unknown }).rawItem === 'object' &&
+        (block as { rawItem?: unknown }).rawItem !== null) return null;
+    }
     const combined = textParts.join('');
 
     // Threshold and shard size derive from the strategy's existing
@@ -16662,6 +16671,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      repair dropped it after the plan and the render stats counted it,
    *      and sent a stub. A store holding one learned a multiplier low
    *      enough to make up for the results it priced and didn't send
+   *   7: a message stored in parts, raw in the adaptive middle, sent with
+   *      its other blocks and each part cut at `maxMessageTokens`, where the
+   *      middle sent its parts' text alone, uncut, and a result after a call
+   *      that text left out was dropped after the plan counted it
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -16695,7 +16708,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 6;
+  static readonly CALIBRATION_PRICING_EPOCH = 7;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -16787,6 +16800,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return false;
     }),
     6: (messages) => messages.some((m) => cycleParts(m.content).length > 1),
+    // 7: a message stored in parts holding a block other than text, or with
+    // a part the cap cuts.
+    7: (messages, strategy) => {
+      const cap = strategy.config.maxMessageTokens;
+      const capped = typeof cap === 'number' && cap > 0;
+      return messages.some((m) => !!m.bodyGroupId &&
+        (m.content.some((b) => b.type !== 'text') || (capped && strategy.estimateTextOnlyTokens(m) > cap)));
+    },
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
@@ -19827,21 +19848,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Returns true if the last message in the chunk-in-progress contains a
-   * `tool_use` block, or is a later shard of a body whose first shard
-   * contains one, as turnStart reads it (`listing` is the store's messages,
-   * `position` each one's place in it). Used by `rebuildChunks` to defer
-   * chunk closure until the matching `tool_result` (in the
-   * immediately-following user message) is pulled into the same chunk. See
-   * `stripUnpairedToolBlocks` for the runtime safety net.
+   * `tool_use` block. Used by `rebuildChunks` to defer chunk closure until
+   * the matching `tool_result` (in the immediately-following user message)
+   * is pulled into the same chunk. See `stripUnpairedToolBlocks` for the
+   * runtime safety net.
+   */
+  protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
+    const last = chunk[chunk.length - 1];
+    if (!last) return false;
+    return last.content.some((b) => b.type === 'tool_use');
+  }
+
+  /**
+   * Whether a chunk may not close after its last message: that message
+   * holds a call (lastMessageContainsToolUse), or is a later shard of a body
+   * whose first shard holds one, as turnStart reads it (`listing` is the
+   * store's messages, `position` each one's place in it).
    */
   protected chunkEndsOnCall(
-    chunk: readonly StoredMessage[],
+    chunk: StoredMessage[],
     listing: readonly StoredMessage[],
     position: ReadonlyMap<MessageId, number>,
   ): boolean {
+    if (this.lastMessageContainsToolUse(chunk)) return true;
     const last = chunk[chunk.length - 1];
     if (!last) return false;
-    if (this.hasToolUse(last)) return true;
     const at = position.get(last.id);
     if (at === undefined || listing[at] !== last) return false;
     const start = bodyStart((k) => listing[k], at);
@@ -20044,8 +20075,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (over.bytes && ceilingSet.bytes) notes.bytes = true;
     };
 
-    /** The position of the message a block is stored on (_storedOn), or
-     *  `pos`, its entry's. */
     const homeOf = (block: ContentBlock, pos: number): number => {
       const on = this._storedOn.get(block);
       return on === undefined ? pos : posById.get(on) ?? -1;
@@ -20130,15 +20159,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const bucket = bucketAt(pos);
-      const homes: number[] = [];
-      for (const block of entry.content) homes.push(...Array.from(imagesIn([block]), () => homeOf(block, pos)));
+      const found: Array<{ image: ContentBlock; home: number }> = [];
+      for (const block of entry.content) for (const image of imagesIn([block])) found.push({ image, home: homeOf(block, pos) });
+      const kept = new Map<number, boolean>();
+      for (const k of found.map((_, k) => k).sort((a, b) => found[b]!.home - found[a]!.home)) {
+        kept.set(k, keeps(found[k]!.image, found[k]!.home));
+      }
       let next = 0;
       // Every image the entry carries, nested in a tool_result included, in
       // the order postStripEstimates and imageStripReplay count them. A block
       // is copied only when an image in it goes, and the raw forms an edited
       // block carried are released, so a replay can't bring the image back.
-      entry.content = replaceImages(entry.content, (image) => {
-        if (keeps(image, homes[next++]!)) return false;
+      entry.content = replaceImages(entry.content, () => {
+        if (kept.get(next++)) return false;
         // Stats-neutral: the bucket stays as its path tallied it (see the
         // doc above). selectAdaptive tallies at post-strip prices, so
         // reclaiming here would double-decrement there. The strip pass only
@@ -21572,9 +21605,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < entries.length; i++) entries[i].index = i;
   }
 
-  /** The message a block is stored on, where the entry sending it may name
-   *  another: a non-text block of a body's joined parts (joinParts), and a
-   *  tool result pairing repair moved (moveResult), by the block placed. */
   private readonly _storedOn = new WeakMap<ContentBlock, MessageId>();
 
   /**

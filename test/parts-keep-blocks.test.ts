@@ -1,15 +1,3 @@
-/**
- * A message ingress splits into parts goes out as the message it was,
- * wherever its parts render: its thinking, images, tool calls and tool
- * results go out with its text, each once, ahead of the text, and a call's
- * result goes out right after the call. The parts sent raw together are
- * joined into one entry, and so is a part sent raw alone. The middle region
- * used to join its parts' text alone, so a long reply lost its thinking and
- * its call there, and pairing repair then dropped the call's result too.
- * Each part is sent as the windows send it, cut at maxMessageTokens, and
- * priced at what it sends; each image keeps or loses its place by its own
- * part's verdict.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -34,14 +22,11 @@ const images = (sent: Sent[], data: string): number =>
 const isCall = (id: string) => (b: ContentBlock): boolean => b.type === 'tool_use' && (b as { id: string }).id === id;
 const isResult = (id: string) => (b: ContentBlock): boolean =>
   b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === id;
-/** No text block comes before a non-text block in `m`. */
 const nonTextFirst = (m: Sent): boolean => {
   const firstText = m.content.findIndex((b) => b.type === 'text');
   return firstText < 0 || m.content.slice(firstText).every((b) => b.type === 'text');
 };
 
-/** A reply with thinking and a call, its result, and a document with an image
- *  between two texts, each long enough to split. */
 async function story(layout: Layout, kind: Kind, config: Record<string, unknown> = {}) {
   const o = await open({ layout, kind, config: { headWindowTokens: 0, recentWindowTokens: 1_000_000, ...config } });
   o.add('u', [text('intro')]);
@@ -54,7 +39,6 @@ async function story(layout: Layout, kind: Kind, config: Record<string, unknown>
   return { ...o, reply, res: res!, doc };
 }
 
-/** Where the reply's parts render, set after the messages are stored. */
 const PLACES: Record<string, {
   set: (s: Awaited<ReturnType<typeof story>>) => void;
   premise: (s: Awaited<ReturnType<typeof story>>, layout: Layout) => string | undefined;
@@ -68,11 +52,9 @@ const PLACES: Record<string, {
     premise: (s) => (s.strategy.recentStart(s.view()) > s.doc.at(-1)! ? undefined : 'the recent window starts after the document'),
   },
   'across the middle and the recent window': {
-    // The recent window's walk crosses into the reply at its last part.
     set: (s) => s.strategy.set({ headWindowTokens: 0, recentWindowTokens: sum(s.strategy.walkPrices(s.view()), s.reply.at(-1)!) }),
     premise: (s, layout) => {
       const start = s.strategy.recentStart(s.view());
-      // A reply stored with its call on its first part starts the window there.
       const expected = layout === 'new' ? s.reply.at(-1)! : s.reply[0]!;
       return start === expected ? undefined : `the recent window starts at ${expected}, not ${start}`;
     },
@@ -198,8 +180,6 @@ describe('a long string result on a part is cut alike wherever the part renders'
 });
 
 describe("each image keeps or loses its place by its own part's verdict", () => {
-  // A document with its image on its first part, and a reply whose image is
-  // stored after its call, so on its last part.
   async function images2(kind: Kind, config: Record<string, unknown>) {
     const o = await open({ kind, config: { headWindowTokens: 0, ...config } });
     o.add('u', [text('intro')]);
@@ -227,7 +207,6 @@ describe("each image keeps or loses its place by its own part's verdict", () => 
       it(`${kind}, ${where}: a depth limit falling inside the reply keeps the image on its last part and strips the older one`, async () => {
         const o = await images2(kind, { recentWindowTokens });
         try {
-          // The strip starts at the reply's last part (getImageStripStart).
           o.strategy.set({ imageStripDepthTokens: sum(o.estimates(), o.shot.at(-1)!) });
           const sent = (await o.manager.compile(BIG)).messages as Sent[];
           assert.deepEqual([images(sent, 'AAAA'), images(sent, 'BBBB')], [0, 1], 'the reply\'s image goes out, the document\'s doesn\'t');
@@ -286,7 +265,6 @@ describe("a body's bytes stay put while its parts stay in their region", () => {
           const sent = (await o.manager.compile(BIG)).messages as Sent[];
           const at = sent.findIndex((m) => m.content.some(isCall('call-1')));
           assert.ok(sent[at + 1]?.content.some(isResult('call-1')), `turn ${turn}: the call's result follows it`);
-          // What the provider reads: each entry's participant and content.
           const bytes = JSON.stringify(sent
             .filter((m) => textOf(m).includes('REPLY') || m.content.some(isCall('call-1')) || m.content.some(isResult('call-1')))
             .map((m) => ({ participant: m.participant, content: m.content })));
@@ -340,7 +318,6 @@ describe('a Responses reply whose reasoning item comes before its call is stored
         o.add('u', [result('call_1', 'what the tool said')]);
         o.add('a', [text('ok')]);
         o.add('u', [text('next')]);
-        // The recent window starts at the reply's last stored message.
         o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), reply.at(-1)!) });
         const sent = await wire((await o.manager.compile(BIG)).messages as Sent[]);
         const at = (id: string) => sent.findIndex((item) => item.id === id);

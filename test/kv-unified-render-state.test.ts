@@ -380,7 +380,6 @@ const TIES: Record<string, TieCase> = {
     config: { headWindowTokens: 0, recentWindowTokens: 300, maxMessageTokens: 10_000 },
     first: [['u', [text('intro')]], ['a', [call('call-1', 'q')]],
       ['u', [result('call-1', PROSE.slice(0, 60_000)), text(PROSE.slice(0, 80_000))]], ['a', [text(plain(3))]], ...CLOSE],
-    // The render sends the result ahead of the text it was stored with, as a turn of its own.
     premise: (w) => w.some((m, i) => m.content[0]?.type === 'tool_result' && textOf(m.content[0]!).length < 60_000 &&
       textOf(w[i + 1]?.content.at(-1) ?? text('')).length >= 60_000),
     what: 'a middle composite sending a cut result',
