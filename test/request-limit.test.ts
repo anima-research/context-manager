@@ -710,6 +710,24 @@ describe('a too-long refusal (AutobiographicalStrategy.reportRefusedAsTooLong)',
     cm.close();
   });
 
+  it('a refusal of a request whose window was empty changes nothing, and says the request was all overhead and injections', async () => {
+    const { cm, strategy } = await openManager('empty-window', {}, 0);
+    const limited = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, requestLimitTokens: 1_000_000 })).renderStats!;
+    assert.equal(limited.total.tokens, 0, 'premise: the window is empty');
+    const empty = 'The refused request\'s window was empty, so it was all overhead and injections, which the store can\'t fold; ' +
+      'what the request sends beside the window, with the reply\'s reserve against max_tokens, is above what the provider takes';
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(undefined, OVERHEAD), {
+      changed: false,
+      why: `${empty}, and so is the request limit.`,
+    });
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
+    assert.deepStrictEqual(strategy.reportRefusedAsTooLong(5_000, OVERHEAD), {
+      changed: false,
+      why: `${empty}.`,
+    });
+    cm.close();
+  });
+
   it('a stated count over the store\'s price that the multiplier doesn\'t step to sets the provider\'s rate, and the next compile fits at it', async () => {
     const { cm, strategy, limit } = await bound('over-a-little', 1.2);
     const first = await compileUnder(cm, limit);
