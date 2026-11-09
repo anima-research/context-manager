@@ -12,6 +12,21 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.27.0 — 2026-11-09
+
+### Changed
+
+- System changes: a `system_change` block carrying only `effort` (`SystemChangeContent.effort`, added in membrane 0.10.0) changes, from its place on, the effort the model answers with. membrane 0.10.0 sends one only through its native formatter and Anthropic adapter, at its place, or right after the turn its place falls inside where membrane merges turns. On any other formatter or adapter it refuses the whole request, and it refuses an effort change that would end a request after an assistant turn. Every strategy keeps it as it keeps any system change: compiled unaltered, in its place among the raw messages, never dropped, and left out of what compression reads. A write refuses a change carrying `effort` beside a change of tools or system text (a non-empty `removeTools`, `defineTools` or `addSystem`), or beside another block in its message, and one whose `effort` isn't `low`, `medium`, `high`, `xhigh` or `max`, each by name; a read leaves such a change out. An effort-only change between a tool call and its result is refused like any other change: kept raw, it would part the call from its result in the same way. The refusal now gives membrane's placement as its reason for a change of tools or system text only: membrane sends one of those after the call's result anyway.
+
+- **Hosts:** context-manager accepts `@animalabs/membrane`
+  `^0.8.0 || ^0.9.0 || ^0.10.0` (was `^0.8.0 || ^0.9.0`), so a host whose
+  own membrane is 0.10.0 shares it with context-manager, where before
+  context-manager installed its own 0.9.0 beside it. A lockfile's 0.8.0 or
+  0.9.0 is still admitted. membrane 0.10.0 is the release whose system
+  changes carry `effort`, which an effort-only system change needs to reach
+  the model; membrane 0.9.0 leaves such a block out as empty. membrane's
+  changelog for 0.10.0 lists its other changes.
+
 ## 0.26.0 — 2026-11-09
 
 ### Added
