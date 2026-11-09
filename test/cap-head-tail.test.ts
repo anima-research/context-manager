@@ -195,17 +195,19 @@ describe('a string tool result keeps its pairing', () => {
     const content = resultOf(out[0])!;
     const marker = /\[truncated — chars (\d+) to (\d+) of 60000 elided here; the whole is stored message m-2\]/.exec(content);
     assert.ok(marker, content.slice(0, 200));
-    assert.ok(content.startsWith(whole.slice(0, Number(marker[1]))));
-    assert.ok(content.endsWith(whole.slice(Number(marker[2]))));
+    assert.equal(content, `${whole.slice(0, Number(marker[1]))}\n\n${marker[0]}\n\n${whole.slice(Number(marker[2]))}`,
+      "exactly the head before the marker's first offset and the tail from its second");
     assert.ok(textEstimate(out) <= 2_000);
   });
 
-  it('a result wholly in the middle says so in its content, and one the tail starts in says its start is elided', () => {
-    const out = capContent([result('t1', lines(1000)), result('t2', lines(300)), result('t3', lines(1000))], 2_000, textEstimate);
+  it('a result wholly in the middle says so in its content, and one the tail starts in says its start is elided, each naming the stored whole', () => {
+    const out = capContent([result('t1', lines(1000)), result('t2', lines(300)), result('t3', lines(1000))], 2_000, textEstimate,
+      { whole: { kind: 'message', id: 'm-3' } });
     assert.deepEqual(out.map((b) => (b as { toolUseId?: string }).toolUseId), ['t1', 't2', 't3'], 'every result keeps its pairing, in order');
-    assert.match(resultOf(out[0])!, /\[truncated — chars \d+ to \d+ of 69000 elided here\]$/, "the first result's head, then the marker");
-    assert.equal(resultOf(out[1]), '[truncated — this result is in the chars the marker above elides]');
-    assert.match(resultOf(out[2])!, /^\[truncated — this result's start is in the chars the marker above elides\]\n\nzz-line-\d{5} /);
+    assert.match(resultOf(out[0])!, /\[truncated — chars \d+ to \d+ of 69000 elided here; the whole is stored message m-3\]$/, "the first result's head, then the marker");
+    assert.equal(resultOf(out[1]), '[truncated — this result is elided; the whole is stored message m-3]',
+      'a notice stands alone, since pairing repair can drop the result that holds the marker');
+    assert.match(resultOf(out[2])!, /^\[truncated — this result's start is elided; the whole is stored message m-3\]\n\nzz-line-\d{5} /);
     assert.ok(resultOf(out[2])!.endsWith('zz-line-00999 ...............\n'));
     assert.ok(textEstimate(out) <= 2_000, `the notices count against the cap too: ${textEstimate(out)}`);
   });

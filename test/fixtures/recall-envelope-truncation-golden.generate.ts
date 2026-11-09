@@ -30,8 +30,8 @@
  * It was captured again, on purpose, when the cap began keeping a message's
  * head and tail around one marker naming the stored message or summary,
  * found by the strategy's own estimate, and never cutting a message to
- * something longer than its whole. Every cap here is smaller than that
- * marker. So a raw turn the cap cuts, every one of the adaptive renders',
+ * something longer than its whole. Every cap here but
+ * `hierarchicalCombinedUncut`'s is smaller than that marker. So a raw turn the cap cuts, every one of the adaptive renders',
  * renders as the marker alone, where it rendered its first characters and
  * the old suffix. Every summary here, and every raw turn of the
  * hierarchical renders, is no longer than its marker, so it renders whole,

@@ -52,7 +52,7 @@ describe('capContent', () => {
     assert.deepEqual(out.map((b) => b.type), ['text', 'text', 'tool_result', 'text']);
     assert.match(textOf(out[0])!, /^x+$/);
     assert.ok(isCapMarker(out[1]!));
-    assert.equal((out[2] as { content: unknown }).content, '[truncated — this result is in the chars the marker above elides]');
+    assert.equal((out[2] as { content: unknown }).content, '[truncated — this result is elided]', 'with no stored whole to name');
     assert.match(textOf(out[3])!, /^y+$/);
   });
 

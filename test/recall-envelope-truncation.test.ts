@@ -3,9 +3,9 @@
  * able to tear the envelope.
  *
  * Wrapping an answer and then truncating it is the failure this file exists
- * to forbid. The truncator keeps a prefix and appends its own marker, so an
- * enveloped answer loses its closing tag, and a cap smaller than the opener
- * emits half of one — a delimiter convention that sometimes lies, which is
+ * to forbid. The cut keeps a head and a tail around its own marker, so an
+ * enveloped answer cut whole would lose its opener or its closer, and a cap
+ * smaller than a tag would emit half of one — a delimiter convention that sometimes lies, which is
  * worse than no convention at all, because a reader that meets one torn
  * envelope learns to distrust the intact ones. The render therefore truncates
  * the PROSE and envelopes what survives.
@@ -126,8 +126,11 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
         // fragment. A longer summary's marker inside the tags is pinned in
         // test/combined-recall-answer.test.ts.
         for (const body of bodies) {
-          assert.doesNotMatch(body, TRUNCATION_MARKER, `${label}: no summary here is longer than its marker`);
-          assert.ok(body.length > 0, `${label}: the envelope must not be empty`);
+          if (name === 'adaptiveTightCap') {
+            assert.match(body, /^zz-adaptive-memory-\d+ recollection of an earlier stretch$/, `${label}: the summary whole`);
+          } else {
+            assert.equal(body, [HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, HIERARCHICAL_FIXTURE_PLAIN_PROSE, 'zz-memory-with-carriers'][index], `${label}: the summary whole`);
+          }
         }
       }
     }
@@ -164,6 +167,7 @@ describe('recallEnvelope under maxMessageTokens: the combined turn measures each
       assert.equal(separatorCount(answer), 2, `${label}: two separators join them`);
       assert.equal(bodies[0], HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, `${label}: summary one fits, so it is whole`);
       assert.equal(bodies[1], HIERARCHICAL_FIXTURE_PLAIN_PROSE, `${label}: summary two fits, so it is whole`);
+      assert.equal(bodies[2], 'zz-memory-with-carriers', `${label}: summary three fits, so it is whole`);
       assert.ok(!TRUNCATION_MARKER.test(textOf(answer)), `${label}: nothing is cut`);
     });
   }

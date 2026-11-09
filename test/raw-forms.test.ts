@@ -968,7 +968,8 @@ describe('raw forms: on the wire, through membrane\'s formatters', () => {
     });
     const manager = await ContextManager.open({ path: STORE, strategy });
     manager.addMessage('user', [{ type: 'text', text: 'go' }]);
-    // The first part fits; the second is cut; the third is dropped.
+    // The first part is in the head, the second is cut there, and the third's
+    // start is elided while its end is the tail.
     manager.addMessage('Claude', [
       reasoning(),
       itemText('first part', item),
@@ -981,7 +982,7 @@ describe('raw forms: on the wire, through membrane\'s formatters', () => {
     const sent = (await wire(new OpenAIResponsesFormatter(), compiled)) as Array<Record<string, unknown>>;
     assert.equal(occurrences(sent, 'msg_1'), 0, 'the uncut item is not replayed');
     assert.equal(occurrences(sent, 'rs_1'), 0, 'nor is the reasoning that led to it, by its id');
-    assert.equal(occurrences(sent, 'third'), 0, 'the dropped part is not on the wire');
+    assert.equal(occurrences(sent, 'third'), 0, "the third part's start is not on the wire");
     assert.equal(occurrences(sent, 'second y'), 1, 'the cut part ships once');
     assert.equal(occurrences(sent, '[truncated'), 1, 'with its marker');
     const thinking = sent.filter((i) => i.type === 'reasoning');

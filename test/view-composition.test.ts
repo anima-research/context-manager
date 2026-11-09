@@ -514,7 +514,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
       strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
     });
     manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
-    manager.addMessage('u', [
+    const capped = manager.addMessage('u', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'tool_result', toolUseId: 't1', content: 'the file' },
       { type: 'text', text: 'y'.repeat(2000) },
@@ -524,7 +524,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const result = blocks.find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
     assert.equal(result?.toolUseId, 't1', 'the result still answers its call');
     assert.ok(blocks.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 't1'), 'and the call is still there');
-    assert.equal(result?.content, '[truncated — this result is in the chars the marker above elides]');
+    assert.equal(result?.content, `[truncated — this result is elided; the whole is stored message ${capped}]`);
     await manager.close();
   });
 
@@ -535,7 +535,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
       strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 }),
     });
     manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
-    manager.addMessage('u', [
+    const capped = manager.addMessage('u', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'tool_result', toolUseId: 't1', content: 'the file' },
       { type: 'text', text: 'y'.repeat(2000) },
@@ -543,7 +543,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const compiled = await manager.compile(budget);
     const result = compiled.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
     assert.equal(result?.toolUseId, 't1');
-    assert.equal(result?.content, '[truncated — this result is in the chars the marker above elides]');
+    assert.equal(result?.content, `[truncated — this result is elided; the whole is stored message ${capped}]`);
     await manager.close();
   });
 

@@ -109,17 +109,21 @@ describe('the combined recall answer cuts each summary to maxMessageTokens on it
 });
 
 describe('a cap smaller than the envelope and the marker', () => {
-  it('positioned, xml: leaves a summary longer than its marker as that marker alone, inside intact tags, listed whole', async () => {
+  it('positioned, xml: leaves a summary longer than its marker as that marker alone, inside intact tags, listed as partial', async () => {
+    class Exposed extends SeedableStrategy {
+      render(summary: SummaryEntry, cap: number) { return this.renderSummaryAnswer(summary, cap); }
+    }
     const dir = mkdtempSync(join(tmpdir(), 'zz-positioned-marker-alone-'));
     try {
-      const strategy = new SeedableStrategy({
+      const strategy = new Exposed({
         headWindowTokens: 0, recentWindowTokens: 8, positionedRecallPairs: true, recallEnvelope: 'xml', maxMessageTokens: 1,
       });
       const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
       const a = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-one' }]);
       cm.addMessage('user', [{ type: 'text', text: 'zz-turn-latest ' + 'Z'.repeat(60) }]);
       const prose = summaryLines('zza', 300);
-      strategy.seedSummary({ id: 'L1-a', level: 1, content: prose, tokens: Math.ceil(prose.length / 4), sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+      const seeded = strategy.seedSummary({ id: 'L1-a', level: 1, content: prose, tokens: Math.ceil(prose.length / 4), sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+      assert.deepEqual(strategy.render(seeded, 1).refs, [{ id: 'L1-a', level: 1, partial: true }], 'listed, as partial');
       const compiled = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
       const answers = (compiled.messages as RenderedMessage[]).filter((m, i, all) => i > 0 && all[i - 1]!.participant === 'Context Manager');
       assert.equal(answers.length, 1, 'one recall pair');
@@ -172,8 +176,8 @@ describe('every recall answer cuts each summary head and tail, its marker naming
             const [, head, tailStart, total] = markers[0]!.map(Number);
             assert.equal(total, prose.length);
             assert.equal(cm.capMeasuredText({ id }), prose, "the reader pages the summary's answer prose");
-            assert.ok(sent.includes(prose.slice(0, head!)), `${id}'s head is sent`);
-            assert.ok(sent.includes(prose.slice(tailStart!)), `${id}'s tail is sent`);
+            assert.ok(sent.includes(`${prose.slice(0, head!)}\n${markers[0]![0]}\n${prose.slice(tailStart!)}`),
+              `${id}: exactly the head before the marker's first offset, the marker, and the tail from its second`);
             assert.ok(sent.includes(`${label}-00999`), `${id}'s last line is sent`);
             assert.ok(!sent.includes(prose.slice(head!, tailStart!)), `${id}'s middle is not`);
             if (mode !== 'none') {
