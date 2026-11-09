@@ -2,7 +2,7 @@
   `AutobiographicalStrategy` and `KnowledgeStrategy` pair each tool result with
   the nearest call before it with that id, as with distinct ids, in pairing
   repair (`enforceToolPairing`) and in `toolResultMaxLastN`'s count, and so does
-  `stripUnpairedToolBlocks`, which every summariser request goes through. Where
+  `stripUnpairedToolBlocks`, which every summariser request that carries tool blocks goes through. Where
   each of two responses streams one tool call without an id, membrane's
   OpenAI-compatible adapter gives both the id `call_1`. Where the earlier call
   had no result and the later call's result lay within the repair's look-ahead,
