@@ -25,8 +25,9 @@
   (the head window gives such a body up whole). And if it isn't yet in a
   closed chunk when the host upgrades, the chunk that takes it closes only
   after its result, so the body stays raw until that chunk is summarized,
-  where its earlier parts used to fold. Measured once, a 30,000-token reply
-  stored that way kept about 20,000 tokens more raw than the previous
-  release, and a compile at a 70,000-token budget was refused where the
-  previous release compiled. A body stored after the upgrade doesn't pay
-  this.
+  where its earlier parts used to fold. A probe of the chunker's rule alone,
+  on the previous release, measured this once: after compression, with no
+  message after it, a 30,000-token reply stored that way kept about 20,000
+  tokens more raw, and a compile at a 70,000-token budget was refused where
+  the release without the rule compiled. A body stored after the upgrade
+  doesn't pay this.
