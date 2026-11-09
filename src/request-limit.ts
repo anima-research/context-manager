@@ -1,7 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type { RequestOverhead, SelectOptions } from './types/strategy.js';
 import type { StoredMessage } from './types/index.js';
-import { OverBudgetError } from './adaptive/picker.js';
+import { OverBudgetError, type OverBudgetDiagnostics } from './adaptive/picker.js';
 
 export function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
   const content: ContentBlock[] = [];
@@ -59,18 +59,21 @@ export function overRequestLimit(parts: RequestBesidesWindow & { window: number 
   return error;
 }
 
+export type LimitBound = Required<Pick<OverBudgetDiagnostics, 'requestLimitTokens' | 'requestAllowanceTokens' | 'requestLimitBound'>>;
+
 export function roomUnderRequestLimit(
   store: { estimateTokens(message: StoredMessage): number },
   reserve: number,
   room: number,
   opts: SelectOptions | undefined,
-): number {
+): { room: number; limitBound?: LimitBound } {
   const limit = opts?.requestLimitTokens;
-  if (limit === undefined || !opts?.requestOverhead) return room;
+  if (limit === undefined || !opts?.requestOverhead) return { room };
   const price = (content: ContentBlock[]) => (content.length > 0 ? store.estimateTokens({ content } as unknown as StoredMessage) : 0);
   const overhead = price(requestOverheadContent(opts.requestOverhead));
   const injected = (opts.messageInjections ?? []).reduce((n, content) => n + price([...content]), 0);
   const allowance = Math.floor(limit - reserve - overhead - injected);
   if (allowance <= 0) throw noRoomUnderRequestLimit({ limit, reserve, overhead, injected, allowance });
-  return Math.min(room, allowance);
+  if (allowance >= room) return { room };
+  return { room: allowance, limitBound: { requestLimitTokens: limit, requestAllowanceTokens: allowance, requestLimitBound: true } };
 }

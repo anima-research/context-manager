@@ -869,9 +869,11 @@ export interface SelectOptions {
    * the refusal's stated count implies, where that is above both the
    * multiplier and the rate it priced the refused request at, or, where the
    * refusal stated no count, the calibration's ceiling, where it priced the
-   * request below that. Each usage sample after that which declares its
-   * overhead replaces the rate with its own, and ends it where its own is no
-   * higher than the multiplier. The store rounds each block's price at the
+   * request below that; in neither case a rate at which what the request
+   * sends beside the window leaves it no room. Each usage sample after that
+   * which declares its overhead replaces the rate with its own, and ends it
+   * where its own is no higher than the multiplier and the calibration's
+   * band doesn't reject it. The store rounds each block's price at the
    * multiplier by up to half a token, so at a true rate up to the one it
    * priced at, the request can pass the
    * limit by up to half a token a block, scaled by that rate over the
@@ -915,6 +917,10 @@ export interface PreviewResult {
    *  bound reports the plan instead, without them. */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /** Present, and true, on a preview that doesn't fit, where the request
+   *  limit, not the budget, is the bound it measured against, as the live
+   *  compile's refusal says (`OverBudgetDiagnostics.requestLimitBound`). */
+  requestLimitBound?: true;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
   /** True when the picker could not fold any further, and when the request

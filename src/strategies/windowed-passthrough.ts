@@ -681,7 +681,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     opts?: SelectOptions,
   ): ContextEntry[] {
     this.syncToBranch();
-    const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
+    const { room: maxTokens, limitBound } = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
     const messages = store.getAll();
     const presented = this.presentedAnchor(opts?.dryRun === true);
     const shown = this.atOrAfterAnchor(presented);
@@ -808,6 +808,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
           middleTokens: 0,
           middleChunkCount: 0,
           deepestLevel: 0,
+          ...limitBound,
         },
       });
     }

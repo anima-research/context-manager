@@ -10,7 +10,7 @@ import type {
   SelectOptions,
 } from '../types/index.js';
 import { OverBudgetError } from '../adaptive/picker.js';
-import { roomUnderRequestLimit } from '../request-limit.js';
+import { roomUnderRequestLimit, type LimitBound } from '../request-limit.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
@@ -50,7 +50,7 @@ export class PassthroughStrategy implements ContextStrategy {
     const messages = store.getAll();
     const entries: ContextEntry[] = [];
     let totalTokens = 0;
-    const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
+    const { room: maxTokens, limitBound } = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
 
     // Add messages until we hit the budget
     for (let i = 0; i < messages.length; i++) {
@@ -76,7 +76,7 @@ export class PassthroughStrategy implements ContextStrategy {
     // If we hit the limit before adding all messages,
     // keep the most recent ones that fit
     if (entries.length < messages.length) {
-      return this.selectFromEnd(store, maxTokens, opts);
+      return this.selectFromEnd(store, maxTokens, opts, limitBound);
     }
 
     return entries;
@@ -98,7 +98,7 @@ export class PassthroughStrategy implements ContextStrategy {
    * participant from another, and membrane refuses a request holding a
    * change it can't place.
    */
-  private selectFromEnd(store: MessageStoreView, maxTokens: number, opts?: SelectOptions): ContextEntry[] {
+  private selectFromEnd(store: MessageStoreView, maxTokens: number, opts?: SelectOptions, limitBound?: LimitBound): ContextEntry[] {
     const messages = store.getAll();
     const changes = systemChangePositions(messages);
     let changeTokens = 0;
@@ -110,7 +110,7 @@ export class PassthroughStrategy implements ContextStrategy {
         actual: totalTokens,
         stage: 'Passthrough kept only its system changes',
         clearedBy: [],
-        diagnostics: { headTokens: totalTokens, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
+        diagnostics: { headTokens: totalTokens, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0, ...limitBound },
       });
     }
 
@@ -140,7 +140,7 @@ export class PassthroughStrategy implements ContextStrategy {
         actual: changeTokens + newestTokens,
         stage: 'Passthrough: its system changes and the newest conversation message',
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
-        diagnostics: { headTokens: changeTokens, tailTokens: newestTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
+        diagnostics: { headTokens: changeTokens, tailTokens: newestTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0, ...limitBound },
       });
     }
 
