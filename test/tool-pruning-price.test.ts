@@ -134,20 +134,22 @@ describe('tool pruning, priced as sent', () => {
     });
 
     it(`${name}: replaces a result before the cap would cut it, and prices its marker`, async () => {
-      // Each result is about 2,500 tokens, over a cap of 500: the newest is
-      // cut, and the older ones are sent and priced as their markers. The
-      // first result's message also carries a note after it, which a cap
-      // taken before the replacement would have cut away with the result.
+      // Each result is past a cap of 500: the newest is cut, and the older
+      // ones are sent and priced as their markers. The first result's message
+      // also carries a note after it, about 375 tokens, which fits the cap
+      // beside the marker, and which a cap taken before the replacement would
+      // cut, since a 500-token cut keeps a tail of about 200 tokens.
+      const NOTE = 'a note after the result. '.repeat(60);
       const { cm, store } = await open({ ...selector, toolResultMaxLastN: 1, maxMessageTokens: 500 });
       cm.addMessage('u', text('look these up'));
       cm.addMessage('a', [call('call-1')]);
-      cm.addMessage('u', [result('call-1', `1 ${PROSE}`), { type: 'text', text: 'a note after the result' }]);
+      cm.addMessage('u', [result('call-1', `1 ${PROSE}`), { type: 'text', text: NOTE }]);
       lookups(cm, 2, 2);
       cm.addMessage('a', text('ok'));
       cm.addMessage('u', text('next'));
       const compiled = await cm.compile(BUDGET);
       assert.equal(resultOf(compiled, 'call-1'), MARKER);
-      assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'a note after the result')),
+      assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === NOTE)),
         'the note after the replaced result is sent whole');
       assert.equal(resultOf(compiled, 'call-2'), MARKER);
       assert.match(resultOf(compiled, 'call-3')!, /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored message \S+\]/);

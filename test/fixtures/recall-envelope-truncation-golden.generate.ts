@@ -42,6 +42,10 @@
  * cases at caps of 12 and 1 are gone: with every summary whole they render
  * as `hierarchicalCombinedUncut` does, and test/combined-recall-answer.test.ts
  * pins the combined answer at a cap of 1, and its cuts with longer summaries.
+ * So since this capture no summary here is cut, and this golden no longer sees
+ * the envelope's cut-then-wrap order. test/combined-recall-answer.test.ts pins
+ * it: each long summary's head, marker and tail inside one whole envelope, on
+ * the positioned, combined and adaptive paths.
  *
  * `hierarchicalCombinedUncut` pins a combined answer the cap cuts nothing
  * from.

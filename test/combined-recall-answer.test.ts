@@ -79,8 +79,13 @@ describe('the combined recall answer cuts each summary to maxMessageTokens on it
 
     it(`${mode}: a cap smaller than the marker sends each summary no longer than its marker whole, so every one is listed`, async () => {
       const rendered = await renderHierarchicalFixture({ positionedRecallPairs: false, maxMessageTokens: 1, recallEnvelope: mode });
+      // The compile's coverage check refuses one the answer doesn't list, so the
+      // render itself shows all three listed; their bodies show each sent whole.
       const text = textOf(combinedAnswerOf(rendered.messages));
-      assert.ok(text.includes(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE) && text.includes(HIERARCHICAL_FIXTURE_PLAIN_PROSE), 'the summaries whole');
+      for (const prose of [HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, HIERARCHICAL_FIXTURE_PLAIN_PROSE, 'zz-memory-with-carriers']) {
+        assert.ok(text.includes(prose), `${prose} is sent whole`);
+      }
+      assert.equal(separators(combinedAnswerOf(rendered.messages)), 2, 'three summaries, joined by two separators');
       assert.doesNotMatch(text, SUMMARY_MARKER, 'none cut');
     });
 
@@ -203,23 +208,37 @@ describe('the adaptive render cuts each long summary head and tail inside its en
   const longSummary = (n: number): string => summaryLines(`zzs${n}`, 20).trimEnd();
   for (const mode of ['xml', 'bare'] as const) {
     it(`adaptive, ${mode}: each long summary's head, the marker naming it and its tail sit inside its one whole envelope, the offsets indexing its prose`, async () => {
+      const measured = new Map<string, string | null>();
       const rendered = await renderAdaptiveFixture(
         { maxMessageTokens: 60, recallEnvelope: mode },
         (n) => [{ type: 'text', text: longSummary(n) }],
         1_200,
+        undefined,
+        undefined,
+        (manager) => {
+          for (const s of manager.getSummariesInRange({})) measured.set(s.id, manager.capMeasuredText({ id: s.id }));
+        },
       );
       const sent = rendered.messages.map((m) => textOf(m)).join('\n');
       const markers = [...sent.matchAll(new RegExp(SUMMARY_MARKER.source, 'g'))];
       assert.ok(markers.length > 0, `the adaptive render recalls a long summary: ${JSON.stringify(sent.slice(0, 300))}`);
       const envelopes = [...sent.matchAll(WHOLE_ENVELOPE)].map((m) => m[0]);
+      // Every summary the mock writes is long, so every recall answer is cut.
+      const recalled = envelopes.filter((e) => /zzs\d+-00000/.test(e));
+      assert.ok(recalled.length >= 2, `premise: the render recalls more than one summary: ${recalled.length}`);
+      for (const envelope of recalled) {
+        assert.equal(markers.filter((m) => envelope.includes(m[0])).length, 1, `one marker in each recall answer: ${JSON.stringify(envelope.slice(0, 200))}`);
+      }
       for (const marker of markers) {
         const [head, tailStart, total] = [marker[1], marker[2], marker[3]].map(Number);
+        assert.ok(head < tailStart, `${marker[4]}'s marker elides something: ${head} to ${tailStart}`);
         const envelope = envelopes.find((e) => e.includes(marker[0]));
         assert.ok(envelope, `the marker naming ${marker[4]} sits inside a whole envelope`);
         const label = /zzs(\d+)-00000/.exec(envelope)?.[1];
         assert.ok(label !== undefined, `${marker[4]}'s envelope holds its summary's first line`);
         const prose = longSummary(Number(label));
         assert.equal(total, prose.length, `${marker[4]}'s marker counts its prose`);
+        assert.equal(measured.get(marker[4]!), prose, `paging by ${marker[4]}, the id its marker names, reads this summary's prose`);
         assert.ok(envelope.includes(`${prose.slice(0, head)}\n${marker[0]}\n${prose.slice(tailStart)}`),
           `${marker[4]}: exactly the head before the marker's first offset, the marker, and the tail from its second`);
       }
@@ -228,19 +247,25 @@ describe('the adaptive render cuts each long summary head and tail inside its en
 });
 
 describe('a summary whose head and tail hold nothing', () => {
+  /** A store whose summary A is blank at both ends, under `maxMessageTokens`. */
+  async function blankEnds(dir: string, maxMessageTokens?: number) {
+    const strategy = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8, positionedRecallPairs: false, ...(maxMessageTokens ? { maxMessageTokens } : {}) });
+    const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    const a = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-one' }]);
+    const b = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-two' }]);
+    cm.addMessage('user', [{ type: 'text', text: 'zz-turn-latest ' + 'Z'.repeat(60) }]);
+    // A's prose is blank at both ends, and past the cap without its blank blocks
+    // too, so under the cap its head and tail hold nothing and its marker stands alone.
+    strategy.seedSummary({ id: 'L1-a', level: 1, content: 'the middle of A', tokens: 3_425, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a },
+      responseContent: [{ type: 'text', text: ' '.repeat(6_000) }, { type: 'text', text: 'the middle of A. '.repeat(100) }, { type: 'text', text: ' '.repeat(6_000) }] });
+    strategy.seedSummary({ id: 'L1-b', level: 1, content: 'zz-memory-b', tokens: 3, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
+    return { cm, a };
+  }
+
   it('is listed nowhere, so the compile that would send it refuses', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zz-combined-blank-ends-'));
     try {
-      const strategy = new SeedableStrategy({ headWindowTokens: 0, recentWindowTokens: 8, positionedRecallPairs: false, maxMessageTokens: 200 });
-      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
-      const a = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-one' }]);
-      const b = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-two' }]);
-      cm.addMessage('user', [{ type: 'text', text: 'zz-turn-latest ' + 'Z'.repeat(60) }]);
-      // A's prose is blank at both ends, and past the cap without its blank blocks
-      // too, so its head and tail hold nothing and its marker stands alone.
-      strategy.seedSummary({ id: 'L1-a', level: 1, content: 'the middle of A', tokens: 3_425, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a },
-        responseContent: [{ type: 'text', text: ' '.repeat(6_000) }, { type: 'text', text: 'the middle of A. '.repeat(100) }, { type: 'text', text: ' '.repeat(6_000) }] });
-      strategy.seedSummary({ id: 'L1-b', level: 1, content: 'zz-memory-b', tokens: 3, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
+      const { cm, a } = await blankEnds(dir, 200);
       await assert.rejects(
         cm.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
         (err: Error & { droppedIds?: readonly string[] }) => {
@@ -250,6 +275,20 @@ describe('a summary whose head and tail hold nothing', () => {
           return true;
         },
       );
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is sent and listed where no cap cuts it: its blank ends alone leave nothing out', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zz-combined-blank-ends-whole-'));
+    try {
+      const { cm } = await blankEnds(dir);
+      const compiled = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      const text = textOf(combinedAnswerOf(compiled.messages as RenderedMessage[]));
+      assert.ok(text.includes('the middle of A. ') && text.includes('zz-memory-b'), 'both summaries are sent, A whole');
+      assert.equal(separators(combinedAnswerOf(compiled.messages as RenderedMessage[])), 1, 'two summaries, joined by one separator');
       cm.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

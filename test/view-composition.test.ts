@@ -553,7 +553,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
       path,
       strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
     });
-    manager.addMessage('u', [
+    const id = manager.addMessage('u', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'text', text: 'second' },
       { type: 'text', text: 'third' },
@@ -563,7 +563,12 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const blocks = compiled.messages[0].content.map((b) => (b as { text: string }).text);
     assert.equal(blocks.length, 3, 'the head, one marker for the dropped middle, the tail');
     assert.match(blocks[0], /^x+$/);
-    assert.match(blocks[1], /^\[truncated — chars \d+ to \d+ of 4011 elided here; the whole is stored message \S+\]$/);
+    const marker = /^\[truncated — chars (\d+) to (\d+) of 4011 elided here; the whole is stored message (\S+)\]$/.exec(blocks[1]);
+    assert.ok(marker, blocks[1]);
+    assert.equal(marker[3], id, 'the marker names the stored message');
+    const measured = 'x'.repeat(2000) + 'second' + 'third' + 'y'.repeat(2000);
+    assert.equal(blocks[0] + measured.slice(Number(marker[1]), Number(marker[2])) + blocks[2], measured,
+      'the elided characters are the measured text between the two offsets');
     assert.match(blocks[2], /^y+$/);
     await manager.close();
   });
@@ -582,7 +587,7 @@ describe('the message cap\'s marker, in both strategies', () => {
       const path = freshPath();
       const manager = await ContextManager.open({ path, strategy: make() });
       manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
-      manager.addMessage('u', [
+      const id = manager.addMessage('u', [
         { type: 'text', text: 'x'.repeat(2000) },
         { type: 'tool_result', toolUseId: 't1', content: 'the file' },
         { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
@@ -594,7 +599,13 @@ describe('the message cap\'s marker, in both strategies', () => {
       const call = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
       const blocks = compiled.messages.slice(call + 1).flatMap((m) => m.content);
       assert.deepEqual(blocks.map((b) => b.type), ['text', 'text', 'text', 'tool_result', 'image', 'text']);
-      assert.match((blocks[1] as { text: string }).text, /^\[truncated — chars \d+ to \d+ of 2015 elided here; the whole is stored message \S+\]$/);
+      const marker = /^\[truncated — chars (\d+) to (\d+) of 2015 elided here; the whole is stored message (\S+)\]$/.exec((blocks[1] as { text: string }).text);
+      assert.ok(marker, (blocks[1] as { text: string }).text);
+      assert.equal(marker[3], id, 'the marker names the stored message');
+      const measured = 'x'.repeat(2000) + 'the file' + 'dropped';
+      const [head, tail] = [(blocks[0] as { text: string }).text, (blocks[2] as { text: string }).text];
+      assert.equal(head + measured.slice(Number(marker[1]), Number(marker[2])) + tail + 'the file' + 'dropped', measured,
+        'the elided characters are the measured text between the two offsets');
       assert.equal((blocks[3] as { content: unknown }).content, 'the file');
       assert.equal((blocks[5] as { text: string }).text, 'dropped');
       await manager.close();
@@ -619,13 +630,14 @@ describe('the message cap\'s marker, in both strategies', () => {
 });
 
 describe('WindowedPassthroughStrategy: the price of a message the cap leaves whole', () => {
-  it('is its full estimate, as it renders, though the message is far past the cap', async () => {
-    // Its text, 3 tokens, is under the 10-token cap, so nothing is cut. A tool call, which the cap
-    // doesn't read, makes the message far larger than the budget.
+  it('is its full estimate, as it renders, though its estimate passed the cap', async () => {
+    // Eleven one-character blocks estimate at 11 tokens, rounded up per block, past the 10-token cap,
+    // but the marker alone would estimate more, so the cut, never longer than the whole, sends them
+    // whole. A tool call, which the cap doesn't read, makes the message far larger than the budget.
     const priced = async (maxMessageTokens: number | undefined): Promise<number> => {
       const manager = await ContextManager.open({ path: freshPath(), strategy: new WindowedPassthroughStrategy(maxMessageTokens === undefined ? {} : { maxMessageTokens }) });
       manager.addMessage('a', [
-        { type: 'text', text: 'x'.repeat(11) },
+        ...Array.from({ length: 11 }, (): ContentBlock => ({ type: 'text', text: 'x' })),
         { type: 'tool_use', id: 't1', name: 'zz_note', input: { note: 'y'.repeat(4000) } } as ContentBlock,
       ]);
       try {

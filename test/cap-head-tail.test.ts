@@ -81,6 +81,9 @@ describe('capContent keeps head and tail around one marker', () => {
     const head = marker.head;
     const tail = marker.total - marker.tailStart;
     assert.equal(head, Math.floor((head + tail) * 0.6), `head ${head}, tail ${tail}`);
+    assert.equal(textOf(out[0]), whole.slice(0, head), 'the head is the text up to the first elided character');
+    assert.equal(textOf(out[2]), whole.slice(marker.tailStart), 'the tail is the text from the first character after the middle');
+    assert.ok(textEstimate(out) >= 2_000 - 3, `and what it keeps fills the cap: ${textEstimate(out)}`);
     assert.equal(marker.kind, undefined, 'no stored whole was named, so the marker names none');
   });
 
@@ -98,6 +101,9 @@ describe('capContent keeps head and tail around one marker', () => {
     const marker = markerOf(textOf(out[1]));
     const tail = marker.total - marker.tailStart;
     assert.equal(marker.head, Math.floor((marker.head + tail) * 0.6), `the 60/40 split stands: head ${marker.head}, tail ${tail}`);
+    assert.equal(textOf(out[0]), whole.slice(0, marker.head), 'the head is the text up to the first elided character');
+    assert.equal(textOf(out[2]), whole.slice(marker.tailStart), 'the tail is the text from the first character after the middle');
+    assert.ok(textEstimate(out) >= 1_000 - 3, `and what it keeps fills the cap: ${textEstimate(out)}`);
   });
 
   for (const [name, estimate] of [
@@ -192,6 +198,7 @@ describe('a string tool result keeps its pairing', () => {
     const whole = lines(2000);
     const out = capContent([result('t1', whole)], 2_000, textEstimate, { whole: { kind: 'message', id: 'm-2' } });
     assert.equal(out.length, 1);
+    assert.equal(out[0]!.type, 'tool_result', 'still a tool result');
     assert.equal((out[0] as { toolUseId?: string }).toolUseId, 't1');
     const content = resultOf(out[0])!;
     const marker = /\[truncated — chars (\d+) to (\d+) of 60000 elided here; the whole is stored message m-2\]/.exec(content);
@@ -205,6 +212,7 @@ describe('a string tool result keeps its pairing', () => {
     const out = capContent([result('t1', lines(1000)), result('t2', lines(300)), result('t3', lines(1000))], 2_000, textEstimate,
       { whole: { kind: 'message', id: 'm-3' } });
     assert.deepEqual(out.map((b) => (b as { toolUseId?: string }).toolUseId), ['t1', 't2', 't3'], 'every result keeps its pairing, in order');
+    assert.deepEqual(out.map((b) => b.type), ['tool_result', 'tool_result', 'tool_result'], 'each still a tool result');
     assert.match(resultOf(out[0])!, /\[truncated — chars \d+ to \d+ of 69000 elided here; the whole is stored message m-3\]$/, "the first result's head, then the marker");
     assert.equal(resultOf(out[1]), '[truncated — this result is elided; the whole is stored message m-3]',
       'a notice stands alone, since pairing repair can drop the result that holds the marker');
@@ -298,6 +306,26 @@ describe('a call input over toolUseInputMaxTokens names where its whole is', () 
       assert.equal(cm.capMeasuredText({ id, toolUseId: 't9' }), JSON.stringify(input), 'the reader pages the input whole');
     });
   });
+
+  it("a preview with another capReadHint renders its own stub, and the next compile's names the live hint", async () => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, toolUseInputMaxTokens: 10, capReadHint: hint, adaptiveResolution: true,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    await withManager(strategy, async (cm) => {
+      const input = { path: '/notes.md', text: 'zz-' + 'w'.repeat(500) };
+      const id = cm.addMessage('Claude', [{ type: 'tool_use', id: 't9', name: 'fs:write', input } as ContentBlock]);
+      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 't9', content: 'ok' } as ContentBlock]);
+      const stub = (entries: Array<{ content: unknown }>): string | undefined =>
+        (entries.flatMap((e) => e.content as ContentBlock[]).find((b) => b.type === 'tool_use') as { input: { _whole?: string } } | undefined)?.input._whole;
+      const before = `[truncated — this call's input, ${JSON.stringify(input).length} chars, is elided; the whole is stored message ${id}, call t9; `;
+      const preview = cm.previewContext(BUDGET, { capReadHint: (at: { id: string }) => `zz-preview-hint ${at.id}` }, { render: true });
+      assert.ok(preview?.entries, 'premise: the preview renders');
+      assert.equal(stub(preview.entries), `${before}zz-preview-hint ${id}]`, "the preview's stub names the preview's hint");
+      const compiled = await cm.compile(BUDGET);
+      assert.equal(stub(compiled.messages), `${before}read them with message_read ${JSON.stringify({ id, toolUseId: 't9' })}]`,
+        "the compile's stub names the live hint");
+    });
+  });
 });
 
 describe('the cut is never longer than the whole', () => {
@@ -388,17 +416,25 @@ describe('a capReadHint that throws', () => {
     assert.ok(tried >= 1, 'premise: the strategy tried to say the throw');
   });
 
-  it("autobiographical: a call input's `_whole` names the message and the call alone", async () => {
-    await withManager(makers.autobiographical!(), async (cm) => {
-      const input = { path: '/notes.md', text: 'zz-' + 'w'.repeat(500) };
-      const id = cm.addMessage('Claude', [{ type: 'tool_use', id: 't9', name: 'fs:write', input } as ContentBlock]);
-      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 't9', content: 'ok' } as ContentBlock]);
+  it("autobiographical: a call input's `_whole` names the message and the call alone, and the throw is said once", async () => {
+    let asked = 0;
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, toolUseInputMaxTokens: 10,
+      capReadHint: () => { asked += 1; return throwingHint(); },
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    await withManager(strategy, async (cm) => {
+      // An append can price the message, which makes its stub, so the window
+      // that hears the throw holds the appends too.
       const said = await warned(async () => {
+        const input = { path: '/notes.md', text: 'zz-' + 'w'.repeat(500) };
+        const id = cm.addMessage('Claude', [{ type: 'tool_use', id: 't9', name: 'fs:write', input } as ContentBlock]);
+        cm.addMessage('user', [{ type: 'tool_result', toolUseId: 't9', content: 'ok' } as ContentBlock]);
         const compiled = await cm.compile(BUDGET);
         const call = compiled.messages.flatMap((m) => m.content as ContentBlock[]).find((b) => b.type === 'tool_use') as { input: { _whole?: string } };
         assert.equal(call.input._whole, `[truncated — this call's input, ${JSON.stringify(input).length} chars, is elided; the whole is stored message ${id}, call t9]`);
       });
-      assert.ok(said.length <= 1);
+      assert.ok(asked >= 1, 'the stub asked the hint');
+      assert.equal(said.filter((line) => line.includes('capReadHint')).length, 1, `said once: ${JSON.stringify(said)}`);
     });
   });
 });

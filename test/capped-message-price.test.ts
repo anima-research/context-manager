@@ -83,8 +83,9 @@ const CASES: Record<string, Case> = {
     old: 'too little',
     messages: [['u', [{ type: 'text', text: 'a short note' }, IMAGE]]],
   },
-  // connectome-host's default cap. The cap keeps four characters a token,
-  // which the store prices at its own rates.
+  // connectome-host's default cap. The cut keeps what fits the cap, marker
+  // included, by the strategy's estimate, which the store prices at its own
+  // rates.
   'prose alone past a cap of 10,000': {
     cap: 10_000,
     old: 'too little',
@@ -442,11 +443,13 @@ describe("an override of truncateContent is the cut a raw message is priced and 
       return super.truncateContent(rewritten, maxTokens, estimate);
     }
   }
-  const rewrites: Array<[string, typeof AutobiographicalStrategy]> = [
-    ['that adds a block', AddsNote],
-    ['that keeps the block count', ReplacesText],
+  // The marker counts the measured text of what the override passed on:
+  // 'hello' and the note, or the note in its place.
+  const rewrites: Array<[string, typeof AutobiographicalStrategy, number]> = [
+    ['that adds a block', AddsNote, 4005],
+    ['that keeps the block count', ReplacesText, 4000],
   ];
-  for (const [how, Rewrites] of rewrites) for (const [mode, config] of SELECTIONS) {
+  for (const [how, Rewrites, total] of rewrites) for (const [mode, config] of SELECTIONS) {
     it(`autobiographical, ${mode}: a rewrite ${how}, passed on to the cut, is cut by its own estimate, and the render stats count it`, async () => {
       // 'hello' alone is 2 tokens to the cut's estimate, under a cap of 100,
       // and with the override's 4,000 characters it is past 1,000.
@@ -455,7 +458,7 @@ describe("an override of truncateContent is the cut a raw message is priced and 
       try {
         const compiled = await manager.compile(BIG);
         const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
-        assert.ok(texts.some((text) => /\[truncated — chars \d+ to \d+ of 400[05] elided here/.test(text)),
+        assert.ok(texts.some((text) => new RegExp(`\\[truncated — chars \\d+ to \\d+ of ${total} elided here`).test(text)),
           `the rewrite is cut: ${JSON.stringify(texts.map((text) => text.slice(0, 60)))}`);
         assert.ok(!texts.some((text) => text.includes('n'.repeat(4000))), 'nothing sends the rewrite whole');
         const sent = rendered(compiled);
@@ -495,12 +498,12 @@ describe("the cut asks about a stored message's own content through the message'
         const stored = new Map(store.getAll().map((m) => [m.id, m]));
         assert.ok(strategy.asked.length > 0, 'premise: the cut asked for estimates');
         // The cut also estimates the head and tail it tries, which are no
-        // stored message; what it mustn't do is estimate a stored message's
-        // own content through any object but the message.
-        const owners = new Map([...stored.values()].map((m) => [m.content, m]));
-        const apart = strategy.asked.filter((m) => owners.has(m.content) && owners.get(m.content) !== m);
-        assert.equal(apart.length, 0, `a stored message's content estimated apart from the message: ${apart.length} of ${strategy.asked.length}`);
-        assert.ok(strategy.asked.some((m) => stored.get(m.id) === m), 'premise: a stored message was estimated through itself');
+        // stored message and carry no id; what it mustn't do is estimate a
+        // stored message through any object but the message, a copy of it
+        // or of its content included.
+        const apart = strategy.asked.filter((m) => m.id !== undefined && stored.has(m.id) && stored.get(m.id) !== m);
+        assert.equal(apart.length, 0, `a stored message estimated apart from itself: ${apart.length} of ${strategy.asked.length}`);
+        for (const m of stored.values()) assert.ok(strategy.asked.includes(m), `premise: stored message ${m.id} was estimated through itself`);
       } finally {
         await close();
       }

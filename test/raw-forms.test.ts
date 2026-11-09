@@ -728,19 +728,21 @@ describe('raw forms: the recall envelope', () => {
 
     it('takes a block of a summary whose text equals the marker, come back as a copy, for that block and not the marker', () => {
       const itemA = { ...MESSAGE_ITEM, id: 'msg_a' };
+      // Text in the cut's marker format: only a block the cut writes is a marker (isCapMarker).
+      const LIKE_A_MARKER = '[truncated — chars 0 to 9 of 99 elided here]';
       // The short blank part and the part whose text is the marker's are in the head and kept, the head
       // ends in the long blank part, and the rest of the item is elided, so both kept parts come back
       // as copies.
       const a = { ...summary, id: 'L1-a', responseContent: [
-        itemText(' ', itemA), itemText(OMITTED, itemA), itemText(' '.repeat(4000), itemA), itemText('the rest of the answer '.repeat(40), itemA), itemText(' '.repeat(4000), itemA),
+        itemText(' ', itemA), itemText(LIKE_A_MARKER, itemA), itemText(' '.repeat(4000), itemA), itemText('the rest of the answer '.repeat(40), itemA), itemText(' '.repeat(4000), itemA),
       ] };
       const { content, refs } = new Exposed({}).render([a], 60);
-      assert.ok(content[1] !== a.responseContent[1] && (content[1] as { text: string }).text === OMITTED && rawOf(content[1]!).rawItem === undefined,
-        'premise: the part whose text equals the omission text is kept, as a copy without its item');
+      assert.ok(content[1] !== a.responseContent[1] && (content[1] as { text: string }).text === LIKE_A_MARKER && rawOf(content[1]!).rawItem === undefined,
+        'premise: the part whose text reads as a marker is kept, as a copy without its item');
       assert.ok(isCapMarker(content[2]!), 'premise: the cut\'s marker follows it');
       assert.deepEqual(listed(refs), ['L1-a~'], 'its own text reached the answer, and it lost the rest');
       assert.deepEqual(listed(new Exposed({ recallEnvelope: 'xml' }).render([a], 60).refs), ['L1-a~'],
-        'the xml answer admits it too: a block of its own whose text equals the omission text is no marker');
+        'the xml answer admits it too: a block of its own whose text reads as a marker is no marker');
     });
 
     it('in the xml answer, a blank block one summary\'s cap leaves out spends none of the next summary\'s cap', () => {
