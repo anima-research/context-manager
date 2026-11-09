@@ -1,6 +1,9 @@
 - A removal (`removeMessage`, `removeMessages`) or a `viewFilter` that leaves
   most of an autobiographical store's chunk records naming no message in view
-  no longer halts its compression, read through a view with `onBranch`. The
+  no longer halts its compression, read through a view with `onBranch`.
+  0.25.0's entry for `retractRemoved` and `retractAbsentRows` says a large
+  removal halts the compression of a reader not told of it (`FAIL-CLOSED`);
+  read through such a view, it no longer does. The
   chain-break guard now asks the store whether the first messages of the
   oldest and the newest of those records are on this branch's messages chain,
   through `onBranch`, an optional `MessageStoreView` method that
@@ -18,9 +21,9 @@
 - While the guard halts, no chunk, waiting or new, is sent to be summarized,
   and demand queues none. A chunk already sent when it trips isn't called
   back: its attempt runs to its end, a later rung of its ladder included.
-  Merges already queued still run and can queue the next level; only the
-  open's merge check and the one after a drop wait, and once the guard clears,
-  the next tick that can send a chunk runs them first. `getCompressionDebt()`
+  Merges run as usual, the merge check and merge-quarantine sweep at open and
+  after a drop included, which earlier releases skipped while the guard
+  halted. `getCompressionDebt()`
   reads `critical` with `failure: 'chunk-records'`. Its `error` gives the
   cause and the first step, which changes nothing. The `FAIL-CLOSED` log line
   gives every step. `scripts/drain-autobiographical.ts` then stops before any

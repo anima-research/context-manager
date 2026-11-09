@@ -256,7 +256,7 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
-      'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
+      'Effect: no new chunk is sent to be summarized; merges run as usual.',
       "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
     ].join('\n');
   }
@@ -264,14 +264,14 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the strategy reads the store through a view without `onBranch`, which can't tell a removal or a filter from a broken chain.",
-      'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
+      'Effect: no new chunk is sent to be summarized; merges run as usual.',
       'Fix: give the strategy a view with `onBranch`, as MessageStore and the views built on it have; each rebuild checks again.',
     ].join('\n');
   }
   return [
     'Compression of new conversation has stopped.',
     `Cause: the store couldn't read its messages chain to check the emptied chunk records (${causeText(cause.chainUnread)}).`,
-    'Effect: no new chunk is sent to be summarized; queued merges still run and can queue the next level.',
+    'Effect: no new chunk is sent to be summarized; merges run as usual.',
     'Fix: fix the cause, whole in the FAIL-CLOSED log line; a rebuild retries.',
   ].join('\n');
 }
@@ -2353,14 +2353,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summarized: the rebuild that sets it empties the queue, and demand
    * (enqueueL1ForRange) queues nothing. Duplicate memories are strictly
    * worse than delayed compression. Merges combine summaries that already
-   * exist, so they go on: merges already queued still run and can queue
-   * the next level; only the open's merge check and the one after a drop
-   * wait, and once the latch clears, the next tick that can send a chunk
-   * runs them first (_mergeCheckOwed).
+   * exist and cut no chunk, so they run as usual: the open's and a drop's
+   * merge check and quarantine sweep included.
    */
   protected chunkRecordsOrphaned = false;
-  /** Whether the latch has cleared since it last held, so the merge checks it held back are owed to the next tick that can send a chunk. */
-  private _mergeCheckOwed = false;
   /** Why the latch is set (chunkRecordsMessage). */
   private _orphanCause: ChunkRecordsCause = 'off-branch';
   /**
@@ -3303,7 +3299,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // never start consolidating. Idempotent: already-queued/merged sources
       // are skipped.
       if (abortIfStale()) return;
-      if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
+      if (this.config.hierarchical && !this.config.auditOnly) {
         // Clear quarantine records whose sources were merged or repaired while
         // the store was closed. Such a record holds nothing (mergeRecordHolds),
         // but getCompressionDebt lists every record's key, and the alarm-driven
@@ -3411,7 +3407,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.chunkIdCounter = 0;
     this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
-    this._mergeCheckOwed = false;
     this._failClosedLogged = undefined;
     this._overlapBlocked.clear();
     this.summaries = [];
@@ -8580,7 +8575,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } finally {
       this.rebuildChunks(ctx.messageStore);
     }
-    if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
+    if (this.config.hierarchical && !this.config.auditOnly) {
       // A merge-quarantine record naming a dropped summary no longer stands.
       this.sweepPaidOffMergeQuarantine();
       this.checkMergeThreshold();
@@ -8853,23 +8848,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // which blocks the very merges that would bring the count back down.
     const hasMerges = this.config.hierarchical === true && this.mergeQueue.length > 0;
     const hasCompression = this.compressionQueue.length > 0;
-    // The merge checks the chain-break guard held back are work too while no
-    // chunk is queued: the tick runs them before anything else, and they can
-    // queue a merge. With chunks queued, the preflight decides as before, and
-    // the next tick that can send a chunk runs them first. A compression
-    // pause holds them as it holds a chunk: the tick returns at the pause,
-    // the drain stops, and they run at the first tick after it.
-    const hasOwedChecks = !hasCompression && this._mergeCheckOwed && !this.chunkRecordsOrphaned;
-    if (!hasCompression && !hasMerges && !hasOwedChecks) return;
+    if (!hasCompression && !hasMerges) return;
     // Only bail when the *sole* available work is L1 compression that the
-    // preflight currently forbids. Merge work always proceeds, and so do the
-    // owed merge checks with no chunk queued. Here no merge is queued, or
-    // `hierarchical` is off, and the cap holds nothing either way
-    // (speculativeCapHolds), so it can't be what stops the drain. With a
-    // merge queued and `hierarchical` on, tick's L1 step comes first and
-    // takes a chunk unless the queue is empty or the cap holds, and the
-    // merge runs otherwise.
-    if (!hasMerges && !hasOwedChecks && !this.shouldCompressPreflight()) return;
+    // preflight currently forbids. Merge work always proceeds. Here no merge
+    // is queued, or `hierarchical` is off, and the cap holds nothing either
+    // way (speculativeCapHolds), so it can't be what stops the drain. With a
+    // merge queued and `hierarchical` on, tick's L1 step comes first and takes
+    // a chunk unless the queue is empty or the cap holds, and the merge runs
+    // otherwise.
+    if (!hasMerges && !this.shouldCompressPreflight()) return;
 
     const progressBefore = this._drainProgress;
     const drainIdentity = this.loadedBranchIdentity;
@@ -9002,15 +8989,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A transient provider failure paused the lane: no compression call and
     // no queue item consumed until the pause ends (see pauseCompressionLane).
     if (this.activeCompressionPause(ctx)) return;
-
-    // The merge checks the chain-break guard held back, before any chunk goes, as at open.
-    // They stay owed until both have run, so a check that throws is tried
-    // again at the next tick.
-    if (this._mergeCheckOwed && !this.chunkRecordsOrphaned) {
-      this.sweepPaidOffMergeQuarantine();
-      this.checkMergeThreshold();
-      this._mergeCheckOwed = false;
-    }
 
     // Priority 1: Compress raw chunks → L1. Skipped while the speculative cap
     // (maxSpeculativeL1s) holds production, so we don't pile up more unmerged
@@ -19802,7 +19780,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
-    if (this.chunkRecordsOrphaned && this.config.hierarchical && !this.config.auditOnly) this._mergeCheckOwed = true;
     this.chunkRecordsOrphaned = false;
     this._failClosedLogged = undefined;
 
@@ -22663,7 +22640,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       compressionFailureRuns: new Map(this.compressionFailureRuns),
       mergeFailureRuns: new Map(this.mergeFailureRuns),
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
-      mergeCheckOwed: this._mergeCheckOwed,
       orphanCause: this._orphanCause,
       failClosedLogged: this._failClosedLogged,
       prevCacheKeys: this._prevCacheKeys,
@@ -22697,7 +22673,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionFailureRuns = saved.compressionFailureRuns;
       this.mergeFailureRuns = saved.mergeFailureRuns;
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
-      this._mergeCheckOwed = saved.mergeCheckOwed;
       this._orphanCause = saved.orphanCause;
       this._failClosedLogged = saved.failClosedLogged;
       this._prevCacheKeys = saved.prevCacheKeys;
