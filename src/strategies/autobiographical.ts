@@ -52,7 +52,7 @@ import {
 } from './settle-summaries.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
-import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { answeredCallIndexes, splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import {
   hoistToolProse,
   DEFAULT_TOOL_PROSE_FIELD,
@@ -67,6 +67,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { noRoomUnderRequestLimit, requestOverheadContent } from '../request-limit.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
@@ -687,45 +688,34 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
- * the earliest call with its id before it, in its own message or an earlier
- * one, that no result has answered yet; a result with no such call goes with
- * the call its id last answered, as a further result; a result with neither
- * answers none. Epoch 4's predicate reads the same calls, so it sees what the
- * count sees.
+ * the nearest call with its id before it, in its own message or an earlier
+ * one (answeredCallIndexes); a result whose call a result has already
+ * answered goes with that call, as a further result; a result with no call
+ * before it with its id answers none.
+ * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
-  type Waiting = { toolName: string; call: AnsweredCall };
-  // Calls no result has answered yet, oldest first, by id, and the call
-  // each id's latest first answer went to.
-  const waiting = new Map<string, Waiting[]>();
-  const answeredLast = new Map<string, AnsweredCall>();
+  const blocks: ContentBlock[] = [];
+  const where: Array<{ message: number; index: number }> = [];
+  messages.forEach((m, message) => m.content.forEach((block, index) => {
+    blocks.push(block);
+    where.push({ message, index });
+  }));
+  const calls = new Map<number, AnsweredCall>();
   const byTool = new Map<string, AnsweredCall[]>();
-  let place = 0;
-  for (let at = 0; at < messages.length; at++) {
-    const m = messages[at]!;
-    for (let i = 0; i < m.content.length; i++, place++) {
-      const block = m.content[i]!;
-      if (block.type === 'tool_use') {
-        let queue = waiting.get(block.id);
-        if (!queue) waiting.set(block.id, (queue = []));
-        queue.push({ toolName: block.name, call: { message: at, place: -1, results: [] } });
-      } else if (block.type === 'tool_result') {
-        const first = waiting.get(block.toolUseId)?.shift();
-        let call: AnsweredCall | undefined;
-        if (first) {
-          call = first.call;
-          call.place = place;
-          answeredLast.set(block.toolUseId, call);
-          let answered = byTool.get(first.toolName);
-          if (!answered) byTool.set(first.toolName, (answered = []));
-          answered.push(call);
-        } else {
-          call = answeredLast.get(block.toolUseId);
-        }
-        call?.results.push({ message: m.id, index: i });
-      }
+  answeredCallIndexes(blocks).forEach((callAt, place) => {
+    if (callAt === undefined) return;
+    let call = calls.get(callAt);
+    if (!call) {
+      calls.set(callAt, (call = { message: where[callAt]!.message, place, results: [] }));
+      const toolName = (blocks[callAt] as { name: string }).name;
+      let answered = byTool.get(toolName);
+      if (!answered) byTool.set(toolName, (answered = []));
+      answered.push(call);
     }
-  }
+    const { message, index } = where[place]!;
+    call.results.push({ message: messages[message]!.id, index });
+  });
   return byTool;
 }
 
@@ -2146,14 +2136,16 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
-type SelectPricing = { overhead: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
-
-function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
-  const content: ContentBlock[] = [];
-  if (overhead.system) content.push({ type: 'text', text: overhead.system });
-  if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
-  return content;
-}
+type SelectPricing = {
+  overhead: ContentBlock[];
+  injections?: ReadonlyArray<ContentBlock[]>;
+  limitTokens?: number;
+  allowance?: number;
+  allowanceTokens?: number;
+  limitBound?: boolean;
+  stubTokens?: number;
+  stubReserve?: number;
+};
 
 /**
  * A summary getStrandedSummaries lists: alone in a run at its level that is
@@ -2820,13 +2812,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           finalTokens: err.actual,
           budgetTokens: err.budget,
           fits: false,
-          exhausted: true,
+          exhausted: this.stubRefusals.has(err) ? partial?.exhausted ?? true : true,
           clearedBy: err.clearedBy,
           headTokens: err.diagnostics.headTokens,
           tailTokens: err.diagnostics.tailTokens,
           middleTokens: err.diagnostics.middleTokens,
           middleChunkCount: err.diagnostics.middleChunkCount,
           deepestLevel: err.diagnostics.deepestLevel,
+          ...(err.diagnostics.requestLimitTokens !== undefined ? { requestLimitTokens: err.diagnostics.requestLimitTokens } : {}),
+          ...(err.diagnostics.requestAllowanceTokens !== undefined ? { requestAllowanceTokens: err.diagnostics.requestAllowanceTokens } : {}),
           // An early throw means no fold plan was computed at all; a late one
           // means we have it.
           resolutions: partial?.resolutions ?? {},
@@ -9562,7 +9556,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private selectPricing: SelectPricing | null = null;
 
   private selectPricingOf(opts: SelectOptions | undefined): SelectPricing | null {
-    return opts?.requestOverhead ? { overhead: requestOverheadContent(opts.requestOverhead), injections: opts.messageInjections } : null;
+    if (!opts?.requestOverhead) return null;
+    return {
+      overhead: requestOverheadContent(opts.requestOverhead),
+      injections: opts.messageInjections,
+      ...(opts.requestLimitTokens !== undefined ? { limitTokens: opts.requestLimitTokens } : {}),
+    };
+  }
+
+  /** Call it once the select path has loaded its multiplier. */
+  private boundsUnderRequestLimit(
+    budget: TokenBudget,
+    target: number,
+    bound: number,
+    adaptive: boolean,
+  ): { maxTokens: number; rejectionBudget: number } {
+    const pricing = this.selectPricing;
+    const limit = pricing?.limitTokens;
+    if (pricing === null || limit === undefined) return { maxTokens: target, rejectionBudget: bound };
+    const overhead = this.priceContent(pricing.overhead);
+    const injected = this.priceMessageInjections(pricing.injections);
+    const atCeiling = adaptive && this._calibrationProvisional !== null;
+    const scale = atCeiling ? this._calibration / CALIBRATION_CEILING : 1;
+    const allowance = Math.floor((limit - budget.reserveForResponse) * scale - overhead - injected);
+    if (allowance <= 0) {
+      pricing.limitBound = true;
+      throw noRoomUnderRequestLimit({
+        limit,
+        reserve: budget.reserveForResponse,
+        overhead: Math.ceil(overhead / scale),
+        injected: Math.ceil(injected / scale),
+        allowance,
+        ...(atCeiling ? { ceiling: CALIBRATION_CEILING } : {}),
+      });
+    }
+    pricing.allowance = allowance;
+    const room = allowance - (pricing.stubReserve ?? 0);
+    if (room < target || room < bound) pricing.allowanceTokens = room;
+    if (room < bound) pricing.limitBound = true;
+    return { maxTokens: Math.min(target, room), rejectionBudget: Math.min(bound, room) };
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -9573,23 +9605,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.config.adaptiveResolution) {
       const adaptive = (dry: boolean): ContextEntry[] => this.selectAdaptive(store, budget, dry === dryRun ? opts : { ...opts, dryRun: dry });
       try {
-        return this.selectByWindowRule(store, adaptive, dryRun);
+        return this.withRoomForStubs(() => this.selectByWindowRule(store, adaptive, dryRun));
       } catch (err) {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
-        // it (#179, the startup wedge). Any other refusal stands.
+        // it (#179, the startup wedge). Any other refusal stands, and so does
+        // one the request limit made (dropProvisionalCalibration).
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, dryRun)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
         // its own (previewContext reads _lastPreview).
         this._lastPreview = undefined;
-        return this.selectByWindowRule(store, adaptive, dryRun);
+        return this.withRoomForStubs(() => this.selectByWindowRule(store, adaptive, dryRun));
       }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
-    return this.selectByWindowRule(store, () => this.selectHierarchical(store, budget), dryRun);
+    return this.withRoomForStubs(() => this.selectByWindowRule(store, () => this.selectHierarchical(store, budget), dryRun));
+  }
+
+  private withRoomForStubs(select: () => ContextEntry[]): ContextEntry[] {
+    const pricing = this.selectPricing;
+    if (pricing) {
+      pricing.stubReserve = undefined;
+      pricing.stubTokens = undefined;
+    }
+    try {
+      return select();
+    } catch (err) {
+      const stubs = pricing?.stubTokens;
+      if (!(err instanceof OverBudgetError) || !this.stubRefusals.has(err) || pricing?.allowance === undefined
+        || stubs === undefined || stubs >= pricing.allowance) throw err;
+      const refusedPreview = this._lastPreview;
+      pricing.stubReserve = stubs;
+      pricing.stubTokens = undefined;
+      this._lastPreview = undefined;
+      try {
+        return select();
+      } catch (retryErr) {
+        if (!(retryErr instanceof OverBudgetError || retryErr instanceof UncoveredDropError)
+          || (retryErr instanceof OverBudgetError && this.stubRefusals.has(retryErr))) throw retryErr;
+        this._lastPreview = refusedPreview;
+        throw err;
+      }
+    }
   }
 
   private acrossMode: 'ask' | 'leave' | 'take' = 'take';
@@ -10556,6 +10616,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Commit the accumulated stats as the last-render snapshot, and return
    *  it; null when this pass recorded none. */
+  private rsTokens(r: RenderStats): number {
+    const s = r.summaries;
+    return r.head.tokens + r.tail.tokens + r.middleRaw.tokens + s.l1.tokens + s.l2.tokens + s.l3.tokens;
+  }
+
   protected rsEnd(): RenderStats | null {
     const r = this._rs;
     if (!r) return null;
@@ -10567,9 +10632,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const summaryMsgs = (s.l1.count + s.l2.count + s.l3.count) * 2; // Q/A pair each
     r.total = {
       messages: r.head.messages + r.tail.messages + r.middleRaw.messages + summaryMsgs,
-      tokens:
-        r.head.tokens + r.tail.tokens + r.middleRaw.tokens +
-        s.l1.tokens + s.l2.tokens + s.l3.tokens,
+      tokens: this.rsTokens(r),
     };
     // Planner vs emitter reconciliation. `planned` is what the picker
     // projected after folding; `actual` is what the emitter committed. They
@@ -10643,6 +10706,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       r.request = {
         overheadTokens: this.priceContent(pricing.overhead),
         injectedTokens: this.priceMessageInjections(pricing.injections),
+        ...(pricing.limitTokens !== undefined ? { limitTokens: pricing.limitTokens } : {}),
+        ...(pricing.allowanceTokens !== undefined ? { allowanceTokens: pricing.allowanceTokens } : {}),
+        ...(pricing.stubTokens !== undefined ? { stubTokens: pricing.stubTokens } : {}),
       };
     }
     this._lastRenderStats = r;
@@ -15046,6 +15112,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         configuredBudget: budget.maxTokens,
         reserveForResponse: budget.reserveForResponse,
         inputBudget: budget.maxTokens - budget.reserveForResponse,
+        ...(this.selectPricing?.limitTokens !== undefined ? { requestLimitTokens: this.selectPricing.limitTokens } : {}),
+        ...(this.selectPricing?.allowanceTokens !== undefined ? { requestAllowanceTokens: this.selectPricing.allowanceTokens } : {}),
       },
     });
   }
@@ -15126,14 +15194,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
-    const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
-    const rejectionBudget = Math.floor(maxTokens * (1 + overBudgetGraceRatio));
     // Closed-loop calibration: apply the persisted multiplier BEFORE any
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store, { dryRun });
+    const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
+    const room = budget.maxTokens - budget.reserveForResponse;
+    const { maxTokens, rejectionBudget } = this.boundsUnderRequestLimit(
+      budget, room, Math.floor(room * (1 + overBudgetGraceRatio)), true);
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -15664,7 +15733,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         // With the line a compile at prodBudget refuses above, as the live
         // pick has its own, so the solver plans as that compile would.
-        const prodLine = Math.floor(prodBudget * (1 + overBudgetGraceRatio));
+        const prodLine = Math.min(Math.floor(prodBudget * (1 + overBudgetGraceRatio)), rejectionBudget);
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
           targetBudget: prodBudget * (1 - slack),
@@ -16104,12 +16173,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     this.assertMiddleCoverage();
+    this.keepStubsUnderRequestLimit(merged, budget, 'picker-chunks');
 
     // Commit the carried frontier only after EVERY refusal-capable stage has
     // succeeded: plan budget, emission budget, tail reservation, structural
-    // repair, full coverage, tool pairing, and marker placement. A rejected
-    // compile may still enqueue demanded summaries above, but it cannot become
-    // the next compile's presentation state.
+    // repair, full coverage, tool pairing, marker placement, and the stubs
+    // under a request limit. A rejected compile may still enqueue demanded
+    // summaries above, but it cannot become the next compile's presentation
+    // state.
     if (pendingResolutionChanges.length > 0 && !dryRun) {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
@@ -16183,7 +16254,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * for a request built from the latest compile (fresh + cache_read +
    * cache_creation, as the provider reports it), and what the request sent
    * besides the window and the compile's message-position injections: its
-   * system prompt and tool definitions (#323). The injections are priced at
+   * system prompt and tool definitions (#323), and any other messages it
+   * sent beside the window. The injections are priced at
    * the compile (SelectOptions.messageInjections) and the overhead here, as
    * the store prices the window, and both are added to the estimate, so the
    * sample compares the whole request with the whole request; left out, the
@@ -16349,7 +16421,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** The store's price of what a request sent besides the window: its system
    *  prompt and its tool definitions as sent, priced as a compression request
-   *  prices its own (priceRequest in the compression path), at the current
+   *  prices its own (priceRequest in the compression path), and its other
+   *  messages' blocks as the window prices them sent whole, at the current
    *  multiplier, so it adds to the window estimate in the same units. */
   private priceRequestOverhead(overhead: RequestOverhead): number {
     return this.priceContent(requestOverheadContent(overhead));
@@ -16610,7 +16683,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the clamp allows, and says nothing about this release's); otherwise it
    * is kept, but not re-stamped. A provisional multiplier above 1 that puts
    * the first compile over budget is dropped to 1 and the select runs again
-   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * (dropProvisionalCalibration), unless the request limit made the
+   * refusal: its bound, no room, or the stubs past what it left. The first
+   * sample the band accepts replaces
    * a provisional multiplier outright, instead of stepping the EMA toward it,
    * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
    * from is provisional too, so one sample sets it rather than about ten; it
@@ -16865,7 +16940,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
                   `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
-                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first, unless the request limit ` +
+                  `made the refusal. Stamped (epoch ` +
                   `${current}) once a sample confirms it.`,
               );
             }
@@ -16898,10 +16974,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  persists it, a dry one keeps it to itself (select() puts it back).
    *  Returns false when there is nothing to drop: no provisional multiplier,
    *  or one at or below 1, where raising estimates can't help, so the refusal
-   *  stands. The 1 stays provisional: the first sample sets it. */
+   *  stands. Also false when the request limit made the refusal: it set the
+   *  hard bound, left no room, or found the pairing repair's stubs past what
+   *  it left. Each such bound scales with the multiplier as the window's
+   *  price does, so a lower one can't make the window fit. The 1 stays provisional: the
+   *  first sample sets it. */
   protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
     const provisional = this._calibrationProvisional;
-    if (!provisional || this._calibration <= 1) return false;
+    if (!provisional || this._calibration <= 1 || this.selectPricing?.limitBound) return false;
     const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const discarded = this._calibration;
     const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
@@ -18347,17 +18427,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const room = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
     const msgCap = this.config.maxMessageTokens;
     // Emission grace (coverage invariant, 76e95a0): selection below still
     // TARGETS maxTokens, but emission never silently drops content to fit —
     // it may overshoot up to the grace window, and beyond that the select
     // refuses the turn (OverBudgetError) rather than losing history.
-    // enforceBudget=false disables the ceiling entirely (legacy behavior).
-    const graceLimit = this.config.enforceBudget === false
-      ? Number.POSITIVE_INFINITY
-      : Math.floor(maxTokens * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0)));
+    // enforceBudget=false disables the ceiling entirely (legacy behavior),
+    // apart from a request limit's.
+    const { maxTokens, rejectionBudget: graceLimit } = this.boundsUnderRequestLimit(budget, room,
+      this.config.enforceBudget === false
+        ? Number.POSITIVE_INFINITY
+        : Math.floor(room * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0))),
+      false);
 
     let totalTokens = 0;
 
@@ -18963,6 +19046,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
+    this.keepStubsUnderRequestLimit(entries, budget, 'selection-items');
     // Strip stale images (this path places no cache markers). Its emission
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
@@ -19232,13 +19316,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * True if `projectedTotal` exceeds `max` AND the strategy is configured
-   * to enforce budget. When `enforceBudget: false`, always returns false
-   * — the rendering pipeline emits the full ideal context regardless of
-   * budget overage. Caller's API will reject if it exceeds the model's
-   * context window; the philosophy is "surface overage, don't hide it."
+   * to enforce budget. When `enforceBudget: false`, false unless a request
+   * limit (`SelectOptions.requestLimitTokens`) applies, and then true only
+   * past what that limit leaves the window — the rendering pipeline emits
+   * the full ideal context regardless of budget overage, within the limit.
+   * Caller's API will reject if it exceeds the model's context window; the
+   * philosophy is "surface overage, don't hide it."
    */
   protected isOverBudget(projectedTotal: number, max: number): boolean {
-    if (this.config.enforceBudget === false) return false;
+    if (this.config.enforceBudget === false) {
+      const allowance = this.selectPricing?.allowance;
+      return allowance !== undefined && projectedTotal > allowance;
+    }
     return projectedTotal > max;
   }
 
@@ -19878,9 +19967,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  repair keep each block's images in order, copying a block at most. A
    *  result the repair drops, such as a second one for a call, leaves its
    *  verdicts unused, so its images took slots the window could have used.
-   *  Two results for one call id in a single message share a group, which
-   *  pairing repair, taking ids to be unique, doesn't expect: where it moves
-   *  one, they can take each other's verdicts. A verdict whose image had
+   *  Two results for one call id in a single message share a group, and
+   *  pairing repair can send them apart: in a message holding its own tool
+   *  cycle, a result before a later call with its id goes up to an earlier
+   *  call, and the result after that call stays. They can then take each
+   *  other's verdicts. A verdict whose image had
    *  another payload (imagePayload) isn't this image's, so the image is
    *  replaced, as is one with no verdict at all, such as an entry with no
    *  source would send: both err under the budget. Only the same image in
@@ -21216,6 +21307,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.enforceToolPairing(entries);
   }
 
+  private keepStubsUnderRequestLimit(
+    entries: readonly ContextEntry[],
+    budget: TokenBudget,
+    middleCountUnit: 'picker-chunks' | 'selection-items',
+  ): void {
+    const pricing = this.selectPricing;
+    if (pricing?.allowance === undefined || pricing.limitTokens === undefined || !this._rs) return;
+    const stubs = entries.flatMap((entry) => entry.content.filter((block) => this.generatedToolResultStubs.has(block)));
+    if (stubs.length === 0) return;
+    const stubTokens = this.priceContent(stubs);
+    pricing.stubTokens = stubTokens;
+    const window = this.rsTokens(this._rs);
+    if (window + stubTokens <= pricing.allowance) return;
+    pricing.limitBound = true;
+    pricing.allowanceTokens = pricing.allowance;
+    const error = this.overBudgetError(budget, {
+      stage: 'Request limit',
+      budget: pricing.allowance,
+      actual: window + stubTokens,
+      clearedBy: [],
+      diagnostics: {
+        middleCountUnit,
+        deepestLevelKind: 'attempted',
+        headTokens: this._rs.head.tokens,
+        tailTokens: this._rs.tail.tokens,
+        middleTokens: window - this._rs.head.tokens - this._rs.tail.tokens,
+        middleChunkCount: 0,
+        deepestLevel: 0,
+      },
+    });
+    error.message = `The tool-result stubs the pairing repair added, ${stubTokens} tokens, take the window of ${window} ` +
+      `past the ${pricing.allowance} the request limit of ${pricing.limitTokens} leaves it`;
+    this.stubRefusals.add(error);
+    throw error;
+  }
+
+  private readonly stubRefusals = new WeakSet<OverBudgetError>();
+
   /**
    * Remove trailing entries that contain tool_use without a following tool_result.
    * This prevents orphaned tool_use blocks when a budget break cuts between
@@ -21296,7 +21425,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
    * subclass overrides like KnowledgeStrategy are covered) and
    * `selectAdaptive` (the path FKM defaults onto). It's a no-op on
-   * already-valid output.
+   * already-valid output in which each call has one result.
    */
   protected enforceToolPairing(entries: ContextEntry[]): void {
     const originOf = new Map<ContextEntry, ContextEntry>();
@@ -21304,7 +21433,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const cut = cycleParts(entry.content);
       if (cut.length < 2) return [entry];
       return cut.map((content) => {
-        const part: ContextEntry = { ...entry, content, relocatedResults: undefined };
+        const part: ContextEntry = { ...entry, content, relocatedResults: undefined, relocatedBlocks: undefined };
         originOf.set(part, entry);
         return part;
       });
@@ -21334,6 +21463,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       open.origin.content.push(...part.content);
       if (part.relocatedResults?.length) open.origin.relocatedResults = [...(open.origin.relocatedResults ?? []), ...part.relocatedResults];
+      if (part.relocatedBlocks?.length) open.origin.relocatedBlocks = [...(open.origin.relocatedBlocks ?? []), ...part.relocatedBlocks];
     });
     entries.splice(0, entries.length, ...folded);
     for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
@@ -21341,17 +21471,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
+    let prevRunIds = new Set<string>();
+    const stubbed = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
 
       // --- Rule A: every tool_result must answer a tool_use in the
-      // immediately-preceding entry (and only once). Drop orphans/dupes. ---
+      // immediately-preceding entry, and only once, but for an id in
+      // prevRunIds, whose every result there answers it. Drop the rest. ---
       if (entry.content.some(b => b.type === 'tool_result')) {
         const seen = new Set<string>();
         const filtered = entry.content.filter(b => {
           if (b.type !== 'tool_result') return true;
-          if (!prevUseIds.has(b.toolUseId) || seen.has(b.toolUseId)) return false;
+          if (!prevUseIds.has(b.toolUseId) || (seen.has(b.toolUseId) && !prevRunIds.has(b.toolUseId))) return false;
           seen.add(b.toolUseId);
           return true;
         });
@@ -21370,20 +21503,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (b.type === 'tool_result') answered.add(b.toolUseId);
         }
         const missing = [...prevUseIds].filter(id => !answered.has(id));
-        if (missing.length > 0) {
-          // Look-ahead relocation: the genuine result for a "missing" id is
-          // often sitting a few entries down, displaced by an interleaved
-          // recall pair / pin (it will otherwise be dropped as an orphan by
-          // Rule A when we reach it). Move the real block up into position and
-          // only stub the ids for which no real result exists — so tool output
-          // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
+        // Look-ahead relocation: the genuine result for a "missing" id is
+        // often sitting a few entries down, displaced by an interleaved
+        // recall pair / pin (it will otherwise be dropped as an orphan by
+        // Rule A when we reach it). Move the real block up into position and
+        // only stub the ids for which no real result exists — so tool output
+        // is preserved, not silently replaced by a placeholder.
+        const results = missing.length > 0 ? this.relocateOrDropMissingResults(entries, i, missing, unitOf, stubbed) : [];
+        const further = this.gatherRunResults(entries, i, [...prevRunIds].filter((id) => !entry.content.some((b) => b.type === 'tool_use' && b.id === id)), unitOf);
+        if (results.length > 0 || further.length > 0) {
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
             // sit together (the API wants tool_result blocks at the head of
             // the message).
-            entry.content = [...results, ...entry.content];
+            const last = entry.content.reduce((at, b, k) => (b.type === 'tool_result' ? k : at), -1);
+            entry.content = [...results, ...entry.content.slice(0, last + 1), ...further, ...entry.content.slice(last + 1)];
           } else {
             // Not a results entry at all — insert a synthetic user entry
             // between the tool_use entry and this one.
@@ -21391,7 +21526,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               index: i,
               participant: 'user',
               sourceRelation: 'derived',
-              content: results,
+              content: [...results, ...further],
             });
             // The stub entry (no tool_use blocks) is now at index i; the
             // current entry moved to i+1 and is re-processed next iteration
@@ -21399,10 +21534,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // already filtered above and none survived — Rule A matched
             // against the same prevUseIds and answered.size === 0).
             prevUseIds = new Set();
+            prevRunIds = new Set();
             continue;
           }
         }
       }
+
+      const later = (b: ContentBlock, p: number): boolean =>
+        b.type === 'tool_use' && entry.content.some((c, k) => k > p && c.type === 'tool_use' && c.id === b.id);
+      prevRunIds = new Set(entry.content.flatMap((b, p) => (b.type === 'tool_use' && later(b, p) ? [b.id] : [])));
+      if (prevRunIds.size > 0) entry.content = releaseEditedRawForms(entry.content, entry.content.filter((b, p) => !later(b, p)));
+      for (const b of entry.content) if (b.type === 'tool_use' && stubbed.delete(b.id)) prevRunIds.add(b.id);
 
       prevUseIds = new Set();
       for (const b of entry.content) {
@@ -21426,8 +21568,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** The message each tool result pairing repair moved was moved from, by
-   *  the block it placed (relocateOrDropMissingResults), where the entry it
-   *  came from has an id. */
+   *  the block it placed (moveResult), where the entry it came from has an
+   *  id. */
   private readonly _movedFrom = new WeakMap<ContentBlock, MessageId>();
 
   /**
@@ -21441,18 +21583,62 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     survives the repair;
    *   - otherwise emit a stub.
    *
-   * tool_use ids are unique, so the single result carrying a given id is
-   * unambiguously the answer to that use — relocating it cannot break any
-   * other pairing. Results for `missing` ids never sit at or before
-   * `afterIndex` (that entry's results are already matched), so the search
-   * starts at `afterIndex + 1`.
+   * The genuine result is the first one in the window that answers the call
+   * (resultsAnswering). A later call can reuse an id: a provider that leaves
+   * a streamed call's id out can get the same id in every response.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],
     afterIndex: number,
     missing: string[],
     unitOf: (entry: ContextEntry) => ContextEntry,
+    stubbed: Set<string>,
   ): ContentBlock[] {
+    const end = this.lookAheadEnd(entries, afterIndex, unitOf);
+    return missing.map(id => {
+      const [first] = this.resultsAnswering(entries, afterIndex - 1, afterIndex, end, [id]);
+      if (first) return this.moveResult(first.entry, first.entry.content.indexOf(first.block), unitOf);
+      stubbed.add(id);
+      return this.createToolResultStub(id);
+    });
+  }
+
+  /**
+   * The results in `entries[from, end)` that answer the last call with one of
+   * `ids` in `entries[callsAt]`, in send order, by the one pairing rule
+   * (answeredCallIndexes) over `entries[callsAt, end)`. Read again after each
+   * move, since a move can rewrite its entry's blocks (raw-forms.ts).
+   */
+  private resultsAnswering(
+    entries: ContextEntry[],
+    callsAt: number,
+    from: number,
+    end: number,
+    ids: readonly string[],
+  ): Array<{ entry: ContextEntry; block: ContentBlock }> {
+    const blocks: ContentBlock[] = [];
+    const owners: number[] = [];
+    for (let j = callsAt; j < end; j++) {
+      for (const block of entries[j]!.content) {
+        blocks.push(block);
+        owners.push(j);
+      }
+    }
+    const calls = new Set<number>();
+    for (const id of ids) {
+      for (let k = entries[callsAt]!.content.length - 1; k >= 0; k--) {
+        const block = blocks[k]!;
+        if (block.type === 'tool_use' && block.id === id) {
+          calls.add(k);
+          break;
+        }
+      }
+    }
+    return answeredCallIndexes(blocks).flatMap((call, k) =>
+      call !== undefined && calls.has(call) && owners[k]! >= from ? [{ entry: entries[owners[k]!]!, block: blocks[k]! }] : []);
+  }
+
+  private lookAheadEnd(entries: ContextEntry[], afterIndex: number, unitOf: (entry: ContextEntry) => ContextEntry): number {
     const LOOKAHEAD = 6;
     let end = afterIndex + 1;
     for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
@@ -21461,33 +21647,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (++units > LOOKAHEAD) break;
       unit = next;
     }
-    return missing.map(id => {
-      for (let j = afterIndex + 1; j < end; j++) {
-        const src = entries[j];
-        const bi = src.content.findIndex(
-          b => b.type === 'tool_result' && b.toolUseId === id,
-        );
-        if (bi === -1) continue;
-        const source = src.content;
-        const real = source[bi];
-        const rest = source.filter((_, k) => k !== bi);
-        // A raw replay form shared with the results left behind (one
-        // <function_results> holding several) is true of neither side once
-        // they're apart; each gives it up (see raw-forms.ts).
-        src.content = rest.length > 0
-          ? releaseEditedRawForms(source, rest)
-          : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
-        // The result still reaches the request, next to its tool_use:
-        // provenance credits the source body with it there.
-        (src.relocatedResults ??= []).push(id);
-        const moved = releaseSharedRawFormsOnMove(real, source);
-        // Where it came from, for the image strip (applyImageStripping's
-        // asEstimated).
-        if (src.sourceMessageId !== undefined) this._movedFrom.set(moved, src.sourceMessageId);
-        return moved;
-      }
-      return this.createToolResultStub(id);
-    });
+    return end;
+  }
+
+  private moveResult(src: ContextEntry, bi: number, unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock {
+    const source = src.content;
+    const real = source[bi]!;
+    const rest = source.filter((_, k) => k !== bi);
+    // A raw replay form shared with the results left behind (one
+    // <function_results> holding several) is true of neither side once
+    // they're apart; each gives it up (see raw-forms.ts).
+    src.content = rest.length > 0
+      ? releaseEditedRawForms(source, rest)
+      : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
+    // The result still reaches the request, next to its tool_use:
+    // provenance credits the source body with it there.
+    (src.relocatedResults ??= []).push((real as { toolUseId: string }).toolUseId);
+    const moved = { ...releaseSharedRawFormsOnMove(real, source) };
+    (src.relocatedBlocks ??= []).push(moved);
+    // Where it came from, for the image strip (applyImageStripping's
+    // asEstimated).
+    if (src.sourceMessageId !== undefined) this._movedFrom.set(moved, src.sourceMessageId);
+    return moved;
+  }
+
+  private gatherRunResults(entries: ContextEntry[], afterIndex: number, ids: string[], unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock[] {
+    if (ids.length === 0) return [];
+    const end = this.lookAheadEnd(entries, afterIndex, unitOf);
+    const gathered: ContentBlock[] = [];
+    for (;;) {
+      const [next] = this.resultsAnswering(entries, afterIndex - 1, afterIndex + 1, end, ids);
+      if (!next) return gathered;
+      gathered.push(this.moveResult(next.entry, next.entry.content.indexOf(next.block), unitOf));
+    }
   }
 
   /**
@@ -21497,14 +21689,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
    *    its message's id and its place in that message's content, with the
    *    marker its content becomes. The count is of calls. A result answers
-   *    the earliest call with its id before it, in its own message or an
-   *    earlier one, that no result has answered yet, the order pairing
-   *    repair's look-ahead pairs them in where it reaches: a result beyond
-   *    its reach still answers its call and keeps the slot, as a folded one
-   *    does. A result with no such call goes with the call its id last
-   *    answered, as a further result, and takes no slot. A result with
-   *    neither, before any call with its id, answers none and is left as it
-   *    is: pairing repair drops it. Each tool's answered calls are ordered by
+   *    the nearest call with its id before it, in its own message or an
+   *    earlier one (answeredToolCalls), the call pairing repair's look-ahead
+   *    pairs it with where it reaches: a result beyond its reach still
+   *    answers its call and keeps the slot, as a folded one does. A result
+   *    whose call a result has already answered goes with that call, as a
+   *    further result, and takes no slot. A result with no call before it
+   *    with its id answers none and is left as it is: pairing repair drops
+   *    it. Each tool's answered calls are ordered by
    *    their call's message, and calls made in one message by where the
    *    results that answer them are stored, the order the render sends a
    *    batch the repair leaves alone. All but the last N have every result
@@ -21520,11 +21712,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * content, since it can change in place. The store's listing is a new array
    * after each write, so a compile computes this once. A merged view lists
    * afresh at every read (mergeMessageStoreViews), so whatever prices every
-   * raw message holds the decision while it does (withToolPruning). Calls
-   * are matched by id, which pairing repair takes to be unique: where a host
-   * reuses an id, the repair can pair a result, or a further one, with a
-   * different call with that id than this count does, and so send more than
-   * N whole. A decision isn't changed once returned, by this method or an
+   * raw message holds the decision while it does (withToolPruning). A
+   * decision isn't changed once returned, by this method or an
    * override: a different decision is a new object, which is what the
    * prices kept per decision (postStripEstimates) rely on.
    */

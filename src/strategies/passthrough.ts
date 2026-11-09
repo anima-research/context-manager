@@ -10,6 +10,7 @@ import type {
   SelectOptions,
 } from '../types/index.js';
 import { OverBudgetError } from '../adaptive/picker.js';
+import { roomUnderRequestLimit } from '../request-limit.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
@@ -49,7 +50,7 @@ export class PassthroughStrategy implements ContextStrategy {
     const messages = store.getAll();
     const entries: ContextEntry[] = [];
     let totalTokens = 0;
-    const maxTokens = budget.maxTokens - budget.reserveForResponse;
+    const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
 
     // Add messages until we hit the budget
     for (let i = 0; i < messages.length; i++) {

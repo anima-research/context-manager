@@ -841,19 +841,39 @@ export interface SelectOptions {
    * request carries and the select's window doesn't. A strategy whose
    * calibration compares the provider's input total with the compile prices
    * it there (AutobiographicalStrategy.reportRealInputTokens).
-   * ContextManager.compile fills it from its injections; `system` ones go
-   * into the caller's system prompt instead. */
+   * ContextManager.compile fills it from its injections, and passes none
+   * when it has none, whatever its caller gave; `system` ones go into the
+   * caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
-  /** The overhead of the request the compile is for: the system prompt and
-   * tool definitions it sends besides the window and its message-position
-   * injections. Its system prompt is the one the request sends, with the
+  /** The overhead of the request the compile is for: the system prompt, the
+   * tool definitions and any other messages it sends besides the window and
+   * its message-position injections. Its system prompt is the one the request sends, with the
    * system-position injections passed to this compile appended: the compile
    * hands those back unchanged (`systemInjections`) and prices none of them.
    * AutobiographicalStrategy prices it, and the message injections, for
-   * `RenderStats.request`, and selects exactly as it would without it. An
-   * overhead whose tool definitions can't be serialised as JSON is refused
-   * before anything is selected. */
+   * `RenderStats.request`, and selects exactly as it would without it,
+   * unless `requestLimitTokens` is given. An overhead whose tool definitions
+   * can't be serialised as JSON is refused before anything is selected. */
   requestOverhead?: RequestOverhead;
+  /** The most the whole request may hold, in tokens, as the provider limits
+   * it: the selected window, the message injections, `requestOverhead` and
+   * the budget's `reserveForResponse` together, with any tool-result stubs
+   * an AutobiographicalStrategy's pairing repair adds to the window. Given,
+   * the select keeps that sum within it, in the window's units at the
+   * compile's multiplier (for a strategy that doesn't calibrate, such as the
+   * passthrough strategies, as the store's estimator prices it), the
+   * strategy's over-budget grace included; while an AutobiographicalStrategy's
+   * multiplier is provisional, it keeps the sum within it priced at the
+   * calibration's ceiling, by scaling its price at the provisional
+   * multiplier. The store rounds each block's price at that multiplier, by
+   * up to half a token, so at a true rate up to the ceiling the request can
+   * pass the limit by up to half a token a block, scaled by the ceiling over
+   * the multiplier. A select whose sum would still pass it, or whose
+   * limit leaves the window no room, refuses with an `OverBudgetError`.
+   * It needs `requestOverhead`: one given without it, or one that isn't a
+   * positive finite number, is refused with a `TypeError` before anything is
+   * selected. */
+  requestLimitTokens?: number;
 }
 
 /**
@@ -873,13 +893,23 @@ export class NoFoldPlanToPreviewError extends Error {
  * the rendered entries. Mirrors the diagnostics `OverBudgetError` would carry.
  */
 export interface PreviewResult {
-  /** Rendered token total the layout would occupy. */
+  /** Rendered token total the layout would occupy. A preview a request
+   *  limit refused before planning, for want of room, gives what the request
+   *  holds besides the window instead. */
   finalTokens: number;
-  /** Hard budget the preview ran against. */
+  /** Hard budget the preview ran against; for that refusal, the limit. */
   budgetTokens: number;
+  /** The limit and what it left the window, where the refusal the preview
+   *  reports carries them in its diagnostics (`requestLimitTokens`,
+   *  `requestAllowanceTokens`), as the strategy's over-budget refusals under
+   *  `SelectOptions.requestLimitTokens` do. A preview of a plan over its
+   *  bound reports the plan instead, without them. */
+  requestLimitTokens?: number;
+  requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
-  /** True when the picker could not fold any further. */
+  /** True when the picker could not fold any further, and when the request
+   *  limit leaves the window no room at any fold. */
   exhausted: boolean;
   /**
    * When the layout doesn't fit: what clears that refusal besides a larger
@@ -1271,6 +1301,11 @@ export interface RequestOverhead {
   system?: string;
   /** The tool definitions the request sends. */
   tools?: ReadonlyArray<ToolDefinition>;
+  /** The content of each message the request sends besides the compiled
+   * window and the message injections, such as tool results a caller adds to
+   * the request after the compile. Each is priced as the window prices the
+   * same blocks sent whole. */
+  messages?: ReadonlyArray<ContentBlock[]>;
 }
 
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
@@ -1367,14 +1402,23 @@ export interface RenderStats {
    * (`SelectOptions.messageInjections`), 0 when it has none. Present only when
    * the select was given an overhead, so a compile without one has no price
    * here rather than a price of 0. The overhead's price is the store's
-   * estimate of the system prompt and of the tool definitions as JSON
-   * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * estimate of the system prompt, of the tool definitions as JSON
+   * (`JSON.stringify`) and of its messages' blocks as the window prices them
+   * sent whole, not the provider's count of what its formatter sends.
    * System-position injections are priced only as part of that system
    * prompt: the compile hands the ones it was passed back unchanged
    * (`systemInjections`) for the caller to append, so the overhead's system
-   * prompt is the one sent, with them appended.
+   * prompt is the one sent, with them appended. With
+   * `SelectOptions.requestLimitTokens`, `limitTokens` is that limit, and
+   * `allowanceTokens`, present only when the limit lowered the select's
+   * target or its hard bound, is what it left the window: the limit less
+   * `reserveForResponse`, the injections and the overhead, at the price the
+   * select kept it at, and less the price of the first select's stubs where
+   * a second select reserved room for them. `stubTokens`, present only under
+   * a limit where the pairing repair added tool-result stubs, is their price,
+   * which `total` doesn't count; the limit counts them.
    */
-  request?: { overheadTokens: number; injectedTokens: number };
+  request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number; stubTokens?: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
@@ -2543,10 +2587,11 @@ export interface AutobiographicalConfig {
    * The count runs over the whole conversation, not only what a compile
    * renders raw: a result is replaced once the conversation holds N newer
    * answered calls of its tool, folded ones included, so folding never
-   * brings a replaced result back. A result answers the earliest call with
-   * its id before it, in its own message or an earlier one, that no result
-   * has answered yet; a further result for an answered call goes with that
-   * call. Calls are ordered by the message that made them, and calls made in
+   * brings a replaced result back. A result answers the nearest call with
+   * its id before it, in its own message or an earlier one, so a later call
+   * that reuses an id takes the results after it; a further result for an
+   * answered call goes with that call. Calls are ordered by the message that
+   * made them, and calls made in
    * one message by where their results are stored, as the render sends them
    * unless pairing repair moves some. A result is replaced before
    * `maxMessageTokens` cuts its message, and the plan and the render stats

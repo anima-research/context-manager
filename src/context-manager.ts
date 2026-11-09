@@ -53,6 +53,7 @@ import type { DerivationManifestOptions } from './types/index.js';
 import { isStateExistsFor } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
+import { overRequestLimit, refuseUnreadableRequestLimit, requestOverheadContent } from './request-limit.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
@@ -3180,6 +3181,7 @@ export class ContextManager {
     // Before anything is selected or committed: a compile refused here leaves
     // nothing behind.
     if (opts?.thinkingBinding?.binds === true) refuseUnboundBinding(opts);
+    refuseUnreadableRequestLimit(opts);
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -3208,16 +3210,20 @@ export class ContextManager {
     const messageInjections = (injections ?? [])
       .filter((inj) => inj.position === 'beforeUser' || inj.position === 'afterUser')
       .map((inj) => inj.content);
-    const entries = this.strategy.select(
-      view,
-      this.contextLog.createView(),
-      effectiveBudget,
-      messageInjections.length > 0 ? { ...opts, messageInjections } : opts
-    );
+    let selectOpts = opts;
+    if (messageInjections.length > 0) selectOpts = { ...opts, messageInjections };
+    else if (opts?.messageInjections !== undefined) {
+      const { messageInjections: _callers, ...rest } = opts;
+      selectOpts = rest;
+    }
+    const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
     const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
+    if (opts?.requestLimitTokens !== undefined) {
+      this.refuseOverRequestLimit(opts, effectiveBudget, entries, renderStats, view, messageInjections);
+    }
 
     const viewMessages = view.getAll();
     // Raw bodies are judged as stored: the view filter can hide a shard of a
@@ -4036,6 +4042,7 @@ export class ContextManager {
     opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
+    refuseUnreadableRequestLimit(opts);
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
@@ -4058,6 +4065,23 @@ export class ContextManager {
       if (err instanceof NoFoldPlanToPreviewError) return null;
       throw err;
     }
+  }
+
+  private refuseOverRequestLimit(
+    opts: SelectOptions,
+    budget: TokenBudget,
+    entries: readonly ContextEntry[],
+    stats: RenderStats | null,
+    view: MessageStoreView,
+    messageInjections: ReadonlyArray<ContentBlock[]>,
+  ): void {
+    const price = (content: ContentBlock[]) => (content.length > 0 ? view.estimateTokens({ content } as unknown as StoredMessage) : 0);
+    const priced = stats?.request;
+    const window = stats && priced ? stats.total.tokens : entries.reduce((n, entry) => n + price(entry.content), 0);
+    const overhead = priced ? priced.overheadTokens : price(requestOverheadContent(opts.requestOverhead!));
+    const injected = priced ? priced.injectedTokens : messageInjections.reduce((n, content) => n + price(content), 0);
+    const parts = { limit: opts.requestLimitTokens!, reserve: budget.reserveForResponse, overhead, injected, window };
+    if (window + overhead + injected + parts.reserve > parts.limit) throw overRequestLimit(parts);
   }
 
   // ==========================================================================
