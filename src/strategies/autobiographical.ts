@@ -3094,9 +3094,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (textParts.length === 0) return null;
-    // A Responses reasoning item and the call it led to are checked as a
-    // pair by the provider (raw-forms.ts); split across parts, the call can
-    // go out without its reasoning. Such a message is stored whole.
+    // raw-forms.ts pairs a Responses reasoning item with the next item that
+    // isn't reasoning; split across parts, the call could go out with its id
+    // but without its reasoning. Such a message is stored whole.
     let reasoned = false;
     for (const block of content) {
       if (isReasoningItem(block)) reasoned = true;

@@ -381,7 +381,8 @@ describe('epoch 7 reprices a store holding a split message the middle now sends 
   ] as const) {
     it(name, async () => {
       const first = await open();
-      first.add('u', content());
+      const parts = first.add('u', content());
+      assert.ok(parts.length > 1 && parts.every((k) => !!first.all()[k]!.bodyGroupId), 'the message is stored in parts');
       first.add('a', [text('ok')]);
       await first.manager.compile(BIG);
       type Calibration = { _calibration: number; calibrationStateId: string; store: { setStateJson(id: string, v: unknown): void; getStateJson(id: string): unknown } };
