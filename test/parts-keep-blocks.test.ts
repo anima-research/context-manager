@@ -242,6 +242,32 @@ describe("an image in a result pairing repair moves out of a joined entry keeps 
   }
 });
 
+describe("an image in a result that pairing repair copies, dropping an orphan sharing its raw form, keeps its own part's verdict", () => {
+  const RESULTS_XML = '<function_results>both</function_results>';
+  for (const kind of KINDS) {
+    it(`${kind}: the result answering its call goes out with its image`, async () => {
+      const o = await open({ kind, config: { headWindowTokens: 0, recentWindowTokens: 300, maxLiveImages: 2 } });
+      try {
+        o.add('u', [text('intro')]);
+        o.add('a', [call('call-8')]);
+        const res = o.add('u', [
+          { type: 'tool_result', toolUseId: 'call-8', content: [image('DDDD'), text('shot')], rawXml: RESULTS_XML } as unknown as ContentBlock,
+          { type: 'tool_result', toolUseId: 'call-gone', content: 'nothing called this', rawXml: RESULTS_XML } as unknown as ContentBlock,
+          text(long('RES')),
+        ]);
+        o.add('a', [text('ok')]);
+        o.add('u', [text('next')]);
+        assert.ok(res.length > 1 && o.all()[res[0]!]!.content.some(isResult('call-8')), 'premise: both results are on the body\'s first part');
+        const sent = (await o.manager.compile(BIG)).messages as Sent[];
+        assert.ok(!sent.some((m) => m.content.some(isResult('call-gone'))), 'premise: pairing repair dropped the orphan');
+        assert.equal(images(sent, 'DDDD'), 1);
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
 describe("a body's bytes stay put while its parts stay in their region", () => {
   for (const kind of KINDS) {
     it(`${kind}: one compile a turn while the recent window's edge crosses a reply with a call`, async () => {
@@ -288,7 +314,7 @@ describe("a body's bytes stay put while its parts stay in their region", () => {
   }
 });
 
-describe('a Responses reply whose reasoning item comes before its call is stored whole, and replays in its own order', () => {
+describe('a message with a block carrying a provider item is stored whole, and a Responses reply replays in its own order', () => {
   const reasoning = (): ContentBlock =>
     ({ type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque' } }) as unknown as ContentBlock;
   const functionCall = (): ContentBlock => ({
@@ -305,9 +331,10 @@ describe('a Responses reply whose reasoning item comes before its call is stored
     });
     return adapter.getLastRequest()!.messages as Array<Record<string, unknown>>;
   }
+  const WHOLE = `${long('RESP')} RESP-END`;
   const SHAPES: Record<string, { content: () => ContentBlock[]; between: number }> = {
-    'reasoning, then its call, then text': { content: () => [reasoning(), functionCall(), text(`${long('RESP')} RESP-END`)], between: 0 },
-    'reasoning, then text, then its call': { content: () => [reasoning(), text(`${long('RESP')} RESP-END`), functionCall()], between: 1 },
+    'reasoning, then its call, then text': { content: () => [reasoning(), functionCall(), text(WHOLE)], between: 0 },
+    'reasoning, then text, then its call': { content: () => [reasoning(), text(WHOLE), functionCall()], between: 1 },
   };
   for (const [shape, { content, between }] of Object.entries(SHAPES)) {
     it(`${shape}: one stored message, and the wire carries its items in its own order`, async () => {
@@ -323,8 +350,26 @@ describe('a Responses reply whose reasoning item comes before its call is stored
         const at = (id: string) => sent.findIndex((item) => item.id === id);
         assert.ok(at('rs_1') >= 0 && at('fc_1') >= 0, 'both items go out with their ids');
         assert.equal(at('fc_1') - at('rs_1') - 1, between, 'with only the message\'s own text between them');
-        if (between) assert.ok(JSON.stringify(sent[at('rs_1') + 1]).includes('RESP-END'), 'the whole text, in one item');
+        const textAt = between ? at('rs_1') + 1 : at('fc_1') + 1;
+        assert.ok(JSON.stringify(sent[textAt]).includes(JSON.stringify(WHOLE).slice(1, -1)), 'the whole text, in one item, in its place');
         assert.equal(reply.length, 1, 'stored as one message');
+      } finally {
+        await o.close();
+      }
+    });
+  }
+  const SPLIT_BEFORE: Record<string, () => ContentBlock[]> = {
+    'reasoning, a call with no item, then a result carrying one': () => [
+      reasoning(), text(long('BUNDLE')), call('c2'),
+      { type: 'tool_result', toolUseId: 'c2', content: 'done', rawItem: { type: 'function_call_output', id: 'fco_2', call_id: 'c2', output: 'done' } } as unknown as ContentBlock,
+    ],
+    'text, a call carrying its item, then trailing reasoning': () => [text(long('TRAIL')), functionCall(), reasoning()],
+  };
+  for (const [shape, content] of Object.entries(SPLIT_BEFORE)) {
+    it(`${shape}: one stored message`, async () => {
+      const o = await open();
+      try {
+        assert.equal(o.add('a', content()).length, 1);
       } finally {
         await o.close();
       }

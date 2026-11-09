@@ -176,6 +176,20 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
 });
 
 describe("the newest turn a refusal names as the floor", () => {
+  it('a newest reply whose last part, holding a call with no result, is trimmed refuses the compile though its earlier parts are sent', async () => {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 1_000_000 } });
+    try {
+      o.add('u', [text('intro')]);
+      const reply = o.add('a', [text(long('R')), call('c9')]);
+      assert.ok(reply.length > 1, 'premise: the reply is stored in parts');
+      o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), reply.at(-1)!) });
+      const refused = await o.manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }).then(() => undefined, (e: unknown) => e);
+      assert.ok(refused instanceof OverBudgetError);
+      assert.match(refused.message, /did not retain the newest turn/);
+    } finally {
+      await o.close();
+    }
+  });
   it('a result after a reply stored as ingress stores it now needs only the call\'s part kept raw with it', async () => {
     const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
     try {
