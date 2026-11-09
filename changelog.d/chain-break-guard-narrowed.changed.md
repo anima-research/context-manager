@@ -11,8 +11,10 @@
   halts that rebuild alone. The README's section on the
   autobiographical strategy names the states that hold message ids, for a
   store rebuilt under new ones.
-- While the guard halts, no chunk is summarized and no new merge is queued,
-  and `getCompressionDebt()` reads `critical` with `failure: 'chunk-records'`.
+- While the guard halts, no chunk, waiting or new, is summarized. Merges
+  already queued still run and can queue the next level; only the open's
+  merge check and the one after a drop wait. `getCompressionDebt()` reads
+  `critical` with `failure: 'chunk-records'`.
   Its `error` gives the cause and the first step, which changes nothing. The `FAIL-CLOSED` log line gives every step.
   `scripts/drain-autobiographical.ts` then stops before any step, with
   `stopped: 'chunk-records'`, and exits 1.

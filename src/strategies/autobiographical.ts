@@ -256,7 +256,7 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
-      'Effect: no chunk, waiting or new, is summarized, and no new merge is queued.',
+      'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
       "Fix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
     ].join('\n');
   }
@@ -264,14 +264,14 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     return [
       'Compression of new conversation has stopped.',
       "Cause: most chunk records name no message in view, and the strategy reads the store through a view without `onBranch`, which can't tell a removal or a filter from a broken chain.",
-      'Effect: no chunk, waiting or new, is summarized, and no new merge is queued.',
+      'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
       'Fix: give the strategy a view with `onBranch`, as MessageStore and the views built on it have; each rebuild checks again.',
     ].join('\n');
   }
   return [
     'Compression of new conversation has stopped.',
     `Cause: the store couldn't read its messages chain to check the chunk records that name no message in view (${causeText(cause.chainUnread)}).`,
-    'Effect: no chunk is summarized and no new merge is queued until the read succeeds.',
+    'Effect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level.',
     'Fix: fix what the cause names; the next rebuild asks again.',
   ].join('\n');
 }
@@ -2346,9 +2346,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Fail-closed latch: set when most persisted records resolve to zero live
    * messages and the oldest or newest of those names a message off this
    * branch's messages chain (the messages-chain-break signature), or the
-   * view can't say. While set, no chunk is summarized, waiting or new, and
-   * no new merge is queued — duplicate memories are strictly worse than
-   * delayed compression.
+   * view can't say. While set, no chunk is summarized, waiting or new —
+   * duplicate memories are strictly worse than delayed compression. Merges
+   * combine summaries that already exist, so they go on: merges already
+   * queued still run and can queue the next level; only the open's merge
+   * check and the one after a drop wait.
    */
   protected chunkRecordsOrphaned = false;
   /** Why the latch is set (chunkRecordsMessage). */

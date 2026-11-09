@@ -106,7 +106,7 @@ const halts = async (cm: ContextManager, s: AutobiographicalStrategy, label: str
   assert.strictEqual(debt.state, 'critical', `${label}: the debt report is critical`);
   assert.strictEqual(debt.failure, 'chunk-records', label);
   assert.match(debt.error ?? '', /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/, `${label}: the off-chain cause`);
-  assert.match(debt.error ?? '', /\nEffect: no chunk, waiting or new, is summarized, and no new merge is queued\.\n/, `${label}: what waits`);
+  assert.match(debt.error ?? '', /\nEffect: no chunk, waiting or new, is summarized; queued merges still run and can queue the next level\.\n/, `${label}: what waits`);
   assert.match(debt.error ?? '', /\nFix: change nothing until the emptied records' first messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step\.$/, `${label}: the fix's first step`);
 };
 const offBranch = (cm: ContextManager, ids: string[], label: string): void => {
