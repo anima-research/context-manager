@@ -14,16 +14,17 @@
   middle's document text is cut where it used to go out whole, and a compile
   its uncut price refused can now fit.
 - Each image is kept or stripped by the verdict of the part it's stored on.
-- Ingress puts a split message's non-text blocks from its first `tool_use` on
-  on its last part, and the others on its first, where it used to put them all
-  on its first. A reply's call then sits next to its result, and the reply's
-  earlier parts can fold apart from it. For a body stored before, with its
-  call on its first part, the recent window's start, a compression hold, the
-  head window's end and the chunker each keep the call's result with the whole
-  body, as they keep a result with a call stored whole. Two cases keep their
-  old ends: a chunk closed before the upgrade and not yet summarized, and a
-  head window whose end the coverage anchor carries into such a body, where
-  the store's chunks begin partway through it.
+- Ingress puts a split message's non-text blocks from its first `tool_use` on,
+  or, in a message that holds a `tool_use`, from its first thinking on, on its
+  last part, and the others on its first, where it used to put them all on its
+  first. A reply's call then sits next to its result with the thinking that
+  led to it, and the reply's earlier parts can fold apart from it. For a body
+  stored before, with its call on its first part, the recent window's start, a
+  compression hold, the head window's end and the chunker each keep the call's
+  result with the whole body, as they keep a result with a call stored whole.
+  Two cases keep their old ends: a chunk closed before the upgrade and not yet
+  summarized, and a head window whose end the coverage anchor carries into
+  such a body, where the store's chunks begin partway through it.
 - A message with a block that carries a provider item (an object `rawItem`, as
   a Responses reply's message parts and reasoning do) is stored whole, however
   long, with every item in its place. It's capped as one message, and folds as
@@ -40,6 +41,7 @@
   window's end now move back to the run's first message, however long the run,
   the head window's end back to the head's own start at most, where they used
   to move back one message and part the call before it from its result.
+  Messages that each answer their own call still move them back one message.
 - **Hosts upgrading a store:** a body stored before with its call on its first
   part keeps more tokens raw for a while. While the recent window's start, or
   a compression hold, falls inside it or on its result, that window or hold
