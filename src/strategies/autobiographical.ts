@@ -92,7 +92,7 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
-import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { withoutThinking } from '../thinking-binding.js';
 import { carriesRawItem, releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
@@ -19863,10 +19863,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const last = chunk[chunk.length - 1];
     if (!last) return false;
     const at = position.get(last.id);
-    if (at === undefined || listing[at] !== last) return false;
-    const start = bodyStart((k) => listing[k], at);
+    if (at === undefined || listing[at]?.id !== last.id) return false;
+    let starts = this._bodyStarts.get(listing);
+    if (!starts) this._bodyStarts.set(listing, starts = new Map());
+    const known = (k: number): number | undefined => {
+      const seen = starts!.get(k);
+      return seen && seen.id === listing[k]?.id ? seen.start : undefined;
+    };
+    let start = known(at);
+    if (start === undefined) {
+      start = at > 0 && continuesBody(listing[at - 1], listing[at]) ? known(at - 1) ?? bodyStart((k) => listing[k], at) : at;
+      starts.set(at, { id: last.id, start });
+    }
     return start < at && this.hasToolUse(listing[start]!);
   }
+
+  private readonly _bodyStarts = new WeakMap<readonly StoredMessage[], Map<number, { id: MessageId; start: number }>>();
 
   protected createChunk(
     index: number,
@@ -21021,10 +21033,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * boundary and the refusal's newest-turn floor read it.
    */
   protected turnStart(messages: readonly StoredMessage[], b: number): number {
-    if (b <= 0 || b >= messages.length) return b;
-    const at = this.hasToolResult(messages[b]!) ? b - 1 : b;
-    const start = bodyStart((k) => messages[k], at);
-    return start < at && this.hasToolUse(messages[start]!) ? start : at;
+    for (;;) {
+      if (b <= 0 || b >= messages.length) return b;
+      const at = this.hasToolResult(messages[b]!) ? b - 1 : b;
+      const start = bodyStart((k) => messages[k], at);
+      const next = start < at && this.hasToolUse(messages[start]!) ? start : at;
+      if (next === b) return b;
+      b = next;
+    }
   }
 
   /**
@@ -21213,10 +21229,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Don't split a tool_use/tool_result pair: if the boundary message's
         // predecessor has tool_use, pull back by one so the pair stays
         // together; if it is a later shard of a body whose first shard has
-        // one (as turnStart reads it), pull back to that first shard.
-        if (boundary > startIdx) {
+        // one (as turnStart reads it), pull back to that first shard. Then
+        // again from there, until the message before holds no call.
+        while (boundary > startIdx) {
           const body = Math.max(startIdx, bodyStart((k) => messages[k], boundary - 1));
           const back = this.hasToolUse(messages[body]) ? body : this.hasToolUse(messages[boundary - 1]) ? boundary - 1 : boundary;
+          if (back === boundary) break;
           for (; boundary > back; boundary--) tokens -= store.estimateTokens(messages[boundary]);
         }
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);

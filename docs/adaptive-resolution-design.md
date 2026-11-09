@@ -201,7 +201,7 @@ Solvers shipped:
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
-Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is split into shards at ingestion. Each shard is its own `MessageEntry` with:
+Any message whose token count exceeds `chunkThreshold` (default 8192 tokens) is split into shards at ingestion, unless a block of it carries a provider item (an object `rawItem`, as a Responses reply's items do), which keeps the message whole. Each shard is its own `MessageEntry` with:
 
 - A stable `bodyGroupId` shared with its sibling shards.
 - A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.
@@ -218,7 +218,7 @@ the same shard boundaries.
 **Chunker strategy** (V1, simple): structural-first (markdown headings, code-fence boundaries, blank-line paragraph breaks), token-bucket fallback (default `chunkSize` = 4096 tokens, no overlap), last-resort hard split at the largest UTF-8-safe position when no structural seam exists. Deterministic: re-ingesting identical content produces identical shards with identical `sourceHash`es. Byte-faithful: concatenating shards in order reproduces the original message body byte-for-byte.
 
 **Rendering** (revised — see §3.6.1 for the implemented model):
-- **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message whose body is the byte-faithful concatenation of those shards. The role is the group's role. KV cache preserved across the run.
+- **Unfolded run** of consecutive same-`bodyGroupId` shards at L0 → one composite API message (`joinBodyParts`): the shards' non-text blocks in order, then their text, the byte-faithful concatenation of the shards' text. The role is the group's role. KV cache preserved across the run.
 - **Folded run** (consecutive shards under the same L_k ancestor) → emitted as a standard Q+A recall pair (one Context Manager question + one summaryParticipant answer carrying the summary text). The same format used for chat summaries elsewhere — consistent agent experience.
 
 A bodyGroup with mixed resolutions therefore renders as multiple alternating entries: raw composite User message → recall pair → raw composite User message → recall pair → … The KV cache breaks at the fold boundaries (where the byte sequence changes anyway), but raw runs between folds stay cache-stable.

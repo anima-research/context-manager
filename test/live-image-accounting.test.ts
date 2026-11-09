@@ -537,9 +537,9 @@ describe('live image accounting', () => {
     assert.equal(stateOf(entries, 'tail'), 'image');
   });
 
-  it("the strip counts a merged body's images once, at its first shard, where the chunker puts them, as the estimate does", () => {
-    // chunkIngressMessage puts a body's images on its first shard, and
-    // mergeAdjacentBodyGroupRaw keeps them ahead of the merged text.
+  it("the strip counts a merged body's images once, at its first shard, where the chunker puts those before any call, as the estimate does", () => {
+    // chunkIngressMessage puts a body's images that come before its first
+    // call on its first shard, and the join keeps them ahead of the text.
     const messages = [
       { id: 'a', sequence: 0, participant: 'User', content: [{ type: 'text', text: 'a' }, base64Image(), base64Image()] as ContentBlock[] },
       { id: 'b', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'b' }] as ContentBlock[] },
@@ -561,7 +561,7 @@ describe('live image accounting', () => {
     assert.deepEqual(entries[0]!.content.map((b) => b.type), ['image', 'text', 'text']);
   });
 
-  it("the real chunker and merge put a body's images on its first shard, ahead of its text, where the strip and the estimate count them alike", () => {
+  it("the real chunker and merge put the images of a body with no call on its first shard, ahead of its text, where the strip and the estimate count them alike", () => {
     class Chunking extends FoldedWindow {
       merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
         return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
