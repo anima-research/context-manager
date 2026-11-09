@@ -53,12 +53,25 @@ export interface ContextEntry {
   /**
    * The tool_use ids whose results a structural repair moved out of this
    * entry into the entry that answers their tool_use. The request still
-   * carries each result, in that other entry: attribution looks for it
-   * there by its tool_use id, so moving a result is not a loss, while a
-   * moved result that was later altered, or is missing from the request,
-   * still is.
+   * carries each result, in that other entry: attribution looks for it by
+   * its tool_use id among every result in the request, so moving a result
+   * is not a loss, while a moved result that was later altered, or is
+   * missing from the request, still is. Where `relocatedBlocks` is set,
+   * attribution looks for those blocks instead, and for a result with the
+   * id still in this entry.
    */
   relocatedResults?: string[];
+  /**
+   * The result blocks that repair placed for `relocatedResults`, as it
+   * placed them, one block of its own for each move. Where it's set,
+   * attribution credits a moved result only through one of these blocks
+   * still in the request, unaltered, or through a result with its id still
+   * in this entry that isn't among the blocks repair recorded as placed for
+   * any entry. A stub repair generated, or a copy that releasing a raw form
+   * made of a block it placed, isn't recorded, so either counts as a carrier
+   * wherever it covers the moved result.
+   */
+  relocatedBlocks?: ContentBlock[];
 }
 
 /**

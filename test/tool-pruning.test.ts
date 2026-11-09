@@ -203,6 +203,42 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     assert.equal((useBlock.input as Record<string, unknown>).content, undefined);
   });
 
+  for (const [select, config] of [['hierarchical select', { adaptiveResolution: false }], ['adaptive select', { adaptiveResolution: true }]] as const) {
+    for (const reach of ['within', 'beyond'] as const) {
+      it(`${select}: a result counts toward the call that made it where an earlier unanswered call has its id, ${reach} the repair's look-ahead`, async () => {
+        const strategy = new AutobiographicalStrategy({
+          autoTickOnNewMessage: false,
+          headWindowTokens: 0,
+          recentWindowTokens: 1_000_000,
+          toolResultMaxLastN: 1,
+          ...config,
+        } as never);
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        manager.addMessage('User', [{ type: 'text', text: 'Please look something up.' }]);
+        manager.addMessage('Claude', [toolUse('call_1', 'lookup', { q: 'first' })]);
+        manager.addMessage('User', [{ type: 'text', text: 'Never mind that one.' }]);
+        if (reach === 'beyond') {
+          for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'User' : 'Claude', [{ type: 'text', text: `aside ${i}` }]);
+        }
+        manager.addMessage('Claude', [toolUse('call_9', 'lookup', { q: 'other' })]);
+        manager.addMessage('User', [toolResult('call_9', 'what the other call returned')]);
+        manager.addMessage('Claude', [toolUse('call_1', 'lookup', { q: 'again' })]);
+        manager.addMessage('User', [toolResult('call_1', 'what the newest call returned')]);
+        manager.addMessage('Claude', [{ type: 'text', text: 'Here it is.' }]);
+
+        const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+        const resultAfter = (q: string): unknown => {
+          const at = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && (b.input as { q?: string }).q === q));
+          const block = compiled.messages[at + 1]?.content.find((b) => b.type === 'tool_result') as { content?: unknown } | undefined;
+          return block?.content;
+        };
+        assert.strictEqual(resultAfter('again'), 'what the newest call returned', "the newest call's result goes whole");
+        assert.strictEqual(resultAfter('other'), "[result of tool 'lookup' left out: this context shows only the tool's last result]");
+        await manager.close();
+      });
+    }
+  }
+
   it('does nothing when both pruning configs are unset (default)', async () => {
     const strategy = new AutobiographicalStrategy({
       headWindowTokens: 0,
