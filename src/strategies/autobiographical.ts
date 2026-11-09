@@ -272,7 +272,7 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
     'Compression of new conversation has stopped.',
     `Cause: the store couldn't read its messages chain to check the chunk records that name no message in view (${causeText(cause.chainUnread)}).`,
     'Effect: no chunk is sent to be summarized; queued merges still run and can queue the next level.',
-    'Fix: fix what the cause names; the next rebuild asks again.',
+    'Fix: fix the cause, whole in the FAIL-CLOSED log line; it retries.',
   ].join('\n');
 }
 
@@ -2361,9 +2361,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _mergeCheckOwed = false;
   /** Why the latch is set (chunkRecordsMessage). */
   private _orphanCause: ChunkRecordsCause = 'off-branch';
-  private _orphanWarned = false;
-  /** Whether a failed read of the chain has been logged this load, apart from _orphanWarned, so a later trip on a broken chain still logs. */
-  private _chainUnreadWarned = false;
+  /**
+   * The cause whose FAIL-CLOSED line was logged since the latch last
+   * cleared, a failed read's by its error: a line is logged when the cause
+   * differs, so a repeat logs nothing, and a new cause, another read
+   * failure, or a trip after the latch cleared logs its own. A read's error
+   * is keyed by its text, on the premise that one failure reads the same at
+   * every rebuild: a read of one record's state replays the same operations,
+   * and chronicle's errors on that path carry no value that moves.
+   */
+  private _failClosedLogged: string | undefined = undefined;
   /** Per emptied record asked about: whether its first message is on this branch's messages chain (emptiedEndsCause). */
   private readonly _recordOnBranch = new WeakMap<ChunkRecord, boolean>();
   /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
@@ -3403,8 +3410,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.heldAsStoredAt.clear();
     this.chunkRecordsOrphaned = false;
     this._mergeCheckOwed = false;
-    this._orphanWarned = false;
-    this._chainUnreadWarned = false;
+    this._failClosedLogged = undefined;
     this._overlapBlocked.clear();
     this.summaries = [];
     this.summaryIdCounter = 0;
@@ -19775,29 +19781,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecordsOrphaned = true;
       this._orphanCause = cause;
       this.compressionQueue = [];
-      if (typeof cause === 'object') {
-        if (!this._chainUnreadWarned) {
-          this._chainUnreadWarned = true;
-          this.diag.error(
-            `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +
+      const logged = typeof cause === 'object' ? `chain-unread: ${oneLine(failureMessage(cause.chainUnread))}` : cause;
+      if (this._failClosedLogged !== logged) {
+        this._failClosedLogged = logged;
+        this.diag.error(typeof cause === 'object'
+          ? `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +
             `records that name no message in the view (${oneLine(failureMessage(cause.chainUnread))}). Chunk compression ` +
-            `halted for this rebuild; the next rebuild asks again.`,
-          );
-        }
-      } else if (!this._orphanWarned) {
-        this._orphanWarned = true;
-        this.diag.error(cause === 'off-branch'
-          ? chunkRecordsFailClosedLine(orphaned, n)
-          : `[autobiographical] FAIL-CLOSED: ${orphaned}/${n} chunk records name no message in the view, ` +
-            `and the strategy reads the store through a view without onBranch, which can't tell a removal ` +
-            `or a filter from a broken messages chain. Chunk compression halted to prevent duplicate memory ` +
-            `formation. Give the strategy a view with onBranch; each rebuild checks again.`,
+            `halted for this rebuild; the next rebuild asks again.`
+          : cause === 'off-branch'
+            ? chunkRecordsFailClosedLine(orphaned, n)
+            : `[autobiographical] FAIL-CLOSED: ${orphaned}/${n} chunk records name no message in the view, ` +
+              `and the strategy reads the store through a view without onBranch, which can't tell a removal ` +
+              `or a filter from a broken messages chain. Chunk compression halted to prevent duplicate memory ` +
+              `formation. Give the strategy a view with onBranch; each rebuild checks again.`,
         );
       }
       return;
     }
     if (this.chunkRecordsOrphaned && this.config.hierarchical && !this.config.auditOnly) this._mergeCheckOwed = true;
     this.chunkRecordsOrphaned = false;
+    this._failClosedLogged = undefined;
 
     // Queue uncompressed record-backed chunks (crash-recovery: record was
     // appended but the process died before its L1 landed).
@@ -22658,8 +22661,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
       mergeCheckOwed: this._mergeCheckOwed,
       orphanCause: this._orphanCause,
-      chainUnreadWarned: this._chainUnreadWarned,
-      orphanWarned: this._orphanWarned,
+      failClosedLogged: this._failClosedLogged,
       prevCacheKeys: this._prevCacheKeys,
       lastFrontierTokens: this.lastFrontierTokens,
       transitionBlocked: this.transitionBlocked,
@@ -22693,8 +22695,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
       this._mergeCheckOwed = saved.mergeCheckOwed;
       this._orphanCause = saved.orphanCause;
-      this._chainUnreadWarned = saved.chainUnreadWarned;
-      this._orphanWarned = saved.orphanWarned;
+      this._failClosedLogged = saved.failClosedLogged;
       this._prevCacheKeys = saved.prevCacheKeys;
       this.lastFrontierTokens = saved.lastFrontierTokens;
       this.transitionBlocked = saved.transitionBlocked;

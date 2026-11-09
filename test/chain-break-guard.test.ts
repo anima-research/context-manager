@@ -776,7 +776,7 @@ describe('how the chain-break guard asks', () => {
       assert.strictEqual(debt.state, 'critical');
       assert.strictEqual(debt.failure, 'chunk-records');
       assert.match(debt.error ?? '', /\nCause: the store couldn't read its messages chain to check the chunk records that name no message in view \(a read of the messages state failed \(test\)\)\./);
-      assert.match(debt.error ?? '', /\nFix: fix what the cause names; the next rebuild asks again\.$/);
+      assert.match(debt.error ?? '', /\nFix: fix the cause, whole in the FAIL-CLOSED log line; it retries\.$/);
       assert.doesNotMatch(debt.error ?? '', /chronicle before 0\.5\.0|onBranch|change nothing/, 'it names no broken chain or view');
       const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
       assert.strictEqual(failClosed.length, 1, failClosed.join('\n'));
@@ -786,6 +786,74 @@ describe('how the chain-break guard asks', () => {
       await cm.close();
     });
   }
+
+  it('a view that gains onBranch, on a store off the chain, logs the off-chain steps after the view\'s own line, and a repeat logs nothing', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm).slice(0, 3).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    const rebuild = (view: unknown) => (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(view);
+    const { onBranch: _, ...withoutOnBranch } = messageStoreOf(cm).createView();
+    rebuild(withoutOnBranch);
+    const offChain = mock.method(MessageStore.prototype, 'onBranch', () => false);
+    t.after(() => offChain.mock.restore());
+    rebuild(messageStoreOf(cm).createView());
+    rebuild(messageStoreOf(cm).createView());
+    const debt = s.getCompressionDebt();
+    assert.strictEqual(debt.failure, 'chunk-records');
+    assert.match(debt.error ?? '', /\nCause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain/);
+    const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(failClosed.length, 2, failClosed.join('\n'));
+    assert.match(failClosed[0]!, /reads the store through a view without onBranch/);
+    assert.match(failClosed[1]!, /Before resuming, check the store was opened with every message slot it was written with/);
+    await cm.close();
+  });
+
+  it('another read failure logs its own FAIL-CLOSED line with its error whole, and a repeat logs nothing', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm).slice(0, 3).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    const rebuild = () => (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(messageStoreOf(cm).createView());
+    const store = messageStoreOf(cm);
+    let error = 'a read of the messages state failed (test, first)';
+    store.onBranch = () => { throw new Error(error); };
+    rebuild();
+    rebuild();
+    error = 'a read of the messages state failed (test, second)';
+    rebuild();
+    rebuild();
+    const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(failClosed.length, 2, failClosed.join('\n'));
+    assert.match(failClosed[0]!, /\(a read of the messages state failed \(test, first\)\)/);
+    assert.match(failClosed[1]!, /\(a read of the messages state failed \(test, second\)\)/);
+    assert.match(s.getCompressionDebt().error ?? '', /\(a read of the messages state failed \(test, second\)\)/);
+    await cm.close();
+  });
+
+  it('a guard that clears and trips again for the same cause logs its line again', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm).slice(0, 3).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    const rebuild = (view: unknown) => (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(view);
+    const { onBranch: _, ...withoutOnBranch } = messageStoreOf(cm).createView();
+    rebuild(withoutOnBranch);
+    rebuild(messageStoreOf(cm).createView());
+    assert.strictEqual(s.getCompressionDebt().failure, undefined, 'setup: through a view with onBranch, the guard clears');
+    rebuild(withoutOnBranch);
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds again');
+    const failClosed = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    assert.strictEqual(failClosed.length, 2, failClosed.join('\n'));
+    for (const line of failClosed) assert.match(line, /reads the store through a view without onBranch/);
+    await cm.close();
+  });
 
   it('MessageStore.onBranch throws where its read of the record or of the chain fails', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: strategy(), membrane });
