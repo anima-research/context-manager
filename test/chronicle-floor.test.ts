@@ -8,8 +8,7 @@
  * (appendManyToStateJson, appendManyToStateJsonWithIdentity,
  * getStateItemsJson, getRecords) are in no published release before 0.6.0:
  * 0.5.0 has none of them. So the range takes nothing below 0.6.0, and the
- * chronicle this suite runs on (a linked tree until 0.6.0 is published) has
- * all four.
+ * chronicle this suite runs on has all four.
  */
 
 import { describe, it } from 'node:test';
@@ -21,16 +20,22 @@ type Manifest = { name: string; version: string; dependencies?: Record<string, s
 // From dist/test, as the suite runs.
 const ours = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as Manifest;
 
-/** A caret range's floor (`^M.m.p`), the form context-manager declares. */
+/** A caret range's floor (`^M.m.p`), the form each member of context-manager's range takes. */
 function floorOf(range: string): [number, number, number] {
   const parts = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(range);
   assert.ok(parts, `${range} is a caret range on a release`);
   return [Number(parts[1]), Number(parts[2]), Number(parts[3])];
 }
 
+/** Whether `range`, caret ranges joined by `||`, admits the release `version`,
+ *  as npm reads it: some member does. */
+function admits(range: string, version: string): boolean {
+  return range.split('||').some((member) => caretAdmits(member.trim(), version));
+}
+
 /** Whether the caret `range` admits the release `version`, as npm reads it:
  *  at or above the floor, below the next change of its first nonzero part. */
-function admits(range: string, version: string): boolean {
+function caretAdmits(range: string, version: string): boolean {
   const [major, minor, patch] = floorOf(range);
   const [vMajor, vMinor, vPatch] = version.split('.').map(Number) as [number, number, number];
   const atOrAbove = vMajor > major || (vMajor === major && (vMinor > minor || (vMinor === minor && vPatch >= patch)));
@@ -50,6 +55,10 @@ describe("context-manager's chronicle range", () => {
     assert.equal(admits('^0.6.0', '0.7.0'), false);
     assert.equal(admits('^1.2.0', '1.9.0'), true);
     assert.equal(admits('^0.0.3', '0.0.4'), false);
+    assert.equal(admits('^0.6.0 || ^0.7.0', '0.7.2'), true);
+    assert.equal(admits('^0.6.0 || ^0.7.0', '0.6.1'), true);
+    assert.equal(admits('^0.6.0 || ^0.7.0', '0.5.0'), false);
+    assert.equal(admits('^0.6.0 || ^0.7.0', '0.8.0'), false);
   });
 
   it('takes chronicle only at a release with the batched calls: not 0.5.0 or earlier, which have none', () => {
@@ -60,6 +69,7 @@ describe("context-manager's chronicle range", () => {
         `${range} admits chronicle ${published}, published without ${BATCHED_CALLS.join(', ')}`);
     }
     assert.equal(admits(range, '0.6.0'), true, `${range} admits chronicle 0.6.0, the release with the batched calls`);
+    assert.equal(admits(range, '0.7.0'), true, `${range} admits chronicle 0.7.0, so a host on it shares its copy`);
   });
 
   it('runs on a chronicle with each batched call', () => {

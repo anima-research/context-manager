@@ -405,12 +405,14 @@ function foreignness(state: IndexState): string | null {
  * names it, or the error thrown on: a value that isn't JSON, where the
  * store reads the value's bytes and they don't parse, or records the store
  * can't read back as one value, where reading the bytes fails with
- * chronicle's deserialization error (`Deserialization error: …`, matched
- * by its prefix, as state-registration.ts matches a duplicate
- * registration: chronicle gives no code), as an item appended to a
- * snapshot's value leaves. Both are what the state holds, read after read.
- * Any other failure, a store that can't be read now, throws `error`, and
- * so do bytes that parse: the read failed some other way.
+ * chronicle's deserialization error (`Deserialization error: …`, matched by
+ * its prefix, as state-registration.ts matches a duplicate registration:
+ * chronicle 0.6.0 gives it no distinct code, so the message, which 0.7.0
+ * keeps, is matched, where reading `code` would miss it on 0.6.0), as an
+ * item appended to a snapshot's value leaves. Both are what the state
+ * holds, read after read. Any other failure, a store that can't be read
+ * now, throws `error`, and so do bytes that parse: the read failed some
+ * other way.
  */
 function unreadableValue(store: JsStore, stateId: string, error: unknown): string {
   let raw: Buffer | null;
