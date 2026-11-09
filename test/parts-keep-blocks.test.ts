@@ -4,7 +4,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { Membrane, MockAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
 import { AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
 import type { StoredMessage } from '../src/types/index.js';
-import { call, image, long, open, result, sum, text, thinking, type Kind, type Layout } from './body-parts-harness.js';
+import { call, image, long, open, Probe, result, sum, text, thinking, type Kind, type Layout } from './body-parts-harness.js';
 
 const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const KINDS: Kind[] = ['adaptive', 'kv-unified'];
@@ -457,6 +457,66 @@ describe('epoch 7 reprices a store holding a split message the middle now sends 
         }
       } finally {
         await again.close();
+      }
+    });
+  }
+});
+
+describe('a newest message carrying a provider item, too large to go raw, refuses the compile where its earlier parts used to fold', () => {
+  const reasoning = (): ContentBlock =>
+    ({ type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_9', encrypted_content: 'opaque' } }) as unknown as ContentBlock;
+  const summarizer = {
+    complete: async () => ({
+      stopReason: 'end_turn',
+      content: [{ type: 'text', text: 'A memory of this stretch, kept brief.' }],
+      usage: { input_tokens: 1000, output_tokens: 10 },
+    }),
+  };
+  class SplitsAnyway extends Probe {
+    override chunkIngressMessage(participant: string, content: ContentBlock[]) {
+      return super.chunkIngressMessage(participant, content.map((block) => {
+        const { rawItem: _, ...rest } = block as ContentBlock & { rawItem?: unknown };
+        return rest as ContentBlock;
+      }));
+    }
+  }
+  async function story(kind: Kind, Strategy?: typeof Probe) {
+    const o = await open({ kind, membrane: summarizer, Strategy, config: { headWindowTokens: 0, recentWindowTokens: 2_000, targetChunkTokens: 4_000 } });
+    for (let k = 0; k < 6; k++) o.add(k % 2 ? 'a' : 'u', [text(long(`turn${k}`, 4_000))]);
+    const reply = o.add('a', [reasoning(), text(long('REPLY', 200_000))]);
+    await o.manager.compile(BIG);
+    for (let k = 0; k < 500 && !o.manager.isReady(); k++) await o.manager.tick();
+    return { ...o, reply };
+  }
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: stored whole and larger than the whole budget, it refuses, where the same story stored in parts folds and sends`, async () => {
+      const whole = await story(kind);
+      let budget: number;
+      try {
+        assert.equal(whole.reply.length, 1, 'premise: stored whole');
+        const size = whole.estimates()[whole.reply[0]!]!;
+        budget = Math.floor(size * 0.8);
+        assert.ok(size > budget, 'premise: larger than the whole budget');
+        await assert.rejects(whole.manager.compile({ maxTokens: budget, reserveForResponse: 0 }), OverBudgetError);
+      } finally {
+        await whole.close();
+      }
+      const parts = await story(kind, SplitsAnyway);
+      try {
+        assert.ok(parts.reply.length > 1, 'premise: stored in parts');
+        assert.ok(parts.estimates()[parts.reply.at(-1)!]! < budget!, 'premise: its last part alone fits');
+        const compiled = await parts.manager.compile({ maxTokens: budget!, reserveForResponse: 0 });
+        const head = parts.all()[parts.reply[0]!]!.id;
+        const named = compiled.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : [])).filter((b) => b.messageId === head);
+        assert.ok(named.length > 0, 'premise: part of it goes out raw');
+        assert.ok(named.every((b) => !b.complete && (b.missing ?? []).includes('shards')), `premise: part of it is left out of its raw body: ${JSON.stringify(named)}`);
+        const at = new Map(parts.all().map((m, k) => [m.id, k] as const));
+        const covered = compiled.provenance!.messages.flatMap((m) => (m.kind === 'summary' ? m.summaries : []))
+          .map((s) => parts.manager.getSummary(s.id)!.sourceRange)
+          .filter((range) => parts.reply.slice(0, -1).some((k) => at.get(range.first)! <= k && k <= at.get(range.last)!));
+        assert.ok(covered.length > 0, 'premise: a summary the compile sends covers an earlier part');
+      } finally {
+        await parts.close();
       }
     });
   }
