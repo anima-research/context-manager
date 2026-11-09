@@ -72,14 +72,37 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 }
 
 /**
+ * Which call each tool result answers, for blocks in send order. A result
+ * answers the nearest call before it with its id. So a call is answered only
+ * by results that come before the next call with its id, and a result with no
+ * call before it with its id answers none. Ids can repeat: a provider that
+ * leaves a streamed call's id out can mint the same id in every response.
+ *
+ * Returns, for each block, the index of the call it answers, or undefined for
+ * a call, a result that answers none, and any other block. The count of
+ * answered calls, this module's strip and pairing repair's look-ahead all
+ * pair by it.
+ */
+export function answeredCallIndexes(blocks: readonly ContentBlock[]): Array<number | undefined> {
+  const latest = new Map<string, number>();
+  return blocks.map((block, i) => {
+    if (block.type === 'tool_use') {
+      latest.set((block as { id: string }).id, i);
+      return undefined;
+    }
+    return block.type === 'tool_result' ? latest.get((block as { toolUseId: string }).toolUseId) : undefined;
+  });
+}
+
+/**
  * Strip each `tool_use` that no `tool_result` in the message list answers,
  * and each `tool_result` that answers no `tool_use` there. A result answers
- * the nearest call before it with its id, so a call is kept only if a result
- * with its id follows it before the next call with that id, and a result
- * only if a call with its id comes before it. If stripping leaves a message
- * with no blocks, replace its content with a placeholder text block so the
- * message stays structurally valid (collapse/rendering paths assume
- * non-empty content).
+ * the nearest call before it with its id (answeredCallIndexes), so a call is
+ * kept only if a result with its id follows it before the next call with
+ * that id, and a result only if a call with its id comes before it. If
+ * stripping leaves a message with no blocks, replace its content with a
+ * placeholder text block so the message stays structurally valid
+ * (collapse/rendering paths assume non-empty content).
  *
  * Why this exists: the Anthropic API requires every `tool_use` to be
  * followed by its `tool_result` in the immediately-next message (and every
@@ -103,22 +126,20 @@ export function splitMixedToolMessages<T extends { participant: string; content:
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
-  const paired = new Set<string>();
-  const latest = new Map<string, string>();
-  messages.forEach((msg, m) => {
-    msg.content.forEach((block, b) => {
-      if (block.type === 'tool_use') latest.set((block as { id: string }).id, `${m}:${b}`);
-      else if (block.type === 'tool_result') {
-        const call = latest.get((block as { toolUseId: string }).toolUseId);
-        if (call) {
-          paired.add(call);
-          paired.add(`${m}:${b}`);
-        }
-      }
-    });
+  const starts: number[] = [];
+  const blocks: ContentBlock[] = [];
+  for (const msg of messages) {
+    starts.push(blocks.length);
+    for (const block of msg.content) blocks.push(block);
+  }
+  const paired = new Set<number>();
+  answeredCallIndexes(blocks).forEach((call, at) => {
+    if (call === undefined) return;
+    paired.add(call);
+    paired.add(at);
   });
   return messages.map((msg, m) => {
-    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(`${m}:${b}`) : true));
+    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(starts[m]! + b) : true));
     if (trimmed.length === msg.content.length) {
       return { participant: msg.participant, content: msg.content };
     }

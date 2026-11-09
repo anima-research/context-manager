@@ -187,6 +187,17 @@ for (const select of Object.keys(selects) as Array<keyof typeof selects>) {
       }
     });
 
+    it('a further result after text, for a call its own message answered, is left out, and the text is sent', async () => {
+      const { compiled } = await compileOf(select, [
+        ['User', [text('Please look at the file.')]],
+        ['Claude', [call('look-1'), result('look-1'), text('It says hello.'), result('look-1')]],
+        ['User', [text('Thanks.')]],
+      ]);
+      const results = compiled.messages.flatMap((m) => m.content.filter((b) => b.type === 'tool_result' && b.toolUseId === 'look-1'));
+      assert.equal(results.length, 1, JSON.stringify(compiled.messages));
+      assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'It says hello.')), JSON.stringify(compiled.messages));
+    });
+
     it("under toolResultMaxLastN: 0, a message's own result is replaced with the tool's marker", async () => {
       const { compiled } = await compileOf(select, [
         ['User', [text('Please look at the file.')]],

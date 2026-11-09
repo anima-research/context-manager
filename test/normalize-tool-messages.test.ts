@@ -14,6 +14,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../src/index.js';
+import { answeredCallIndexes } from '../src/normalize-tool-messages.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 function mkBlocks(spec: string): ContentBlock[] {
@@ -242,5 +243,16 @@ describe('stripUnpairedToolBlocks', () => {
     const msg = { participant: 'user', content: [t('hello')] };
     const out = stripUnpairedToolBlocks([msg]);
     assert.deepStrictEqual(out[0].content, [t('hello')]);
+  });
+});
+
+describe('answeredCallIndexes', () => {
+  const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
+  const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res' });
+  const t = (text: string): ContentBlock => ({ type: 'text', text });
+
+  it('pairs each result with the nearest call before it with its id, and a result with no call before it with none', () => {
+    const blocks = [r('A'), u('A'), r('A'), t('again'), u('A'), r('A'), r('A'), u('B'), r('A'), r('B')];
+    assert.deepStrictEqual(answeredCallIndexes(blocks), [undefined, undefined, 1, undefined, undefined, 4, 4, undefined, 4, 7]);
   });
 });

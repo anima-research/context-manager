@@ -52,7 +52,7 @@ import {
 } from './settle-summaries.js';
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
-import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
+import { answeredCallIndexes, splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import {
   hoistToolProse,
   DEFAULT_TOOL_PROSE_FIELD,
@@ -688,34 +688,33 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
  * the nearest call with its id before it, in its own message or an earlier
- * one; a result whose nearest call a result has already answered goes with
- * that call, as a further result; a result with no call before it with its
- * id answers none.
+ * one (answeredCallIndexes); a result whose call a result has already
+ * answered goes with that call, as a further result; a result with no call
+ * before it with its id answers none.
  * Epoch 4's predicate reads the same calls, so it sees what the count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
-  const latest = new Map<string, { toolName: string; call: AnsweredCall }>();
+  const blocks: ContentBlock[] = [];
+  const where: Array<{ message: number; index: number }> = [];
+  messages.forEach((m, message) => m.content.forEach((block, index) => {
+    blocks.push(block);
+    where.push({ message, index });
+  }));
+  const calls = new Map<number, AnsweredCall>();
   const byTool = new Map<string, AnsweredCall[]>();
-  let place = 0;
-  for (let at = 0; at < messages.length; at++) {
-    const m = messages[at]!;
-    for (let i = 0; i < m.content.length; i++, place++) {
-      const block = m.content[i]!;
-      if (block.type === 'tool_use') {
-        latest.set(block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } });
-      } else if (block.type === 'tool_result') {
-        const nearest = latest.get(block.toolUseId);
-        if (!nearest) continue;
-        if (nearest.call.results.length === 0) {
-          nearest.call.place = place;
-          let answered = byTool.get(nearest.toolName);
-          if (!answered) byTool.set(nearest.toolName, (answered = []));
-          answered.push(nearest.call);
-        }
-        nearest.call.results.push({ message: m.id, index: i });
-      }
+  answeredCallIndexes(blocks).forEach((callAt, place) => {
+    if (callAt === undefined) return;
+    let call = calls.get(callAt);
+    if (!call) {
+      calls.set(callAt, (call = { message: where[callAt]!.message, place, results: [] }));
+      const toolName = (blocks[callAt] as { name: string }).name;
+      let answered = byTool.get(toolName);
+      if (!answered) byTool.set(toolName, (answered = []));
+      answered.push(call);
     }
-  }
+    const { message, index } = where[place]!;
+    call.results.push({ message: messages[message]!.id, index });
+  });
   return byTool;
 }
 
@@ -21446,8 +21445,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     survives the repair;
    *   - otherwise emit a stub.
    *
-   * A later call can reuse an id: a provider that leaves a streamed call's
-   * id out can get the same id in every response.
+   * The genuine result is the first one in the window that answers the call
+   * (resultsAnswering). A later call can reuse an id: a provider that leaves
+   * a streamed call's id out can get the same id in every response.
    */
   private relocateOrDropMissingResults(
     entries: ContextEntry[],
@@ -21458,18 +21458,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContentBlock[] {
     const end = this.lookAheadEnd(entries, afterIndex, unitOf);
     return missing.map(id => {
-      for (let j = afterIndex; j < end; j++) {
-        const src = entries[j];
-        const bi = src.content.findIndex(
-          b => (b.type === 'tool_result' && b.toolUseId === id) || (b.type === 'tool_use' && b.id === id),
-        );
-        if (bi === -1) continue;
-        if (src.content[bi]!.type === 'tool_use') break;
-        return this.moveResult(src, bi, unitOf);
-      }
+      const [first] = this.resultsAnswering(entries, afterIndex - 1, afterIndex, end, [id]);
+      if (first) return this.moveResult(first.entry, first.entry.content.indexOf(first.block), unitOf);
       stubbed.add(id);
       return this.createToolResultStub(id);
     });
+  }
+
+  /**
+   * The results in `entries[from, end)` that answer the last call with one of
+   * `ids` in `entries[callsAt]`, in send order, by the one pairing rule
+   * (answeredCallIndexes) over `entries[callsAt, end)`. Read again after each
+   * move, since a move can rewrite its entry's blocks (raw-forms.ts).
+   */
+  private resultsAnswering(
+    entries: ContextEntry[],
+    callsAt: number,
+    from: number,
+    end: number,
+    ids: readonly string[],
+  ): Array<{ entry: ContextEntry; block: ContentBlock }> {
+    const blocks: ContentBlock[] = [];
+    const owners: number[] = [];
+    for (let j = callsAt; j < end; j++) {
+      for (const block of entries[j]!.content) {
+        blocks.push(block);
+        owners.push(j);
+      }
+    }
+    const calls = new Set<number>();
+    for (const id of ids) {
+      for (let k = entries[callsAt]!.content.length - 1; k >= 0; k--) {
+        const block = blocks[k]!;
+        if (block.type === 'tool_use' && block.id === id) {
+          calls.add(k);
+          break;
+        }
+      }
+    }
+    return answeredCallIndexes(blocks).flatMap((call, k) =>
+      call !== undefined && calls.has(call) && owners[k]! >= from ? [{ entry: entries[owners[k]!]!, block: blocks[k]! }] : []);
   }
 
   private lookAheadEnd(entries: ContextEntry[], afterIndex: number, unitOf: (entry: ContextEntry) => ContextEntry): number {
@@ -21508,20 +21536,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private gatherRunResults(entries: ContextEntry[], afterIndex: number, ids: string[], unitOf: (entry: ContextEntry) => ContextEntry): ContentBlock[] {
     if (ids.length === 0) return [];
     const end = this.lookAheadEnd(entries, afterIndex, unitOf);
-    const open = new Set(ids);
     const gathered: ContentBlock[] = [];
-    for (let j = afterIndex + 1; j < end && open.size > 0; j++) {
-      const src = entries[j]!;
-      for (let bi = 0; bi < src.content.length;) {
-        const b = src.content[bi]!;
-        if (b.type === 'tool_result' && open.has(b.toolUseId)) gathered.push(this.moveResult(src, bi, unitOf));
-        else {
-          if (b.type === 'tool_use') open.delete(b.id);
-          bi++;
-        }
-      }
+    for (;;) {
+      const [next] = this.resultsAnswering(entries, afterIndex - 1, afterIndex + 1, end, ids);
+      if (!next) return gathered;
+      gathered.push(this.moveResult(next.entry, next.entry.content.indexOf(next.block), unitOf));
     }
-    return gathered;
   }
 
   /**
