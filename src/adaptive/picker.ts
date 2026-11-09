@@ -62,6 +62,29 @@ export interface OverBudgetDiagnostics {
    * any.
    */
   rawPins?: { tokens: number; pins: readonly OverBudgetRawPin[] };
+  /**
+   * Under adaptive resolution, the cheapest plan the summaries held allow,
+   * head and tail included (#415). Under kv-unified, at or under the budget a
+   * plan that fits exists, so the refusal isn't for want of summaries.
+   * Outside kv-unified the floor counts no lock and is a lower bound: a floor
+   * over `hardBudget` (`inputBudget` with `overBudgetGraceRatio` added, the
+   * plan size above which a compile refuses, as `RenderStats` reports it)
+   * means every compile refuses, and one at or under it doesn't promise a
+   * plan fits. Over `hardBudget`, no plan fits until the floor drops under it
+   * or the budget rises, as new summaries, a smaller tail, fewer messages, or
+   * a released pin or lock that kept a message from its cheapest form can
+   * bring about. Absent where it couldn't
+   * be computed, and on a refusal that comes before the plan, as the head
+   * and tail reservation's does.
+   */
+  floorTokens?: number;
+  /**
+   * Under adaptive resolution, what the queued compression work is expected
+   * to take off `floorTokens` once it lands (RenderStats' `queuedReliefTokens`).
+   * It's an estimate, so a floor that stays over `hardBudget` less this much
+   * isn't expected to be cleared by draining the queue alone.
+   */
+  queuedReliefTokens?: number;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
@@ -271,6 +294,8 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.configuredBudget === undefined ? '' : `, configured=${opts.diagnostics.configuredBudget}`) +
         (opts.diagnostics.reserveForResponse === undefined ? '' : `, response reserve=${opts.diagnostics.reserveForResponse}`) +
         (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
+        (opts.diagnostics.floorTokens === undefined ? '' : `, floor=${opts.diagnostics.floorTokens}`) +
+        (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across

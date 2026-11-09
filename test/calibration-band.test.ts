@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { JsStore } from '@animalabs/chronicle';
 
 const dir = mkdtempSync(join(tmpdir(), 'calibration-band-'));
 const BUDGET = { maxTokens: 100_000, reserveForResponse: 2_000 };
@@ -66,7 +67,7 @@ async function calibrationWarnings<T>(fn: () => Promise<T>): Promise<{ result: T
 /** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
 const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
 
-async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; toolCycle?: boolean; toolNearMiss?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
+async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; toolCycle?: boolean; toolNearMiss?: boolean; recentWindowTokens?: number; maxMessageTokens?: number; store?: JsStore } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
@@ -75,7 +76,7 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
     adaptiveResolution: true, // the calibration sample is armed on the adaptive (folding) path only
     ...(opts.maxMessageTokens !== undefined ? { maxMessageTokens: opts.maxMessageTokens } : {}),
   });
-  const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane });
+  const cm = await ContextManager.open(opts.store ? { store: opts.store, strategy, membrane } : { path: join(dir, name), strategy, membrane });
   for (let i = 0; i < 6; i++) {
     cm.addMessage(i % 2 ? 'Claude' : 'User', [
       ...(i % 2 && opts.signedThinking ? [SIGNED_THINKING as never] : []),
@@ -144,6 +145,32 @@ describe('estimator calibration band', () => {
     const est = internals._lastCompileEstimate;
     strategy.reportRealInputTokens(est * 1.5);
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a ratio inside the band is learned from, though the multiplier it implies is past the ceiling', async () => {
+    const first = await openManager('band-top');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.2, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('band-top');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1.2, null], 'premise: the seeded record loads as learned');
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.6);
+    await cm.compile(BUDGET);
+    const { multiplier } = cm.getRenderStats()!.calibration!;
+    assert.ok(multiplier > 1.2 && multiplier < 1.8, `the EMA steps toward the sample: got ${multiplier}`);
+    cm.close();
+  });
+
+  it('a sample on a branch the strategy has not loaded is refused', async () => {
+    const { cm, strategy } = await openManager('unloaded-branch');
+    const main = cm.currentBranch().name;
+    await cm.fork('other');
+    await cm.compile(BUDGET);
+    cm.getStore().switchBranch(main);
+    assert.throws(() => strategy.reportRealInputTokens(1_000), /requires reinitialization for the current branch generation/);
     cm.close();
   });
 
@@ -502,6 +529,30 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
+  it('a report with no usable total spends the compile\'s sample, and the next compile samples again', async () => {
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      const { cm, strategy, internals } = await openManager(`unusable-total-${unusable}`);
+      await cm.compile(BUDGET);
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        strategy.reportRealInputTokens(unusable);
+      } finally {
+        console.error = error;
+      }
+      assert.deepEqual(logged.filter((line) => line.includes('[estimator-calibration]')), [], `${unusable} isn't read as a sample`);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+      await cm.compile(BUDGET);
+      assert.equal(cm.getRenderStats()!.calibration!.multiplier, 1, `nothing learned after ${unusable}`);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+      await cm.compile(BUDGET);
+      const { multiplier } = cm.getRenderStats()!.calibration!;
+      assert.ok(Math.abs(multiplier - 1.4) < 1e-9, `the next compile's first report is its sample, after ${unusable}: got ${multiplier}`);
+      cm.close();
+    }
+  });
+
   it('a store with no calibration record is still provisional after a restart before its first sample', async () => {
     const first = await openManager('fresh-restart');
     await first.cm.compile(BUDGET);
@@ -513,6 +564,31 @@ describe('estimator calibration band', () => {
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 0.8);
     assert.ok(Math.abs(internals._calibration - 0.8) < 1e-9, `set by the sample, got ${internals._calibration}`);
     cm.close();
+  });
+
+  it('a calibration write the store refuses leaves the sample in force', async () => {
+    const owned = JsStore.openOrCreate({ path: join(dir, 'refused-write') });
+    let refused = 0;
+    const store = new Proxy(owned, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (typeof value !== 'function') return value;
+        if (prop !== 'setStateJson') return value.bind(target);
+        return (id: string, state: unknown) => {
+          if (id.includes('calibration')) { refused++; throw new Error(`refused ${id}`); }
+          return value.call(target, id, state);
+        };
+      },
+    });
+    const { cm, strategy, internals } = await openManager('refused-write', { store });
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+    assert.ok(refused > 0, 'premise: the sample wrote the record, and the store refused it');
+    await cm.compile(BUDGET);
+    const { multiplier } = cm.getRenderStats()!.calibration!;
+    assert.ok(Math.abs(multiplier - 1.4) < 1e-9, `the sample is in force: got ${multiplier}`);
+    cm.close();
+    owned.close();
   });
 
   it('a record with no multiplier to use loads as no record: a provisional 1', async () => {

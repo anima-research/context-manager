@@ -138,6 +138,30 @@ describe('AutobiographicalStrategy — per-region recall pairs (gap #2)', () => 
     assert.equal(pairs[0].q, `[Recall ${seeded.id}]`, 'default template should be [Recall {id}]');
   });
 
+  it("falls back to '[Recall {id}]' when a caller passes recallHeaderTemplate as undefined", async () => {
+    const strategy = new TestableStrategy({
+      headWindowTokens: 0,
+      recentWindowTokens: 8,
+      recallHeaderTemplate: undefined,
+    });
+    assert.strictEqual((strategy as unknown as { config: { recallHeaderTemplate?: string } }).config.recallHeaderTemplate, undefined);
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+
+    const m1 = manager.addMessage('user', textBlock('foo'));
+    manager.addMessage('user', textBlock('latest ' + 'X'.repeat(50)));
+    const seeded = strategy.seedL1Against('content', m1, m1);
+
+    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+    const pairs = recallEntries(compiled.messages);
+
+    assert.equal(pairs.length, 1);
+    assert.equal(pairs[0].q, `[Recall ${seeded.id}]`);
+    manager.close();
+  });
+
   it('honors a custom recall header template with all substitutions', async () => {
     const strategy = new TestableStrategy({
       headWindowTokens: 0,

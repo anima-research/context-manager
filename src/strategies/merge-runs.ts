@@ -261,7 +261,7 @@ export function mergeGroupProblem<S extends RunSummary>(
   }
   const runs = runsOf(sources, position);
   if (runs.length !== 1) {
-    return `sources are not adjacent in store order: ` +
+    return `sources are not adjacent in store order (the strategy's view: the window's order once a host presents): ` +
       runs.map((r) => `[${r.map((s) => `${s.id}(${s.sourceRange!.first}..${s.sourceRange!.last})`).join(',')}]`).join(' | ');
   }
   return null;
