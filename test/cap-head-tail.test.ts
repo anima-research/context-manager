@@ -3,11 +3,12 @@
  * 60% of what it keeps and the tail 40%, around one marker that says which
  * characters it elided and where the whole is: the stored message or
  * summary by id, and, where the host supplies `capReadHint`, how to read it.
- * The cut finds the largest head and tail whose estimate, by the strategy's
- * own estimate the cap is given, fits the cap with the marker, and counts
- * no characters per token of its own. The characters it names are offsets
- * into the text it measures, `capMeasuredText`'s, so a reader paging from
- * the marker's first offset reads exactly the elided middle.
+ * The cut halves over how much it keeps to find a head and tail whose
+ * estimate, by the strategy's own estimate the cap is given, fits the cap
+ * with the marker, and counts no characters per token of its own. The
+ * characters it names are offsets into the text it measures,
+ * `capMeasuredText`'s, so a reader paging from the marker's first offset
+ * reads exactly the elided middle.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

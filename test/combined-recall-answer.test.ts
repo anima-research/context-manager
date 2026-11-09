@@ -12,6 +12,7 @@ import {
   HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
   HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   SeedableStrategy,
+  renderAdaptiveFixture,
   renderHierarchicalFixture,
   type RenderedMessage,
 } from './fixtures/recall-envelope-fixture.js';
@@ -192,6 +193,37 @@ describe('every recall answer cuts each summary head and tail, its marker naming
         }
       });
     }
+  }
+});
+
+describe('the adaptive render cuts each long summary head and tail inside its envelope', () => {
+  /** Compression call `n`'s summary: 20 lines labelled `zzs<n>`, with no line
+   *  break at its end, long enough for the cap to cut and short enough for
+   *  the fold plan, which prices a summary whole, to fit the budget. */
+  const longSummary = (n: number): string => summaryLines(`zzs${n}`, 20).trimEnd();
+  for (const mode of ['xml', 'bare'] as const) {
+    it(`adaptive, ${mode}: each long summary's head, the marker naming it and its tail sit inside its one whole envelope, the offsets indexing its prose`, async () => {
+      const rendered = await renderAdaptiveFixture(
+        { maxMessageTokens: 60, recallEnvelope: mode },
+        (n) => [{ type: 'text', text: longSummary(n) }],
+        1_200,
+      );
+      const sent = rendered.messages.map((m) => textOf(m)).join('\n');
+      const markers = [...sent.matchAll(new RegExp(SUMMARY_MARKER.source, 'g'))];
+      assert.ok(markers.length > 0, `the adaptive render recalls a long summary: ${JSON.stringify(sent.slice(0, 300))}`);
+      const envelopes = [...sent.matchAll(WHOLE_ENVELOPE)].map((m) => m[0]);
+      for (const marker of markers) {
+        const [head, tailStart, total] = [marker[1], marker[2], marker[3]].map(Number);
+        const envelope = envelopes.find((e) => e.includes(marker[0]));
+        assert.ok(envelope, `the marker naming ${marker[4]} sits inside a whole envelope`);
+        const label = /zzs(\d+)-00000/.exec(envelope)?.[1];
+        assert.ok(label !== undefined, `${marker[4]}'s envelope holds its summary's first line`);
+        const prose = longSummary(Number(label));
+        assert.equal(total, prose.length, `${marker[4]}'s marker counts its prose`);
+        assert.ok(envelope.includes(`${prose.slice(0, head)}\n${marker[0]}\n${prose.slice(tailStart)}`),
+          `${marker[4]}: exactly the head before the marker's first offset, the marker, and the tail from its second`);
+      }
+    });
   }
 });
 
