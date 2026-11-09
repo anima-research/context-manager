@@ -1542,7 +1542,7 @@ export function requireBatchedIdentityAppend(store: JsStore): void {
   throw new Error(
     'ContextManager: the store handle has no appendManyToStateJsonWithIdentity, the identity-stamped batched append of ' +
       '@animalabs/chronicle 0.6.0, with which the window index writes several rows as one record; ' +
-      'install @animalabs/chronicle ^0.6.0, which context-manager declares, and open the store with it',
+      "install a release of @animalabs/chronicle that context-manager's range admits (0.6.0 or newer within it), and open the store with it",
   );
 }
 

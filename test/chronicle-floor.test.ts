@@ -20,21 +20,16 @@ type Manifest = { name: string; version: string; dependencies?: Record<string, s
 // From dist/test, as the suite runs.
 const ours = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as Manifest;
 
-/** A caret range's floor (`^M.m.p`), the form each member of context-manager's range takes. */
 function floorOf(range: string): [number, number, number] {
   const parts = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(range);
   assert.ok(parts, `${range} is a caret range on a release`);
   return [Number(parts[1]), Number(parts[2]), Number(parts[3])];
 }
 
-/** Whether `range`, caret ranges joined by `||`, admits the release `version`,
- *  as npm reads it: some member does. */
 function admits(range: string, version: string): boolean {
   return range.split('||').some((member) => caretAdmits(member.trim(), version));
 }
 
-/** Whether the caret `range` admits the release `version`, as npm reads it:
- *  at or above the floor, below the next change of its first nonzero part. */
 function caretAdmits(range: string, version: string): boolean {
   const [major, minor, patch] = floorOf(range);
   const [vMajor, vMinor, vPatch] = version.split('.').map(Number) as [number, number, number];
