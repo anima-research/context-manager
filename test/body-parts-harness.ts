@@ -81,9 +81,9 @@ export class Probe extends AutobiographicalStrategy {
   }
 }
 
-export async function open(o: { layout?: Layout; kind?: Kind; config?: Record<string, unknown>; persist?: boolean } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'cm-body-parts-'));
-  const strategy = new Probe({
+export async function open(o: { layout?: Layout; kind?: Kind; config?: Record<string, unknown>; persist?: boolean; dir?: string; membrane?: unknown; Strategy?: typeof Probe } = {}) {
+  const dir = o.dir ?? mkdtempSync(join(tmpdir(), 'cm-body-parts-'));
+  const strategy = new (o.Strategy ?? Probe)({
     adaptiveResolution: true,
     compressionModel: 'mock',
     overBudgetGraceRatio: 0,
@@ -93,7 +93,7 @@ export async function open(o: { layout?: Layout; kind?: Kind; config?: Record<st
   });
   strategy.layout = o.layout ?? 'new';
   strategy.persist = o.persist ?? true;
-  const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+  const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, ...(o.membrane ? { membrane: o.membrane as never } : {}) });
   const view = (): MessageStoreView => (manager as unknown as { strategyMessageView(): MessageStoreView }).strategyMessageView();
   const all = (): StoredMessage[] => view().getAll();
   /** Adds a message and gives the positions of its parts. */
@@ -104,11 +104,11 @@ export async function open(o: { layout?: Layout; kind?: Kind; config?: Record<st
   };
   /** The store's estimate of each stored message, as the head's walk and the image strip's depth price it. */
   const estimates = (): number[] => all().map((m) => view().estimateTokens(m));
-  const close = async (): Promise<void> => {
+  const close = async (remove = true): Promise<void> => {
     await manager.close();
-    rmSync(dir, { recursive: true, force: true });
+    if (remove) rmSync(dir, { recursive: true, force: true });
   };
-  return { manager, strategy, view, all, add, estimates, close };
+  return { dir, manager, strategy, view, all, add, estimates, close };
 }
 
 /** The sum of `prices` from `from` up to (not including) `to`. */

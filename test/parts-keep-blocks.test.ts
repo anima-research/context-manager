@@ -13,7 +13,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { OverBudgetError } from '../src/index.js';
+import { Membrane, MockAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
+import { AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import type { StoredMessage } from '../src/types/index.js';
 import { call, image, long, open, result, sum, text, thinking, type Kind, type Layout } from './body-parts-harness.js';
 
 const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
@@ -273,6 +275,7 @@ describe("a body's bytes stay put while its parts stay in their region", () => {
         const bodyIds = new Set([...reply.map((i) => ids[i]!), ids[res!]!]);
         let before: { regions: string; bytes: string } | undefined;
         let compared = 0;
+        let comparedSplit = 0;
         let crossed = 0;
         for (let turn = 0; turn < 40; turn++) {
           o.add(turn % 2 ? 'u' : 'a', [text(`turn ${turn} ${long('T', 4_000)}`)]);
@@ -294,12 +297,133 @@ describe("a body's bytes stay put while its parts stay in their region", () => {
               `turn ${turn}: the body's bytes are unchanged while its parts stay put (${regions}); they differ at ${at}: ` +
               `${JSON.stringify(before.bytes.slice(Math.max(0, at - 80), at + 120))} became ${JSON.stringify(bytes.slice(Math.max(0, at - 80), at + 120))}`);
             compared++;
+            if (regions.includes('recent') && regions.includes('middle')) comparedSplit++;
           }
           before = { regions, bytes };
         }
-        assert.ok(crossed > 0 && compared > 10, `premise: the edge crossed the body (${crossed} turns) and turns were compared (${compared})`);
+        assert.ok(crossed > 0 && compared > 10 && comparedSplit > 0,
+          `premise: the edge crossed the body (${crossed} turns), and turns were compared (${compared}), ${comparedSplit} of them with the body split`);
       } finally {
         await o.close();
+      }
+    });
+  }
+});
+
+describe('a Responses reply whose reasoning item comes before its call is stored whole, and replays in its own order', () => {
+  const reasoning = (): ContentBlock =>
+    ({ type: 'redacted_thinking', data: 'opaque', rawItem: { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque' } }) as unknown as ContentBlock;
+  const functionCall = (): ContentBlock => ({
+    type: 'tool_use', id: 'call_1', name: 'lookup', input: { q: 1 },
+    rawItem: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'lookup', arguments: '{"q":1}' },
+  }) as unknown as ContentBlock;
+  async function wire(sent: Sent[]): Promise<Array<Record<string, unknown>>> {
+    const adapter = new MockAdapter({ defaultResponse: 'ok' });
+    const membrane = new Membrane(adapter, { formatter: new OpenAIResponsesFormatter(), assistantParticipant: 'a' });
+    await membrane.complete({
+      messages: sent.map(({ participant, content }) => ({ participant, content })),
+      config: { model: 'test-model', maxTokens: 16 },
+      tools: [{ name: 'lookup', description: 'Look it up.', inputSchema: { type: 'object', properties: { q: { type: 'number' } } } }],
+    });
+    return adapter.getLastRequest()!.messages as Array<Record<string, unknown>>;
+  }
+  const SHAPES: Record<string, { content: () => ContentBlock[]; between: number }> = {
+    'reasoning, then its call, then text': { content: () => [reasoning(), functionCall(), text(long('RESP'))], between: 0 },
+    'reasoning, then text, then its call': { content: () => [reasoning(), text(long('RESP')), functionCall()], between: 1 },
+  };
+  for (const [shape, { content, between }] of Object.entries(SHAPES)) {
+    it(`${shape}: one stored message, and the wire carries its items in its own order`, async () => {
+      const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 1_000_000 } });
+      try {
+        o.add('u', [text('intro')]);
+        const reply = o.add('a', content());
+        o.add('u', [result('call_1', 'what the tool said')]);
+        o.add('a', [text('ok')]);
+        o.add('u', [text('next')]);
+        // The recent window starts at the reply's last stored message.
+        o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), reply.at(-1)!) });
+        const sent = await wire((await o.manager.compile(BIG)).messages as Sent[]);
+        const at = (id: string) => sent.findIndex((item) => item.id === id);
+        assert.ok(at('rs_1') >= 0 && at('fc_1') >= 0, 'both items go out with their ids');
+        assert.equal(at('fc_1') - at('rs_1') - 1, between, 'with only the message\'s own text between them');
+        if (between) assert.ok(JSON.stringify(sent[at('rs_1') + 1]).includes(long('RESP').slice(-200)), 'the whole text, in one item');
+        assert.equal(reply.length, 1, 'stored as one message');
+      } finally {
+        await o.close();
+      }
+    });
+  }
+  it('a reply whose thinking carries no raw item is still split', async () => {
+    const o = await open();
+    try {
+      const reply = o.add('a', [thinking('T'), text(long('A')), call('c1')]);
+      assert.ok(reply.length > 1);
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe("renderAsNewest keeps a joined body's images newest part first", () => {
+  it('under maxLiveImages 1, the image stored after the call is kept and the one before it replaced', async () => {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 1 } });
+    try {
+      o.add('u', [text('intro')]);
+      const reply = o.add('a', [image('AAAA'), text(long('IMGS')), call('c7'), image('BBBB')]);
+      o.add('u', [result('c7', 'ok')]);
+      assert.ok(o.all()[reply.at(-1)!]!.content.some((b) => b.type === 'image'), 'premise: the second image is on the last part');
+      const [rendered] = o.manager.renderAsNewest([o.all()[reply[0]!]!.id])!;
+      const sent = [{ participant: 'a', content: rendered! }];
+      assert.deepEqual([images(sent, 'AAAA'), images(sent, 'BBBB')], [0, 1]);
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe('epoch 7 reprices a store holding a split message the middle now sends differently', () => {
+  let seq = 0;
+  const msg = (content: ContentBlock[], part?: number): StoredMessage =>
+    ({ id: `m${++seq}`, sequence: seq, participant: 'u', content, timestamp: new Date(0), ...(part === undefined ? {} : { bodyGroupId: 'g', shardIndex: part }) }) as StoredMessage;
+  const view = (messages: StoredMessage[]) => ({ getAll: () => messages }) as never;
+  it("the predicate: a part holding a non-text block, or a part over the cap", () => {
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[7];
+    assert.equal(typeof reprices, 'function');
+    const at = (config: Record<string, unknown>) => new AutobiographicalStrategy(config as never);
+    const split = (second: ContentBlock[]) => [msg([text('first part')], 0), msg(second, 1)];
+    assert.equal(reprices!(split([text('x'), image('AAAA')]), at({}), view([])), true, 'a part holding an image');
+    assert.equal(reprices!(split([text('x'), call('c')]), at({}), view([])), true, 'a part holding a call');
+    assert.equal(reprices!(split([text('x')]), at({}), view([])), false, 'parts of text alone, no cap');
+    assert.equal(reprices!(split([text(long('X', 8_000))]), at({ maxMessageTokens: 100 }), view([])), true, 'a part over the cap');
+    assert.equal(reprices!(split([text('x')]), at({ maxMessageTokens: 100 }), view([])), false, 'parts under the cap');
+    assert.equal(reprices!([msg([text('x'), image('AAAA')])], at({}), view([])), false, 'a message stored whole');
+  });
+  for (const [name, content, discarded] of [
+    ['a split message holding an image: a multiplier from epoch 6 is discarded', () => [text(long('DOC')), image('AAAA')], true],
+    ['split messages of text alone: a multiplier from epoch 6 is kept, re-stamped', () => [text(long('DOC'))], false],
+  ] as const) {
+    it(name, async () => {
+      const first = await open();
+      first.add('u', content());
+      first.add('a', [text('ok')]);
+      await first.manager.compile(BIG);
+      type Calibration = { _calibration: number; calibrationStateId: string; store: { setStateJson(id: string, v: unknown): void; getStateJson(id: string): unknown } };
+      const internals = (o: { strategy: unknown }) => o.strategy as Calibration;
+      internals(first).store.setStateJson(internals(first).calibrationStateId, { multiplier: 0.8, at: 1, pricing: 6 });
+      await first.close(false);
+      const again = await open({ dir: first.dir });
+      try {
+        await again.manager.compile(BIG);
+        if (discarded) {
+          assert.equal(internals(again)._calibration, 1);
+          assert.equal(again.manager.getRenderStats()!.calibration!.reset?.fromEpoch, 6);
+        } else {
+          assert.equal(internals(again)._calibration, 0.8);
+          const saved = internals(again).store.getStateJson(internals(again).calibrationStateId) as { pricing?: number };
+          assert.equal(saved.pricing, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH);
+        }
+      } finally {
+        await again.close();
       }
     });
   }

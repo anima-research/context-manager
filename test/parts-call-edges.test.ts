@@ -12,9 +12,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredMessage } from '../src/types/index.js';
 import * as contextManager from '../src/index.js';
 import { concatBodyGroups, OverBudgetError } from '../src/index.js';
-import { call, long, open, result, sum, text, thinking, type Layout } from './body-parts-harness.js';
+import { call, long, open, Probe, result, sum, text, thinking, type Layout } from './body-parts-harness.js';
 
 const types = (m: { content: ContentBlock[] }): string[] => m.content.map((b) => b.type);
 const recall = (): string => '';
@@ -86,6 +87,7 @@ describe("the chunker closes a stored reply's parts before its last as it closes
     const chunkOf = (c: typeof stored, id: string) => c.chunks.findIndex((chunk) => chunk.includes(id));
     const lastPart = stored.reply.at(-1)!;
     const refLastPart = reference.reply.at(-1)!;
+    assert.ok(chunkOf(stored, lastPart) >= 0, "premise: the call's part is chunked");
     assert.ok(reference.chunks.some((chunk) => chunk.at(-1) === refLastPart),
       'premise: without the call, a chunk closes on the reply\'s last part');
     assert.equal(chunkOf(stored, lastPart), chunkOf(stored, stored.res), 'the call\'s part closes with its result');
@@ -111,8 +113,6 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
     assert.equal(reply.length, 19, `premise: the reply is stored in ${reply.length} parts`);
     return { ...o, reply, res: res! };
   }
-  /** Where an edge landing at `k` may go: before the call's part, or past its result. */
-  const keeps = (edge: number, callAt: number, res: number): boolean => edge <= callAt || edge > res;
 
   for (const layout of ['new', 'old'] as const) {
     const label = layout === 'new' ? 'stored as ingress stores it now' : 'stored with its call on its first part';
@@ -123,7 +123,7 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
         for (const k of [...o.reply, o.res]) {
           o.strategy.set({ recentWindowTokens: sum(prices, k) });
           const start = o.strategy.recentStart(o.view());
-          if (layout === 'old') assert.ok(keeps(start, o.reply[0]!, o.res), `landing at ${k}: start ${start} keeps the call with its result`);
+          if (layout === 'old') assert.equal(start, o.reply[0]!, `landing at ${k}: the window starts at the reply's first part`);
           else assert.equal(start, k === o.res ? o.reply.at(-1)! : k, `landing at ${k}: as for a message stored whole`);
         }
       } finally {
@@ -139,7 +139,7 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
         for (const k of [...o.reply, o.res]) {
           o.strategy.set({ headWindowTokens: sum(prices, 0, k) });
           const end = o.strategy.headEnd(o.view());
-          if (layout === 'old') assert.ok(keeps(end, o.reply[0]!, o.res), `landing at ${k}: end ${end} keeps the call with its result`);
+          if (layout === 'old') assert.equal(end, o.reply[0]!, `landing at ${k}: the head ends before the reply's first part`);
           else assert.equal(end, k === o.res ? o.reply.at(-1)! : k, `landing at ${k}: as for a message stored whole`);
         }
       } finally {
@@ -154,7 +154,7 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
         for (const k of [...o.reply, o.res]) {
           o.manager.holdCompression([ids[k]!]);
           const start = o.strategy.holdStart(o.view());
-          if (layout === 'old') assert.ok(keeps(start, o.reply[0]!, o.res), `holding ${k}: the hold starts at ${start}, keeping the call with its result`);
+          if (layout === 'old') assert.equal(start, o.reply[0]!, `holding ${k}: the hold starts at the reply's first part`);
           else assert.equal(start, k === o.res ? o.reply.at(-1)! : k, `holding ${k}: as for a message stored whole`);
           o.manager.releaseCompression([ids[k]!]);
         }
@@ -169,7 +169,7 @@ describe('the edges around a reply stored in 19 parts, swept across every part',
       try {
         const ids = o.all().map((m) => m.id);
         const prices = o.estimates();
-        for (const k of o.reply.slice(1)) {
+        for (const k of o.reply) {
           // A chunk from the first message reaches its size at part k, half
           // way through it, so a few tokens either way don't move the close.
           o.strategy.set({ targetChunkTokens: sum(prices, 0, k) + Math.floor(prices[k]! / 2) });
@@ -212,4 +212,26 @@ describe("the newest turn a refusal names as the floor", () => {
       await o.close();
     }
   });
+});
+
+describe("a subclass's lastMessageContainsToolUse still decides where the chunker may not close", () => {
+  class Holds extends Probe {
+    protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
+      return chunk.at(-1)!.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HOLD'));
+    }
+  }
+  for (const [name, Strategy, closesAt] of [['the base', Probe, 3], ['a subclass holding at its marker', Holds, 4]] as const) {
+    it(`${name}: the first chunk closes at message ${closesAt}`, async () => {
+      const o = await open({ Strategy, persist: false, config: { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false } });
+      try {
+        for (let k = 0; k < 8; k++) o.add(k % 2 ? 'a' : 'u', [text(`${k === 3 ? 'HOLD' : 'turn'} ${k} ${long('T', 4_000)}`)]);
+        o.strategy.set({ targetChunkTokens: sum(o.estimates(), 0, 3) + 1 });
+        const ids = o.all().map((m) => m.id);
+        const first = o.strategy.chunkIds(o.view())[0]!;
+        assert.equal(ids.indexOf(first.at(-1)!), closesAt);
+      } finally {
+        await o.close();
+      }
+    });
+  }
 });

@@ -19,8 +19,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError, UncoveredDropError } from '../src/index.js';
-import { Picker } from '../src/adaptive/picker.js';
-import type { RenderStats, StoredMessage } from '../src/types/index.js';
+import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
+import type { RenderStats, SelectOptions, StoredMessage } from '../src/types/index.js';
 
 const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const IMAGE = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock;
@@ -195,6 +195,31 @@ describe("a body's raw shards, joined into one text block, are counted as the sh
       const { planned, actual } = stats.planVsActual!;
       assert.deepEqual([planned, actual, stats.total.tokens], [parts, parts, parts],
         `planned ${planned}, emitted ${actual}, render stats ${stats.total.tokens}, the parts ${parts}`);
+    } finally {
+      await o.close();
+    }
+  });
+  it('raw in the adaptive middle, with a plan that reports less than it holds: the run\'s own check refuses the compile', async () => {
+    class UnderReportingPlan extends AutobiographicalStrategy {
+      protected override buildPicker(
+        inputs: PickerInputs,
+        preparedBudget?: { totalBudget: number; targetBudget: number },
+        immutablePrefixHash?: string,
+        continuityRelaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
+      ): Picker {
+        const picker = super.buildPicker(inputs, preparedBudget, immutablePrefixHash, continuityRelaxation);
+        const run = picker.run.bind(picker);
+        picker.run = (...runArgs: Parameters<Picker['run']>) => {
+          const result = run(...runArgs);
+          return { ...result, finalTokens: result.finalTokens - 5_000 };
+        };
+        return picker;
+      }
+    }
+    const o = await open([{ type: 'text', text: PROSE + DENSE }], WINDOWS['raw in the adaptive middle'].config, UnderReportingPlan);
+    try {
+      const parts = o.parts();
+      await assert.rejects(o.manager.compile({ maxTokens: parts - 1, reserveForResponse: 0 }), /Emission overran the plan/);
     } finally {
       await o.close();
     }
