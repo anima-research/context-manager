@@ -126,7 +126,7 @@ export interface ControlResult {
 }
 
 /**
- * Per-chunk fold-depth band from the saliency field: flat zone and pins are
+ * Per-chunk fold-depth band from the saliency field: the raw zone and pins are
  * raw (0); otherwise log-age banded against the base-k geometry. The "finest
  * requirement wins". This is the SOFT shape prior of the ideal cut (design
  * §13.3): phase A folds under it, phase B folds past it when W demands —
@@ -136,12 +136,12 @@ export interface ControlResult {
 export function foldDepthCap(
   chunk: PickerChunk,
   now: number,
-  flatZone: ReadonlySet<ChunkId>,
+  rawZone: ReadonlySet<ChunkId>,
   flatZoneChunks: number,
   mergeThreshold: number,
   maxLevel: number = MAX_FOLD_LEVEL,
 ): number {
-  if (chunk.pinned || flatZone.has(chunk.id)) return 0;
+  if (chunk.pinned || rawZone.has(chunk.id)) return 0;
   const age = Math.max(0, now - chunk.sequence);
   const ratio = age / Math.max(1, flatZoneChunks);
   if (ratio < 1) return 0; // just outside the flat zone → still raw
@@ -1051,7 +1051,8 @@ export interface ControlPlanParams {
   /** Chunks forced to raw and never folded: the attended window (the flat
    *  zone), and any head and pins kept raw. */
   rawZone: ReadonlySet<ChunkId>;
-  attendedChunks?: number;
+  /** How many chunks the attended window (the flat zone) holds: the unit a chunk's age is measured in. */
+  attendedChunks: number;
   /**
    * Chunks kept at their carried resolution (locked), never folded or
    * un-folded by the solve. The base lowers a lock to its pin-max-level when
@@ -1400,7 +1401,7 @@ function planUnreported(
 
   // Shape prior: soft per-chunk depth caps (log-age band + pin caps), with the
   // −1 sentinel marking the hard-protected set (never folded by anything).
-  const flatZoneChunks = p.attendedChunks ?? p.rawZone.size;
+  const flatZoneChunks = p.attendedChunks;
   const caps = new Map<ChunkId, number>();
   for (const c of ordered) {
     let cap: number;
@@ -1606,7 +1607,7 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
     // [LW, HW] a no-op dead band; never past the hard wall W.
     const plan = planControlledFrontier(inputs, tree, {
       previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
-      windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,
+      windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, attendedChunks: flatZone.size, now, mergeThreshold,
       seedFromCarried: opts.seedFromCarried,
     });
     // The replay renders each turn's plan, so it reports the plan's overlap.

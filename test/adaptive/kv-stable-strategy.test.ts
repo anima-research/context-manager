@@ -50,7 +50,7 @@ test('kv-stable strategy: picker walks to exactly the planned frontier and fits 
   let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
   const plan = planControlledFrontier(inputs, tree, {
     previous: new Map(), foldAtTokens: budget.totalBudget, expandAtTokens: budget.targetBudget,
-    targetTokens: budget.targetBudget, windowTokens: budget.totalBudget, rawZone: new Set(), now, mergeThreshold: 6,
+    targetTokens: budget.targetBudget, windowTokens: budget.totalBudget, rawZone: new Set(), attendedChunks: 0, now, mergeThreshold: 6,
   });
 
   const strategy = new KvStableStrategy({});
@@ -256,7 +256,7 @@ test('kv-stable shape prior: a store whose only raw chunks are its attended tail
     const reference = planControlledFrontier(inputs, new SummaryTree(inputs), {
       previous: new Map(inputs.chunks.map((c) => [c.id, c.currentResolution])),
       foldAtTokens: budget.totalBudget, expandAtTokens: budget.targetBudget, targetTokens: budget.targetBudget,
-      windowTokens: budget.totalBudget, rawZone: inputs.tailChunkIds, now, mergeThreshold: 6,
+      windowTokens: budget.totalBudget, rawZone: inputs.tailChunkIds, attendedChunks: inputs.tailChunkIds.size, now, mergeThreshold: 6,
     });
     const sol = new KvStableStrategy({}).solve(inputs, budget);
     assert.deepEqual(sol.frontier, reference.resolutions, `budget ${total}`);

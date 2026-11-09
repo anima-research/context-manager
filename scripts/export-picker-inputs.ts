@@ -153,6 +153,7 @@ async function main() {
     targetTokens: budget,
     windowTokens: budget,
     rawZone: new Set(),
+    attendedChunks: 0,
     now: newestSeq,
     mergeThreshold: 6,
   });

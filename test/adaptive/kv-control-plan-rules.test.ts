@@ -27,7 +27,7 @@ function misallocatedCarry() {
   const rawZone = new Set<ChunkId>([id(0), id(1), ...ch.chunks.slice(30).map((c) => c.id)]);
   const previous = new Map<ChunkId, number>(ch.chunks.map((c, i) => [c.id, i >= 24 && i < 30 ? 1 : 0]));
   const params = {
-    previous, rawZone, now: 35, mergeThreshold: 6,
+    previous, rawZone, attendedChunks: rawZone.size, now: 35, mergeThreshold: 6,
     foldAtTokens: 31_000, expandAtTokens: 29_000, targetTokens: 30_000, windowTokens: 40_000,
   };
   return { inputs, tree: new SummaryTree(inputs), params };
@@ -55,7 +55,7 @@ test('an ideal over the fold watermark but under W is not escalated', () => {
   const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
   const inputs = inputsOf(ch);
   const plan = planControlledFrontier(inputs, new SummaryTree(inputs), {
-    previous: new Map(), rawZone: new Set(ch.chunks.slice(18).map((c) => c.id)), now: 35, mergeThreshold: 6,
+    previous: new Map(), rawZone: new Set(ch.chunks.slice(18).map((c) => c.id)), attendedChunks: ch.chunks.slice(18).length, now: 35, mergeThreshold: 6,
     foldAtTokens: 15_000, targetTokens: 15_000, windowTokens: 40_000,
   });
   assert.ok(plan.tokens > 15_000 && plan.tokens <= 40_000, `over the watermark, under W: ${plan.tokens}`);
@@ -74,7 +74,7 @@ function overlappingL1s() {
   }
   const previous = new Map<ChunkId, number>(ch.chunks.map((c, i) => [c.id, i === 0 || i === 1 || i === 5 ? 1 : 0]));
   const params = {
-    previous, rawZone: new Set([id(15), id(16), id(17)]), now: 17, mergeThreshold: 6,
+    previous, rawZone: new Set([id(15), id(16), id(17)]), attendedChunks: 3, now: 17, mergeThreshold: 6,
     foldAtTokens: 14_000, targetTokens: 12_000, reachTokens: 1_000_000,
   };
   return { inputs, tree, params };
@@ -104,7 +104,7 @@ function sixGroups() {
 test('when the shape prior can\'t reach the target but the plan fits under W, nothing folds past the prior', () => {
   const { ch, inputs, rawZone } = sixGroups();
   const plan = planControlledFrontier(inputs, new SummaryTree(inputs), {
-    previous: new Map(), rawZone, now: 35, mergeThreshold: 6,
+    previous: new Map(), rawZone, attendedChunks: rawZone.size, now: 35, mergeThreshold: 6,
     foldAtTokens: 5_000, targetTokens: 5_000, windowTokens: 40_000,
   });
   assert.ok(plan.tokens > 5_000 && plan.tokens <= 40_000, `over the target, under W: ${plan.tokens}`);
@@ -120,7 +120,7 @@ test('a from-scratch solve folds the lower-salience group first, then the oldest
   const tree = new SummaryTree(inputs);
   for (const [target, folded] of [[33_000, [24]], [26_000, [24, 0]]] as const) {
     const plan = planControlledFrontier(inputs, tree, {
-      previous: new Map(), rawZone, now: 35, mergeThreshold: 6,
+      previous: new Map(), rawZone, attendedChunks: rawZone.size, now: 35, mergeThreshold: 6,
       foldAtTokens: target, targetTokens: target, windowTokens: 40_000,
     });
     for (let i = 0; i < 36; i++) {

@@ -115,7 +115,7 @@ test('within the trust region P the ideal is adopted outright, with no override,
   let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
   const turn = {
     previous: new Map(inputs.chunks.map((c) => [c.id, 0])), foldAtTokens: 10_000, expandAtTokens: 9_000, targetTokens: 9_000,
-    windowTokens: 10_000, rawZone: new Set(inputs.chunks.slice(-12).map((c) => c.id)), now, mergeThreshold: 6,
+    windowTokens: 10_000, rawZone: new Set(inputs.chunks.slice(-12).map((c) => c.id)), attendedChunks: inputs.chunks.slice(-12).length, now, mergeThreshold: 6,
   };
   const ideal = planControlledFrontier(inputs, tree, { ...turn, reachTokens: Number.MAX_SAFE_INTEGER });
   const P = ideal.perturbation;
@@ -135,14 +135,14 @@ test('bidirectional: under budget with a folded F_prev, un-folds to use headroom
   // 1) Fold tight (expandAt 0 → fold-only this call).
   const folded = planControlledFrontier(inputs, tree, {
     previous: new Map(), foldAtTokens: 18_000, expandAtTokens: 0, targetTokens: 18_000,
-    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+    windowTokens: 72_000, rawZone: new Set(), attendedChunks: 0, now, mergeThreshold: 6,
   });
   assert.ok(folded.folded && !folded.expanded, 'first call folds down');
 
   // 2) From that folded state, a generous budget should UN-FOLD to use headroom.
   const expanded = planControlledFrontier(inputs, tree, {
     previous: folded.resolutions, foldAtTokens: 50_000, expandAtTokens: 50_000, targetTokens: 50_000,
-    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+    windowTokens: 72_000, rawZone: new Set(), attendedChunks: 0, now, mergeThreshold: 6,
   });
   assert.ok(expanded.expanded && !expanded.folded, 'un-folds, does not fold');
   assert.ok(expanded.tokens > folded.tokens, `used headroom: ${expanded.tokens} > ${folded.tokens}`);
@@ -151,7 +151,7 @@ test('bidirectional: under budget with a folded F_prev, un-folds to use headroom
   // 3) Dead band: within [expandAt, foldAt] nothing changes (zero perturbation).
   const quiet = planControlledFrontier(inputs, tree, {
     previous: expanded.resolutions, foldAtTokens: 60_000, expandAtTokens: 40_000, targetTokens: 50_000,
-    windowTokens: 72_000, rawZone: new Set(), now, mergeThreshold: 6,
+    windowTokens: 72_000, rawZone: new Set(), attendedChunks: 0, now, mergeThreshold: 6,
   });
   assert.ok(!quiet.folded && !quiet.expanded, 'in-band → no perturbation');
 });
