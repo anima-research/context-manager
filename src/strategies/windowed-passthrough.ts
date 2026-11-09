@@ -233,10 +233,10 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
  *
  * **Hard budget.** After per-message shaping (truncation, image policy) the
  * window is priced against `maxTokens - reserveForResponse`. Overflow
- * re-anchors; if the newest message, with every message back to the calls
- * its tool results answer, still exceeds the usable budget, or with system
- * changes, the changes and that newest conversation message, or the changes
- * alone, the strategy refuses with
+ * re-anchors; if the newest message, with every message back to the latest
+ * start that keeps every tool result with its call, still exceeds the
+ * usable budget, or with system changes, the changes and that newest
+ * conversation message, or the changes alone, the strategy refuses with
  * {@link OverBudgetError} (the framework's over-budget breaker handles it)
  * rather than emitting a request the provider will reject. Previews report
  * the oversized window instead.
@@ -781,8 +781,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       // target, emit just that message rather than nothing — subject to the
       // hard-budget check below. A system change is no conversation message,
       // so that's the newest message that isn't one, if the window holds one,
-      // with every message back to the calls its tool results answer: the
-      // latest clean start before it.
+      // with every message back to the latest clean start before it, so
+      // every tool result goes with its call.
       if (newStart === messages.length && messages.length > 0) {
         newStart = messages.length - 1;
         while (newStart > start && (holdsSystemChange(messages[newStart]!.content) || !clean[newStart])) newStart--;
@@ -811,7 +811,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // leaves it where the last sent window started, so the turns that fit
     // once the caller consolidates its changes are still in the window.
     if (total > maxTokens && !opts?.dryRun) {
-      const unit = messages.slice(start).filter((m) => !holdsSystemChange(m.content)).length > 1 ? ', back to the calls its tool results answer' : '';
+      const unit = messages.slice(start).filter((m) => !holdsSystemChange(m.content)).length > 1 ? ', back to the latest start that keeps every tool result with its call' : '';
       throw new OverBudgetError({
         budget: maxTokens,
         actual: total,

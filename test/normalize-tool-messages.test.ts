@@ -14,7 +14,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../src/index.js';
-import { answeredCallIndexes } from '../src/normalize-tool-messages.js';
+import { answeredCallIndexes, cleanStarts } from '../src/normalize-tool-messages.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 function mkBlocks(spec: string): ContentBlock[] {
@@ -288,5 +288,19 @@ describe('answeredCallIndexes', () => {
   it('pairs each result with the nearest call before it with its id, and a result with no call before it with none', () => {
     const blocks = [r('A'), u('A'), r('A'), t('again'), u('A'), r('A'), r('A'), u('B'), r('A'), r('B')];
     assert.deepStrictEqual(answeredCallIndexes(blocks), [undefined, undefined, 1, undefined, undefined, 4, 4, undefined, 4, 7]);
+  });
+});
+
+describe('cleanStarts', () => {
+  const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
+  const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res' });
+  const t = (text: string): ContentBlock => ({ type: 'text', text });
+  const m = (...content: ContentBlock[]) => ({ content });
+
+  it('marks a start clean where no result at or after it answers a call in a message before it', () => {
+    assert.deepStrictEqual(cleanStarts([m(t('hi')), m(u('A'), r('A')), m(t('ok'))]), [true, true, true, true], 'a call and its result in one message');
+    assert.deepStrictEqual(cleanStarts([m(r('A')), m(u('A')), m(t('ok'))]), [true, true, true, true], 'a result before any call with its id');
+    assert.deepStrictEqual(cleanStarts([m(u('A')), m(), m(r('A')), m(t('ok'))]), [true, false, false, true, true], 'a message with no blocks between a call and its result');
+    assert.deepStrictEqual(cleanStarts([m(u('A')), m(u('B')), m(r('A')), m(r('B')), m(t('ok'))]), [true, false, false, false, true, true], 'overlapping pairs');
   });
 });

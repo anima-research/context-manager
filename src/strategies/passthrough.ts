@@ -104,7 +104,8 @@ export class PassthroughStrategy implements ContextStrategy {
    * change it can't place. The window starts only where no tool_result it
    * sends has its tool_use left out (cleanStarts), so a cut across a call
    * and its result leaves both out, and the newest conversation message
-   * counts with every message back to the calls its results answer.
+   * counts with every message back to the latest start that keeps every
+   * tool result with its call.
    */
   private selectFromEnd(store: MessageStoreView, messages: readonly StoredMessage[], maxTokens: number, opts?: SelectOptions): ContextEntry[] {
     const clean = cleanStarts(messages);
@@ -151,7 +152,7 @@ export class PassthroughStrategy implements ContextStrategy {
         actual: changeTokens + unitTokens,
         stage: unit === newest
           ? 'Passthrough: its system changes and the newest conversation message'
-          : 'Passthrough: its system changes and the newest conversation message, back to the calls its tool results answer',
+          : 'Passthrough: its system changes and the newest conversation message, back to the latest start that keeps every tool result with its call',
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
         diagnostics: { headTokens: changeTokens, tailTokens: unitTokens, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
       });

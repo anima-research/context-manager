@@ -112,7 +112,7 @@ export function cleanStarts(messages: ReadonlyArray<{ content: readonly ContentB
   });
   const opened = new Array<number>(messages.length + 2).fill(0);
   answeredCallIndexes(blocks).forEach((call, at) => {
-    if (call === undefined || owner[call] === owner[at]) return;
+    if (call === undefined) return;
     opened[owner[call]! + 1]!++;
     opened[owner[at]! + 1]!--;
   });

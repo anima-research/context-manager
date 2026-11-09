@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, OverBudgetError, PassthroughStrategy, WindowedPassthroughStrategy } from '../src/index.js';
-import { answeredCallIndexes } from '../src/normalize-tool-messages.js';
 import type { ContextStrategy, MessageStoreView } from '../src/types/index.js';
 
 const dirs: string[] = [];
@@ -26,11 +25,15 @@ const change = (): ContentBlock => ({ type: 'system_change', addSystem: ['Use me
 const OPEN = { maxTokens: 1_000_000, reserveForResponse: 0 };
 const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 0 });
 
-/** The ids of the tool_results a window sends with no earlier block in it holding the call they answer. */
+/** The ids of the tool_results a window sends with no earlier block in it a tool_use with their id. */
 function orphans(messages: ReadonlyArray<{ content: ContentBlock[] }>): string[] {
-  const blocks = messages.flatMap((m) => m.content);
-  const answers = answeredCallIndexes(blocks);
-  return blocks.flatMap((b, i) => (b.type === 'tool_result' && answers[i] === undefined ? [(b as { toolUseId: string }).toolUseId] : []));
+  const calls = new Set<string>();
+  const out: string[] = [];
+  for (const b of messages.flatMap((m) => m.content)) {
+    if (b.type === 'tool_use') calls.add((b as { id: string }).id);
+    else if (b.type === 'tool_result' && !calls.has((b as { toolUseId: string }).toolUseId)) out.push((b as { toolUseId: string }).toolUseId);
+  }
+  return out;
 }
 const shape = (messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>): string[] =>
   messages.map((m) => `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text.slice(0, 12) : b.type)).join(', ')}`);
@@ -269,6 +272,8 @@ describe('passthrough strategies send no tool result without its call', () => {
           assert.deepEqual(shape(r.messages), ['User: hi', 'User: [tool call o', 'Claude: AGAIN, tool_use'], strategy.name);
           assert.deepEqual(r.messages[1]!.content, [{ type: 'text', text: '[tool call omitted]' }]);
           assert.deepEqual(orphans(r.messages), []);
+          const source = r.provenance?.messages[1];
+          assert.ok(source?.kind === 'raw' && source.bodies[0]?.complete === false && source.bodies[0].missing?.includes('content'), `${strategy.name}: the message that held only the result is reported as sent without part of its content`);
         } finally {
           cm.close();
         }
@@ -319,6 +324,8 @@ describe('passthrough strategies send no tool result without its call', () => {
           const r = await cm.compile(OPEN);
           const last = r.messages.at(-1)!.content;
           assert.deepEqual(last.map((b) => [b.type, (b as { toolUseId?: string }).toolUseId, (b as { rawXml?: string }).rawXml]), [['tool_result', 't2', undefined]], strategy.name);
+          const source = r.provenance?.messages.at(-1);
+          assert.ok(source?.kind === 'raw' && source.bodies[0]?.complete === false && source.bodies[0].missing?.includes('content'), `${strategy.name}: the message that keeps t2's result is reported as sent without part of its content`);
         } finally {
           cm.close();
         }
@@ -403,7 +410,7 @@ describe('passthrough strategies send no tool result without its call', () => {
     }
   });
 
-  it('12. where every start is clean and the view holds every call, both send the stored messages from the same start as before', async () => {
+  it('12. where the start main would take is clean and the view holds every call, both send the stored messages from that start', async () => {
     for (const make of [() => new PassthroughStrategy(), () => new WindowedPassthroughStrategy({ reAnchorFraction: 0.5 })]) {
       const cm = await open(make());
       const ids = [
@@ -423,6 +430,25 @@ describe('passthrough strategies send no tool result without its call', () => {
       } finally {
         cm.close();
       }
+    }
+  });
+
+  it('13. overlapping pairs: an anchor on the later result starts the window at the earlier call, not at its own', async () => {
+    const strategy = new WindowedPassthroughStrategy();
+    const cm = await open(strategy);
+    cm.addMessage('User', [text('hi')]);
+    cm.addMessage('Claude', [text('CALL A'), call('a')]);
+    cm.addMessage('Claude', [text('CALL B'), call('b')]);
+    cm.addMessage('User', [result('a', 'A')]);
+    const resultB = cm.addMessage('User', [result('b', 'B')]);
+    cm.addMessage('Claude', [text('done')]);
+    try {
+      strategy.setAnchor(cm.getMessage(resultB)!.sequence);
+      const r = await cm.compile(OPEN);
+      assert.deepEqual(shape(r.messages), ['Claude: CALL A, tool_use', 'Claude: CALL B, tool_use', 'User: tool_result', 'User: tool_result', 'Claude: done']);
+      assert.deepEqual(orphans(r.messages), []);
+    } finally {
+      cm.close();
     }
   });
 });
