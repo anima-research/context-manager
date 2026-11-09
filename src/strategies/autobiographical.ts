@@ -17245,8 +17245,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  persists it, a dry one keeps it to itself (select() puts it back).
    *  Returns false when there is nothing to drop: no provisional multiplier,
    *  or one at or below 1, where raising estimates can't help, or a refusal
-   *  the request limit bounds while the store prices the limit at a rate kept
-   *  from a too-long refusal, which no multiplier moves; so the refusal
+   *  the request limit bounds while the store prices the limit at a rate it
+   *  keeps for the request limit, which no multiplier moves; so the refusal
    *  stands. A drop leaves no sample armed: the estimate armed was priced at
    *  the multiplier it discards. The 1 stays provisional: the first sample
    *  sets it. */
