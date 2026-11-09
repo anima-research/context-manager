@@ -16,12 +16,13 @@ import { bodyEnd } from '../body-runs.js';
 /**
  * A body's parts joined into one message's content: every non-text block of
  * the parts, in part order and each part's own order, then their text joined
- * into one text block. Non-text blocks go first because a turn's tool results
- * must lead it for the API to pair them with the call before, and a reply's
- * thinking leads its turn. Each part is given as it is to be sent: a raw
- * part's content, cut as its region cuts it, or a folded part's recall text
- * as a text block. The adaptive strategy joins every run of a body's raw
- * parts it sends with this, one part included.
+ * into one text block, left out when the parts hold no text. Non-text
+ * blocks go first because a turn's tool results must lead it for the API to
+ * pair them with the call before, and a reply's thinking leads its turn.
+ * Each part is given as it is to be sent: a raw part's content, cut as its
+ * region cuts it, or a folded part's recall text as a text block. The
+ * adaptive strategy joins every run of a body's raw parts it sends with
+ * this, one part included.
  */
 export function joinBodyParts(parts: readonly (readonly ContentBlock[])[]): ContentBlock[] {
   const others: ContentBlock[] = [];
@@ -32,7 +33,8 @@ export function joinBodyParts(parts: readonly (readonly ContentBlock[])[]): Cont
       else others.push(block);
     }
   }
-  return [...others, { type: 'text', text: text.join('') } as ContentBlock];
+  const joined = text.join('');
+  return joined === '' ? others : [...others, { type: 'text', text: joined } as ContentBlock];
 }
 
 /**

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { chunkMessage } from '../../src/adaptive/chunker.js';
-import { concatBodyGroups, placeholderRecallText } from '../../src/adaptive/render.js';
+import { concatBodyGroups, joinBodyParts, placeholderRecallText } from '../../src/adaptive/render.js';
 import type { StoredMessage } from '../../src/types/message.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -152,4 +152,13 @@ test("render: a raw shard's non-text blocks go ahead of the joined text, in shar
   assert.equal(out[0].id, 'bg-x-shard-0');
   assert.equal(out[0].metadata?.shardCount, 3);
   assert.deepEqual(out[0].content, [image, call, { type: 'text', text: 'first part  last part' }]);
+});
+
+test('render: parts with no text join into their other blocks alone, with no empty text block', () => {
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } } as unknown as ContentBlock;
+  const call = { type: 'tool_use', id: 'call-1', name: 'look', input: {} } as unknown as ContentBlock;
+  assert.deepEqual(joinBodyParts([[image], [call]]), [image, call]);
+  assert.deepEqual(joinBodyParts([[image], [{ type: 'text', text: '' } as ContentBlock]]), [image]);
+  assert.deepEqual(joinBodyParts([[{ type: 'text', text: 'a' } as ContentBlock, call], [{ type: 'text', text: 'b' } as ContentBlock]]),
+    [call, { type: 'text', text: 'ab' }]);
 });

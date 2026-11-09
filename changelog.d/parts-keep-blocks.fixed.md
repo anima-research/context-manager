@@ -19,3 +19,13 @@
   with its call on its first part, the recent window's start, a compression
   hold, the head window's end and the chunker each keep the call's result
   with the whole body, as they keep a result with a call stored whole.
+- **Hosts upgrading a store:** such a body keeps more tokens raw for a
+  while. While an edge of the head or recent window falls inside it or on
+  its result, that window takes the whole body. And if it isn't yet in a
+  closed chunk when the host upgrades, the chunk that takes it closes only
+  after its result, so the body stays raw until that chunk is summarized,
+  where its earlier parts used to fold. Measured once, a 30,000-token reply
+  stored that way kept about 20,000 tokens more raw than the previous
+  release, and a compile at a 70,000-token budget was refused where the
+  previous release compiled. A body stored after the upgrade doesn't pay
+  this.
