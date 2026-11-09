@@ -366,3 +366,43 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     assert.doesNotMatch(r.stdout, /Cause:|Effect:|Fix:/);
   });
 });
+
+describe('the scripts on a store whose chain-break guard has stopped compression', () => {
+  async function stopped(name: string): Promise<string> {
+    const path = join(dir, name);
+    const seed = await ContextManager.open({
+      path, namespace: 'probe', strategy: new AutobiographicalStrategy({ autoTickOnNewMessage: false } as never),
+      membrane: { complete: async () => { throw new Error('no provider call while seeding (test)'); } } as never,
+    });
+    for (let c = 0; c < 4; c++) {
+      seed.getStore().appendToStateJson('probe/autobio:chunks', { id: `c-${c}`, sourceIds: [`ghost-${c}`], compressed: true, summaryId: `L1-${c}` });
+    }
+    seed.sync();
+    await seed.close();
+    return path;
+  }
+
+  it('the drain stops before any step and fails, printing the debt report\'s words for what has to change', async () => {
+    const r = run(DRAIN, drainArgs(await stopped('guard')));
+    assert.equal(r.status, 1, r.stderr);
+    const seen = events(r.stdout);
+    assert.deepEqual(seen.map((e) => e.event), ['start', 'finish'], 'no step');
+    const finish = seen.at(-1)!;
+    assert.deepEqual([finish.completed, finish.stopped, finish.debtFailure], [false, 'chunk-records', 'chunk-records']);
+    assert.match(String(finish.debtError), /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view, and the oldest or newest names one that isn't on this branch's messages chain/);
+    assert.match(r.stderr, /not drained \(chunk-records\): the chain-break guard has stopped compression\. Its debt report says what has to change before a drain can go on:\nCompression of new conversation has stopped\./);
+    assert.doesNotMatch(r.stderr, /run the drain again/);
+  });
+
+  it('the audit reads it critical, and with the ledger unreadable too prints the ledger\'s error once, after the guard\'s', async () => {
+    const path = await stopped('guard-ledger');
+    const plain = run(AUDIT, [path, '--namespace', 'probe']);
+    assert.equal(plain.status, 0, plain.stderr);
+    assert.match(plain.stdout, /compression debt critical\n/, plain.stdout);
+    assert.match(plain.stdout, /\n  Compression of new conversation has stopped\.\n/, plain.stdout);
+    const r = run(AUDIT, [path, '--namespace', 'probe'], UNREADABLE_LEDGER);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /\n  stranded summaries: not checked \(see above\)\n/, r.stdout);
+    assert.equal(r.stdout.split("couldn't read this agent's compression quarantine ledger").length, 2, 'the ledger error is printed once');
+  });
+});

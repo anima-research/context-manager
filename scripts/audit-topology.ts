@@ -86,7 +86,8 @@ async function main(): Promise<void> {
       if (debt.error !== undefined) for (const line of debt.error.split('\n')) console.log(`  ${line}`);
       console.log(`  ${runsLine(runs)}`);
       if (stranded.summaries === null) {
-        const same = stranded.error === debt.error;
+        // The debt report's error puts the guard's words before the ledger's when both hold.
+        const same = debt.error !== undefined && debt.error.split('\n\n').includes(stranded.error);
         console.log(`  stranded summaries: not checked${same ? ' (see above)' : ':'}`);
         if (!same) for (const line of stranded.error.split('\n')) console.log(`    ${line}`);
       }
