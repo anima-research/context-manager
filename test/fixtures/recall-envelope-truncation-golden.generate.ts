@@ -29,17 +29,19 @@
  *
  * It was captured again, on purpose, when the cap began keeping a message's
  * head and tail around one marker naming the stored message or summary,
- * found by the strategy's own estimate. Every cap here is smaller than that
- * marker, so every summary and raw turn the cap cuts renders as the marker
- * alone, where it rendered its first characters and the old suffix. Every
- * message the cap doesn't cut is as it was. The adaptive renders fold
- * differently, since a capped raw turn is priced as its marker: `adaptive`
- * keeps 26 raw turns beside one recall pair, where it kept 22 beside two, and
- * `adaptiveTightCap` keeps six raw turns beside two pairs, where it kept six
- * beside four. The combined cases at caps of 12 and 1 are gone: their
- * summaries would be their markers alone, so the answer would hold none of
- * them and the compile refuses (test/combined-recall-answer.test.ts pins
- * that, and the combined answer's cuts with longer summaries).
+ * found by the strategy's own estimate, and never cutting a message to
+ * something longer than its whole. Every cap here is smaller than that
+ * marker. So a raw turn the cap cuts, every one of the adaptive renders',
+ * renders as the marker alone, where it rendered its first characters and
+ * the old suffix. Every summary here, and every raw turn of the
+ * hierarchical renders, is no longer than its marker, so it renders whole,
+ * where it was cut. The adaptive renders fold differently, since a capped
+ * raw turn is priced as its marker: `adaptive` keeps 26 raw turns beside one
+ * recall pair, where it kept 22 beside two, and `adaptiveTightCap` keeps six
+ * raw turns beside two pairs, where it kept six beside four. The combined
+ * cases at caps of 12 and 1 are gone: with every summary whole they render
+ * as `hierarchicalCombinedUncut` does, and test/combined-recall-answer.test.ts
+ * pins the combined answer at a cap of 1, and its cuts with longer summaries.
  *
  * `hierarchicalCombinedUncut` pins a combined answer the cap cuts nothing
  * from.

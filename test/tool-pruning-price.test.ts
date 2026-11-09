@@ -628,6 +628,9 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), false, 'not the earlier call it reuses the id of');
       const big = conversation(1, { body: 'x'.repeat(2_000) });
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 100 }), view(big)), true, 'an input over the cap');
+      const short = conversation(1, { body: 'x'.repeat(60) });
+      assert.equal(reprices(short, at({ toolUseInputMaxTokens: 10 }), view(short)), true,
+        'an input over the cap that is now sent whole, since its stub would be longer: the epoch is about what was sent then');
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 1_000 }), view(big)), false, 'an input under the cap');
     });
   });

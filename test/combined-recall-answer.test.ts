@@ -9,6 +9,8 @@ import { ContextManager } from '../src/index.js';
 import { COMBINED_RECALL_SEPARATOR_TEXT } from '../src/strategies/autobiographical.js';
 import type { SummaryEntry } from '../src/types/index.js';
 import {
+  HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
+  HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   SeedableStrategy,
   renderHierarchicalFixture,
   type RenderedMessage,
@@ -74,13 +76,59 @@ describe('the combined recall answer cuts each summary to maxMessageTokens on it
       }
     });
 
-    it(`${mode}: a cap smaller than the marker leaves each summary as its marker alone, so none is listed and the compile refuses`, async () => {
-      await assert.rejects(
-        renderHierarchicalFixture({ positionedRecallPairs: false, maxMessageTokens: 1, recallEnvelope: mode }),
-        (err: Error) => err.name === 'UncoveredDropError' && err.message.includes('covered-by-unemitted-summary'),
-      );
+    it(`${mode}: a cap smaller than the marker sends each summary no longer than its marker whole, so every one is listed`, async () => {
+      const rendered = await renderHierarchicalFixture({ positionedRecallPairs: false, maxMessageTokens: 1, recallEnvelope: mode });
+      const text = textOf(combinedAnswerOf(rendered.messages));
+      assert.ok(text.includes(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE) && text.includes(HIERARCHICAL_FIXTURE_PLAIN_PROSE), 'the summaries whole');
+      assert.doesNotMatch(text, SUMMARY_MARKER, 'none cut');
+    });
+
+    it(`${mode}: a cap smaller than the marker leaves a longer summary as its marker alone, so it is listed nowhere and the compile refuses`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'zz-combined-marker-alone-'));
+      try {
+        const strategy = new SeedableStrategy({
+          headWindowTokens: 0, recentWindowTokens: 8, positionedRecallPairs: false, recallEnvelope: mode, maxMessageTokens: 5,
+        });
+        const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+        const ids = ['zz-turn-one', 'zz-turn-two'].map((t) => cm.addMessage('user', [{ type: 'text', text: t }]));
+        cm.addMessage('user', [{ type: 'text', text: 'zz-turn-latest ' + 'Z'.repeat(60) }]);
+        ids.forEach((id, i) => {
+          const prose = summaryLines(`zz${i}`, 300);
+          strategy.seedSummary({ id: `L1-${i}`, level: 1, content: prose, tokens: Math.ceil(prose.length / 4), sourceLevel: 0, sourceIds: [id], sourceRange: { first: id, last: id } });
+        });
+        await assert.rejects(
+          cm.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
+          (err: Error) => err.name === 'UncoveredDropError' && err.message.includes('covered-by-unemitted-summary'),
+        );
+        await cm.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   }
+});
+
+describe('a cap smaller than the envelope and the marker', () => {
+  it('positioned, xml: leaves a summary longer than its marker as that marker alone, inside intact tags, listed whole', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zz-positioned-marker-alone-'));
+    try {
+      const strategy = new SeedableStrategy({
+        headWindowTokens: 0, recentWindowTokens: 8, positionedRecallPairs: true, recallEnvelope: 'xml', maxMessageTokens: 1,
+      });
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+      const a = cm.addMessage('user', [{ type: 'text', text: 'zz-turn-one' }]);
+      cm.addMessage('user', [{ type: 'text', text: 'zz-turn-latest ' + 'Z'.repeat(60) }]);
+      const prose = summaryLines('zza', 300);
+      strategy.seedSummary({ id: 'L1-a', level: 1, content: prose, tokens: Math.ceil(prose.length / 4), sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+      const compiled = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      const answers = (compiled.messages as RenderedMessage[]).filter((m, i, all) => i > 0 && all[i - 1]!.participant === 'Context Manager');
+      assert.equal(answers.length, 1, 'one recall pair');
+      assert.match(textOf(answers[0]!), new RegExp(`^<cm-recall[^>]*>\\n\\[truncated — chars 0 to ${prose.length} of ${prose.length} elided here; the whole is stored summary L1-a\\]\\n</cm-recall>$`));
+      await cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Renders the combined answer without one summary, as a subclass of the strategy could. */

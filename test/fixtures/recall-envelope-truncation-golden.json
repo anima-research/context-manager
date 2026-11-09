@@ -14,7 +14,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 51 of 51 elided here; the whole is stored summary L2-100]"
+          "text": "zz-memory-merged-level covering the first two turns"
         }
       ]
     },
@@ -32,7 +32,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 21 of 21 elided here; the whole is stored summary L1-101]"
+          "text": "zz-memory-plain-prose"
         }
       ]
     },
@@ -55,7 +55,7 @@
         },
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 23 of 23 elided here; the whole is stored summary L1-102]"
+          "text": "zz-memory-with-carriers"
         }
       ]
     },
@@ -64,7 +64,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 75 of 75 elided here; the whole is stored message 5]"
+          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
         }
       ]
     }
@@ -84,7 +84,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 51 of 51 elided here; the whole is stored summary L2-100]"
+          "text": "zz-memory-merged-level covering the first two turns"
         }
       ]
     },
@@ -102,7 +102,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 21 of 21 elided here; the whole is stored summary L1-101]"
+          "text": "zz-memory-plain-prose"
         }
       ]
     },
@@ -125,7 +125,7 @@
         },
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 23 of 23 elided here; the whole is stored summary L1-102]"
+          "text": "zz-memory-with-carriers"
         }
       ]
     },
@@ -134,7 +134,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 75 of 75 elided here; the whole is stored message 5]"
+          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
         }
       ]
     }
@@ -204,7 +204,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L1-0]"
+          "text": "zz-adaptive-memory-1 recollection of an earlier stretch"
         }
       ]
     },
@@ -458,7 +458,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L2-6]"
+          "text": "zz-adaptive-memory-7 recollection of an earlier stretch"
         }
       ]
     },
@@ -476,7 +476,7 @@
       "content": [
         {
           "type": "text",
-          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L2-7]"
+          "text": "zz-adaptive-memory-8 recollection of an earlier stretch"
         }
       ]
     },

@@ -9,16 +9,15 @@
  *
  *  - `*TightCap` uses a cap of 1 token, far SMALLER than the envelope's own
  *    tag text and the cut's marker. That is the boundary case: the envelope
- *    is not charged against the cap, so what renders is opener + the marker
- *    alone + closer.
- *  - the ordinary caps cut the fixture's summaries, which are smaller than
- *    the marker, to the marker alone too, so a positioned answer is its
- *    marker inside a whole envelope.
+ *    is not charged against the cap, and the cut is never longer than the
+ *    whole, so a summary no longer than its marker, as the fixture's are,
+ *    renders whole: opener + prose + closer.
+ *  - the ordinary caps leave the fixture's summaries whole too, for the same
+ *    reason.
  *  - `hierarchicalCombinedUncut` drives the legacy
- *    `positionedRecallPairs: false` path at a cap that cuts nothing. A cap
- *    that leaves a combined answer's summaries as their markers alone refuses
- *    the compile, and the combined path's cuts, each summary's head and tail
- *    inside its own envelope, are pinned with longer summaries in
+ *    `positionedRecallPairs: false` path at a cap that cuts nothing. Every
+ *    recall answer's cuts, each summary's head and tail inside its own
+ *    envelope, are pinned with summaries longer than the marker in
  *    test/combined-recall-answer.test.ts.
  */
 
@@ -58,9 +57,10 @@ export const CAPPED_RENDER_CASES = {
   adaptiveTightCap: {
     path: 'adaptive',
     options: { maxMessageTokens: 1 },
-    // A raw message capped at 1 token renders as the cut's marker alone, and
-    // is priced as it renders (#223), so the fixture's 30 fit 900 tokens raw.
-    // A smaller budget makes the render fold, as the case needs.
+    // A raw message capped at 1 token renders as the cut's marker alone, or
+    // whole where it's no longer than that marker, and is priced as it
+    // renders (#223), so the fixture's 30 fit 900 tokens raw. A smaller
+    // budget makes the render fold, as the case needs.
     maxTokens: 300,
   },
 } as const satisfies Record<string, CappedRenderCase>;

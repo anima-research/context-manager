@@ -12,6 +12,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { format } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -292,6 +293,109 @@ describe('a call input over toolUseInputMaxTokens names where its whole is', () 
           `read them with message_read ${JSON.stringify({ id, toolUseId: 't9' })}]`,
       });
       assert.equal(cm.capMeasuredText({ id, toolUseId: 't9' }), JSON.stringify(input), 'the reader pages the input whole');
+    });
+  });
+});
+
+describe('the cut is never longer than the whole', () => {
+  it('a message over the cap that its marker alone would outgrow is sent whole', () => {
+    const content = [text('x'.repeat(40))];
+    assert.ok(textEstimate(content) > 1, 'premise: over the cap');
+    const alone = capContent([text(unbroken(10_000))], 1, textEstimate, { whole: { kind: 'message', id: 'm-1' } });
+    assert.ok(alone.length === 1 && textEstimate(alone) > textEstimate(content), 'premise: the marker alone is longer than this message');
+    assert.equal(capContent(content, 1, textEstimate, { whole: { kind: 'message', id: 'm-1' } }), content);
+  });
+
+  it('sends the whole, too, where the marker alone would estimate exactly as much, since the whole loses nothing', () => {
+    const perBlock = (blocks: ContentBlock[]): number => blocks.length * 10;
+    const content = [text('x'.repeat(4_000))];
+    assert.equal(capContent(content, 5, perBlock), content, 'the whole and the marker alone each estimate at 10, over the cap of 5');
+  });
+
+  it('a call input whose stub would be no shorter than it is sent whole', async () => {
+    const strategy = new AutobiographicalStrategy({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, toolUseInputMaxTokens: 10,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    await withManager(strategy, async (cm) => {
+      const input = { path: '/a', text: 'zz-' + 'w'.repeat(40) };
+      assert.ok(JSON.stringify(input).length > 40, 'premise: over the 10-token cap at four characters a token');
+      cm.addMessage('Claude', [{ type: 'tool_use', id: 't8', name: 'fs:write', input } as ContentBlock]);
+      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 't8', content: 'ok' } as ContentBlock]);
+      const compiled = await cm.compile(BUDGET);
+      const call = compiled.messages.flatMap((m) => m.content as ContentBlock[]).find((b) => b.type === 'tool_use') as { input: Record<string, unknown> };
+      assert.deepEqual(call.input, input);
+    });
+  });
+});
+
+/** The lines console.warn gets while `body` runs, formatted as console formats them. */
+async function warned(body: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const { warn } = console;
+  console.warn = (...args: unknown[]) => { lines.push(format(...args)); };
+  try {
+    await body();
+  } finally {
+    console.warn = warn;
+  }
+  return lines;
+}
+
+const throwingHint = (): string => { throw new Error('zz-hint-down'); };
+
+describe('a capReadHint that throws', () => {
+  const makers: Record<string, () => ContextStrategy> = {
+    autobiographical: () => new AutobiographicalStrategy({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, maxMessageTokens: 10_000, toolUseInputMaxTokens: 10, capReadHint: throwingHint,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+    'windowed passthrough': () => new WindowedPassthroughStrategy({
+      imageStripDepthTokens: 0, maxMessageTokens: 10_000, capReadHint: throwingHint,
+    } as ConstructorParameters<typeof WindowedPassthroughStrategy>[0]),
+  };
+  for (const [name, make] of Object.entries(makers)) {
+    it(`${name}: fails no compile; the marker names the stored message by id alone, and the throw is said once`, async () => {
+      const said = await warned(() => withManager(make(), async (cm) => {
+        const id = cm.addMessage('user', [text(lines(2000))]);
+        for (let i = 0; i < 2; i++) {
+          const compiled = await cm.compile(BUDGET);
+          const content = compiled.messages.at(-1)!.content as ContentBlock[];
+          const marker = markerOf(textOf(content[1]));
+          assert.deepEqual([marker.kind, marker.id, marker.hint], ['message', id, undefined]);
+        }
+      }));
+      assert.equal(said.filter((line) => line.includes('capReadHint')).length, 1, `said once: ${JSON.stringify(said)}`);
+      assert.ok(said.some((line) => line.includes('zz-hint-down')), 'with what it threw');
+    });
+  }
+
+  it('fails no compile where the logger it says the throw to throws too', async () => {
+    const { warn } = console;
+    let tried = 0;
+    console.warn = () => { tried += 1; throw new Error('zz-logger-down'); };
+    try {
+      await withManager(makers['windowed passthrough']!(), async (cm) => {
+        const id = cm.addMessage('user', [text(lines(2000))]);
+        const compiled = await cm.compile(BUDGET);
+        const marker = markerOf(textOf((compiled.messages.at(-1)!.content as ContentBlock[])[1]));
+        assert.deepEqual([marker.kind, marker.id, marker.hint], ['message', id, undefined]);
+      });
+    } finally {
+      console.warn = warn;
+    }
+    assert.ok(tried >= 1, 'premise: the strategy tried to say the throw');
+  });
+
+  it("autobiographical: a call input's `_whole` names the message and the call alone", async () => {
+    await withManager(makers.autobiographical!(), async (cm) => {
+      const input = { path: '/notes.md', text: 'zz-' + 'w'.repeat(500) };
+      const id = cm.addMessage('Claude', [{ type: 'tool_use', id: 't9', name: 'fs:write', input } as ContentBlock]);
+      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 't9', content: 'ok' } as ContentBlock]);
+      const said = await warned(async () => {
+        const compiled = await cm.compile(BUDGET);
+        const call = compiled.messages.flatMap((m) => m.content as ContentBlock[]).find((b) => b.type === 'tool_use') as { input: { _whole?: string } };
+        assert.equal(call.input._whole, `[truncated — this call's input, ${JSON.stringify(input).length} chars, is elided; the whole is stored message ${id}, call t9]`);
+      });
+      assert.ok(said.length <= 1);
     });
   });
 });

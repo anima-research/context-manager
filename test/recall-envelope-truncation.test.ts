@@ -17,10 +17,13 @@
  *     the cap cuts, the cut's marker INSIDE them. This holds down to caps far
  *     smaller than the tag text itself — the envelope is not charged against
  *     `maxMessageTokens` (it is priced in `capRecallPairs`, where the
- *     accounting is load bearing), so what a tight cap leaves is the marker
- *     inside intact tags rather than a broken tag. The combined path's cuts
- *     are pinned in test/combined-recall-answer.test.ts, with summaries
- *     longer than the marker.
+ *     accounting is load bearing), so what a tight cap leaves of a summary
+ *     longer than its marker is that marker inside intact tags rather than a
+ *     broken tag. The fixture's summaries are
+ *     no longer than their markers, so these caps send them whole; the cuts,
+ *     each marker inside its summary's envelope, are pinned in
+ *     test/combined-recall-answer.test.ts, with summaries longer than the
+ *     marker.
  *  2. With the envelope off, capped renders are byte-identical to the tree
  *     before the fix apart from the cut's own changes, for each of which the
  *     golden was captured again (see its generator), pinned against
@@ -106,21 +109,7 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
     });
   }
 
-  it('puts the marker inside the envelope, not after it', async () => {
-    const rendered = await renderCappedCase('hierarchicalPositioned', 'xml');
-    const answers = recallAnswers(rendered.messages);
-    const truncated = answers.map(textOf).filter((text) => TRUNCATION_MARKER.test(text));
-    assert.ok(truncated.length > 0, 'the cap must actually truncate at least one answer');
-    for (const text of truncated) {
-      assert.match(
-        text,
-        /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored summary \S+?\]\n<\/cm-recall>$/,
-        'the marker must land inside the envelope',
-      );
-    }
-  });
-
-  it('renders the marker inside intact tags when the cap is smaller than the envelope itself', async () => {
+  it('renders each summary whole inside intact tags when the cap is smaller than the envelope itself and than its marker', async () => {
     for (const name of ['hierarchicalPositionedTightCap', 'adaptiveTightCap'] as const) {
       const rendered = await renderCappedCase(name, 'xml');
       const answers = recallAnswers(rendered.messages);
@@ -131,10 +120,13 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
         const bodies = envelopeBodies(answer);
         assert.ok(bodies.length > 0, `${label}: envelope body must be readable`);
         // The documented boundary behaviour: the envelope is not charged
-        // against the cap, so a cap below the tag's own size still leaves the
-        // marker inside it — never an empty envelope, never a bare fragment.
+        // against the cap, and the cut is never longer than the whole, so a
+        // summary no longer than its marker, as every one here is, stays
+        // whole inside intact tags — never an empty envelope, never a bare
+        // fragment. A longer summary's marker inside the tags is pinned in
+        // test/combined-recall-answer.test.ts.
         for (const body of bodies) {
-          assert.match(body, TRUNCATION_MARKER, `${label}: a tight cap must cut every summary's prose`);
+          assert.doesNotMatch(body, TRUNCATION_MARKER, `${label}: no summary here is longer than its marker`);
           assert.ok(body.length > 0, `${label}: the envelope must not be empty`);
         }
       }
