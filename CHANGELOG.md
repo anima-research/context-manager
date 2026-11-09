@@ -12,6 +12,64 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.26.0 — 2026-11-09
+
+### Added
+
+- `compile`'s `requestLimitTokens` option keeps the whole request within a provider's limit: the context, with any tool-result stubs the autobiographical strategy's pairing repair adds, the message-position injections, `requestOverhead` and the budget's `reserveForResponse`, in the context's units, the strategy's over-budget grace included. While the autobiographical strategy's multiplier is provisional, it prices the request at the calibration's ceiling by scaling its price at the provisional multiplier. The store rounds each block's price at that multiplier, by up to half a token, so for any true rate up to the ceiling a request while the multiplier is provisional can pass the limit by up to half a token a block, scaled by the ceiling over the provisional multiplier. That request's sample, where the calibration's band accepts it, then replaces the provisional multiplier, or confirms it where the two are within 2%. `RequestOverhead` gains `messages`, the content of each message a request sends besides the context and its message-position injections, such as a tool result a caller adds after the compile. It's priced as the context prices the same blocks sent whole, and counted wherever the overhead is: against the limit, in `RenderStats.request.overheadTokens`, and in a calibration sample given it. The strategy's target and hard bound are each lowered only where the limit is below them, which `RenderStats.request` reports as `limitTokens` and `allowanceTokens`, with the stubs' price as `stubTokens`. Where the stubs take the window past the limit, the strategy selects once more with their price reserved, and refuses for the stubs only if that select can't make room. A limit that leaves the context no room, or a request a strategy compiles past it, is refused with an `OverBudgetError`. Passthrough and windowed-passthrough keep within it as a cap on their room, as the store's estimator prices the request, since they don't calibrate. A limit needs `requestOverhead`: one without it, or one that isn't a positive finite number, is refused with a `TypeError` before anything is selected. The autobiographical strategy's over-budget refusals under a limit, the no-room one included, name it in their diagnostics as `requestLimitTokens`, and, where the limit lowered the target or the bound, what it left the context as `requestAllowanceTokens`; so does the compile's own refusal of a request past the limit, and a preview that reports a refusal carrying them copies them. A refusal the limit made, by its bound, by leaving no room or by the stubs past what it left, keeps a provisional multiplier, since a lower one can't make the context fit there. Without `requestLimitTokens`, every select is as it was.
+
+- `ContextEntry.relocatedBlocks` holds the result blocks pairing repair placed
+  for an entry's `relocatedResults`, one for each move. Where it's set, compile
+  provenance credits a moved result only through one of those blocks still in
+  the request, unaltered, or through a result with its id still in the entry
+  that isn't among the blocks repair recorded as placed for any entry.
+  `AutobiographicalStrategy` and `KnowledgeStrategy` set it.
+
+### Changed
+
+- Where a later tool call reuses an earlier call's id,
+  `AutobiographicalStrategy` and `KnowledgeStrategy` pair each tool result with
+  the nearest call before it with that id, as with distinct ids, in pairing
+  repair (`enforceToolPairing`) and in `toolResultMaxLastN`'s count, and so does
+  `stripUnpairedToolBlocks`, which every summariser request that carries tool blocks goes through. Where
+  each of two responses streams one tool call without an id, membrane's
+  OpenAI-compatible adapter gives both the id `call_1`. Where the earlier call
+  had no result and the later call's result lay within the repair's look-ahead,
+  the repair moved that result up to answer the earlier call and sent the later
+  call, which made it, with a stub; now the earlier call goes with the stub.
+  `toolResultMaxLastN`'s doc said a result answers the earliest call with its id
+  before it that no result has answered.
+- Where one message holds several calls with one id and no result with the id
+  between them, pairing repair keeps only the last, with every result with the
+  id after them, up to the next call with the id and within the repair's
+  look-ahead. So `NativeFormatter`, which refused such a request, sends it, with
+  the further results as `[duplicate tool_result for …]` text. Compile
+  provenance reports such a message's body as not complete
+  (`missing: ['content']`).
+- Where a host stores a call's result after a later call has reused the call's
+  id, that result now goes with the later call, beside the later call's own,
+  and the earlier call goes with a stub. Where the earlier call's result was
+  stored first, the later call now goes out with it first, where each call went
+  with its own before; where the later call's was stored first, the two no
+  longer go crossed.
+- A store in which a later call reuses a call's id can compile a different
+  request where a compile sends the earlier call without its own result, and
+  where it does, the prompt cache can't serve that request from the first
+  message that differs. A store with several calls with one id in one message
+  now compiles requests membrane sends. Every other store compiles what it
+  compiled. A summariser request changes only where the strip now drops a call
+  or result it kept.
+
+### Fixed
+
+- `compile()` no longer passes a caller's own `SelectOptions.messageInjections` to the select. The field holds the compile's own injections, as its doc says.
+
+- Compile provenance attributes a moved result of an entry that sets
+  `relocatedResults` and no `relocatedBlocks` by tool_use id, as the field's
+  doc says, against every result with that id in the request. It checked only
+  the first, so where a later call reused the id, a moved result that sat
+  unaltered in the request could read as missing.
+
 ## 0.25.1 — 2026-11-08
 
 ### Added

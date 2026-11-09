@@ -1,1 +1,0 @@
-- `compile()` no longer passes a caller's own `SelectOptions.messageInjections` to the select. The field holds the compile's own injections, as its doc says.
