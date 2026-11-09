@@ -5,9 +5,10 @@
   lost its images. The middle, kv-unified's cache check, and the head and
   recent windows now join every run of a body's raw parts, a lone part
   included, with `joinBodyParts`, newly exported: their non-text blocks in
-  stored order, then their text. A lone part used to go out as stored, text
-  first. `concatBodyGroups` keeps non-text blocks in place of writing
-  placeholders.
+  stored order, then their text, left out where the joined text is empty. A
+  lone part used to go out as stored, text first. `concatBodyGroups` keeps
+  non-text blocks in place of writing placeholders, and leaves out the text
+  block where the joined text is empty.
 - The middle now sends and prices each raw part cut at `maxMessageTokens`, as
   the head and recent windows do. Where the cap is under a part's size, the
   middle's document text is cut where it used to go out whole.
@@ -15,13 +16,16 @@
 - Ingress puts a split message's non-text blocks from its first `tool_use` on
   on its last part, and the others on its first, where it used to put them
   all on its first. A reply's call then sits next to its result, and the
-  reply's earlier parts can fold apart from it. A Responses reply whose
-  reasoning item comes before a call carrying its own item is stored whole,
-  so splitting can't send the call without that reasoning. For a body stored
-  before, with its call on its first part, the recent window's start, a
-  compression hold, the head window's end and the chunker each keep the
-  call's result with the whole body, as they keep a result with a call
-  stored whole.
+  reply's earlier parts can fold apart from it. A message with a block that
+  carries a provider item (an object `rawItem`, as a Responses reply's
+  message parts and reasoning do) is stored whole, however long, with every
+  item in its place. For a body stored before, with its call on its first
+  part, the recent window's start, a compression hold, the head window's end
+  and the chunker each keep the call's result with the whole body, as they
+  keep a result with a call stored whole. Two cases keep their old ends: a
+  chunk closed before the upgrade and not yet summarized, and a head window
+  whose end the coverage anchor carries into such a body, where the store's
+  chunks begin partway through it.
 - **Hosts upgrading a store:** such a body keeps more tokens raw for a
   while. While the recent window's start, or a compression hold, falls
   inside it or on its result, that window or hold takes the whole body
