@@ -5,6 +5,7 @@ import { registerStateIfAbsent } from '../state-registration.js';
 import { describeThrown } from '../describe-thrown.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
+  CapReadHint,
   ContextStrategy,
   ImageCeilings,
   ResettableStrategy,
@@ -97,7 +98,8 @@ import { withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import { CAP_OMISSION_TEXT, capContent, capMeasuredTextOf, cappedPriceExtra, cappedWhole, cutInputText, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import type { CapWhole } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
   DEFAULT_IMAGE_BYTE_CEILING,
@@ -728,14 +730,27 @@ function sameMarkers(a: ReadonlyMap<number, string> | undefined, b: ReadonlyMap<
 
 /** `block` with its input truncated, when its serialized input is over
  *  `cap` tokens (`toolUseInputMaxTokens`), at four characters a token: the
- *  input becomes `{ _truncated, _originalTokens, _keys }`, `_keys` holding
- *  its first five keys. Null when the input fits. */
-function truncatedToolUse(block: Extract<ContentBlock, { type: 'tool_use' }>, cap: number): ContentBlock | null {
-  const inputTokens = Math.ceil(JSON.stringify(block.input).length / 4);
+ *  input becomes `{ _truncated, _originalTokens, _keys, _whole }`, `_keys`
+ *  holding its first five keys and `_whole` saying where the whole is stored
+ *  (`cutInputText`), with the host's clause for reading it. Null when the
+ *  input fits. */
+function truncatedToolUse(
+  block: Extract<ContentBlock, { type: 'tool_use' }>,
+  cap: number,
+  messageId: string,
+  hint: CapReadHint | undefined,
+): ContentBlock | null {
+  const serialized = JSON.stringify(block.input);
+  const inputTokens = Math.ceil(serialized.length / 4);
   if (inputTokens <= cap) return null;
   return {
     ...block,
-    input: { _truncated: true, _originalTokens: inputTokens, _keys: Object.keys(block.input).slice(0, 5) },
+    input: {
+      _truncated: true,
+      _originalTokens: inputTokens,
+      _keys: Object.keys(block.input).slice(0, 5),
+      _whole: cutInputText(serialized.length, messageId, block.id, hint),
+    },
   };
 }
 
@@ -16784,7 +16799,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (!(pruning.inputCap > 0)) return false;
-      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap) !== null));
+      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap, m.id, undefined) !== null));
     },
     // 5: generated images, which estimated as 0 before (an unknown block) and
     // are now priced as an image, wherever MessageStore prices them.
@@ -21796,7 +21811,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let next: ContentBlock = block;
       if (block.type === 'tool_use' && pruning.inputCap > 0) {
         inputs = true;
-        next = truncatedToolUse(block, pruning.inputCap) ?? block;
+        next = truncatedToolUse(block, pruning.inputCap, msg.id, this.config.capReadHint) ?? block;
       } else if (block.type === 'tool_result') {
         const marker = results?.get(i);
         if (marker !== undefined) next = { ...block, content: marker };
@@ -22116,7 +22131,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const refs: Array<{ id: string; level: number; partial?: true }> = [];
     for (const s of summaries) {
       const prose = this.liveWindowAnswerProse(s);
-      const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+      const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens, undefined, { kind: 'summary', id: s.id }) : prose;
       if (capped !== prose && capped.every((b) => isEmptyTextBlock(b) || isCapMarker(b))) continue;
       // A separator follows the answer before it on the wire, so the reasoning at
       // that answer's end gives up its id first (see raw-forms.ts).
@@ -22158,28 +22173,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the recall envelope. The cap is spent on the PROSE, and the envelope is
    * applied to what survives.
    *
-   * Ordering is the whole point. Truncating an enveloped answer retains a
-   * prefix and appends the truncator's own marker, which drops the closing
-   * tag and — under a cap smaller than the opener — emits a half-written one:
-   * a delimiter convention that sometimes lies is worse than no convention,
-   * because the reader learns to distrust the tags that ARE intact. Wrapping
-   * last makes opener and closer survive every cap by construction.
+   * Ordering is the whole point. Cutting an enveloped answer would cut into
+   * its tags, and under a cap smaller than the opener emit a half-written
+   * one: a delimiter convention that sometimes lies is worse than no
+   * convention, because the reader learns to distrust the tags that ARE
+   * intact. Wrapping last makes opener and closer survive every cap by
+   * construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
-   * capped enveloped answer runs over the cap by its own tag text. That is
-   * the same soft-cap overshoot the truncator already takes for granted — it
-   * appends its `[truncated — original was N tokens]` marker AFTER spending
-   * the budget — and the envelope is priced where the accounting is load
-   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
-   * the render is opener + whatever prose the cap bought + marker + closer:
-   * never an empty envelope, never a torn one.
+   * capped enveloped answer runs over the cap by its own tag text, and the
+   * envelope is priced where the accounting is load bearing, in
+   * `capRecallPairs`. At a cap smaller than the envelope overhead the render
+   * is opener + whatever head and tail the cap kept around its marker +
+   * closer: never an empty envelope, never a torn one.
    */
   protected renderSummaryAnswer(
     summary: SummaryEntry,
     maxTokens: number,
   ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
     const prose = this.liveWindowAnswerProse(summary);
-    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens, undefined, { kind: 'summary', id: summary.id }) : prose;
     return {
       content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
       refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
@@ -22234,14 +22247,43 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries alike go through it, so an override changes both, and the
    * price of a raw message follows what the override sends. A compile cuts
    * each message more than once, to price it and to send it, so an override
-   * must answer the same arguments with the same content.
+   * must answer the same arguments with the same content. `whole` names the
+   * stored message or summary the cut comes from, which its marker names,
+   * with `capReadHint`'s clause after it.
    */
   protected truncateContent(
     content: ContentBlock[],
     maxTokens: number,
     estimate?: (content: ContentBlock[]) => number,
+    whole?: CapWhole,
   ): ContentBlock[] {
-    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)));
+    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)), {
+      ...(whole ? { whole } : {}),
+      ...(this.config.capReadHint ? { hint: this.config.capReadHint } : {}),
+    });
+  }
+
+  /**
+   * The text the per-message cap measures for `at`, read through `store`, the
+   * agent's view (see `ContextStrategy.capMeasuredText`): a message's text
+   * blocks and string tool results as this strategy sends it before the cut
+   * (prunedForSend), so a result tool pruning leaves out reads as its marker;
+   * a summary's answer prose (liveWindowAnswerProse), as every recall answer
+   * cuts it; with `toolUseId`, the JSON of that call's input as stored, which
+   * `toolUseInputMaxTokens` measures. Null for an id `store` holds no message
+   * for and no summary of the loaded branch has, and for a call the message
+   * doesn't hold.
+   */
+  capMeasuredText(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null {
+    this.requireLoadedBranch('capMeasuredText');
+    const msg = store.get(at.id as MessageId);
+    if (at.toolUseId !== undefined) {
+      const call = msg?.content.find((b) => b.type === 'tool_use' && b.id === at.toolUseId) as Extract<ContentBlock, { type: 'tool_use' }> | undefined;
+      return call ? JSON.stringify(call.input) : null;
+    }
+    if (msg) return capMeasuredTextOf(this.prunedForSend(store, msg).content);
+    const summary = this.summaries.find((s) => s.id === at.id);
+    return summary ? capMeasuredTextOf(this.liveWindowAnswerProse(summary)) : null;
   }
 
   /**
@@ -22282,7 +22324,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // override's rewrite passed on to this class's cut.
     const sent = this.prunedForSend(store, msg);
     const content = this.truncateContent(sent.content, msgCap, (blocks) =>
-      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage),
+    { kind: 'message', id: msg.id });
     return { content, extra: cappedPriceExtra(store, sent, content) };
   }
 

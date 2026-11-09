@@ -237,6 +237,15 @@ export interface ReadinessState {
 }
 
 /**
+ * A host's clause saying how to read what the per-message cap elided, which
+ * follows the cap's marker after `; `: for a message or summary from its
+ * first elided character (`offsetChars`), for a call's input by the call's
+ * id (`toolUseId`). It must be pure, the same arguments giving the same
+ * text, since every compile writes it into the request again.
+ */
+export type CapReadHint = (at: { id: string; offsetChars?: number; toolUseId?: string }) => string;
+
+/**
  * Pluggable strategy for context management.
  * Strategies control how context is selected, compressed, and maintained.
  */
@@ -294,6 +303,17 @@ export interface ContextStrategy {
    * change what a later compile sends.
    */
   renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
+
+  /**
+   * The text the per-message cap measures for a message or summary `at.id`,
+   * read through `store`, the agent's view, or with `at.toolUseId` the JSON
+   * of that call's input: the text a capped message's marker gives offsets
+   * into, so a reader paging it from the marker's first offset reads exactly
+   * what the cap elided. Null where the view holds no such row, for a
+   * summary the strategy doesn't have, and for a call the message doesn't
+   * hold. A strategy with no per-message cap has none.
+   */
+  capMeasuredText?(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null;
 
   /**
    * Initialize the strategy with context.
@@ -2012,13 +2032,24 @@ export interface AutobiographicalConfig {
    * already in quarantine stay there until their records are cleared.
    */
   recoverLiteralThinkingWrappedCompression?: boolean;
-  /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. The combined
-   *  recall answer of `positionedRecallPairs: false` is the exception. Each
-   *  summary in it is cut to this limit, as a positioned recall answer is, so
-   *  the answer as a whole can pass it. A value that isn't a positive number,
-   *  such as 0 or NaN, means no limit. */
+  /** Maximum tokens per individual message in compiled output. A message
+   *  exceeding this limit keeps the head and the tail of its text and string
+   *  tool results, around one marker naming the characters it elided and the
+   *  stored message whose whole holds them (`capContent`). Each summary in a
+   *  recall answer is cut so too, its marker naming the summary, so the
+   *  combined recall answer of `positionedRecallPairs: false` can pass the
+   *  limit as a whole. A value that isn't a positive number, such as 0 or
+   *  NaN, means no limit. */
   maxMessageTokens: number;
+
+  /**
+   * The host's clause for reading what `maxMessageTokens` and
+   * `toolUseInputMaxTokens` leave out, which follows each marker after `; `
+   * (see `CapReadHint`). It must be pure: the same arguments give the same
+   * text, since every compile writes it into the request again. Without it
+   * a marker names the stored message or summary by id alone.
+   */
+  capReadHint?: CapReadHint;
 
   /**
    * Fractional grace above the configured hard context budget before a
@@ -2617,8 +2648,10 @@ export interface AutobiographicalConfig {
   /**
    * Truncate `tool_use` block inputs whose serialized JSON exceeds this
    * many tokens, at four characters a token. The truncated input becomes
-   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...] }`, `_keys`
-   * holding the original input's first five keys. The plan and the render
+   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...], "_whole": "…" }`,
+   * `_keys` holding the original input's first five keys and `_whole` saying
+   * how long the input is and where its whole is stored (the message and the
+   * call), with `capReadHint`'s clause after it. The plan and the render
    * stats price the truncated input, and the stored message is unchanged.
    * Default: 0 (no truncation).
    */

@@ -93,6 +93,7 @@ export type {
   ImageCeilings,
   ThinkingBinding,
   RequestIdentity,
+  CapReadHint,
 } from './strategy.js';
 
 export {

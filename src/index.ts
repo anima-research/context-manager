@@ -127,6 +127,7 @@ export type {
   ImageCeilings,
   ThinkingBinding,
   RequestIdentity,
+  CapReadHint,
 } from './types/index.js';
 
 // Accepted rounds and fold receipts
