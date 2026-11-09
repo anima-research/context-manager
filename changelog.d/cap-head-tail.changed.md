@@ -17,9 +17,9 @@
     no summary.
   - Old: a string tool result past the cap became `[content omitted: this
     message reached its token limit before this result]`. New: one wholly
-    in the middle becomes `[truncated — this result is in the chars the
-    marker above elides]`, and one the tail starts in begins `[truncated —
-    this result's start is in the chars the marker above elides]` before
+    in the middle becomes `[truncated — this result is elided; the whole is
+    stored message ID]`, and one the tail starts in begins `[truncated —
+    this result's start is elided; the whole is stored message ID]` before
     its kept end. Where the middle starts in a string tool result, the
     marker is in that result's content, so the result keeps its pairing.
   - Old: a `tool_use` input over `toolUseInputMaxTokens` became
@@ -45,8 +45,9 @@
   Text blocks that hold nothing are still left out at no loss: where
   leaving them out brings a message under the cap, it comes back without
   them and nothing else is cut, as `main` left them out past the cap. A cap
-  smaller than the marker sends the marker alone, over the cap, except
-  that the cut is never longer than the whole: where the marker alone
+  smaller than the marker sends the marker, over the cap, with any block
+  the cut passes through, such as thinking, and a notice for each later
+  string tool result, except that the cut is never longer than the whole: where the marker alone
   estimates at least as much as the text it would stand for, the message
   goes whole. A text
   block that holds nothing, or an opaque carrier, at the end is now kept in
@@ -77,10 +78,12 @@
   answer lists, so a summary left out of it, by a strategy's own
   `renderCombinedRecallAnswer` or because its head and tail hold nothing (a
   cap smaller than the marker leaves every summary longer than its marker
-  so), refuses the
+  so, unless a block such as thinking survives its cut), refuses the
   compile with `UncoveredDropError` unless the compile sends its messages
   some other way. The compile's layout, and so the fold journal, names each
-  summary the answer holds, whole or partial by its own cut.
+  summary the answer holds, whole or partial by its own cut. A positioned
+  recall answer keeps a summary its cut leaves as the marker alone, listed
+  as partial, as it keeps any summary it cuts.
 - Prompt cache: every request that holds a capped message, a cut summary or
   a cut tool input changes from the first of them on, once, the first
   compile after upgrading, and again where a host starts supplying

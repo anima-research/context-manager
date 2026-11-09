@@ -240,8 +240,10 @@ export interface ReadinessState {
  * A host's clause saying how to read what the per-message cap elided, which
  * follows the cap's marker after `; `: for a message or summary from its
  * first elided character (`offsetChars`), for a call's input by the call's
- * id (`toolUseId`). It must be pure, the same arguments giving the same
- * text, since every compile writes it into the request again. One that
+ * id (`toolUseId`). `offsetChars`, like the marker's offsets, counts UTF-16
+ * code units (JavaScript string indices) from 0. It must be pure, the same
+ * arguments giving the same text, since every compile writes it into the
+ * request again. One that
  * throws fails no compile: that marker names the stored message or summary
  * by id alone, as with no hint, and the strategy says the first throw.
  */
@@ -313,7 +315,9 @@ export interface ContextStrategy {
    * into, so a reader paging it from the marker's first offset reads exactly
    * what the cap elided. Null where the view holds no such row, for a
    * summary the strategy doesn't have, and for a call the message doesn't
-   * hold. A strategy with no per-message cap has none.
+   * hold. A strategy with no per-message cap has none. See
+   * `ContextManager.capMeasuredText` for what the offsets count and when
+   * they stop indexing it.
    */
   capMeasuredText?(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null;
 
@@ -2040,8 +2044,13 @@ export interface AutobiographicalConfig {
    *  stored message whose whole holds them (`capContent`). Each summary in a
    *  recall answer is cut so too, its marker naming the summary, so the
    *  combined recall answer of `positionedRecallPairs: false` can pass the
-   *  limit as a whole. A value that isn't a positive number, such as 0 or
-   *  NaN, means no limit. */
+   *  limit as a whole. A message comes back whole where its marker alone
+   *  would cost at least as much as the text it stands for, and loses only
+   *  its text blocks that hold nothing where that alone brings it under the
+   *  limit. Blocks the cut passes through, such as thinking, can keep a
+   *  message over it, and so can a marker on a limit smaller than the
+   *  marker. A value that isn't a positive number, such as 0 or NaN, means
+   *  no limit. */
   maxMessageTokens: number;
 
   /**
@@ -2653,7 +2662,8 @@ export interface AutobiographicalConfig {
    * `{ "_truncated": true, "_originalTokens": N, "_keys": [...], "_whole": "…" }`,
    * `_keys` holding the original input's first five keys and `_whole` saying
    * how long the input is and where its whole is stored (the message and the
-   * call), with `capReadHint`'s clause after it. The plan and the render
+   * call), with `capReadHint`'s clause after it. An input whose stub would be
+   * no shorter than its JSON is sent whole. The plan and the render
    * stats price the truncated input, and the stored message is unchanged.
    * Default: 0 (no truncation).
    */

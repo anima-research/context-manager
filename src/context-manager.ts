@@ -3814,6 +3814,13 @@ export class ContextManager {
    * agent's view doesn't hold, such as one the view filter leaves out or one
    * not yet presented, for an id nothing has, for a call the message doesn't
    * hold, and under a strategy with no per-message cap.
+   *
+   * The marker's offsets, `chars H to T of M`, count UTF-16 code units
+   * (JavaScript string indices) from 0: H is the first elided, T the first
+   * kept after them. They index the text as the compile that wrote the
+   * marker sent it. Where tool pruning has since replaced a result of that
+   * message, the text read now differs, so a reader whose text's length
+   * isn't the marker's M doesn't page it.
    */
   capMeasuredText(at: { id: string; toolUseId?: string }): string | null {
     this.requireInitialized('capMeasuredText');

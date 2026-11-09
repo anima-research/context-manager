@@ -21786,8 +21786,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * `msg` as this strategy sends it before any cut: each `tool_result`
    * toolPruning replaces carries its marker, and each `tool_use` input over
-   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys }`
-   * (its first five keys as stored: in the order written on chronicle 0.5.1
+   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys, _whole }`,
+   * unless that stub would be no shorter than the input (its first five keys as stored: in the order written on chronicle 0.5.1
    * or later, sorted for an input chronicle before 0.5.1 stored or reads
    * back). `msg` itself when
    * neither touches it. A compile
@@ -22255,7 +22255,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * each message more than once, to price it and to send it, so an override
    * must answer the same arguments with the same content. `whole` names the
    * stored message or summary the cut comes from, which its marker names,
-   * with `capReadHint`'s clause after it.
+   * with `capReadHint`'s clause after it. An override that rewrites the
+   * content it cuts overrides `capMeasuredText` too, so a reader pages the
+   * text the marker's offsets index.
    */
   protected truncateContent(
     content: ContentBlock[],

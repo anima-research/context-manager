@@ -108,8 +108,10 @@ export function capMeasuredTextOf(content: readonly ContentBlock[]): string {
   return text;
 }
 
-const MIDDLE_RESULT_TEXT = '[truncated — this result is in the chars the marker above elides]';
-const TAIL_RESULT_TEXT = "[truncated — this result's start is in the chars the marker above elides]";
+function resultNotice(startOnly: boolean, opts: CapOptions): string {
+  const where = opts.whole ? `; the whole is stored ${opts.whole.kind} ${opts.whole.id}` : '';
+  return `[truncated — this result${startOnly ? "'s start" : ''} is elided${where}]`;
+}
 
 function markerText(head: number, tailStart: number, total: number, opts: CapOptions): string {
   const { whole, hint } = opts;
@@ -194,7 +196,7 @@ function cutAt(content: readonly ContentBlock[], headEnd: number, tailStart: num
       marked = true;
       if (after) blocks.push({ type: 'text', text: after });
     } else {
-      const middle = !marked ? marker : after && !before ? TAIL_RESULT_TEXT : MIDDLE_RESULT_TEXT;
+      const middle = !marked ? marker : resultNotice(Boolean(after) && !before, opts);
       marked = true;
       blocks.push({ ...block, content: [before, middle, after].filter((part) => part !== '').join('\n\n') } as ContentBlock);
     }
@@ -229,7 +231,7 @@ function cutAt(content: readonly ContentBlock[], headEnd: number, tailStart: num
  *   in one, since a result keeps its pairing.
  * - A text block wholly in the middle is dropped. A string tool result
  *   wholly in the middle says so in its content, and one the tail starts in
- *   says its start is elided. A text block that holds nothing, kept whole at
+ *   says its start is elided, each naming the stored whole too. A text block that holds nothing, kept whole at
  *   either end, is left out where an end falls in it, as is a kept piece
  *   that would hold nothing, and the marker counts its characters as elided.
  * - Every other block passes through in place.

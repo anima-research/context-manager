@@ -3,8 +3,12 @@
   this agent's view: a message's text blocks and string tool results as the
   strategy sends them before the cut, a summary's answer prose, or with
   `toolUseId` that call's input as JSON. A capped message's marker gives
-  offsets into it, so a reader paging it from the marker's first offset
-  reads exactly what the cap elided. It returns null for a row the view
+  offsets into it, `chars H to T of M`, in UTF-16 code units (JavaScript
+  string indices) from 0, so a reader paging it from H reads exactly what
+  the cap elided. They index the text as the compile that wrote the marker
+  sent it: where tool pruning has since replaced a result of that message,
+  the text read now differs, so a reader whose text's length isn't M
+  doesn't page it. It returns null for a row the view
   doesn't hold, an id nothing has, a call the message doesn't hold, and
   under a strategy with no per-message cap. Strategies answer it through
   the optional `ContextStrategy.capMeasuredText`, which the autobiographical
