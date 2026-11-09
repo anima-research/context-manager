@@ -363,6 +363,64 @@ describe('the chain-break guard still halts for a broken chain or a store rebuil
   });
 });
 
+// The guard holds chunks, not merges: a merge combines summaries that already exist.
+class MergeQueueing extends AutobiographicalStrategy {
+  queueMergeOf(sourceIds: string[]): void {
+    this.enqueueMerge({ level: 2, sourceIds });
+  }
+  queuedLevels(): number[] {
+    return this.mergeQueue.map((merge) => merge.level);
+  }
+}
+
+describe('merges while the chain-break guard holds', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  it('merges queued before the guard tripped, and persisted, run at tick, and the one that lands last queues the next level', async () => {
+    const queueing = (mergeThreshold: number) => new MergeQueueing({
+      compressionModel: 'test-compression-model',
+      targetChunkTokens: 100,
+      summaryTargetTokens: 20,
+      headWindowTokens: 0,
+      recentWindowTokens: 300,
+      l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false,
+      mergeThreshold,
+    });
+    const path = freshPath();
+    {
+      // No merge queues by itself here: the two are queued by hand.
+      const s = queueing(99);
+      const cm = await ContextManager.open({ path, strategy: s, membrane });
+      await growTo(cm, 4);
+      const l1s = cm.getSummariesInRange({ level: 1 }).map((summary) => summary.id);
+      assert.strictEqual(l1s.length, 4, 'setup: four L1s to merge');
+      s.queueMergeOf(l1s.slice(0, 2));
+      s.queueMergeOf(l1s.slice(2, 4));
+      assert.deepStrictEqual(s.queuedLevels(), [2, 2], 'setup: two merges are queued');
+      const store = cm.getStore();
+      for (let c = 0; c < 6; c++) {
+        store.appendToStateJson(CHUNKS, { id: `ghost-c-${c}`, sourceIds: [`ghost-${c}`], compressed: true, summaryId: `L1-ghost-${c}` });
+      }
+      cm.sync();
+      await cm.close();
+    }
+    // Two L2s reach this threshold, so the merge that lands second queues an L3.
+    const s = queueing(2);
+    const cm = await ContextManager.open({ path, strategy: s, membrane });
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'setup: the guard holds');
+    assert.deepStrictEqual(s.queuedLevels(), [2, 2], 'setup: the persisted merges are queued, and the open queued none');
+    await cm.tick();
+    assert.strictEqual(cm.getSummariesInRange({ level: 2 }).length, 1, 'the first queued merge ran');
+    await cm.tick();
+    assert.strictEqual(cm.getSummariesInRange({ level: 2 }).length, 2, 'the second queued merge ran');
+    assert.deepStrictEqual(s.queuedLevels(), [3], 'the merge that landed queued the next level');
+    assert.strictEqual(s.getCompressionDebt().failure, 'chunk-records', 'the guard still holds');
+    await cm.close();
+  });
+});
+
 describe('how the chain-break guard asks', () => {
   before(() => cleanup());
   after(() => cleanup());
