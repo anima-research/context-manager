@@ -9910,11 +9910,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *                group stands in the merge quarantine because merging it
    *                would have minted a crossed node (`topologyRefusals`).
    *                And while the chain-break guard in rebuildChunks has
-   *                stopped compression (`failure` `chunk-records`): most
-   *                chunk records name no message in view, and the oldest or
-   *                newest of those names one off this branch's messages
-   *                chain, or the view can't say, or that read failed. No new
-   *                chunk forms then, so nothing else here would show it.
+   *                stopped compression of new conversation (`failure`
+   *                `chunk-records`): most chunk records name no message in
+   *                view, and the oldest or newest of those names one off
+   *                this branch's messages chain, or the view can't say, or
+   *                that read failed. No new chunk forms then, so nothing
+   *                else here would show it.
    * - `unknown`  — the report couldn't read what decides its state.
    *
    * A report that couldn't read something says in `error` what happened,
