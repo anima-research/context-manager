@@ -26,5 +26,5 @@
   halted. `getCompressionDebt()`
   reads `critical` with `failure: 'chunk-records'`. Its `error` gives the
   cause and the first step, which changes nothing. The `FAIL-CLOSED` log line
-  gives every step. `scripts/drain-autobiographical.ts` then stops before any
-  step, with `stopped: 'chunk-records'`, and exits 1.
+  gives every step. `scripts/drain-autobiographical.ts` takes no step once it
+  finds the guard holding, with `stopped: 'chunk-records'`, and exits 1.

@@ -227,12 +227,14 @@ function causeText(thrown: unknown): string {
  * characters (causeText) it stays under 500, where connectome-host's status
  * notices and agent-framework's alert webhook cut a message.
  */
-function compressionQuarantineUnreadableMessage(cause: unknown): string {
+function compressionQuarantineUnreadableMessage(cause: unknown, guardHolds = false): string {
   return [
     'Compression of new conversation has stalled.',
     `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
     'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
-    'Fix: fix what the cause names; compression then resumes by itself.',
+    guardHolds
+      ? 'Fix: fix the cause; it resumes once the chain-break guard clears.'
+      : 'Fix: fix what the cause names; compression then resumes by itself.',
   ].join('\n');
 }
 
@@ -255,7 +257,7 @@ function chunkRecordsMessage(cause: ChunkRecordsCause): string {
   if (cause === 'off-branch') {
     return [
       'Compression of new conversation has stopped.',
-      "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
+      "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a message slot left unopened, a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
       'Effect: no new chunk is sent to be summarized; merges run as usual.',
       "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
     ].join('\n');
@@ -10070,7 +10072,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if ('count' in ledger) {
         state = stateWith(ledger.count);
       } else {
-        error = compressionQuarantineUnreadableMessage(ledger.error);
+        error = compressionQuarantineUnreadableMessage(ledger.error, this.chunkRecordsOrphaned);
         const withNone = stateWith(0);
         state = withNone === stateWith(1) ? withNone : 'unknown';
       }
@@ -10153,7 +10155,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       quarantined = this.readCompressionQuarantineProjection();
     } catch (error) {
-      return { summaries: null, tokens: null, error: compressionQuarantineUnreadableMessage(error) };
+      return { summaries: null, tokens: null, error: compressionQuarantineUnreadableMessage(error, this.chunkRecordsOrphaned) };
     }
     try {
       const summaries = this.strandedSummaries(quarantined);
@@ -19764,7 +19766,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._orphanCause = cause;
       this.compressionQueue = [];
       const logged = typeof cause === 'object' ? `chain-unread: ${oneLine(failureMessage(cause.chainUnread))}` : cause;
-      if (this._failClosedLogged !== logged) {
+      if (!this._dryRunSelect && this._failClosedLogged !== logged) {
         this._failClosedLogged = logged;
         this.diag.error(typeof cause === 'object'
           ? `[autobiographical] FAIL-CLOSED: the store couldn't read its messages chain to check the chunk ` +

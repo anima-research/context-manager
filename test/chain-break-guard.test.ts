@@ -803,6 +803,24 @@ describe('how the chain-break guard asks', () => {
     await cm.close();
   });
 
+  it('a dry compile whose rebuild trips the guard logs nothing, however often it runs, and a live rebuild that trips it after logs its line', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
+    const s = strategy();
+    const cm = await ContextManager.open({ path: freshPath(), strategy: s, membrane });
+    await growTo(cm, 5);
+    for (const id of records(cm).slice(0, 3).flatMap((r) => r.sourceIds)) cm.removeMessage(id);
+    const store = messageStoreOf(cm);
+    store.onBranch = () => { throw new Error('a read of the messages state failed (test)'); };
+    const failClosed = () => spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('FAIL-CLOSED'));
+    for (let i = 0; i < 3; i++) await cm.compile({ maxTokens: 100_000, reserveForResponse: 2_000 }, undefined, { dryRun: true });
+    assert.deepStrictEqual(failClosed(), [], 'the dry compiles log nothing');
+    assert.strictEqual(s.getCompressionDebt().failure, undefined, 'and leave the live guard as it was');
+    (s as unknown as { rebuildChunks(view: unknown): void }).rebuildChunks(store.createView());
+    assert.strictEqual(failClosed().length, 1, failClosed().join('\n'));
+    await cm.close();
+  });
+
   it('MessageStore.onBranch throws where its read of the record or of the chain fails', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: strategy(), membrane });
     const [kept, removed] = add(cm, 2);
@@ -843,6 +861,7 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
       s._orphanCause = cause;
       const error = s.getCompressionDebt().error ?? '';
       assert.ok(error.length > 0 && error.length < 500, `${JSON.stringify(cause).slice(0, 40)}: ${error.length} characters`);
+      if (cause === 'off-branch') assert.match(error, /chain: a message slot left unopened, a chain broken under chronicle before 0\.5\.0, or a store rebuilt under new ids\.\n/);
     }
   });
 
@@ -888,7 +907,9 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
     await cm.close();
   });
 
-  it('with the quarantine ledger unreadable too, the report says both, the guard\'s first', async () => {
+  it('with the quarantine ledger unreadable too, the report says both, the guard\'s first, and the ledger\'s Fix waits on the guard too', async (t) => {
+    const spy = mock.method(console, 'error', () => {});
+    t.after(() => spy.mock.restore());
     const s = strategy();
     const cm = await ContextManager.open({ path: await ghostStore(), strategy: s, membrane });
     const internals = s as unknown as {
@@ -909,7 +930,11 @@ describe('the debt report and the FAIL-CLOSED line while the guard holds', () =>
       const [guard, ledgerError, ...rest] = (debt.error ?? '').split('\n\n');
       assert.match(guard!, /^Compression of new conversation has stopped\.\nCause: most chunk records name no message in view/);
       assert.match(ledgerError!, /couldn't read this agent's compression quarantine ledger \(EACCES: permission denied \(test\)\)/);
+      assert.match(ledgerError!, /\nFix: fix the cause; it resumes once the chain-break guard clears\.$/);
       assert.deepEqual(rest, []);
+      const logged = spy.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('[compression-debt]'));
+      assert.strictEqual(logged.length, 1, logged.join('\n'));
+      assert.match(logged[0]!, /Fix: fix the cause; it resumes once the chain-break guard clears\./);
       assert.strictEqual(debt.compressionQuarantineCount, null);
     } finally {
       internals.store.getStateJson = read;

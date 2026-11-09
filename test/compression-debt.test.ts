@@ -416,6 +416,12 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     assert.equal(ledger.length, 4);
     assert.equal(ledger[1], `Cause: the store couldn't read this agent's compression quarantine ledger (${'x'.repeat(170)} end of a…).`);
     assert.equal(ledger[3], 'Fix: fix what the cause names; compression then resumes by itself.');
+    const guarded = fresh();
+    guarded.setCompressionStopped(true);
+    guarded.breakLedger(long);
+    const [, held] = (guarded.getCompressionDebt(NOW).error ?? '').split('\n\n');
+    assert.ok(held!.length < 500, `with the chain-break guard holding: ${held!.length} characters`);
+    assert.match(held!, /\nFix: fix the cause; it resumes once the chain-break guard clears\.$/);
     const t = fresh();
     Object.defineProperty(t, 'chunks', { get() { throw long; }, configurable: true });
     const outright = (t.getCompressionDebt(NOW).error ?? '').split('\n');
@@ -473,7 +479,7 @@ describe('getCompressionDebt while the chain-break guard has stopped compression
   // The guard's flag set with its default cause, the off-chain one.
   const STOPPED = [
     'Compression of new conversation has stopped.',
-    "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
+    "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a message slot left unopened, a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
     'Effect: no new chunk is sent to be summarized; merges run as usual.',
     "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
   ].join('\n');

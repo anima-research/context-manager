@@ -222,7 +222,7 @@ if (stopped === 'waiting-on-tools') {
   console.error(`not drained (waiting-on-tools): ${final.waitingOnTools} chunks and merges wait on the resident's tool definitions; ` +
     'run the drain again with --tools-log=<a log of its requests>');
 } else if (stopped === 'chunk-records') {
-  console.error('not drained (chunk-records): the chain-break guard has stopped compression, and this drain stopped before any step, queued merges included. ' +
+  console.error('not drained (chunk-records): the chain-break guard has stopped compression, and this drain takes no step once it finds it holding, queued merges included; any step it took before then stands. ' +
     `Its debt report says what has to change before a drain can go on:\n${final.debtError}`);
 } else if (!completed) {
   console.error(`not drained (${stopped}): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands` +
