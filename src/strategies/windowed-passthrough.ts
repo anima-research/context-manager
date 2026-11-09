@@ -822,7 +822,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
             ? `Windowed passthrough: its system changes and the newest conversation message${unit}`
             : 'Windowed passthrough: its system changes alone',
         // No compression here: the window moves past this message once a
-        // newer one that fits arrives (the progress clause above). System
+        // newer one that fits arrives (the progress clause above), unless a
+        // tool result in it answers a call in what was refused. System
         // changes go out wherever the window starts, so once they leave no
         // room for a message only the caller, consolidating them, clears it.
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
