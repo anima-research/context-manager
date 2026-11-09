@@ -99,8 +99,9 @@ describe('tool pruning, priced as sent', () => {
       const { cm, store } = await open({ ...selector, toolUseInputMaxTokens: 100 });
       const inputOf = (k: number) => ({ path: `f${k}`, body: `${k} ${PROSE}`, mode: 'w', owner: 'me', group: 'us', size: k, tag: 't' });
       cm.addMessage('u', text('write these'));
+      const callers: string[] = [];
       for (let k = 1; k <= 3; k++) {
-        cm.addMessage('a', [call(`w-${k}`, 'write', inputOf(k))]);
+        callers.push(cm.addMessage('a', [call(`w-${k}`, 'write', inputOf(k))]));
         cm.addMessage('u', [result(`w-${k}`, 'written')]);
       }
       cm.addMessage('a', text('ok'));
@@ -112,7 +113,8 @@ describe('tool pruning, priced as sent', () => {
         _truncated: true,
         _originalTokens: Math.ceil(JSON.stringify(inputOf(k)).length / 4),
         _keys: ['path', 'body', 'mode', 'owner', 'group'],
-      })), 'the input is truncated to its size and its first five keys');
+        _whole: `[truncated — this call's input, ${JSON.stringify(inputOf(k)).length} chars, is elided; the whole is stored message ${callers[k - 1]}, call w-${k}]`,
+      })), 'the input is truncated to its size, its first five keys and where its whole is');
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
       cm.close();
     });
@@ -148,7 +150,7 @@ describe('tool pruning, priced as sent', () => {
       assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'a note after the result')),
         'the note after the replaced result is sent whole');
       assert.equal(resultOf(compiled, 'call-2'), MARKER);
-      assert.match(resultOf(compiled, 'call-3')!, /truncated — original was/);
+      assert.match(resultOf(compiled, 'call-3')!, /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored message \S+\]/);
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
       cm.close();
     });

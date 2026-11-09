@@ -162,14 +162,17 @@ describe('autobiographical rendered layout', () => {
   it('names every summary of the combined answer, and marks the one its own cut took something from', async () => {
     for (const recallEnvelope of ['none', 'xml'] as const) {
       await withStore(async (path) => {
-        const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 12, recallEnvelope });
-        seedAll(strategy, ids);
+        const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 60, recallEnvelope });
+        const [a, b, c] = ids as [string, string, string];
+        // A and B fit the cap of 60 on their own, and C, 1,200 characters, is cut to it.
+        strategy.seed({ id: 'L1-a', level: 1, content: 'first summary, short', tokens: 5, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+        strategy.seed({ id: 'L1-b', level: 1, content: 'second summary, short', tokens: 6, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b } });
+        strategy.seed({ id: 'L1-c', level: 1, content: 'third summary, long. '.repeat(57).padEnd(1200, '.'), tokens: 300, sourceLevel: 0, sourceIds: [c], sourceRange: { first: c, last: c } });
         const result = await cm.compile(BUDGET);
         const units = spans(result.provenance!.layout!).map(({ unit: u, first, last }) =>
           u.k === 's' ? `s[${u.sm.map((x) => x[0] + (x[3] ? '~' : '')).join(',')}]` : u.k === 'o' ? `omit ${first}..${last}` : `raw ${first}`,
         );
-        // L2-100 and L1-101 fit the cap of 12 on their own, and L1-102, 49 characters, is cut to it.
-        assert.deepEqual(units.slice(0, 3), ['s[L2-100]', 's[L1-101]', 's[L1-102~]'], recallEnvelope);
+        assert.deepEqual(units.slice(0, 3), ['s[L1-a]', 's[L1-b]', 's[L1-c~]'], recallEnvelope);
         cm.close();
       });
     }
@@ -177,24 +180,28 @@ describe('autobiographical rendered layout', () => {
 
   it('attributes a summary whose thinking block survived its own cut after its text was dropped', async () => {
     await withStore(async (path) => {
-      const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 3, recallEnvelope: 'none' });
+      const { cm, strategy, ids } = await setup(path, { positionedRecallPairs: false, maxMessageTokens: 60, recallEnvelope: 'none' });
       const [a, b] = ids as [string, string];
-      strategy.seed({ id: 'L1-a', level: 1, content: 'first summary text that the cap shortens', tokens: 8, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
-      // B's blank block, 12 characters, spends its own cap of 3 tokens exactly, so its
-      // thinking passes and its text is dropped: the thinking is all of B that shows.
+      const longA = 'first summary text that the cap shortens. '.repeat(30);
+      strategy.seed({ id: 'L1-a', level: 1, content: longA, tokens: 315, sourceLevel: 0, sourceIds: [a], sourceRange: { first: a, last: a } });
+      // B's text, past the cap without its blank blocks too, sits between two blank
+      // blocks of 400 characters, so its head and tail fall in them and hold nothing:
+      // its thinking passes and its text is elided, so the thinking is all of B that shows.
       strategy.seed({
-        id: 'L1-b', level: 1, content: 'second summary text', tokens: 6, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b },
+        id: 'L1-b', level: 1, content: 'second summary text', tokens: 410, sourceLevel: 0, sourceIds: [b], sourceRange: { first: b, last: b },
         responseContent: [
-          { type: 'text', text: ' '.repeat(12) },
+          { type: 'text', text: ' '.repeat(400) },
           { type: 'thinking', thinking: 'retained reasoning', signature: 'sig-b' } as ContentBlock,
-          { type: 'text', text: 'second summary text' },
+          { type: 'text', text: 'second summary text. '.repeat(40) },
+          { type: 'text', text: ' '.repeat(400) },
         ],
       });
       const result = await cm.compile(BUDGET);
       const answer = JSON.stringify(result.messages);
-      assert.ok(answer.includes('retained reasoning'), 'the truncator kept B\'s thinking block');
-      assert.ok(!answer.includes('second'), 'and dropped all of its text');
-      assert.ok(answer.includes(OMISSION_MARKER), 'B\'s text gave way to the omission marker, so no prefix of it was kept');
+      assert.ok(answer.includes('retained reasoning'), 'the cut kept B\'s thinking block');
+      assert.ok(!answer.includes('second'), 'and elided all of its text');
+      assert.match(answer, /\[truncated — chars 0 to 1640 of 1640 elided here; the whole is stored summary L1-b\]/,
+        'B\'s marker says it kept none of B\'s text');
       const named = summaryUnits(result.provenance!.layout!).flatMap(([, , sm]) => sm);
       assert.ok(named.includes('L1-b@1~'), `B is named as partially rendered: ${JSON.stringify(named)}`);
       assert.ok(named.includes('L1-a@1~'), 'A was cut');

@@ -7,14 +7,19 @@
  * capped answer is the only render where wrapping and truncating can fight.
  * Each case pins one truncation regime:
  *
- *  - `*TightCap` uses a cap of 1 token (4 characters), far SMALLER than the
- *    envelope's own tag text. That is the boundary case: the envelope is not
- *    charged against the cap, so what renders is opener + the few characters
- *    the cap bought + the truncator's marker + closer.
- *  - the ordinary caps sit mid-prose, so an answer is cut but not obliterated.
- *  - the `combined*` cases drive the legacy `positionedRecallPairs: false`
- *    path, whose single turn concatenates every selected summary, each cut
- *    to the cap on its own inside its own envelope.
+ *  - `*TightCap` uses a cap of 1 token, far SMALLER than the envelope's own
+ *    tag text and the cut's marker. That is the boundary case: the envelope
+ *    is not charged against the cap, so what renders is opener + the marker
+ *    alone + closer.
+ *  - the ordinary caps cut the fixture's summaries, which are smaller than
+ *    the marker, to the marker alone too, so a positioned answer is its
+ *    marker inside a whole envelope.
+ *  - `hierarchicalCombinedUncut` drives the legacy
+ *    `positionedRecallPairs: false` path at a cap that cuts nothing. A cap
+ *    that leaves a combined answer's summaries as their markers alone refuses
+ *    the compile, and the combined path's cuts, each summary's head and tail
+ *    inside its own envelope, are pinned with longer summaries in
+ *    test/combined-recall-answer.test.ts.
  */
 
 import type { AutobiographicalOptions } from '../../src/types/index.js';
@@ -42,14 +47,6 @@ export const CAPPED_RENDER_CASES = {
     path: 'hierarchical',
     options: { maxMessageTokens: 1 },
   },
-  hierarchicalCombined: {
-    path: 'hierarchical',
-    options: { maxMessageTokens: 12, positionedRecallPairs: false },
-  },
-  hierarchicalCombinedTightCap: {
-    path: 'hierarchical',
-    options: { maxMessageTokens: 1, positionedRecallPairs: false },
-  },
   hierarchicalCombinedUncut: {
     path: 'hierarchical',
     options: { maxMessageTokens: 60, positionedRecallPairs: false },
@@ -61,9 +58,9 @@ export const CAPPED_RENDER_CASES = {
   adaptiveTightCap: {
     path: 'adaptive',
     options: { maxMessageTokens: 1 },
-    // A raw message capped at 1 token renders a few characters and the cut's
-    // suffix, and is priced as it renders (#223), so the fixture's 30 fit 900
-    // tokens raw. A smaller budget makes the render fold, as the case needs.
+    // A raw message capped at 1 token renders as the cut's marker alone, and
+    // is priced as it renders (#223), so the fixture's 30 fit 900 tokens raw.
+    // A smaller budget makes the render fold, as the case needs.
     maxTokens: 300,
   },
 } as const satisfies Record<string, CappedRenderCase>;

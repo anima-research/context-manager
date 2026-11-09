@@ -488,16 +488,17 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     await manager.close();
   });
 
-  it('under maxMessageTokens the same message is truncated with the marker and fits', async () => {
+  it('under maxMessageTokens the same message is cut to its head and tail around the marker, and fits', async () => {
     const path = freshPath();
     const manager = await ContextManager.open({
       path,
       strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
     });
-    manager.addMessage('u', text('x'.repeat(2000)));
-    const t = texts(await manager.compile(budget))[0];
-    assert.match(t, /\[truncated — original was 500 tokens\]$/);
-    assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
+    const id = manager.addMessage('u', text('x'.repeat(2000)));
+    const content = (await manager.compile(budget)).messages[0]!.content.map((b) => (b as { text: string }).text);
+    assert.equal(content.length, 3, 'head, marker, tail');
+    assert.equal(content[1], `[truncated — chars ${content[0]!.length} to ${2000 - content[2]!.length} of 2000 elided here; the whole is stored message ${id}]`);
+    assert.ok(content.join('').length <= 400, `cut within the cap, marker included: ${content.join('').length} chars`);
     await manager.close();
   });
 
@@ -506,7 +507,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     assert.equal(strategy.maxMessageTokens, 100);
   });
 
-  it('a tool result past the message\'s cap keeps its pairing and says the cap ran out', async () => {
+  it('a tool result in the middle of a capped message keeps its pairing and says it is elided', async () => {
     const path = freshPath();
     const manager = await ContextManager.open({
       path,
@@ -516,17 +517,18 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     manager.addMessage('u', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+      { type: 'text', text: 'y'.repeat(2000) },
     ]);
     const compiled = await manager.compile(budget);
     const blocks = compiled.messages.flatMap((m) => m.content);
     const result = blocks.find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
     assert.equal(result?.toolUseId, 't1', 'the result still answers its call');
     assert.ok(blocks.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 't1'), 'and the call is still there');
-    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    assert.equal(result?.content, '[truncated — this result is in the chars the marker above elides]');
     await manager.close();
   });
 
-  it('autobiographical\'s message cap writes the same marker on a tool result past it', async () => {
+  it('autobiographical\'s message cap says the same of a tool result in the middle', async () => {
     const path = freshPath();
     const manager = await ContextManager.open({
       path,
@@ -536,15 +538,16 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     manager.addMessage('u', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+      { type: 'text', text: 'y'.repeat(2000) },
     ]);
     const compiled = await manager.compile(budget);
     const result = compiled.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
     assert.equal(result?.toolUseId, 't1');
-    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    assert.equal(result?.content, '[truncated — this result is in the chars the marker above elides]');
     await manager.close();
   });
 
-  it('text past the cap is dropped with one marker where it began', async () => {
+  it('text blocks wholly in the middle are dropped, with one marker where the middle starts', async () => {
     const path = freshPath();
     const manager = await ContextManager.open({
       path,
@@ -554,17 +557,19 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'text', text: 'second' },
       { type: 'text', text: 'third' },
+      { type: 'text', text: 'y'.repeat(2000) },
     ]);
     const compiled = await manager.compile(budget);
     const blocks = compiled.messages[0].content.map((b) => (b as { text: string }).text);
-    assert.equal(blocks.length, 2, 'the cut block and one marker for the two dropped ones');
-    assert.match(blocks[0], /\[truncated — original was 500 tokens\]$/);
-    assert.equal(blocks[1], '[content omitted: this message reached its token limit]');
+    assert.equal(blocks.length, 3, 'the head, one marker for the dropped middle, the tail');
+    assert.match(blocks[0], /^x+$/);
+    assert.match(blocks[1], /^\[truncated — chars \d+ to \d+ of 4011 elided here; the whole is stored message \S+\]$/);
+    assert.match(blocks[2], /^y+$/);
     await manager.close();
   });
 });
 
-describe('the message cap\'s omission marker, in both strategies', () => {
+describe('the message cap\'s marker, in both strategies', () => {
   // Room for the image the cap keeps, which a capped message's price counts
   // as it renders (#223), at the store's 1,600 tokens.
   const budget = { maxTokens: 3000, reserveForResponse: 50 };
@@ -573,7 +578,7 @@ describe('the message cap\'s omission marker, in both strategies', () => {
     ['autobiographical', () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 })],
   ] as const;
   for (const [name, make] of strategies) {
-    it(`${name}: goes where the first dropped text was, after a tool result and an image the cap keeps`, async () => {
+    it(`${name}: goes where the middle starts, and a tool result, an image and a short text in the tail stay as they are`, async () => {
       const path = freshPath();
       const manager = await ContextManager.open({ path, strategy: make() });
       manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
@@ -588,14 +593,14 @@ describe('the message cap\'s omission marker, in both strategies', () => {
       // message's blocks in order across the turns after the call.
       const call = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use'));
       const blocks = compiled.messages.slice(call + 1).flatMap((m) => m.content);
-      assert.deepEqual(blocks.map((b) => b.type), ['text', 'tool_result', 'image', 'text']);
-      assert.match((blocks[0] as { text: string }).text, /\[truncated — original was 500 tokens\]$/);
-      assert.equal((blocks[1] as { content: unknown }).content, '[content omitted: this message reached its token limit before this result]');
-      assert.equal((blocks[3] as { text: string }).text, '[content omitted: this message reached its token limit]');
+      assert.deepEqual(blocks.map((b) => b.type), ['text', 'text', 'text', 'tool_result', 'image', 'text']);
+      assert.match((blocks[1] as { text: string }).text, /^\[truncated — chars \d+ to \d+ of 2015 elided here; the whole is stored message \S+\]$/);
+      assert.equal((blocks[3] as { content: unknown }).content, 'the file');
+      assert.equal((blocks[5] as { text: string }).text, 'dropped');
       await manager.close();
     });
 
-    it(`${name}: isn't written for text blocks past the cap that hold nothing, which are left out, since nothing was lost`, async () => {
+    it(`${name}: is written once, and text blocks that hold nothing at the end stay in the tail as they are`, async () => {
       const path = freshPath();
       const manager = await ContextManager.open({ path, strategy: make() });
       manager.addMessage('u', [
@@ -605,22 +610,22 @@ describe('the message cap\'s omission marker, in both strategies', () => {
       ]);
       const compiled = await manager.compile(budget);
       const blocks = compiled.messages.flatMap((m) => m.content);
-      assert.equal(blocks.length, 1, `only the cut block is sent: ${JSON.stringify(blocks)}`);
-      assert.match(String((blocks[0] as { text?: string }).text), /\[truncated — original was 500 tokens\]$/);
+      assert.deepEqual(blocks.map((b) => (b as { text?: string }).text?.replace(/^x+$/, 'x…')),
+        ['x…', (blocks[1] as { text?: string }).text, 'x…', '', '  '], `head, marker, tail, and the blank blocks: ${JSON.stringify(blocks).slice(0, 300)}`);
+      assert.match(String((blocks[1] as { text?: string }).text), /^\[truncated — chars \d+ to \d+ of 2002 elided here/);
       await manager.close();
     });
   }
 });
 
 describe('WindowedPassthroughStrategy: the price of a message the cap leaves whole', () => {
-  it('is its full estimate, as it renders, though its estimate passed the cap', async () => {
-    // Eleven one-character blocks estimate at 11 tokens, rounded up per block, past the 10-token cap,
-    // but their 11 characters fit its 40, so nothing is cut. A tool call, which the cap doesn't read,
-    // makes the message far larger than the budget.
+  it('is its full estimate, as it renders, though the message is far past the cap', async () => {
+    // Its text, 3 tokens, is under the 10-token cap, so nothing is cut. A tool call, which the cap
+    // doesn't read, makes the message far larger than the budget.
     const priced = async (maxMessageTokens: number | undefined): Promise<number> => {
       const manager = await ContextManager.open({ path: freshPath(), strategy: new WindowedPassthroughStrategy(maxMessageTokens === undefined ? {} : { maxMessageTokens }) });
       manager.addMessage('a', [
-        ...Array.from({ length: 11 }, (): ContentBlock => ({ type: 'text', text: 'x' })),
+        { type: 'text', text: 'x'.repeat(11) },
         { type: 'tool_use', id: 't1', name: 'zz_note', input: { note: 'y'.repeat(4000) } } as ContentBlock,
       ]);
       try {

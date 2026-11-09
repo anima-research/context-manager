@@ -38,6 +38,7 @@ import {
   withoutRawForms,
 } from '../src/raw-forms.js';
 import { wrapRecallAnswerContent } from '../src/recall-envelope.js';
+import { isCapMarker } from '../src/strategies/message-cap.js';
 import { stripEmptyTextBlocks } from '../src/strategies/autobiographical.js';
 import { hoistToolProse, toolProseStub } from '../src/tool-prose-hoist.js';
 
@@ -403,16 +404,15 @@ describe('raw forms: the strategies\' edits', () => {
     const manager = await ContextManager.open({ path: STORE, strategy });
     manager.addMessage('user', [{ type: 'text', text: 'go' }]);
     const long = 'y'.repeat(200);
-    // The first part fits and is kept as it was; the second is cut; the third is dropped, and a marker says so.
+    // The first part is in the head as it was, the second is cut there, and the third's end is the tail.
     manager.addMessage('Claude', [reasoning(), itemText('first part'), itemText(`second ${long}`), itemText(`third ${long}`)]);
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const reply = compiled.messages.find((m) => m.content.some((b) => b.type === 'redacted_thinking'))!;
-    const texts = reply.content.filter((b) => b.type === 'text');
-    assert.equal(texts.length, 3);
-    assert.equal((texts[0] as { text: string }).text, 'first part');
-    assert.ok((texts[1] as { text: string }).text.includes('[truncated'), 'the cap applied');
-    assert.equal((texts[2] as { text: string }).text, '[content omitted: this message reached its token limit]');
-    for (const t of texts) assert.equal(rawOf(t).rawItem, undefined, 'no part replays the uncut item');
+    const texts = reply.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    assert.equal(texts[0], 'first part');
+    assert.ok(texts.some((t) => t.startsWith('[truncated — chars')), 'the cap applied');
+    assert.match(texts.at(-1)!, /^y+$/, "the tail is the third part's end");
+    for (const t of reply.content.filter((b) => b.type === 'text')) assert.equal(rawOf(t).rawItem, undefined, 'no part replays the uncut item');
     const paired = reply.content.find((b) => b.type === 'redacted_thinking')!;
     assert.equal(rawOf(paired).rawItem, undefined, 'the reasoning paired with the cut item is released with it');
     assert.equal((paired as { data: string }).data, 'opaque', 'and keeps its encrypted content');
@@ -420,15 +420,15 @@ describe('raw forms: the strategies\' edits', () => {
   });
 
   it('the windowed strategy\'s message cap does the same', async () => {
-    const strategy = new WindowedPassthroughStrategy({ maxMessageTokens: 20 });
+    const strategy = new WindowedPassthroughStrategy({ maxMessageTokens: 60 });
     const manager = await ContextManager.open({ path: STORE, strategy });
     manager.addMessage('Claude', [xmlUse('a', '/big'), xmlUse('b', '/small')]);
     manager.addMessage('user', [xmlResult('a', 'z'.repeat(400)), xmlResult('b', 'small file')]);
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const results = compiled.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_result');
     const contents = results.map((r) => String((r as { content: unknown }).content));
-    assert.match(contents[0]!, /\[truncated — original was \d+ tokens\]$/, 'the first result is cut at the cap');
-    assert.equal(contents[1], '[content omitted: this message reached its token limit before this result]', 'the second is left out');
+    assert.match(contents[0]!, /\[truncated — chars \d+ to \d+ of 410 elided here; the whole is stored message \S+\]/, 'the first result is cut');
+    assert.equal(contents[1], 'small file', 'the second is in the tail, kept as it was');
     for (const r of results) assert.equal(rawOf(r).rawXml, undefined);
     const uses = compiled.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_use');
     for (const u of uses) assert.equal(rawOf(u).rawXml, CALLS_XML, 'the untouched calls replay verbatim');
@@ -659,52 +659,52 @@ describe('raw forms: the recall envelope', () => {
 
     it("doesn't name a summary whose only survivor is a blank part that came back as a copy, since it shows none of the summary", () => {
       const itemA = { ...MESSAGE_ITEM, id: 'msg_a' };
-      // The blank part spends a cap of 200 characters exactly and is kept. The next part, of the same
-      // item, is past the cap: it's dropped for the marker, and the item is given up, so the blank part
-      // comes back as a copy without it.
-      const a = { ...summary, id: 'L1-a', responseContent: [itemText(' '.repeat(200), itemA), itemText('the rest of the answer', itemA)] };
+      // The short blank part is in the head, kept; the head and tail end in the long blank parts,
+      // which are left out, and the text between them is elided. The item is given up, so the
+      // short blank part comes back as a copy without it.
+      const a = { ...summary, id: 'L1-a', responseContent: [
+        itemText(' '.repeat(10), itemA), itemText(' '.repeat(4000), itemA), itemText('the rest of the answer '.repeat(40), itemA), itemText(' '.repeat(4000), itemA),
+      ] };
       const strategy = new Exposed({});
       const capped = strategy.truncate(a.responseContent, 50);
-      assert.ok(capped[0]?.type === 'text' && (capped[0] as { text: string }).text === ' '.repeat(200) && rawOf(capped[0]).rawItem === undefined,
-        'premise: the blank part is kept, as a copy without its item');
-      assert.equal((capped[1] as { text: string }).text, OMITTED, 'premise: the next part is dropped for the marker');
+      assert.ok(capped[0]?.type === 'text' && (capped[0] as { text: string }).text === ' '.repeat(10) && rawOf(capped[0]).rawItem === undefined,
+        'premise: the short blank part is kept, as a copy without its item');
+      assert.ok(isCapMarker(capped[1]!) && capped.length === 2, 'premise: the marker stands for the rest');
       const { content, refs } = strategy.render([a], 50);
-      assert.deepEqual(listed(refs), [], 'its blank copy shows nothing, and it lost its next part');
+      assert.deepEqual(listed(refs), [], 'its blank copy shows nothing, and it lost its text');
       assert.deepEqual(content.map((b) => (b as { text?: string }).text), [OMITTED], 'so the answer holds no summary, and is the marker alone');
     });
 
     it("doesn't name a summary whose only survivor is a blank part kept as it was, since it shows none of the summary", () => {
-      // The blank part spends a cap of 200 characters exactly and is kept as the same block; the next
-      // part is past the cap and dropped for the marker.
-      const a = { ...summary, id: 'L1-a', responseContent: [plain(' '.repeat(200)), plain('the rest of the answer')] };
+      const a = { ...summary, id: 'L1-a', responseContent: [
+        plain(' '.repeat(10)), plain(' '.repeat(4000)), plain('the rest of the answer '.repeat(40)), plain(' '.repeat(4000)),
+      ] };
       const strategy = new Exposed({});
       const capped = strategy.truncate(a.responseContent, 50);
-      assert.equal(capped[0], a.responseContent[0], 'premise: the blank part is kept as it was');
-      assert.equal((capped[1] as { text: string }).text, OMITTED, 'premise: the next part is dropped for the marker');
+      assert.equal(capped[0], a.responseContent[0], 'premise: the short blank part is kept as it was');
+      assert.ok(isCapMarker(capped[1]!) && capped.length === 2, 'premise: the marker stands for the rest');
       const { content, refs } = strategy.render([a], 50);
-      assert.deepEqual(listed(refs), [], 'its blank part shows nothing, and it lost its next part');
+      assert.deepEqual(listed(refs), [], 'its blank part shows nothing, and it lost its text');
       assert.deepEqual(content.map((b) => (b as { text?: string }).text), [OMITTED], 'so the answer holds no summary, and is the marker alone');
     });
 
-    it("in the xml answer, doesn't admit a summary of which only blank blocks reach the cap, whether kept or across it", () => {
+    it("in the xml answer, doesn't admit a summary whose head and tail hold nothing, whether a blank block is kept or left out", () => {
       const strategy = new Exposed({ recallEnvelope: 'xml' });
-      // The second summary's blank block, 100 characters, spends its own cap of 25 tokens exactly and is
-      // kept, and its text is dropped for the marker.
       const first = { ...summary, id: 'L1-1', responseContent: [plain('first answer')] };
-      const kept = { ...summary, id: 'L1-2', responseContent: [plain(' '.repeat(100)), plain('second answer')] };
-      const keptCapped = strategy.truncate(kept.responseContent, 25);
-      assert.equal(keptCapped[0], kept.responseContent[0], 'premise: the blank block spends the 25 tokens exactly and is kept as it was');
-      assert.deepEqual(keptCapped.slice(1).map((b) => (b as { text?: string }).text), [OMITTED], 'premise: and the text after it is dropped for the marker');
-      const after = strategy.render([first, kept], 25);
-      assert.deepEqual(listed(after.refs), ['L1-1'], 'the second summary, whose blank block alone reached its cap, is not listed');
-      assert.ok(!after.content.some((b) => b.type === 'text' && b.text.includes(' '.repeat(100))), 'nor is its blank block in the answer');
-      assert.ok(!after.content.some((b) => b.type === 'text' && b.text.includes(OMITTED)), 'nor its marker: the answer is the first summary\'s');
-      // A first summary whose blank block crosses the cap's 100 characters: the cap ends there, and its
-      // text is dropped for the marker, so none of it shows.
-      const across = { ...summary, id: 'L1-1', responseContent: [plain(' '.repeat(400)), plain('the rest')] };
-      assert.deepEqual(strategy.truncate(across.responseContent, 25).map((b) => (b as { text?: string }).text), [OMITTED],
-        'premise: the blank block crosses the cap and is left out, and the text after it is dropped for the marker');
-      const alone = strategy.render([across], 25);
+      const kept = { ...summary, id: 'L1-2', responseContent: [
+        plain(' '.repeat(10)), plain(' '.repeat(4000)), plain('second answer '.repeat(40)), plain(' '.repeat(4000)),
+      ] };
+      const keptCapped = strategy.truncate(kept.responseContent, 50);
+      assert.equal(keptCapped[0], kept.responseContent[0], 'premise: the short blank block is kept as it was');
+      assert.ok(isCapMarker(keptCapped[1]!) && keptCapped.length === 2, 'premise: and the marker stands for the rest');
+      const after = strategy.render([first, kept], 50);
+      assert.deepEqual(listed(after.refs), ['L1-1'], 'the second summary, of which only its blank block was kept, is not listed');
+      assert.ok(!after.content.some((b) => b.type === 'text' && b.text.includes('second answer')), 'nor is any of its text in the answer');
+      assert.ok(!after.content.some((b) => b.type === 'text' && b.text.includes('[truncated')), 'nor its marker: the answer is the first summary\'s');
+      const across = { ...summary, id: 'L1-1', responseContent: [plain(' '.repeat(4000)), plain('the rest '.repeat(100)), plain(' '.repeat(4000))] };
+      const acrossCapped = strategy.truncate(across.responseContent, 50);
+      assert.ok(acrossCapped.length === 1 && isCapMarker(acrossCapped[0]!), 'premise: both blank blocks are left out, and the marker stands alone');
+      const alone = strategy.render([across], 50);
       assert.deepEqual(alone.content.map((b) => (b as { text?: string }).text), [OMITTED], 'the answer is the marker alone');
       assert.deepEqual(alone.refs, [], 'and lists none');
     });
@@ -728,23 +728,19 @@ describe('raw forms: the recall envelope', () => {
 
     it('takes a block of a summary whose text equals the marker, come back as a copy, for that block and not the marker', () => {
       const itemA = { ...MESSAGE_ITEM, id: 'msg_a' };
-      // A blank part and a part whose text is the marker's spend a cap of 56 characters exactly, so the
-      // next part, of the same item, is dropped for the marker, and both kept parts come back as copies.
-      const a = { ...summary, id: 'L1-a', responseContent: [itemText(' ', itemA), itemText(OMITTED, itemA), itemText('the rest of the answer', itemA)] };
-      const { content, refs } = new Exposed({}).render([a], 14);
+      // The short blank part and the part whose text is the marker's are in the head and kept, the head
+      // ends in the long blank part, and the rest of the item is elided, so both kept parts come back
+      // as copies.
+      const a = { ...summary, id: 'L1-a', responseContent: [
+        itemText(' ', itemA), itemText(OMITTED, itemA), itemText(' '.repeat(4000), itemA), itemText('the rest of the answer '.repeat(40), itemA), itemText(' '.repeat(4000), itemA),
+      ] };
+      const { content, refs } = new Exposed({}).render([a], 60);
       assert.ok(content[1] !== a.responseContent[1] && (content[1] as { text: string }).text === OMITTED && rawOf(content[1]!).rawItem === undefined,
-        'premise: the part whose text equals the marker is kept, as a copy without its item');
-      assert.equal((content[2] as { text: string }).text, OMITTED, 'premise: the next part is dropped for the marker');
-      assert.deepEqual(listed(refs), ['L1-a~'], 'its own text reached the answer, and it lost its next part');
-      assert.deepEqual(listed(new Exposed({ recallEnvelope: 'xml' }).render([a], 14).refs), ['L1-a~'],
-        'the xml answer admits it too: a block of its own whose text equals the marker is no marker');
-      // In the xml answer, a summary whose cut keeps only such a copy is admitted, and the summary after it
-      // is cut against its own cap.
-      const b = { ...summary, id: 'L1-b', responseContent: [itemText(OMITTED, itemA), itemText('x'.repeat(400), itemA)] };
-      const second = { ...summary, id: 'L1-c', responseContent: [plain('second answer')] };
-      const xml = new Exposed({ recallEnvelope: 'xml' }).render([b, second], 25);
-      assert.deepEqual(listed(xml.refs), ['L1-b~', 'L1-c'], 'the first summary is cut, and the second is whole');
-      assert.ok(xml.content.some((x) => x.type === 'text' && x.text.includes('second answer')), 'the second answer is in it');
+        'premise: the part whose text equals the omission text is kept, as a copy without its item');
+      assert.ok(isCapMarker(content[2]!), 'premise: the cut\'s marker follows it');
+      assert.deepEqual(listed(refs), ['L1-a~'], 'its own text reached the answer, and it lost the rest');
+      assert.deepEqual(listed(new Exposed({ recallEnvelope: 'xml' }).render([a], 60).refs), ['L1-a~'],
+        'the xml answer admits it too: a block of its own whose text equals the omission text is no marker');
     });
 
     it('in the xml answer, a blank block one summary\'s cap leaves out spends none of the next summary\'s cap', () => {
@@ -819,7 +815,7 @@ describe('raw forms: the recall envelope', () => {
     }
     const blank = { ...summary, id: 'L1-b', responseContent: [{ type: 'text', text: ' '.repeat(400) } as ContentBlock] };
     const { content, refs } = new Exposed({}).render(blank, 25);
-    assert.deepEqual(content.map((b) => (b as { text?: string }).text), ['[content omitted: this message reached its token limit]']);
+    assert.deepEqual(content.map((b) => (b as { text?: string }).text), ['[truncated — chars 0 to 400 of 400 elided here; the whole is stored summary L1-b]']);
     assert.deepEqual(refs, [{ id: 'L1-b', level: 1 }]);
   });
 
@@ -827,34 +823,34 @@ describe('raw forms: the recall envelope', () => {
     class Exposed extends AutobiographicalStrategy {
       combined(entries: SummaryEntry[], cap: number): ContentBlock[] { return this.renderCombinedRecallAnswer(entries, cap).content; }
     }
-    const OMITTED = '[content omitted: this message reached its token limit]';
-    const omissions = (content: ContentBlock[]) =>
-      content.filter((b) => b.type === 'text' && b.text.includes(OMITTED)).length;
+    const markers = (content: ContentBlock[]) => content.filter((b) => b.type === 'text' && b.text.includes('[truncated — chars')).length;
     const trailing = { type: 'redacted_thinking', data: 'opaque-2', rawItem: { type: 'reasoning', id: 'rs_2', encrypted_content: 'opaque-2' } } as ContentBlock;
-    // 'first answer' is 12 characters, 3 tokens: a cap of 3 keeps it whole, and cuts 'second answer', 13.
+    // 'first answer' fits a cap of 60 whole, and the second answer, 560 characters, is cut to it.
     const first = { ...summary, id: 'L1-1', responseContent: [itemText('first answer'), trailing] };
-    const second = { ...summary, id: 'L1-2', responseContent: [itemText('second answer', { ...MESSAGE_ITEM, id: 'msg_2' })] };
+    const second = { ...summary, id: 'L1-2', responseContent: [itemText('second answer '.repeat(40), { ...MESSAGE_ITEM, id: 'msg_2' })] };
     const strategy = new Exposed({ recallEnvelope: 'xml' });
 
-    const tight = strategy.combined([first, second], 3);
-    assert.equal(omissions(tight), 0, 'no summary is left out, so no marker');
-    assert.ok(tight.some((b) => b.type === 'text' && /^<cm-recall[^>]*>\nsec[\s\S]*\[truncated — original was \d+ tokens\]\n<\/cm-recall>$/.test(b.text)),
-      'the second answer is cut inside its own envelope');
+    const tight = strategy.combined([first, second], 60);
+    const marker = tight.findIndex((b) => b.type === 'text' && /^\[truncated — chars \d+ to \d+ of 560 elided here; the whole is stored summary L1-2\]$/.test(b.text));
+    assert.ok(marker > 0, 'the second answer is cut, its marker naming it');
+    assert.match((tight[marker - 1] as { text: string }).text, /^<cm-recall[^>]*>\nsecond answer/, 'its head opens its own envelope');
+    assert.match((tight[marker + 1] as { text: string }).text, /second answer \n<\/cm-recall>$/, 'and its tail closes it');
+    assert.ok(tight.some((b) => b.type === 'text' && b.text.includes('first answer')), 'no summary is left out');
     const at = tight.findIndex((b) => b.type === 'redacted_thinking');
     assert.ok(at >= 0, 'the first answer keeps its reasoning');
     assert.equal(rawOf(tight[at]!).rawItem, undefined, 'the separator follows it on the wire, so it goes id-less');
 
-    assert.equal(omissions(strategy.combined([first, second], 1_000)), 0, 'nothing cut, no marker');
+    assert.equal(markers(strategy.combined([first, second], 1_000)), 0, 'nothing cut, no marker');
 
-    // A cap that cuts the first answer's prose drops its later part too: that
-    // answer carries the one marker, inside its envelope, and the second
-    // answer follows it whole.
+    // A cap that cuts the first answer's prose: that answer carries the one
+    // marker, inside its envelope, and the second answer follows it whole.
     const twoParts = { ...summary, id: 'L1-3', responseContent: [itemText('x'.repeat(400)), itemText('later part')] };
-    const cut = strategy.combined([twoParts, second], 50);
-    assert.equal(omissions(cut), 1, 'one marker in all');
-    const marked = cut.findIndex((b) => b.type === 'text' && /\[content omitted: this message reached its token limit\]\n<\/cm-recall>$/.test(b.text));
-    assert.ok(marked >= 0, 'the marker sits inside the first answer\'s envelope');
-    assert.ok(cut.slice(marked + 1).some((b) => b.type === 'text' && b.text.includes('second answer')), 'and the second answer follows it');
+    const short = { ...summary, id: 'L1-4', responseContent: [itemText('the short answer')] };
+    const cut = strategy.combined([twoParts, short], 60);
+    assert.equal(markers(cut), 1, 'one marker in all');
+    const marked = cut.findIndex((b) => b.type === 'text' && /^\[truncated — chars \d+ to \d+ of 410 elided here; the whole is stored summary L1-3\]$/.test(b.text));
+    assert.ok(marked > 0 && /^<cm-recall/.test((cut[marked - 1] as { text: string }).text), 'the marker sits inside the first answer\'s envelope');
+    assert.ok(cut.slice(marked + 1).some((b) => b.type === 'text' && b.text.includes('the short answer')), 'and the second answer follows it');
   });
 
   it('the live-strip answer releases the item its stripped reasoning led to', () => {

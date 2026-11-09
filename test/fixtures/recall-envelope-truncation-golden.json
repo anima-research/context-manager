@@ -14,7 +14,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-memory-me\n\n[truncated — original was 13 tokens]"
+          "text": "[truncated — chars 0 to 51 of 51 elided here; the whole is stored summary L2-100]"
         }
       ]
     },
@@ -32,7 +32,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-memory-pl\n\n[truncated — original was 6 tokens]"
+          "text": "[truncated — chars 0 to 21 of 21 elided here; the whole is stored summary L1-101]"
         }
       ]
     },
@@ -55,7 +55,7 @@
         },
         {
           "type": "text",
-          "text": "zz-memory-wi\n\n[truncated — original was 6 tokens]"
+          "text": "[truncated — chars 0 to 23 of 23 elided here; the whole is stored summary L1-102]"
         }
       ]
     },
@@ -64,7 +64,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-turn-late\n\n[truncated — original was 19 tokens]"
+          "text": "[truncated — chars 0 to 75 of 75 elided here; the whole is stored message 5]"
         }
       ]
     }
@@ -84,7 +84,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-m\n\n[truncated — original was 13 tokens]"
+          "text": "[truncated — chars 0 to 51 of 51 elided here; the whole is stored summary L2-100]"
         }
       ]
     },
@@ -102,7 +102,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-m\n\n[truncated — original was 6 tokens]"
+          "text": "[truncated — chars 0 to 21 of 21 elided here; the whole is stored summary L1-101]"
         }
       ]
     },
@@ -125,7 +125,7 @@
         },
         {
           "type": "text",
-          "text": "zz-m\n\n[truncated — original was 6 tokens]"
+          "text": "[truncated — chars 0 to 23 of 23 elided here; the whole is stored summary L1-102]"
         }
       ]
     },
@@ -134,107 +134,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-t\n\n[truncated — original was 19 tokens]"
-        }
-      ]
-    }
-  ],
-  "hierarchicalCombined": [
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-memory-merged-level covering the first two tu\n\n[truncated — original was 13 tokens]"
-        },
-        {
-          "type": "text",
-          "text": "\n\n---\n\n"
-        },
-        {
-          "type": "text",
-          "text": "zz-memory-plain-prose"
-        },
-        {
-          "type": "text",
-          "text": "\n\n---\n\n"
-        },
-        {
-          "type": "thinking",
-          "thinking": "zz-carrier-reasoning",
-          "signature": "zz-signature"
-        },
-        {
-          "type": "text",
-          "text": "zz-memory-with-carriers"
-        }
-      ]
-    },
-    {
-      "participant": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-turn-latest ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n\n[truncated — original was 19 tokens]"
-        }
-      ]
-    }
-  ],
-  "hierarchicalCombinedTightCap": [
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-m\n\n[truncated — original was 13 tokens]"
-        },
-        {
-          "type": "text",
-          "text": "\n\n---\n\n"
-        },
-        {
-          "type": "text",
-          "text": "zz-m\n\n[truncated — original was 6 tokens]"
-        },
-        {
-          "type": "text",
-          "text": "\n\n---\n\n"
-        },
-        {
-          "type": "thinking",
-          "thinking": "zz-carrier-reasoning",
-          "signature": "zz-signature"
-        },
-        {
-          "type": "text",
-          "text": "zz-m\n\n[truncated — original was 6 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-t\n\n[truncated — original was 19 tokens]"
+          "text": "[truncated — chars 0 to 75 of 75 elided here; the whole is stored message 5]"
         }
       ]
     }
@@ -304,25 +204,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-memory-1 recollection of an earlier \n\n[truncated — original was 14 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-adaptive-memory-2 recollection of an earlier \n\n[truncated — original was 14 tokens]"
+          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L1-0]"
         }
       ]
     },
@@ -331,7 +213,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-8. zzzz zzzz zzzz zzzz zzzz zzz\n\n[truncated — original was 55 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 5]"
         }
       ]
     },
@@ -340,7 +222,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-9. zzzz zzzz zzzz zzzz zzzz zzz\n\n[truncated — original was 55 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 6]"
         }
       ]
     },
@@ -349,7 +231,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-10. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 8]"
         }
       ]
     },
@@ -358,7 +240,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-11. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 9]"
         }
       ]
     },
@@ -367,7 +249,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-12. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 10]"
         }
       ]
     },
@@ -376,7 +258,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-13. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 220 of 220 elided here; the whole is stored message 11]"
         }
       ]
     },
@@ -385,7 +267,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-14. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 13]"
         }
       ]
     },
@@ -394,7 +276,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-15. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 14]"
         }
       ]
     },
@@ -403,7 +285,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-16. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 15]"
         }
       ]
     },
@@ -412,7 +294,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-17. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 16]"
         }
       ]
     },
@@ -421,7 +303,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-18. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 18]"
         }
       ]
     },
@@ -430,7 +312,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-19. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 19]"
         }
       ]
     },
@@ -439,7 +321,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-20. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 20]"
         }
       ]
     },
@@ -448,7 +330,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-21. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 21]"
         }
       ]
     },
@@ -457,7 +339,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-22. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 23]"
         }
       ]
     },
@@ -466,7 +348,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-23. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 24]"
         }
       ]
     },
@@ -475,7 +357,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-24. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 25]"
         }
       ]
     },
@@ -484,7 +366,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-25. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 26]"
         }
       ]
     },
@@ -493,7 +375,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-26. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 28]"
         }
       ]
     },
@@ -502,7 +384,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-27. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 29]"
         }
       ]
     },
@@ -511,7 +393,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-28. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 30]"
         }
       ]
     },
@@ -520,7 +402,43 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-adaptive-turn-29. zzzz zzzz zzzz zzzz zzzz zz\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 31]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 33]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 34]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 35]"
+        }
+      ]
+    },
+    {
+      "participant": "User",
+      "content": [
+        {
+          "type": "text",
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 36]"
         }
       ]
     }
@@ -540,7 +458,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L2-6]"
         }
       ]
     },
@@ -558,43 +476,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 14 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 14 tokens]"
-        }
-      ]
-    },
-    {
-      "participant": "Context Manager",
-      "content": [
-        {
-          "type": "text",
-          "text": "What do you remember from earlier?"
-        }
-      ]
-    },
-    {
-      "participant": "Claude",
-      "content": [
-        {
-          "type": "text",
-          "text": "zz-a\n\n[truncated — original was 14 tokens]"
+          "text": "[truncated — chars 0 to 55 of 55 elided here; the whole is stored summary L2-7]"
         }
       ]
     },
@@ -603,7 +485,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 30]"
         }
       ]
     },
@@ -612,7 +494,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 31]"
         }
       ]
     },
@@ -621,7 +503,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 33]"
         }
       ]
     },
@@ -630,7 +512,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 34]"
         }
       ]
     },
@@ -639,7 +521,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 35]"
         }
       ]
     },
@@ -648,7 +530,7 @@
       "content": [
         {
           "type": "text",
-          "text": "zz-a\n\n[truncated — original was 56 tokens]"
+          "text": "[truncated — chars 0 to 221 of 221 elided here; the whole is stored message 36]"
         }
       ]
     }

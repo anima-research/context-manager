@@ -108,7 +108,7 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     await manager.close();
   });
 
-  it('text past maxMessageTokens is dropped with one marker where it began', async () => {
+  it('text past maxMessageTokens keeps its head and tail around one marker, and short blocks at the end stay whole', async () => {
     const strategy = new AutobiographicalStrategy({
       headWindowTokens: 0,
       recentWindowTokens: 100_000,
@@ -125,9 +125,11 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     ]);
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const texts = compiled.messages.flatMap(m => m.content).map(b => (b as { text?: string }).text);
-    assert.equal(texts.length, 2, 'the cut block and one marker for the two dropped ones');
-    assert.match(String(texts[0]), /\[truncated — original was 500 tokens\]$/);
-    assert.equal(texts[1], '[content omitted: this message reached its token limit]');
+    assert.equal(texts.length, 5, "the long block's head, the marker, its tail, and the two short blocks");
+    assert.match(String(texts[0]), /^x+$/);
+    assert.match(String(texts[1]), /^\[truncated — chars \d+ to \d+ of 2011 elided here; the whole is stored message \S+\]$/);
+    assert.match(String(texts[2]), /^x+$/);
+    assert.deepEqual(texts.slice(3), ['second', 'third']);
     await manager.close();
   });
 

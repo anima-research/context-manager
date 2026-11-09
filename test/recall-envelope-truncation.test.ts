@@ -12,19 +12,18 @@
  *
  * Two properties are asserted here:
  *
- *  1. Under a cap, on every path that renders recall pairs, every emitted
+ *  1. Under a cap, on the positioned and adaptive paths, every emitted
  *     envelope is whole: a complete opener, a complete closer, and, where
- *     the cap cuts, the truncation marker INSIDE them. This holds down to
- *     caps far smaller than the tag text itself — the envelope is not charged against
+ *     the cap cuts, the cut's marker INSIDE them. This holds down to caps far
+ *     smaller than the tag text itself — the envelope is not charged against
  *     `maxMessageTokens` (it is priced in `capRecallPairs`, where the
- *     accounting is load bearing), so what a tight cap buys is a few
- *     characters of prose inside intact tags rather than a broken tag.
+ *     accounting is load bearing), so what a tight cap leaves is the marker
+ *     inside intact tags rather than a broken tag. The combined path's cuts
+ *     are pinned in test/combined-recall-answer.test.ts, with summaries
+ *     longer than the marker.
  *  2. With the envelope off, capped renders are byte-identical to the tree
- *     before the fix apart from the omission marker the truncator writes
- *     where it drops text, and the adaptive renders' choice of what to fold,
- *     which pricing a capped raw message as it renders (#223) moved, and the
- *     combined cases' answers, which cut each summary on its own, for each of
- *     which the golden was captured again (see its generator), pinned against
+ *     before the fix apart from the cut's own changes, for each of which the
+ *     golden was captured again (see its generator), pinned against
  *     `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
  *     null golden runs the fixtures UNCAPPED and so cannot see this
  *     restructure; a red here is the fix leaking into the default path.
@@ -52,8 +51,8 @@ const GOLDEN = JSON.parse(
   readFileSync('test/fixtures/recall-envelope-truncation-golden.json', 'utf8'),
 ) as Record<string, RenderedMessage[]>;
 
-const TRUNCATION_MARKER = /\[truncated — original was \d+ tokens\]/;
-/** What the cap writes in place of what it leaves out of a message. */
+const TRUNCATION_MARKER = /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored (summary|message) \S+?\]/;
+/** The combined answer when it holds no summary. */
 const OMISSION_MARKER = '[content omitted: this message reached its token limit]';
 const WHOLE_ENVELOPE = /<cm-recall[^>]*>[\s\S]*?<\/cm-recall>/g;
 
@@ -107,7 +106,7 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
     });
   }
 
-  it('puts the truncation marker inside the envelope, not after it', async () => {
+  it('puts the marker inside the envelope, not after it', async () => {
     const rendered = await renderCappedCase('hierarchicalPositioned', 'xml');
     const answers = recallAnswers(rendered.messages);
     const truncated = answers.map(textOf).filter((text) => TRUNCATION_MARKER.test(text));
@@ -115,27 +114,14 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
     for (const text of truncated) {
       assert.match(
         text,
-        /\[truncated — original was \d+ tokens\]\n<\/cm-recall>$/,
-        'the truncation marker must land inside the envelope',
+        /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored summary \S+?\]\n<\/cm-recall>$/,
+        'the marker must land inside the envelope',
       );
     }
   });
 
-  it('keeps every envelope whole where the cap cuts a summary of the combined turn', async () => {
-    const rendered = await renderCappedCase('hierarchicalCombined', 'xml');
-    const answers = recallAnswers(rendered.messages);
-    assert.equal(answers.length, 1, 'the legacy combined path emits exactly one recall answer');
-    const text = textOf(answers[0]);
-    assertNoTornEnvelope(text, 'hierarchicalCombined');
-    const openers = text.match(/<cm-recall[^>]*>/g) ?? [];
-    const closers = text.match(/<\/cm-recall>/g) ?? [];
-    assert.ok(openers.length > 0, 'the combined answer must carry at least one envelope');
-    assert.equal(openers.length, closers.length, 'every opener in the combined turn needs its closer');
-    assert.match(text, TRUNCATION_MARKER, 'this cap must truncate the combined turn');
-  });
-
-  it('renders prose inside intact tags when the cap is smaller than the envelope itself', async () => {
-    for (const name of ['hierarchicalPositionedTightCap', 'hierarchicalCombinedTightCap', 'adaptiveTightCap'] as const) {
+  it('renders the marker inside intact tags when the cap is smaller than the envelope itself', async () => {
+    for (const name of ['hierarchicalPositionedTightCap', 'adaptiveTightCap'] as const) {
       const rendered = await renderCappedCase(name, 'xml');
       const answers = recallAnswers(rendered.messages);
       assert.ok(answers.length > 0, `${name}: a tight cap must still emit recall pairs`);
@@ -145,10 +131,10 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
         const bodies = envelopeBodies(answer);
         assert.ok(bodies.length > 0, `${label}: envelope body must be readable`);
         // The documented boundary behaviour: the envelope is not charged
-        // against the cap, so a cap below the tag's own size still buys the
-        // prose it names — never an empty envelope, never a bare fragment.
+        // against the cap, so a cap below the tag's own size still leaves the
+        // marker inside it — never an empty envelope, never a bare fragment.
         for (const body of bodies) {
-          assert.match(body, TRUNCATION_MARKER, `${label}: a tight cap must truncate every summary's prose`);
+          assert.match(body, TRUNCATION_MARKER, `${label}: a tight cap must cut every summary's prose`);
           assert.ok(body.length > 0, `${label}: the envelope must not be empty`);
         }
       }
@@ -156,7 +142,6 @@ describe('recallEnvelope under maxMessageTokens: the cap cannot tear the envelop
   });
 });
 
-const TRAILING_TRUNCATION_MARKER = /\n\n\[truncated — original was \d+ tokens\]$/;
 const ENVELOPE_BODY = /<cm-recall[^>]*>\n([\s\S]*?)\n<\/cm-recall>/g;
 
 function combinedAnswerOf(messages: RenderedMessage[], label: string): RenderedMessage {
@@ -175,14 +160,9 @@ function separatorCount(answer: RenderedMessage): number {
   ).length;
 }
 
-/** What a summary's envelope body charged against the cap: its prose, without the cut's own markers. */
-function chargedTokens(body: string): number {
-  return Math.ceil(body.replace(TRAILING_TRUNCATION_MARKER, '').replace(OMISSION_MARKER, '').length / 4);
-}
-
-describe('recallEnvelope under maxMessageTokens: the combined turn cuts each summary to the cap on its own', () => {
-  for (const maxMessageTokens of [1, 4, 6, 12, 13, 21]) {
-    it(`cap ${maxMessageTokens}: every summary in its own whole envelope, none charged past the cap`, async () => {
+describe('recallEnvelope under maxMessageTokens: the combined turn measures each summary against the cap on its own', () => {
+  for (const maxMessageTokens of [13, 21]) {
+    it(`cap ${maxMessageTokens}: every summary that fits the cap on its own is whole, in its own whole envelope, though together they pass it`, async () => {
       const label = `cap ${maxMessageTokens}`;
       const rendered = await renderHierarchicalFixture({ maxMessageTokens, positionedRecallPairs: false, recallEnvelope: 'xml' });
       const answer = combinedAnswerOf(rendered.messages, label);
@@ -190,14 +170,9 @@ describe('recallEnvelope under maxMessageTokens: the combined turn cuts each sum
       const bodies = envelopeBodies(answer);
       assert.equal(bodies.length, 3, `${label}: all three summaries are in the answer`);
       assert.equal(separatorCount(answer), 2, `${label}: two separators join them`);
-      for (const [index, body] of bodies.entries()) {
-        assert.ok(chargedTokens(body) <= maxMessageTokens, `${label}: summary ${index} charged ${chargedTokens(body)} tokens against a cap of ${maxMessageTokens}`);
-      }
-      const fits = (prose: string): boolean => Math.ceil(prose.length / 4) <= maxMessageTokens;
-      if (fits(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE)) assert.equal(bodies[0], HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, `${label}: summary one fits, so it is whole`);
-      else assert.match(bodies[0], TRUNCATION_MARKER, `${label}: summary one is cut`);
-      if (fits(HIERARCHICAL_FIXTURE_PLAIN_PROSE)) assert.equal(bodies[1], HIERARCHICAL_FIXTURE_PLAIN_PROSE, `${label}: summary two fits, so it is whole`);
-      else assert.match(bodies[1], TRUNCATION_MARKER, `${label}: summary two is cut`);
+      assert.equal(bodies[0], HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE, `${label}: summary one fits, so it is whole`);
+      assert.equal(bodies[1], HIERARCHICAL_FIXTURE_PLAIN_PROSE, `${label}: summary two fits, so it is whole`);
+      assert.ok(!TRUNCATION_MARKER.test(textOf(answer)), `${label}: nothing is cut`);
     });
   }
 
