@@ -45,6 +45,38 @@ jobs:
       - name: Test (each file in its own process)
         run: bash scripts/test-each-file.sh
 
+  floors:
+    name: Build & Test at dependency floors (ubuntu-latest, node 22.12.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.12.0'
+
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: Install each dependency at its range's floor
+        run: node scripts/install-dependency-floors.mjs
+
+      - name: List installed packages
+        run: npm ls
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Test (each file in its own process)
+        run: bash scripts/test-each-file.sh
+
   install-and-start:
     name: Install & start (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
