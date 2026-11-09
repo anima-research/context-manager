@@ -178,8 +178,8 @@ dependency, optional and peer ones included, at the lowest release its range
 admits, since a host's own lockfile can hold that one. A range that joins lines
 with `||` gets one more run for each line other than its lowest, at that line's
 lowest release, with every other dependency at its lowest
-(`scripts/install-dependency-floors.mjs`). Two such ranges aren't tested in
-combination.
+(`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
+aren't tested in crossed combinations.
 Every other leg, on ubuntu and macos, installs with `npm ci`, packs
 the package, installs the tarball into an empty project and imports it. The
 lockfile is committed and strict: `npm install` on npm >= 11 will quietly
