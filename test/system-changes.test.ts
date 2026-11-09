@@ -890,6 +890,7 @@ describe('the passthrough strategies and a system change before their window', (
       if (strategy.getAnchor() !== anchor) anchors++;
       assert.ok(sentTokens(cm, next) <= budget, `compile after M-${i}: ${sentTokens(cm, next)} within ${budget}`);
       assert.ok(holdsChange(next.messages[0]!.content), 'a change still leads');
+      assert.deepEqual(changesSent(next), [cm.getMessage(ids.get('A')!)!.content, cm.getMessage(ids.get('B')!)!.content], `compile after M-${i}: each change once, as stored`);
     }
     assert.ok(anchors >= 2, `setup: the window moved again (${anchors})`);
   });
