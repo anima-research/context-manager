@@ -9,7 +9,11 @@
   request carries as many markers as it placed plus the declared ones. When
   the compile's own
   request is never accepted and a later call takes the count check in its
-  place, that call is held to the same count. Before,
+  place, that call is held to the same count. The count covers the request
+  kv-unified compiles: compression's requests are sent without
+  `cacheMarkers: 'cm-owned'`, so if the caller's hook marks those too,
+  membrane drops any markers past four, shallowest first, with a warning,
+  rather than refusing them. Before,
   such a hook's marker made every call's marker count differ from the
   compile's, so kv-unified kept no cache reference and weighed no cache
   costs, and once its own four were in use the hook's was a fifth, and

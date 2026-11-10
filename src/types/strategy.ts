@@ -1876,7 +1876,11 @@ export interface KvUnifiedConfig {
    * minus this many markers of its own, so its markers and the declared ones
    * together stay within Anthropic's four, and sets a compile's cache
    * reference only when its first accepted call's wire receipt counts
-   * kv-unified's markers plus this many.
+   * kv-unified's markers plus this many. The count covers the request
+   * kv-unified compiles. Compression's requests are sent without
+   * `cacheMarkers: 'cm-owned'`, so if the caller's hook marks those too,
+   * membrane drops any markers past four, shallowest first, with a warning,
+   * rather than refusing them.
    */
   callerCacheMarkers?: number;
 }
