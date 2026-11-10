@@ -3,10 +3,11 @@
   carries outside the messages, such as a membrane `beforeRequest` hook that
   marks the system prompt under `cacheMarkers: 'cm-owned'`. kv-unified then
   places at most 4 minus that many markers of its own (its history markers
-  spread over the history's tokens, the tail end always marked), so the
-  request stays within Anthropic's four, and sets a compile's cache
-  reference only when its first accepted call's request carries as many
-  markers as it placed plus the declared ones. When the compile's own
+  spread over the history's tokens, the tail end always marked), so its
+  markers and the declared ones together stay within Anthropic's four, and
+  sets a compile's cache reference only when its first accepted call's
+  request carries as many markers as it placed plus the declared ones. When
+  the compile's own
   request is never accepted and a later call takes the count check in its
   place, that call is held to the same count. Before,
   such a hook's marker made every call's marker count differ from the
