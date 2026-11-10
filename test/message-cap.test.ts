@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isEmptyTextBlock } from '../src/strategies/message-cap.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { isOpaqueCarrier } from '../src/raw-forms.js';
 
 /** Text and string tool results at four characters a token, as windowed passthrough counts. */
 function textEstimate(content: ContentBlock[]): number {
@@ -87,6 +88,13 @@ describe('capContent', () => {
     assert.equal(after.length, 3);
     assert.equal(after[1], carrier);
     assert.equal(textOf(after[2]), CAP_OMISSION_TEXT, 'a text block after the carrier is still dropped, and marked where it was');
+  });
+
+  it('with keepCarriers, cuts a text block that holds text whatever item it carries', () => {
+    const carrying = { type: 'text', text: 'a'.repeat(2000), rawItem: { type: 'web_search_call', id: 'ws_1' } } as ContentBlock;
+    assert.equal(isOpaqueCarrier(carrying), false, 'a block holding text is no zero-width carrier');
+    const out = capContent([text('a'.repeat(2000)), carrying], 100, textEstimate, true);
+    assert.ok(!out.includes(carrying), 'it is cut like any text past the cap');
   });
 
   it('leaves out blocks that hold nothing past the cap, with no marker, and keeps the rest as they were', () => {

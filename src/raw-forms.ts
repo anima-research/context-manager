@@ -77,11 +77,12 @@ function isReasoningItem(block: ContentBlock): boolean {
 
 /**
  * A text block carrying an opaque Responses item: membrane's zero-width carrier
- * for an item it has no block for (see membrane's parseProviderContent). A text
- * block from a message item's part carries that message item instead.
+ * for an item it has no block for (see membrane's parseProviderContent), whose
+ * text is empty. A text block from a message item's part carries that message
+ * item instead.
  */
 export function isOpaqueCarrier(block: ContentBlock): boolean {
-  if (block.type !== 'text') return false;
+  if (block.type !== 'text' || (block as { text?: unknown }).text !== '') return false;
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }

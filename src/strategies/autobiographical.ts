@@ -19660,7 +19660,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // in a shape that refusal leaves alone.
         closeCurrent(i);
       }
-      let msgTokens = store.estimateTokens(msg);
+      let msgTokens = store.estimateTokens(
+        msg.content.some(isOpaqueCarrier) ? { ...msg, content: msg.content.filter((block) => !isOpaqueCarrier(block)) } : msg,
+      );
 
       if (this.config.attachmentsIgnoreSize) {
         msgTokens = this.estimateTextOnlyTokens(msg);

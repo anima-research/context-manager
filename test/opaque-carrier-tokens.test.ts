@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AutobiographicalStrategy, ContextLog, MessageStore, jsonTokenEstimator } from '../src/index.js';
+import { AutobiographicalStrategy, ContextLog, ContextManager, MessageStore, jsonTokenEstimator } from '../src/index.js';
 
 type Estimate = (content: ContentBlock[]) => number;
 
@@ -153,5 +153,33 @@ describe('zero-width carriers in a stored message', () => {
       assert.strictEqual(strategy.sent([carrier(item), answer], ctx), strategy.sent([answer], ctx), `sentTokensOf, ${String(item.type)}`);
       assert.strictEqual(strategy.prepared([carrier(item), answer], ctx), strategy.prepared([answer], ctx), `preparedTokensOf, ${String(item.type)}`);
     }
+  });
+});
+
+describe('chunks sized with attachments counted leave carriers out, as a compression request does', () => {
+  async function chunkSizes(withCarriers: boolean): Promise<number[]> {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-carrier-chunks-'));
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'mock', attachmentsIgnoreSize: false, targetChunkTokens: 1_400, headWindowTokens: 0, recentWindowTokens: 0,
+    });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    try {
+      for (let i = 0; i < 12; i++) {
+        const text: ContentBlock = { type: 'text', text: 'word '.repeat(200) };
+        manager.addMessage(i % 2 === 0 ? 'user' : 'agent', i % 2 === 1 && withCarriers ? [text, carrier(SEARCH_RESULT)] : [text]);
+      }
+      const internals = strategy as unknown as { rebuildChunks(store: unknown): void; chunks: Array<{ messages: unknown[] }> };
+      internals.rebuildChunks((manager as unknown as { messageStore: unknown }).messageStore);
+      return internals.chunks.map((c) => c.messages.length);
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('closes the same chunks with a search result on each agent message as without', async () => {
+    const without = await chunkSizes(false);
+    assert.ok(without.length > 0 && without.every((n) => n > 4), `premise: without carriers, each chunk holds more than the minimum four messages (${without})`);
+    assert.deepStrictEqual(await chunkSizes(true), without);
   });
 });
