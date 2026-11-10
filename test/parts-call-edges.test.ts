@@ -381,6 +381,16 @@ describe('a run of messages that each hold a call and a result', () => {
 
 describe('the edges held at chunk coverage, where an older chunk divides a body stored before', () => {
   class Seeded extends Probe {
+    holds = true;
+    leftOut = new Set<string>();
+    protected override windowsHoldAtCoverage(): boolean {
+      return this.holds;
+    }
+    protected override summariesAcross(...args: Parameters<Probe['summariesAcross']>): ReturnType<Probe['summariesAcross']> {
+      const across = super.summariesAcross(...args);
+      for (const id of across) this.leftOut.add(id);
+      return across;
+    }
     seedL1(id: string, sourceIds: string[]): void {
       this.summaries.push({
         id, level: 1, content: `${id} recalls ${sourceIds.length} messages`, tokens: 8, sourceLevel: 0, sourceIds,
@@ -438,6 +448,49 @@ describe('the edges held at chunk coverage, where an older chunk divides a body 
       } finally { await o.close(); }
     });
   }
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: the recent window, its count reaching back before the body, gives way only as far as the body's first part where its hold after an older chunk over the body's first two parts would part the pair, and an earlier chunk's summary isn't left out`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-earlier', o.ids.slice(0, o.body[0]!));
+        o.s.seedL1('L1-older', o.ids.slice(o.body[0]!, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+        assert.equal(o.s.recentStart(o.view()), o.body[0]);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+        assert.ok(o.s.leftOut.has('L1-older'), "premise: the older chunk's summary, over messages the window takes in, is left out");
+        assert.ok(!o.s.leftOut.has('L1-earlier'), "the earlier chunk's summary isn't left out");
+      } finally { await o.close(); }
+    });
+  }
+  it("where the recent window's hold gives way, its start is never before the start it has without the holds", async () => {
+    const shapes: Array<[string, (o: Awaited<ReturnType<typeof stored>>) => void]> = [
+      ['an older chunk over the body\'s first two parts, the count inside the body', (o) => {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), o.body[3]!) + 1 });
+      }],
+      ['the same chunk, the count before the body', (o) => {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+      }],
+      ['an earlier chunk and an older one over the body\'s first two parts, the count before the body', (o) => {
+        o.s.seedL1('L1-earlier', o.ids.slice(0, o.body[0]!));
+        o.s.seedL1('L1-older', o.ids.slice(o.body[0]!, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+      }],
+    ];
+    for (const [shape, seed] of shapes) {
+      const o = await stored('adaptive');
+      try {
+        seed(o);
+        o.s.holds = false;
+        const stock = o.s.recentStart(o.view());
+        o.s.holds = true;
+        const held = o.s.recentStart(o.view());
+        assert.ok(held >= stock, `${shape}: the start, ${held}, is at or after the start without the holds, ${stock}`);
+        assert.ok(!parts(o, held), `${shape}: the start, ${held}, doesn't part the call from its result`);
+      } finally { await o.close(); }
+    }
+  });
   it(`a named limit, in the adaptive selection: the head window, its count reaching the body's fourth part, where the newest older chunk starts there and holds the result, ends before the body, and the request sends the call with a stub, the result inside that chunk's summary, which the middle folds`, async () => {
     const o = await stored('adaptive');
     try {
