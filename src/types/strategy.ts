@@ -241,6 +241,12 @@ export interface ReadinessState {
  * Strategies control how context is selected, compressed, and maintained.
  */
 export interface ContextStrategy {
+  /**
+   * Whether this strategy's select reads `SelectOptions.thinkingStanding`.
+   * The manager works it out from the branch's record only for one that
+   * says so; absent or false, a binding compile's select gets none.
+   */
+  readsThinkingStanding?(): boolean;
   /** Strategy name for identification */
   readonly name: string;
 
@@ -669,6 +675,31 @@ export interface ThinkingBinding {
 }
 
 /**
+ * Which stored replies' thinking a binding compile could still send, as the
+ * branch's record has it before the compile selects anything (see
+ * `SelectOptions.thinkingStanding`). It is what holds while the request
+ * stays as the record has it: the compile itself may leave out more, from
+ * the first message that differs.
+ */
+export interface ThinkingStanding {
+  /** No stored reply keeps its thinking, whatever is selected: a head
+   *  digest differs from the record's, the record vouches for nothing, or
+   *  the branch has no record and the request no drop control. */
+  none: boolean;
+  /** The stored bodies whose thinking is already left out: sent without it
+   *  by the record's compile, or noted since as set aside by the provider. */
+  without: ReadonlySet<MessageId>;
+  /** A reply stored at or below this sequence keeps no thinking; absent
+   *  under the drop control, which leaves those to the provider. */
+  recordedAfter?: Sequence;
+  /** A reply stored above this sequence keeps no thinking: it is past the
+   *  end of what the record vouches for (what its compile sent, and what a
+   *  host has noted since), where nothing is compared. Absent with no
+   *  record, where the drop control leaves every reply to the provider. */
+  recordedThrough?: Sequence;
+}
+
+/**
  * Digests of what a request carries before its messages, as the host sends
  * it, each opaque to the context manager and compared only for equality:
  * the system text (system-position injections included), the tools in the
@@ -824,6 +855,16 @@ export interface SelectOptions {
    * `CompileResult.systemInjections`.
    */
   identity?: RequestIdentity;
+  /**
+   * Set by the context manager on the select of a compile with
+   * `thinkingBinding.binds`, and not read from a caller: what the branch's
+   * binding record says, before anything is selected, of the thinking its
+   * stored replies still carry. A strategy that weighs what a change of
+   * layout would drop reads it (the memory strategy's kv-unified
+   * `thinkingLambda`); it changes nothing about what the compile then
+   * leaves out, which the manager decides from what the select returns.
+   */
+  thinkingStanding?: ThinkingStanding;
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
@@ -1427,6 +1468,11 @@ export interface RenderStats {
      *  N individual what-if solves it stopped or, remembered from a compile
      *  on the same inputs, skipped, joined by `+` (`ceiling=`). */
     ceiling?: string;
+    /** Under `foldingStrategy: 'kv-unified'` with `thinkingLambda`, on a
+     *  compile for a model that binds thinking: what a change of layout was
+     *  priced at for the thinking it would drop, in the solver's points,
+     *  rounded (`changePenalty=`). Absent where it is 0. */
+    changePenalty?: number;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
      *  live compile. A caller reads a dry pass's stats from its compile's
@@ -1662,6 +1708,36 @@ export interface KvUnifiedConfig {
      * after a move and then read at whole doublings of the turns since.
      */
     ageBandSteps?: number;
+    /**
+     * Linear price of a rewrite, in points per `cacheScale` of cache churn
+     * (the tokens a layout makes the provider compute again that the last
+     * accepted one wouldn't, times `cacheWritePrice - cacheReadPrice`).
+     * Above 0 it takes the place of the `cacheLambda` term. That term is
+     * quadratic and measured from the pool's cheapest layout, so two
+     * layouts that differ by a few hundred thousand tokens of rewrite
+     * score within a few dozen points, and a change that also re-levels
+     * old history, or folds a stray old message, costs about what one that
+     * only folds new history does. Priced linearly:
+     *
+     * - the layout last accepted, which rewrites nothing, is cheaper than
+     *   any change by that change's whole rewrite, so a small gain no
+     *   longer moves it;
+     * - a change that leaves the earlier cache breakpoints standing is
+     *   cheaper by what stands before them, so old history is re-leveled
+     *   (in either direction: it still returns to a shallower level) only
+     *   where that is worth the extra rewrite.
+     *
+     * The rewrite is measured from the last breakpoint a layout keeps, as
+     * the provider's cache is: changes between two breakpoints cost alike.
+     * With this set, `adoptEpsilon` is the tolerance on top of the
+     * rewrite's own price and can be small. Latent demand (which merges
+     * are worth producing) is decided as if this were 0, so summaries are
+     * produced as they are without it. Absent or 0: the `cacheLambda`
+     * term. As a starting value, 500 prices a 300k-token rewrite at a
+     * 1-hour cache's prices at about 2,900 points, which is what
+     * `adoptEpsilon: 3000` alone asks of a change today.
+     */
+    rewriteLambda?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;
@@ -1707,6 +1783,46 @@ export interface KvUnifiedConfig {
    * merge it would otherwise demand.
    */
   latentDemandMode?: 'individual' | 'joint';
+  /**
+   * What the thinking a change would drop is worth, in points per token,
+   * on a compile for a model that binds thinking
+   * (`SelectOptions.thinkingBinding.binds`); on any other compile it is
+   * not read. Such a model drops every thinking block after the first
+   * message that differs from the request the block was minted in, and
+   * the thinking still in play sits in the newest raw messages, after
+   * everything a fold or an unfold touches. So any change to the layout
+   * drops all of it, wherever the change begins, and the cost is the same
+   * for every change: the layout last accepted is kept while the best
+   * change beats it by no more than `adoptEpsilon` plus this cost
+   * (`KvUnifiedOptions.changePenalty`). It decides whether to change,
+   * never which change.
+   *
+   * The cost is this times the tokens of the thinking a change would
+   * drop: each of the agent's own stored replies still rendered raw whose
+   * thinking the branch's binding record still has as sent, counted at
+   * the store's price and weighted by 2^(-d / `thinkingHalfLifeTokens`),
+   * where d is the raw tokens between the reply and the newest message.
+   * Thinking the record no longer vouches for costs nothing, so after a
+   * change of tools or system text, or a change the provider already set
+   * the thinking aside for, a layout change that was waiting comes at
+   * once. With the layout seriously sticky while recent thinking is in
+   * play, the change comes when a turn starts with little of it, or when
+   * the budget's wall forces it.
+   *
+   * Absent or 0: thinking costs nothing, as for a model that doesn't bind
+   * it. As a starting value, 1 makes a few thousand tokens of recent
+   * thinking outweigh any budget pressure below the wall (the over-budget
+   * penalty reaches `budgetOverLambda` there). A value that isn't a finite
+   * number of 0 or more is refused at the compile that would read it.
+   */
+  thinkingLambda?: number;
+  /**
+   * The half-life, in raw tokens back from the newest message, of the
+   * weight `thinkingLambda` gives a reply's thinking. 50,000 unless set.
+   * Read only while `thinkingLambda` is above 0, where a value that isn't a
+   * finite number above 0 is refused at the compile.
+   */
+  thinkingHalfLifeTokens?: number;
 }
 
 export interface AutobiographicalConfig {
