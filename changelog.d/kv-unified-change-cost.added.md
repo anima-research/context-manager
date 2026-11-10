@@ -31,21 +31,25 @@
     thinking whatever it selects. `[plan-vs-actual]` shows the cost as
     `changePenalty=`, and `RenderStats.planVsActual.changePenalty` carries
     it. It is an upper bound: a change that begins after some raw replies
-    keeps their thinking, and they are priced all the same. A value that
-    isn't a finite number of 0 or more (above 0 for the half-life) is
-    refused at the compile, not read as off.
+    keeps their thinking, and they are priced all the same. A
+    `thinkingLambda` that isn't a finite number of 0 or more is refused at
+    the compile, not read as off, and so is a half-life that isn't above 0
+    while thinking is priced.
   - The context manager gives the select of a binding compile what the
     record says of its replies' thinking before anything is selected
     (`SelectOptions.thinkingStanding`, a new `ThinkingStanding`), as it
     gives `messageInjections`: a caller's value is dropped. It does so
     only for a strategy that says it reads it
     (`ContextStrategy.readsThinkingStanding`, which the memory strategy
-    answers true to while `thinkingLambda` is set), and a preview gets it
-    too, priced under the record's own head. It changes nothing about what
-    a compile leaves out.
+    answers true to while `thinkingLambda` is set), and a binding preview
+    always gets it, priced under the record's own head, since its overrides
+    may be what prices thinking. It changes nothing about what a compile
+    leaves out.
   - The binding record says how far it reaches: `through`, the sequence of
     the newest stored body its compile sent, and `continuedThrough`, the
-    newest row a note vouches for after that. Both are new and optional,
+    newest row a note vouches for after that, counted only while each row
+    the note names is the window's next one (a message another writer
+    stored mid-stream ends it). Both are new and optional,
     are written for every binding compile whether or not thinking is
     priced, and an earlier release reads a record that has them.
   - Latent demand is decided without either price, so the same merges are

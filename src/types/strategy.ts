@@ -1856,13 +1856,15 @@ export interface KvUnifiedConfig {
    * Absent or 0: thinking costs nothing, as for a model that doesn't bind
    * it. As a starting value, 1 makes a few thousand tokens of recent
    * thinking outweigh any budget pressure below the wall (the over-budget
-   * penalty reaches `budgetOverLambda` there).
+   * penalty reaches `budgetOverLambda` there). A value that isn't a finite
+   * number of 0 or more is refused at the compile that would read it.
    */
   thinkingLambda?: number;
   /**
    * The half-life, in raw tokens back from the newest message, of the
-   * weight `thinkingLambda` gives a reply's thinking. 50,000 unless set;
-   * a value that isn't a finite number above 0 takes the default.
+   * weight `thinkingLambda` gives a reply's thinking. 50,000 unless set.
+   * Read only while `thinkingLambda` is above 0, where a value that isn't a
+   * finite number above 0 is refused at the compile.
    */
   thinkingHalfLifeTokens?: number;
 }

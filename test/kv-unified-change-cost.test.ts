@@ -265,3 +265,69 @@ test('a preview is priced as the next compile is, and a caller\'s standing is dr
   assert.match(planLines.at(-1) ?? '', new RegExp(` changePenalty=${live} .*dryRun=true`), 'whatever standing the caller passed');
   manager.close();
 });
+
+test('a half-life nothing reads is not checked', async () => {
+  for (const kvUnified of [{ thinkingHalfLifeTokens: 0 }, { thinkingLambda: 0, thinkingHalfLifeTokens: 'far' }]) {
+    if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
+    const manager = await ContextManager.open({ path: STORE, strategy: new Probe(kvUnified, 100_000) });
+    manager.addMessage('User', [text('U1')]);
+    await assert.doesNotReject(manager.compile(BIG), JSON.stringify(kvUnified));
+    await assert.doesNotReject(manager.compile(BIG, [], bind({ dropBlock: true })), JSON.stringify(kvUnified));
+    manager.close();
+  }
+});
+
+test("a noted reply behind a row the note doesn't name is past the record, and costs nothing to lose", async () => {
+  const strategy = new Probe({ thinkingLambda: 2, thinkingHalfLifeTokens: 200 }, 100_000);
+  const manager = await ContextManager.open({ path: STORE, strategy });
+  manager.addMessage('User', [text('U1')]);
+  const first = await manager.compile(BIG, [], bind({ dropBlock: true }));
+  // Another writer's message is stored while the stream runs, then the stream's reply.
+  manager.addMessage('User', [text('U2 arrived during the stream')]);
+  const a1 = manager.addMessage('Claude', [thought(1), text('A1')]);
+  assert.equal(manager.noteRequestSent([a1], identity(), first.provenance!.compileId), true);
+  const next = await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.ok(next.thinkingStrip?.newly.includes(a1), 'premise: U2 sits where the record has A1, so A1 goes without its thinking');
+  assert.equal(next.renderStats?.planVsActual?.changePenalty, undefined, 'and nothing is priced for it');
+  manager.close();
+});
+
+test('with the reply the next row after what the compile sent, the note reaches it, and a second noted row after it', async () => {
+  const strategy = new Probe({ thinkingLambda: 2, thinkingHalfLifeTokens: 200 }, 100_000);
+  const manager = await ContextManager.open({ path: STORE, strategy });
+  manager.addMessage('User', [text('U1')]);
+  const first = await manager.compile(BIG, [], bind({ dropBlock: true }));
+  const a1 = manager.addMessage('Claude', [thought(1), text('A1')]);
+  const u2 = manager.addMessage('User', [text('U2')]);
+  const a2 = manager.addMessage('Claude', [thought(2), text('A2')]);
+  assert.equal(manager.noteRequestSent([a1, u2, a2], identity(), first.provenance!.compileId), true);
+  const next = await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.equal(next.thinkingStrip, undefined, 'premise: both replies keep their thinking');
+  const both = next.renderStats!.planVsActual!.changePenalty!;
+  // Noting only the first leaves the second past the record.
+  assert.equal(manager.noteRequestSent([a1], identity(), first.provenance!.compileId), true);
+  const one = await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.ok(one.renderStats!.planVsActual!.changePenalty! < both, 'one reply within the record is priced at less than two');
+  manager.close();
+});
+
+test('a preview whose overrides turn thinkingLambda on prices thinking', async (t) => {
+  const planLines: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[plan-vs-actual]')) planLines.push(line);
+    else original(...args);
+  });
+  const manager = await ContextManager.open({ path: STORE, strategy: new Probe({}, 100_000) });
+  manager.addMessage('User', [text('U1')]);
+  manager.addMessage('Claude', [thought(1), text('A1')]);
+  manager.addMessage('User', [text('U2')]);
+  await manager.compile(BIG, [], bind({ dropBlock: true }));
+  assert.ok(!planLines.at(-1)!.includes('changePenalty='), 'premise: the live config prices none');
+  planLines.length = 0;
+  const overrides = { kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy }, thinkingLambda: 2, thinkingHalfLifeTokens: 200 } };
+  assert.ok(manager.previewContext(BIG, overrides, { thinkingBinding: { binds: true, dropBlock: true, participant: 'Claude' } }));
+  assert.match(planLines.at(-1) ?? '', / changePenalty=\d+ .*dryRun=true/, 'the previewed config prices it');
+  manager.close();
+});

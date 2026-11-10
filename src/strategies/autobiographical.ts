@@ -17913,10 +17913,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (lambda !== undefined && (typeof lambda !== 'number' || !Number.isFinite(lambda) || lambda < 0)) {
       throw new Error(`kvUnified.thinkingLambda must be a finite number of 0 or more, got ${JSON.stringify(lambda) ?? String(lambda)}`);
     }
+    if (lambda === undefined || lambda === 0) return null;
+    // The half-life is read only where thinking is priced, and checked there.
     if (halfLife !== undefined && (typeof halfLife !== 'number' || !Number.isFinite(halfLife) || halfLife <= 0)) {
       throw new Error(`kvUnified.thinkingHalfLifeTokens must be a finite number above 0, got ${JSON.stringify(halfLife) ?? String(halfLife)}`);
     }
-    if (lambda === undefined || lambda === 0) return null;
     return { lambda, halfLife: halfLife ?? 50_000 };
   }
 

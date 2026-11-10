@@ -3510,13 +3510,16 @@ export class ContextManager {
    * that (`ContextStrategy.readsThinkingStanding`), and without the field
    * otherwise. It is the manager's to give, as the injections are: a
    * caller's value is dropped. A preview names no head (`identity`), and is
-   * priced as the next compile under the record's own head would be.
+   * priced as the next compile under the record's own head would be; it
+   * gets the standing `whatever` the strategy says of its live config, since
+   * the preview's overrides may be what prices thinking.
    */
   private withThinkingStanding<T extends { thinkingBinding?: SelectOptions['thinkingBinding']; thinkingStanding?: ThinkingStanding }>(
     opts: T | undefined,
     sameHeadAssumed: boolean,
+    whatever = false,
   ): T | undefined {
-    if (opts?.thinkingBinding?.binds === true && this.strategy.readsThinkingStanding?.() === true) {
+    if (opts?.thinkingBinding?.binds === true && (whatever || this.strategy.readsThinkingStanding?.() === true)) {
       return { ...opts, thinkingStanding: this.thinkingStandingFor(opts as SelectOptions, sameHeadAssumed) };
     }
     if (opts?.thinkingStanding === undefined) return opts;
@@ -3945,10 +3948,13 @@ export class ContextManager {
     const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
     let next = 0;
     const continued: string[] = [];
-    // How far the note vouches: the newest row before the first it can't
-    // vouch for. A row after that one is compared against the marker's place
-    // and keeps no thinking, whatever it is.
-    let continuedThrough: Sequence | undefined;
+    // How far the note vouches, for `BindingRecord.continuedThrough`: the
+    // rows it names, in order, for as long as each is the window's next row
+    // after the newest body the record's compile sent. It ends at the first
+    // row it can't vouch for, and at the first window row it doesn't name (a
+    // message another writer stored mid-stream sits where the record has
+    // the row after it, and the next compile diverges there).
+    const vouchedRows: StoredMessage[] = [];
     let unvouched = false;
     for (const row of rows) {
       const stored = typeof row === 'string' ? view.get(row) : null;
@@ -3970,7 +3976,21 @@ export class ContextManager {
       // participant goes as the user's, and a bundled tool cycle as each of
       // its parts.
       for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
-      if (!unvouched && (continuedThrough === undefined || stored.sequence > continuedThrough)) continuedThrough = stored.sequence;
+      if (!unvouched) vouchedRows.push(stored);
+    }
+    let continuedThrough: Sequence | undefined;
+    if (record.through !== undefined && vouchedRows.length > 0) {
+      const window = view.getAll();
+      // The window's first row after the newest body that compile sent.
+      let at = window.length;
+      while (at > 0 && window[at - 1]!.sequence > record.through) at--;
+      for (const row of vouchedRows) {
+        if (window[at]?.id !== row.id) break;
+        continuedThrough = row.sequence;
+        at++;
+        // A body stored as shards is one row of the note and several of the window.
+        while (row.bodyGroupId !== undefined && window[at]?.bodyGroupId === row.bodyGroupId) at++;
+      }
     }
     return this.writeBindingRecordFor(
       continueRecord(record, continued, identity, continuedThrough),
@@ -4129,7 +4149,7 @@ export class ContextManager {
         this.contextLog.createView(),
         budget,
         overrides,
-        this.withThinkingStanding(opts, true),
+        this.withThinkingStanding(opts, true, true),
       );
     } catch (err) {
       if (err instanceof NoFoldPlanToPreviewError) return null;
