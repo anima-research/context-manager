@@ -22,9 +22,21 @@
   stored before, with its call on its first part, the recent window's start, a
   compression hold, the head window's end and the chunker each keep the call's
   result with the whole body, as they keep a result with a call stored whole.
-  Two cases keep their old ends: a chunk closed before the upgrade and not yet
-  summarized, and a head window whose end the coverage anchor carries into
-  such a body, where the store's chunks begin partway through it.
+  One case keeps its old end: a chunk closed before the upgrade and not yet
+  summarized. Where a chunk closed before the upgrade owns some of such a
+  body's parts, a window's edge isn't held at the chunks' coverage where
+  holding it there would part the call from its result. The recent window
+  then starts at the latest edge before the hold that parts nothing, never
+  after the body's first part and never before the start it has without the
+  holds; the head keeps the end it has without the hold. Where the head
+  reaches forward to the chunks' coverage, it reaches past the result, to the
+  first message the chunks own where it parts no call from its result. Each
+  summary over a message a window then takes in is left out, and all of that
+  summary's messages go raw. Where the head's count lands inside such a body
+  and the store's newest chunk, one closed before the upgrade, starts inside
+  it and holds its result, the head ends before the body, and a selection
+  that folds that chunk sends the call with a stub, its result in the
+  chunk's summary.
 - A message with a block that carries a provider item (an object `rawItem`, as
   a Responses reply's message parts and reasoning do) is stored whole, however
   long, with every item in its place. It's capped as one message, and folds as
