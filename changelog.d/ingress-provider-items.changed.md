@@ -14,5 +14,4 @@
   or result. That holds in the autobiographical strategy (and so the knowledge
   strategy) and in windowed passthrough. Before, the carrier was dropped with
   the text after it. A cut part of a Responses message item still gives up the
-  item. An override of
-  `truncateContent` that calls the base needs to pass `keepCarriers` on.
+  item.
