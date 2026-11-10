@@ -129,3 +129,9 @@ npm run typecheck
 ## License
 
 MIT, as `package.json` declares.
+
+### Compression instruction templates
+
+See [compression instruction templates](docs/compression-instructions.md) for
+JSON-compatible per-phase customization, defaults, hook precedence, and host
+recipe wiring requirements.

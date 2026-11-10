@@ -1,3 +1,4 @@
+import type { CompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
@@ -1903,6 +1904,9 @@ export interface AutobiographicalConfig {
    *  background promise so compression runs automatically without the
    *  framework calling tick() explicitly. The name is the hook's older one. */
   autoTickOnNewMessage: boolean;
+  /** Base instruction-hook customization; see docs/compression-instructions.md. */
+  compressionInstructions?: CompressionInstructions;
+
   /** System prompt for summarization */
   summarySystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
