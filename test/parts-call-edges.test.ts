@@ -378,3 +378,64 @@ describe('a run of messages that each hold a call and a result', () => {
     });
   }
 });
+
+describe('the edges held at chunk coverage, where an older chunk divides a body stored before', () => {
+  class Seeded extends Probe {
+    seedL1(id: string, sourceIds: string[]): void {
+      this.summaries.push({
+        id, level: 1, content: `${id} recalls ${sourceIds.length} messages`, tokens: 8, sourceLevel: 0, sourceIds,
+        sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
+      } as never);
+      for (const m of sourceIds) this.resolutions.set(m as never, 1);
+    }
+  }
+  async function stored(kind: 'adaptive' | 'kv-unified') {
+    const o = await open({ layout: 'old', kind, persist: false, Strategy: Seeded, config: { headWindowTokens: 0, recentWindowTokens: 10_000_000, autoTickOnNewMessage: false } });
+    for (let k = 0; k < 4; k++) o.add(k % 2 ? 'a' : 'u', [text(`before ${k} ` + 'words '.repeat(40))]);
+    const body = o.add('a', [text(long('REPLY', 60_000)), call('c1')]);
+    const [answer] = o.add('u', [result('c1', 'what the tool said')]);
+    for (let k = 0; k < 3; k++) o.add(k % 2 ? 'u' : 'a', [text(`after ${k} ` + 'words '.repeat(40))]);
+    assert.ok(body.length > 3 && o.all()[body[0]!]!.content.some((b) => b.type === 'tool_use'), 'premise: the reply is stored in parts, with its call on the first');
+    return { ...o, s: o.strategy as Seeded, ids: o.all().map((m) => m.id), body, answer: answer! };
+  }
+  const sent = async (o: Awaited<ReturnType<typeof stored>>): Promise<{ called: boolean; answered: unknown }> => {
+    const messages = (await o.manager.compile({ maxTokens: 10_000_000, reserveForResponse: 0 })).messages as unknown as Array<{ content: ContentBlock[] }>;
+    const at = messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 'c1'));
+    const next = at < 0 ? undefined : messages[at + 1]?.content.find((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'c1');
+    return { called: at >= 0, answered: (next as { content?: unknown } | undefined)?.content };
+  };
+  const parts = (o: Awaited<ReturnType<typeof stored>>, edge: number): boolean => o.body[0]! < edge && o.answer >= edge;
+
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: the recent window, its count reaching the body's fourth part, isn't held after an older chunk that ends at its second; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), o.body[3]!) + 1 });
+        const start = o.s.recentStart(o.view());
+        assert.ok(!parts(o, start), `the recent window's start, ${start}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+    it(`${kind}: the head window, its count reaching the body's fourth part, doesn't end at an older chunk that starts at its third; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(o.body[2]!, o.ids.length - 2));
+        o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.body[3]!) + 1 });
+        const end = o.s.headEnd(o.view());
+        assert.ok(!parts(o, end), `the head's end, ${end}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+    it(`${kind}: the head window, its count past the whole body, isn't held at an older chunk that owns the body from its fourth part to the result; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(o.body[3]!, o.answer + 1));
+        o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.answer + 1) + 1 });
+        const end = o.s.headEnd(o.view());
+        assert.ok(!parts(o, end), `the head's end, ${end}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+  }
+});
