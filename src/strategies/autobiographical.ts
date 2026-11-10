@@ -66,6 +66,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { noRoomUnderRequestLimit, requestOverheadContent } from '../request-limit.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
@@ -2599,12 +2600,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
     const callerMarkers = this.config.kvUnified?.callerCacheMarkers ?? 0;
     if (!Number.isInteger(callerMarkers) || callerMarkers < 0 || callerMarkers > 3) {
-      const shown =
-        typeof callerMarkers === 'string' || typeof callerMarkers === 'object'
-          ? JSON.stringify(callerMarkers)
-          : String(callerMarkers);
       throw new RangeError(
-        `kvUnified.callerCacheMarkers is ${shown}; it must be an integer from 0 to 3, the cache markers the ` +
+        `kvUnified.callerCacheMarkers is ${inspect(callerMarkers)}; it must be an integer from 0 to 3, the cache markers the ` +
           `caller's request carries outside the messages. kv-unified places at most 4 minus that many of its own, ` +
           `and needs at least one.`,
       );

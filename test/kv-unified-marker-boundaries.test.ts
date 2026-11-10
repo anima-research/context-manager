@@ -467,9 +467,12 @@ describe("a caller that places its own cache markers outside the messages (kvUni
   });
 
   it('a declared count that is not an integer from 0 to 3 is refused when the strategy is built, naming the value as given', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
     for (const [declared, shown] of [
       [4, '4'], [-1, '-1'], [1.5, '1.5'], [Number.NaN, 'NaN'], [Number.POSITIVE_INFINITY, 'Infinity'],
-      ['1', '"1"'], [{ toString: null }, '{"toString":null}'], [1n, '1'],
+      ['1', "'1'"], [{ toString: null }, '{ toString: null }'], [1n, '1n'],
+      [circular, '<ref *1> { self: [Circular *1] }'], [{ n: 1n }, '{ n: 1n }'],
     ] as Array<[unknown, string]>) {
       assert.throws(() => kvUnified({ ...withCallerMarkers(declared as number) }), (error: unknown) =>
         error instanceof RangeError &&
