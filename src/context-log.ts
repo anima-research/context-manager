@@ -10,6 +10,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
+import { isOpaqueCarrier } from './raw-forms.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
 
@@ -302,7 +303,7 @@ export class ContextLog {
   private estimateBlockTokens(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
-        return this.tokenEstimator(block.text);
+        return isOpaqueCarrier(block) ? MessageStore.opaqueCarrierTokens(block) : this.tokenEstimator(block.text);
       case 'thinking': {
         // Mirrors MessageStore.computeBlockTokensRaw: stamped price wins;
         // a signed block is a full hidden chain of thought, priced by the

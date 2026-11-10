@@ -1160,5 +1160,5 @@ function estimateTextOnlyTokens(content: ContentBlock[]): number {
  * needs cutting, so the two strategies cap a message alike.
  */
 function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-  return capContent(content, maxTokens, estimateTextOnlyTokens);
+  return capContent(content, maxTokens, estimateTextOnlyTokens, true);
 }

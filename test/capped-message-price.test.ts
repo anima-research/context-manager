@@ -69,6 +69,14 @@ const CASES: Record<string, Case> = {
       ['u', [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock]],
     ],
   },
+  'text past the cap and a compaction carrier after it': {
+    cap: 100,
+    old: 'too little',
+    messages: [['a', [
+      { type: 'text', text: 'c'.repeat(2000) },
+      { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'E'.repeat(3_000) } } as ContentBlock,
+    ]]],
+  },
   'text alone past the cap': {
     cap: 100,
     old: 'too little',
@@ -165,6 +173,31 @@ function assertStatsMatch(manager: ContextManager, sent: number, adaptive: boole
       `planned ${stats.planVsActual.planned}, emitted ${stats.planVsActual.actual}`);
   }
 }
+
+describe('a raw message keeps a zero-width carrier past the cap', () => {
+  const strategies: Array<[string, () => ContextStrategy]> = [
+    ...SELECTIONS.map(([mode, config]) => [`autobiographical, ${mode}`, () => autobiographical(100, config)] as [string, () => ContextStrategy]),
+    ['windowed passthrough', () => new WindowedPassthroughStrategy({ maxMessageTokens: 100 })],
+  ];
+  for (const [label, make] of strategies) {
+    it(`${label}: a compaction carrier after the cut is sent, and the cut part gives up its message item`, async () => {
+      const item = { type: 'message', id: 'msg_1', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'c'.repeat(2000) }] };
+      const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'E'.repeat(3_000) } } as ContentBlock;
+      const { manager, close } = await open(make(), [['a', [{ type: 'text', text: 'c'.repeat(2000), rawItem: item } as ContentBlock, carrier]]]);
+      try {
+        const sent = (await manager.compile(BIG)).messages.flatMap((m) => m.content);
+        const typeOf = (b: ContentBlock) => ((b as { rawItem?: { type?: string } }).rawItem)?.type;
+        assert.ok(sent.some((b) => typeOf(b) === 'compaction'), 'the carrier is sent');
+        assert.ok(!sent.some((b) => typeOf(b) === 'message'), 'the cut part gives up its item');
+        const texts = sent.map((b) => (b as { text?: string }).text ?? '').filter((t) => t.length > 0);
+        assert.equal(texts.length, 1, 'one text is sent');
+        assert.match(texts[0], /^c{400}\n\n\[truncated — original was \d+ tokens\]$/, 'the cut part sends its text, cut at the cap');
+      } finally {
+        await close();
+      }
+    });
+  }
+});
 
 describe('a capped message is priced as it renders', () => {
   for (const [name, c] of Object.entries(CASES)) {

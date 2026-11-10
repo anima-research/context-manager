@@ -77,20 +77,31 @@ function isReasoningItem(block: ContentBlock): boolean {
 
 /**
  * A text block carrying an opaque Responses item: membrane's zero-width carrier
- * for an item it has no block for (see membrane's parseProviderContent). A text
- * block from a message item's part carries that message item instead.
+ * for an item it has no block for (see membrane's parseProviderContent), whose
+ * text is empty. A text block from a message item's part carries that message
+ * item instead.
  */
 export function isOpaqueCarrier(block: ContentBlock): boolean {
-  if (block.type !== 'text') return false;
+  if (block.type !== 'text' || (block as { text?: unknown }).text !== '') return false;
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
-function itemKey(block: ContentBlock): string | undefined {
+export function isCompactionCarrier(block: ContentBlock): boolean {
+  return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
+}
+
+/** Whether a block carries a provider item: the Responses formatter emits only an object `rawItem`. */
+export function carriesRawItem(block: ContentBlock): boolean {
   const raw = (block as RawFormCarrier).rawItem;
-  // The Responses formatter emits only an object, deduplicated per message by
-  // `type:id`, or by its JSON when it has no string id.
-  if (!raw || typeof raw !== 'object') return undefined;
+  return !!raw && typeof raw === 'object';
+}
+
+function itemKey(block: ContentBlock): string | undefined {
+  // The Responses formatter emits only an object (carriesRawItem), deduplicated
+  // per message by `type:id`, or by its JSON when it has no string id.
+  if (!carriesRawItem(block)) return undefined;
+  const raw = (block as RawFormCarrier).rawItem;
   const item = raw as { type?: unknown; id?: unknown };
   return typeof item.id === 'string'
     ? `item:${String(item.type ?? '')}:${item.id}`
