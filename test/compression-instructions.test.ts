@@ -11,7 +11,18 @@ const text = (value: string): ContentBlock => ({ type: 'text', text: value });
 const instruction = (r: NormalizedRequest) => r.messages.at(-1)!.content
   .filter(b => b.type === 'text').map(b => b.text).join('\n');
 const texts = (r: NormalizedRequest) => r.messages.flatMap(m => m.content.filter(b => b.type === 'text').map(b => b.text));
-const factual: CompressionInstructions = { preset: 'factual', participant: 'Participant' };
+const custom: CompressionInstructions = {
+  templates: {
+    opening: 'CUSTOM OPEN',
+    chunk: 'CUSTOM CHUNK {targetTokens}',
+    witnessedChunk: 'CUSTOM WITNESS {targetTokens}',
+    readingChunk: 'CUSTOM READ {totalTokens} {targetTokens}',
+    merge: 'CUSTOM MERGE {sourceLevelShown} {targetLevel} {targetTokens}',
+    witnessedMerge: 'CUSTOM WMERGE {sourceLevelShown} {targetLevel} {targetTokens}',
+    readingMerge: 'CUSTOM RMERGE {sourceLevelShown} {targetLevel} {totalTokens} {targetTokens}',
+    transition: 'CUSTOM TRANSITION {targetTokens}\n{context}',
+  },
+};
 const options: AutobiographicalOptions = {
   compressionModel: 'mock-only', headWindowTokens: 0, recentWindowTokens: 0,
   targetChunkTokens: 100, minChunkCharsForLLM: 0, mergeThreshold: 99,
@@ -49,7 +60,7 @@ async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: Comp
     const rawCount = texts(request).filter(s => s.startsWith('raw-')).length;
     return (split && rawCount > 1) || (mode.toLowerCase().includes('fallback') && calls.length === 1)
       ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 } }
-      : { content: [text('A factual note with retained attribution.')], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 } };
+      : { content: [text('A mock summary.')], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 } };
   } };
   const manager = await ContextManager.open({ path, strategy, membrane: membrane as never });
   try {
@@ -103,20 +114,22 @@ for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readi
 
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
   for (const pin of ['own', 'mixed', 'inherited'] as const) {
-    it(`${mode}/${pin}: factual instructions reach the actual request, not the stored data`, async () => {
-      const calls = await run(mode, pin, factual);
+    it(`${mode}/${pin}: template-only instructions reach the actual request, not the stored data`, async () => {
+      const calls = await run(mode, pin, custom);
       for (const [index, request] of calls.entries()) {
         const s = instruction(request);
-        assert.match(s, /about Participant/);
-        assert.match(s, /attribut/);
-        assert.match(s, /not.*instructions|not instructions/);
-        assert.doesNotMatch(s, /Do not invent motives or unobserved mental processes/);
-        if (mode.toLowerCase().includes('fallback') && index === 1) assert.match(s, /recalled L1 summaries into a single L2/);
-        else if (mode.toLowerCase().includes('merge') || mode.toLowerCase().includes('fallback')) assert.match(s, /raw L0 records into a single L2/);
-        if (mode === 'reading' || mode === 'readingMerge' || mode === 'readingFallback') assert.match(s, /larger text/);
-        if ((mode === 'chunk' || mode === 'merge' || mode === 'fallback') && pin === 'inherited') assert.match(s, /inherited history/);
+        const shown = mode.toLowerCase().includes('fallback') && index === 1 ? 1 : 0;
+        if (mode === 'transition') assert.match(s, /^CUSTOM TRANSITION 1500\n/);
+        else if (mode === 'readingMerge' || mode === 'readingFallback') {
+          assert.match(s, new RegExp(`^CUSTOM RMERGE ${shown} 2 \\d+ \\d+$`));
+        } else if (mode === 'merge' || mode === 'fallback') {
+          assert.match(s, new RegExp(`^CUSTOM ${pin === 'inherited' ? 'WMERGE' : 'MERGE'} ${shown} 2 \\d+$`));
+        } else if (mode === 'reading' || (mode === 'readingSplit' && index < 2)) {
+          // Canonical/source-only calls use reading; all split attempts use chunk hooks.
+          assert.match(s, /^CUSTOM READ \d+ \d+$/);
+        } else assert.match(s, pin === 'inherited' ? /^CUSTOM WITNESS \d+$/ : /^CUSTOM CHUNK \d+$/);
         if (mode === 'split' || mode === 'readingSplit' || mode === 'chunk' || mode === 'reading') {
-          assert.ok(texts(request).some(t => t.startsWith('The following messages are a historical record supplied as data.')));
+          assert.ok(texts(request).includes('CUSTOM OPEN'));
         }
       }
     });
@@ -125,7 +138,7 @@ for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readi
 
 it('every custom slot substitutes typed values; transition data and participant are nonrecursive', async () => {
   const config: CompressionInstructions = {
-    preset: 'factual', participant: 'Participant {targetTokens} $&',
+    participant: 'Participant {targetTokens} $&',
     templates: {
       opening: 'OPEN {participant}', chunk: 'CHUNK {participant} {targetTokens} {targetTokens}',
       witnessedChunk: 'WITNESS {targetTokens}', readingChunk: 'READ {totalTokens} {targetTokens}',
@@ -155,7 +168,7 @@ it('every custom slot substitutes typed values; transition data and participant 
 });
 
 it('invalid configuration fails synchronously before any provider can be called, without leaking values', () => {
-  for (const value of [null, [], 'secret', { preset: 'legacy' }, { preset: 'FACTUAL' }, { preset: 'factual' },
+  for (const value of [null, [], 'secret', { preset: 'unregistered-preset' }, { preset: 'DEFAULT' }, { preset: 1 }, { preset: null },
     { participant: '' }, { participant: 1 }, { participant: null }, { typo: 'secret' },
     { templates: {} }, { templates: [] }, { templates: { typo: 'secret' } },
     ...['', '  ', 42, null, {}, [], () => 'secret', '{', '}', '{{participant}}', '{targetToken}', '{unknown}', '{totalTokens}', '{participant}'].map(chunk => ({ templates: { chunk } })),
@@ -164,7 +177,7 @@ it('invalid configuration fails synchronously before any provider can be called,
   ]) {
     assert.throws(() => new Probe({ compressionInstructions: value as never }), { name: 'TypeError', message: 'Invalid compressionInstructions configuration' });
   }
-  validateCompressionInstructions(JSON.parse(JSON.stringify(factual)));
+  validateCompressionInstructions(JSON.parse(JSON.stringify(custom)));
   assert.throws(() => new Probe({ witnessedInstruction: 'old', compressionInstructions: { templates: { witnessedChunk: 'new' } } }), /Conflicting witnessed instruction configuration/);
 });
 
@@ -178,10 +191,10 @@ it('existing hooks and reminders keep their precedence', async () => {
   }
   for (const [mode, expected] of [['chunk', 'SUBCLASS'], ['reading', 'READ-SUBCLASS'], ['merge', 'MERGE-SUBCLASS'],
     ['readingMerge', 'READ-MERGE-SUBCLASS'], ['fallback', 'SOURCE-SUBCLASS']] as const) {
-    const calls = await run(mode, 'own', factual, { identityReminder: 'REMINDER' }, Custom);
+    const calls = await run(mode, 'own', custom, { identityReminder: 'REMINDER' }, Custom);
     assert.equal(instruction(calls.at(-1)!), `${expected}\n\nREMINDER`);
   }
-  const calls = await run('chunk', 'inherited', factual, { witnessedInstruction: 'EXISTING {targetTokens}', witnessedIdentityReminder: 'WITNESS-REMINDER' });
+  const calls = await run('chunk', 'inherited', { templates: { chunk: 'UNUSED CUSTOM CHUNK' } }, { witnessedInstruction: 'EXISTING {targetTokens}', witnessedIdentityReminder: 'WITNESS-REMINDER' });
   assert.match(instruction(calls[0]!), /^EXISTING \d+\n\nWITNESS-REMINDER$/);
 });
 
@@ -205,4 +218,40 @@ it('constructor snapshots templates; later caller edits cannot reach request hoo
   const strategy = new Expose({ compressionInstructions: config });
   config.templates!.opening = '{unsupported}';
   assert.equal(strategy.opening(), 'checked text');
+});
+
+it('empty settings and an unused explicit participant do not select new wording', async () => {
+  for (const config of [{}, { participant: 'Explicit actor' }, { preset: 'default', participant: 'Explicit actor' }] as CompressionInstructions[]) {
+    assert.deepEqual(await run('chunk', 'own', config), await run('chunk', 'own'));
+  }
+});
+
+it('only the registered default preset is accepted, including with complete templates', () => {
+  validateCompressionInstructions({ preset: 'default' });
+  validateCompressionInstructions({ ...custom, preset: 'default' });
+  for (const preset of ['unregistered-preset', 'DEFAULT', '', '__proto__', 'constructor']) {
+    for (const config of [{ preset }, { ...custom, preset, participant: 'Explicit actor' }]) {
+      assert.throws(() => validateCompressionInstructions(config), {
+        name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+      });
+      assert.throws(() => new Probe({ compressionInstructions: config as never }), {
+        name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+      });
+    }
+  }
+});
+
+it('participant is explicit and required only by custom placeholders, never inferred from summary ownership', () => {
+  for (const slot of ['opening', 'chunk', 'witnessedChunk', 'readingChunk', 'merge', 'witnessedMerge', 'readingMerge', 'transition'] as const) {
+    const template = slot === 'transition' ? '{participant} {context}' : '{participant}';
+    assert.throws(() => new Probe({ summaryParticipant: 'Not an implicit actor',
+      compressionInstructions: { templates: { [slot]: template } } }), {
+      name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+    });
+    validateCompressionInstructions({ participant: 'Explicit actor', templates: { [slot]: template } });
+  }
+});
+
+it('explicit default still permits custom overrides', async () => {
+  assert.deepEqual(await run('chunk', 'own', { ...custom, preset: 'default' }), await run('chunk', 'own', custom));
 });
