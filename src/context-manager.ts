@@ -36,6 +36,7 @@ import type {
   HotContextSettingsUpdate,
   RequestIdentity,
   SelectOptions,
+  ThinkingStanding,
   PreviewResult,
   HotContextSettingsStatus,
 } from './types/index.js';
@@ -70,7 +71,7 @@ import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-pr
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
-  UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   bindingStateId, refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
@@ -3224,6 +3225,14 @@ export class ContextManager {
       const { messageInjections: _callers, ...rest } = opts;
       selectOpts = rest;
     }
+    // What the branch's record says of its replies' thinking is the
+    // manager's to give, as the injections are: a caller's value is dropped.
+    if (opts?.thinkingBinding?.binds === true) {
+      selectOpts = { ...selectOpts, thinkingStanding: this.thinkingStandingFor(opts) };
+    } else if (selectOpts?.thinkingStanding !== undefined) {
+      const { thinkingStanding: _callers, ...rest } = selectOpts;
+      selectOpts = rest;
+    }
     const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
@@ -3468,6 +3477,36 @@ export class ContextManager {
         pending = null;
       },
     });
+  }
+
+  /**
+   * `SelectOptions.thinkingStanding` for a binding compile: which stored
+   * replies' thinking the branch's record still has as sent, read before
+   * the select. It follows `bindThinking`'s rules for what no compile could
+   * keep (another head, a record that vouches for nothing, no record and no
+   * drop control, a body already sent without its thinking or noted as set
+   * aside, a reply stored before the record began), and leaves the rest to
+   * the comparison `bindThinking` makes of what the select returns. A
+   * record that can't be read is read as none, without a line: the
+   * compile's own read (bindThinkingIn) says so.
+   */
+  private thinkingStandingFor(opts: SelectOptions): ThinkingStanding {
+    const dropBlock = opts.thinkingBinding?.dropBlock === true;
+    let record: BindingRecord | null = null;
+    try {
+      record = readBindingRecord(this.store, this.strategyNamespace).record;
+    } catch {
+      record = null;
+    }
+    if (record === null) return { none: !dropBlock, without: new Set() };
+    const identity = opts.identity;
+    const sameHead = identity !== undefined && IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]);
+    if (!sameHead || record.sent[0] === UNVOUCHED) return { none: true, without: new Set() };
+    return {
+      none: false,
+      without: new Set([...record.without, ...(record.dropped ?? [])]),
+      ...(dropBlock ? {} : { recordedAfter: record.recordedAfter }),
+    };
   }
 
   /**

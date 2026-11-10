@@ -53,6 +53,15 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
    * takes the minimum-token cut instead (#252), so a host can tell whoever
    * sets the recipe. */
   onCeilingFallback?: (hit: KvUnifiedCeilingHit) => void;
+  /** What any change to the accepted presentation costs beside its score,
+   * in the score's points: a cost that is the same for every cut outside
+   * the carried family, such as the thinking a model that binds it to the
+   * request drops when anything before it changes (the memory strategy's
+   * `thinkingLambda`). It decides whether a change beats staying put, never
+   * which change wins, so the live solve adds it to `adoptEpsilon`. Latent
+   * demand is decided without it: see `demand`. Absent, 0 or not a finite
+   * number above 0: no such cost. */
+  changePenalty?: number;
 }
 
 export interface KvUnifiedTimings {
@@ -127,8 +136,21 @@ export class KvUnifiedStrategy implements FoldingSolver {
   private ceilingGate = false;
   private ceilingJoint = false;
   private signature: string | undefined;
+  /** The options every latent-demand solve runs under, and the base they
+   * are measured against: these options without what a change costs
+   * (`changePenalty`, and the policy's `rewriteLambda`, in whose place the
+   * `cacheLambda` term stands). A merge is worth producing when the layout
+   * the policy would move to is better with it, and that is asked before a
+   * change is due: priced at what a change costs now, the best cut is the
+   * carried one in both pools for as long as staying put is cheaper, no
+   * merge would be demanded until a change is forced, and that change would
+   * find none of the summaries it needs. These options themselves where
+   * they price no change. */
+  private readonly demand: KvUnifiedOptions;
 
-  constructor(private readonly options: KvUnifiedOptions = {}) {}
+  constructor(private readonly options: KvUnifiedOptions = {}) {
+    this.demand = withoutChangeCost(options);
+  }
 
   get lastResult(): ParetoPolicySolveResult | null {
     return this.last;
@@ -160,7 +182,13 @@ export class KvUnifiedStrategy implements FoldingSolver {
     if (reuse) reuse.forest = forest;
     const t1 = performance.now();
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
-    const options = { ...this.options, maxTokens: budget.totalBudget };
+    const penalty = changePenaltyOf(this.options);
+    const options = {
+      ...this.options, maxTokens: budget.totalBudget,
+      // The same for every cut outside the carried family, so it is the
+      // tolerance the carried layout is kept within.
+      ...(penalty > 0 ? { adoptEpsilon: adoptEpsilonOf(this.options) + penalty } : {}),
+    };
     let result: ParetoPolicySolveResult;
     let live: KvUnifiedCeilingHit | undefined;
     try {
@@ -209,9 +237,8 @@ export class KvUnifiedStrategy implements FoldingSolver {
       );
     }
     // Demand is gated against the policy's best cut, which a fallback isn't.
-    const produced = this.options.latentDemand && !live
-      ? this.rankLatentDemand(inputs, forest, solver, result, budget)
-      : [];
+    const base = this.options.latentDemand && !live ? this.demandBase(solver, result, budget) : null;
+    const produced = base ? this.rankLatentDemand(inputs, forest, solver, base, budget) : [];
     this.requests = produced;
     this.timings = {
       ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves,
@@ -239,6 +266,29 @@ export class KvUnifiedStrategy implements FoldingSolver {
     };
   }
 
+  /** The base solve latent demand is measured against: the live result where
+   * the options price no change, and where the live solve was certified (its
+   * pool is the carried family, whose churn is zero, so it scores the same
+   * under `demand`). Otherwise the base solved again under `demand`: the
+   * same labels, scored without the change's price. Null where the label
+   * ceiling stopped that solve; then nothing is demanded this compile. */
+  private demandBase(
+    solver: ParetoKvUnifiedPolicySolver,
+    result: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+  ): Extract<ParetoPolicySolveResult, { feasible: true }> | null {
+    if (this.demand === this.options || result.certificate) return result;
+    this.demandSolves++;
+    try {
+      const base = solver.solve({ ...this.demand, maxTokens: budget.totalBudget });
+      return base.feasible ? base : null;
+    } catch (error) {
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      this.ceilingGate = true;
+      return null;
+    }
+  }
+
   /** Score producible higher-level parents with the same bounded solver used
    * for the live cut. Candidates are prefiltered by token reduction, then
    * ranked by the conservative (p80 recall-cost) welfare improvement. */
@@ -249,20 +299,20 @@ export class KvUnifiedStrategy implements FoldingSolver {
     baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
     budget: FoldingBudget,
   ): ProduceRequest[] {
-    const config = this.options.latentDemand!;
+    const config = this.demand.latentDemand!;
     // Holders of candidates this compile does not score are dropped: their
     // merge exists now, or is no longer producible.
-    const live = this.options.reuse;
+    const live = this.demand.reuse;
     const whatIf: WhatIfReuse = { base: forest, live, carried: live?.whatIf, kept: live ? new Map() : undefined };
     if (live) live.whatIf = whatIf.kept;
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
-    const policy = normalizePolicy(this.options.policy);
-    const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
+    const policy = normalizePolicy(this.demand.policy);
+    const multiplier = normalizeContinuityMultiplier(this.demand.continuityMultiplier);
     // Merges worth less than adoptEpsilon are not demanded; that is the
     // hysteresis policy's own tolerance, applied here to best-vs-best.
-    const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
-      ? this.options.adoptEpsilon!
+    const epsilon = Number.isFinite(this.demand.adoptEpsilon) && (this.demand.adoptEpsilon ?? 0) > 0
+      ? this.demand.adoptEpsilon!
       : 0;
     const args = [inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier] as const;
     return config.mode === 'joint' ? this.rankJointLatentDemand(...args) : this.rankIndividualLatentDemand(...args);
@@ -285,7 +335,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
       const conservative = this.measure(
-        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget, failure,
+        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.demand, budget.totalBudget, failure,
       );
       return conservative?.feasible ? [{ candidate, conservative }] : [];
     });
@@ -351,7 +401,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
         for (const entry of undecided) {
           const full = this.measure(
             inputs, whatIf, entry.candidate, entry.candidate.conservativeRecallTokens,
-            { ...this.options, hysteresisCertificate: false }, budget.totalBudget, failure,
+            { ...this.demand, hysteresisCertificate: false }, budget.totalBudget, failure,
           );
           // The certified pool is a real layout, so its gain is a floor. The
           // uncertified solve prunes and can come back worse: keep the better.
@@ -380,7 +430,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
           const tied = passing.some((other) => other !== entry && gain(other) === conservativeImprovement);
           const expected = this.measure(
             inputs, whatIf, candidate, candidate.expectedRecallTokens,
-            tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget, failure,
+            tied ? { ...this.demand, hysteresisCertificate: false } : this.demand, budget.totalBudget, failure,
           );
           // One the label ceiling stopped leaves the conservative gain to
           // order the request, as when the two costs are the same (#252).
@@ -482,7 +532,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     const remembered = whatIf.carried?.get(key);
     const stopped = remembered?.ceilingFailure;
     if (stopped !== undefined &&
-        (stopped === failure(this.options) || stopped === failure({ ...this.options, hysteresisCertificate: false }))) {
+        (stopped === failure(this.demand) || stopped === failure({ ...this.demand, hysteresisCertificate: false }))) {
       whatIf.kept?.set(key, remembered!);
       this.ceilingJoint = true;
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
@@ -510,7 +560,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     inputs: PickerInputs, budget: FoldingBudget, policy: KvUnifiedWelfarePolicy, multiplier: number,
   ): (options: KvUnifiedOptions) => string {
     return (options) => {
-      this.signature ??= ceilingFailureSignature(inputs, this.options, budget.totalBudget, policy, multiplier);
+      this.signature ??= ceilingFailureSignature(inputs, this.demand, budget.totalBudget, policy, multiplier);
       return `${this.signature}:${options.hysteresisCertificate ? 'certified' : 'uncertified'}`;
     };
   }
@@ -558,7 +608,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
   private unrestrictedBase(solver: ParetoKvUnifiedPolicySolver, budget: FoldingBudget): ParetoPolicySolveResult | null {
     this.demandSolves++;
     try {
-      return solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+      return solver.solve({ ...this.demand, maxTokens: budget.totalBudget, hysteresisCertificate: false });
     } catch (error) {
       if (!(error instanceof SparseLabelCeilingError)) throw error;
       this.ceilingGate = true;
@@ -579,7 +629,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     solveJoint: (options: KvUnifiedOptions) => ParetoPolicySolveResult,
   ): ProduceRequest[] {
     type Feasible = Extract<ParetoPolicySolveResult, { feasible: true }>;
-    const initial = solveJoint(this.options);
+    const initial = solveJoint(this.demand);
     if (!initial.feasible) return [];
     let joint: Feasible = initial;
     const best = (result: Feasible, cacheFloor: number, continuityFloor: number): number => {
@@ -612,7 +662,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     const settle = (): void => {
       const slack = joint.certificate?.maxImprovement ?? 0;
       if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
-        const full = solveJoint({ ...this.options, hysteresisCertificate: false });
+        const full = solveJoint({ ...this.demand, hysteresisCertificate: false });
         if (full.feasible) {
           // The two pools are compared in the shared frame, which the new
           // pool may lower; the frame never rises again.
@@ -1013,6 +1063,26 @@ function demandMissingL1(inputs: PickerInputs): ProduceRequest[] {
   }
   flush();
   return produced;
+}
+
+/** A change's fixed cost under these options (see `KvUnifiedOptions.changePenalty`). */
+function changePenaltyOf(options: KvUnifiedOptions): number {
+  const value = options.changePenalty;
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function adoptEpsilonOf(options: KvUnifiedOptions): number {
+  const value = options.adoptEpsilon;
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** These options without what a change costs, or the options themselves
+ * where they price none (see `KvUnifiedStrategy.demand`). */
+function withoutChangeCost(options: KvUnifiedOptions): KvUnifiedOptions {
+  const priced = (options.policy?.rewriteLambda ?? 0) > 0;
+  if (!priced && changePenaltyOf(options) === 0) return options;
+  const { changePenalty: _penalty, ...rest } = options;
+  return priced ? { ...rest, policy: { ...options.policy, rewriteLambda: 0 } } : rest;
 }
 
 // Kept as a function to avoid making the validation path depend on mutable
