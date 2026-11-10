@@ -3171,6 +3171,14 @@ export class ContextManager {
    * `SelectOptions.thinkingBinding`).
    *
    * It awaits nothing, so it doesn't wait for the strategy's background work.
+   *
+   * The `beforeUser` position is DEPRECATED (anima-research/agent-framework#171):
+   * placed again before the last user message at every compile, it moves as
+   * newer user messages arrive, and after a tool call it lands between the
+   * call and its result, which is carried in a user message. Store such
+   * content as an ordinary message (`addMessage`) instead. `system` and
+   * `afterUser` injections are supported, at the costs
+   * {@link ContextInjection.position} gives.
    */
   async compile(
     budget?: TokenBudget,

@@ -1763,11 +1763,20 @@ export interface AutobiographicalConfig {
   quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */
   targetChunkTokens: number;
-  /** Recent tokens to keep uncompressed (~30000) */
+  /** Recent tokens to keep uncompressed (~30000). Counted at the live
+   *  calibration multiplier. Once chunks exist, the window starts no earlier
+   *  than after the last message a chunk owns while that leaves it at least
+   *  half this size: a recalibration doesn't take chunked messages back into
+   *  the window, and a raised value fills from new messages. A value raised
+   *  to more than twice what the chunks left takes effect at once. */
   recentWindowTokens: number;
   /** Tokens at the head of the conversation to preserve verbatim (default: 0).
    *  Messages within this window are never chunked or compressed — they survive
-   *  as raw copies so initial instructions retain full granularity. */
+   *  as raw copies so initial instructions retain full granularity. Counted at
+   *  the live calibration multiplier. Once chunks exist, the head ends at the
+   *  first message a chunk owns while that keeps it between half and twice
+   *  this size, so a recalibration doesn't move it; past either bound the
+   *  token count decides. */
   headWindowTokens: number;
   /** Always break at message boundaries */
   chunkOnMessageBoundary: boolean;
@@ -2037,7 +2046,10 @@ export interface AutobiographicalConfig {
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. Kept within
-   *  `imageCeiling`, so 0 means up to that ceiling. A window kept at the
+   *  `imageCeiling`, so 0, the default, means up to that ceiling: stripping
+   *  an image that was already sent edits the prompt mid-history, which
+   *  rewrites the cache from there and invalidates the thinking after it, so
+   *  no limit strips unless a host sets one. A window kept at the
    *  ceiling leaves no room under it for images a caller appends to the
    *  compiled request, so a caller that keeps its requests within the
    *  ceilings recompiles at each image it adds; at about 1,600 tokens an
@@ -2055,7 +2067,8 @@ export interface AutobiographicalConfig {
    *  text placeholder, even though the surrounding text stays verbatim. Measured
    *  as cumulative tokens walked from the tail over the stored messages, before
    *  tool pruning and image strips, which the recent window's walk counts after.
-   *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
+   *  Typically much shallower than recentWindowTokens. 0, the default, = never
+   *  strip by depth. */
   imageStripDepthTokens?: number;
 
   /**
@@ -2076,7 +2089,7 @@ export interface AutobiographicalConfig {
    * only while their cumulative inline size (a base64 source, a `data:` URL's
    * payload, a generated image's `data`; 0 for a remote URL) stays under
    * this budget — on top of `maxLiveImages` / `imageStripDepthTokens`.
-   * Default 20 MiB of base64. The window keeps at most `imageByteCeiling`
+   * Default 0: no byte wall of its own. The window keeps at most `imageByteCeiling`
    * whatever this says, and 0 here means up to that ceiling. It counts the
    * images the window counts (see `maxLiveImages`), not the request's other
    * bytes, so on its own it can't keep a request under membrane's byte cap:
@@ -3089,8 +3102,11 @@ Write naturally, as recollection of what you experienced.`,
   carrierPolicy: 'full',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
-  maxLiveImages: 6,
-  imageStripDepthTokens: 30000,
+  // No image is stripped by default: replacing an already-sent image edits
+  // the prompt mid-history, which rewrites the cache from there and
+  // invalidates later thinking. Only the ceilings below still bind.
+  maxLiveImages: 0,
+  imageStripDepthTokens: 0,
   imageCeiling: DEFAULT_IMAGE_CEILING,
   imageByteCeiling: DEFAULT_IMAGE_BYTE_CEILING,
   positionedRecallPairs: true,
