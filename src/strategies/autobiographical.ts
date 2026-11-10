@@ -3070,9 +3070,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * API message at compile time (preserving KV cache structure).
    *
    * A message with a block that carries a provider item (an object
-   * `rawItem`, as a Responses reply's message parts and reasoning do) is
-   * never split: it is stored whole, however long, with every item in its
-   * place.
+   * `rawItem`, as a Responses reply's message parts and reasoning do, or an
+   * Anthropic server tool's call and result) is never split: it is stored
+   * whole, however long, with every item in its place. One whose text would
+   * have been split goes out uncut past `maxMessageTokens`, as its shards
+   * would (cappedForSend).
    *
    * Multi-block content: text blocks are concatenated for chunking, then
    * the resulting shards are emitted as text blocks. Non-text blocks
@@ -3103,14 +3105,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // gets sharded into pieces of ~targetChunkTokens each. This keeps
     // doc shards the same size as chat-message chunks for L1 production
     // consistency.
-    const target = this.config.targetChunkTokens ?? DEFAULT_CHUNKER_OPTIONS.chunkSize;
-    const chunkerOpts = {
-      chunkThreshold: target * 2,
-      chunkSize: target,
-      charsPerToken: DEFAULT_CHUNKER_OPTIONS.charsPerToken,
-    };
-
-    const sharded = chunkMessage(combined, chunkerOpts);
+    const sharded = chunkMessage(combined, this.ingressChunkerOptions());
     if (!sharded.wasSharded) return null;
 
     // Build IngressChunkResult. Non-text blocks (if any) go on shard 0
@@ -3127,6 +3122,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       bodyGroupId: sharded.bodyGroupId,
       shards,
     };
+  }
+
+  private ingressChunkerOptions(): { chunkThreshold: number; chunkSize: number; charsPerToken: number } {
+    const target = this.config.targetChunkTokens ?? DEFAULT_CHUNKER_OPTIONS.chunkSize;
+    return { chunkThreshold: target * 2, chunkSize: target, charsPerToken: DEFAULT_CHUNKER_OPTIONS.charsPerToken };
+  }
+
+  private storedWholeForItems(content: ContentBlock[]): boolean {
+    if (!this.config.adaptiveResolution || !content.some(carriesRawItem)) return false;
+    let chars = 0;
+    for (const block of content) if (block.type === 'text' && typeof block.text === 'string') chars += block.text.length;
+    const options = this.ingressChunkerOptions();
+    return Math.ceil(chars / options.charsPerToken) > options.chunkThreshold;
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
@@ -22274,7 +22282,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * refusal's floor, the emission checks, the recent window's eviction walk
    * and the render stats.
    * The adaptive middle's shard path sends a body's raw shards' text uncut,
-   * so their chunks' raw prices take no extra.
+   * so their chunks' raw prices take no extra. A message stored whole for its
+   * items whose text would have been split (chunkIngressMessage) is sent
+   * uncut too, as its shards would be, and takes no extra.
    * A site that emits the message sends `content`. None of the windows' sizes
    * is measured after the cap. The head window's size and the image strip's
    * depth are measured over the stored messages (getHeadWindowEnd,
@@ -22298,6 +22308,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // content, and otherwise of the content it's given, such as an
     // override's rewrite passed on to this class's cut.
     const sent = this.prunedForSend(store, msg);
+    if (this.storedWholeForItems(msg.content)) return { content: sent.content, extra: 0 };
     const content = this.truncateContent(sent.content, msgCap, (blocks) =>
       blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage), true);
     return { content, extra: cappedPriceExtra(store, sent, content) };

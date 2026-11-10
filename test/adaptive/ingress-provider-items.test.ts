@@ -96,3 +96,47 @@ describe('AutobiographicalStrategy — ingestion keeps provider items', () => {
     assert.equal(rows.flat().map((b) => (b as { text: string }).text).join(''), text);
   });
 });
+
+describe('AutobiographicalStrategy — a message stored whole for its items is sent uncut', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+  beforeEach(() => cleanup());
+
+  const item = {
+    type: 'message', id: 'msg_1', role: 'assistant', phase: 'final_answer',
+    content: [{ type: 'output_text', text: prose(30_000) }, { type: 'output_text', text: prose(30_000) }],
+  };
+  const reply = [
+    { type: 'text', text: prose(30_000), rawItem: item },
+    { type: 'text', text: prose(30_000), rawItem: item },
+  ] as ContentBlock[];
+
+  async function sentReply(adaptiveResolution: boolean) {
+    const strategy = new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution, maxMessageTokens: 10_000 });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: mockMembrane as any });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'hello' }]);
+      manager.addMessage('Claude', reply);
+      manager.addMessage('User', [{ type: 'text', text: 'and then?' }]);
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      return compiled.messages.filter((m) => m.participant === 'Claude').flatMap((m) => m.content);
+    } finally {
+      manager.close();
+    }
+  }
+
+  it("a Responses reply past maxMessageTokens goes out whole, as its shards did, with its parts' message item", async () => {
+    const sent = await sentReply(true);
+    const text = sent.map((b) => (b as { text?: string }).text ?? '').join('');
+    assert.equal(text.length, 60_000, `sent ${text.length} characters of 60,000`);
+    assert.ok(!text.includes('[truncated'), 'nothing is cut');
+    assert.deepEqual(sent, reply, 'each part keeps its message item');
+  });
+
+  it('with adaptiveResolution off, such a reply is stored whole and cut at the cap, as before', async () => {
+    const sent = await sentReply(false);
+    const text = sent.map((b) => (b as { text?: string }).text ?? '').join('');
+    assert.ok(text.length < 60_000, `sent ${text.length} characters`);
+    assert.match(text, /\[truncated — original was \d+ tokens\]$/);
+  });
+});

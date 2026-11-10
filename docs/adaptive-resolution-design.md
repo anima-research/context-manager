@@ -207,7 +207,7 @@ Any message whose text blocks together exceed twice `targetChunkTokens` (6,000 t
 - A `shardIndex` (0-based position within the group) for byte-faithful ordering at render time.
 - The same `participant` as the original message.
 
-A message with a block that carries a provider item, an object `rawItem` as a Responses reply's message parts and reasoning do, is never split. It is stored whole, however long, with every item in its place, and is one unit for folding.
+A message with a block that carries a provider item, an object `rawItem` as a Responses reply's message parts and reasoning do, or an Anthropic server tool's call and result, is never split. It is stored whole, however long, with every item in its place, and is one unit for folding. One whose text would have been split goes out uncut past `maxMessageTokens`, as its shards would.
 
 The chunker (`src/adaptive/chunker.ts`) additionally computes a per-shard
 `sourceHash` and `{ startByte, endByte }` range, but those live in the
