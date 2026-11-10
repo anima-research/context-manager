@@ -438,4 +438,15 @@ describe('the edges held at chunk coverage, where an older chunk divides a body 
       } finally { await o.close(); }
     });
   }
+  it(`a named limit, in the adaptive selection: the head window, its count reaching the body's fourth part, where the newest older chunk starts there and holds the result, ends before the body, and the request sends the call with a stub, the result inside that chunk's summary, which the middle folds`, async () => {
+    const o = await stored('adaptive');
+    try {
+      o.s.seedL1('L1-older', o.ids.slice(o.body[3]!, o.answer + 1));
+      o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.body[3]!) + 1 });
+      assert.equal(o.s.headEnd(o.view()), o.body[0], "the head's end comes back before the body");
+      const { called, answered } = await sent(o);
+      assert.ok(called, 'the call is sent');
+      assert.match(String(answered), /isn't shown in this context/, 'a stub stands where its result belongs');
+    } finally { await o.close(); }
+  });
 });
