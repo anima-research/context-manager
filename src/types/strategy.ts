@@ -241,6 +241,12 @@ export interface ReadinessState {
  * Strategies control how context is selected, compressed, and maintained.
  */
 export interface ContextStrategy {
+  /**
+   * Whether this strategy's select reads `SelectOptions.thinkingStanding`.
+   * The manager works it out from the branch's record only for one that
+   * says so; absent or false, a binding compile's select gets none.
+   */
+  readsThinkingStanding?(): boolean;
   /** Strategy name for identification */
   readonly name: string;
 
@@ -686,6 +692,11 @@ export interface ThinkingStanding {
   /** A reply stored at or below this sequence keeps no thinking; absent
    *  under the drop control, which leaves those to the provider. */
   recordedAfter?: Sequence;
+  /** A reply stored above this sequence keeps no thinking: it is past the
+   *  end of what the record vouches for (what its compile sent, and what a
+   *  host has noted since), where nothing is compared. Absent with no
+   *  record, where the drop control leaves every reply to the provider. */
+  recordedThrough?: Sequence;
 }
 
 /**

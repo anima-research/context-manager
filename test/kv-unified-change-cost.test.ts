@@ -33,6 +33,8 @@ const BIG: TokenBudget = { maxTokens: 1_000_000, reserveForResponse: 0 };
 /** A passthrough strategy that keeps the options each select was given. */
 class Listening extends PassthroughStrategy {
   seen: (SelectOptions | undefined)[] = [];
+  reads = true;
+  readsThinkingStanding(): boolean { return this.reads; }
   override select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     this.seen.push(opts);
     return super.select(store, log, budget, opts);
@@ -43,6 +45,7 @@ const standingOf = (opts: SelectOptions | undefined): { none: boolean; without: 
   const standing: ThinkingStanding | undefined = opts?.thinkingStanding;
   return standing && { none: standing.none, without: [...standing.without].sort(), ...(standing.recordedAfter !== undefined ? { recordedAfter: standing.recordedAfter } : {}) };
 };
+const reachOf = (opts: SelectOptions | undefined): number | undefined => opts?.thinkingStanding?.recordedThrough;
 
 test('a binding compile tells its select what the record still vouches for, and no other compile does', async () => {
   const strategy = new Listening();
@@ -75,15 +78,31 @@ test('a binding compile tells its select what the record still vouches for, and 
   await manager.compile(BIG, [], { ...bind(), dryRun: true });
   assert.deepEqual(last(), { none: false, without: [], recordedAfter: began });
 
+  // The record reaches the newest body its compile sent. A message stored
+  // since is past it until a host notes it as a row the stream sent.
+  const u2 = manager.getAllMessages().at(-1)!;
+  assert.equal(reachOf(strategy.seen.at(-1)), u2.sequence);
+  const a2 = manager.addMessage('Claude', [thought(2), text('A2')]);
+  await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.equal(reachOf(strategy.seen.at(-1)), u2.sequence, 'a stored reply nobody noted is past the record');
+  assert.equal(manager.noteRequestSent([a2], identity(), first.provenance!.compileId), true);
+  await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.equal(reachOf(strategy.seen.at(-1)), manager.getMessage(a2)!.sequence, 'noted, the record reaches it');
+  // A note whose first row can't be vouched for reaches no further than the compile did.
+  assert.equal(manager.noteRequestSent([{ unstored: true }, a2], identity(), first.provenance!.compileId), true);
+  await manager.compile(BIG, [], { ...bind({ dropBlock: true }), dryRun: true });
+  assert.equal(reachOf(strategy.seen.at(-1)), u2.sequence, 'rows after one the note cannot vouch for are not reached');
+  assert.equal(manager.noteRequestSent([a2], identity(), first.provenance!.compileId), true);
+
   // Another head: nothing survives, whatever is selected.
   await manager.compile(BIG, [], { ...bind({ dropBlock: true, identity: { tools: 'zz-tools-2' } }), dryRun: true });
   assert.deepEqual(last(), { none: true, without: [] });
 
-  // A compile that leaves A1's thinking out records that it did.
+  // A compile that leaves both replies' thinking out records that it did.
   const stripped = await manager.compile(BIG, [], bind({ dropBlock: true, identity: { tools: 'zz-tools-2' } }));
-  assert.deepEqual(stripped.thinkingStrip?.newly, [a1]);
+  assert.deepEqual([...(stripped.thinkingStrip?.newly ?? [])].sort(), [a1, a2].sort());
   await manager.compile(BIG, [], { ...bind({ dropBlock: true, identity: { tools: 'zz-tools-2' } }), dryRun: true });
-  assert.deepEqual(last(), { none: false, without: [a1] });
+  assert.deepEqual(last(), { none: false, without: [a1, a2].sort() });
   manager.close();
 });
 
@@ -161,24 +180,88 @@ test('thinkingLambda prices a change at the thinking the record still vouches fo
   await manager.compile(BIG, [], bind({ dropBlock: true, identity: { system: 'zz-system-2' } }));
   assert.equal(penaltyOf(manager), undefined);
   // And that compile left A1's thinking out, so it stays out of the count.
-  await manager.compile(BIG, [], bind({ dropBlock: true, identity: { system: 'zz-system-2' } }));
+  const recorded = await manager.compile(BIG, [], bind({ dropBlock: true, identity: { system: 'zz-system-2' } }));
   assert.equal(penaltyOf(manager), undefined);
 
-  // A reply stored since, which the record's compile didn't leave out, counts again.
-  manager.addMessage('Claude', [thought(2), text('A2')]);
-  await manager.compile(BIG, [], bind({ dropBlock: true, identity: { system: 'zz-system-2' } }));
+  // A reply stored since is past the record's end until a host notes it: the
+  // next compile sends it without its thinking whatever it selects, so a dry
+  // pass prices nothing for it.
+  const a2 = manager.addMessage('Claude', [thought(2), text('A2')]);
+  const unnoted = await manager.compile(BIG, [], { ...bind({ dropBlock: true, identity: { system: 'zz-system-2' } }), dryRun: true });
+  assert.equal(unnoted.renderStats?.planVsActual?.changePenalty, undefined, 'a reply the record does not reach costs nothing to lose');
+  // Noted as the stream's last row, the record reaches it, and it counts.
+  assert.equal(manager.noteRequestSent([a2], identity({ system: 'zz-system-2' }), recorded.provenance!.compileId), true);
+  const noted = await manager.compile(BIG, [], bind({ dropBlock: true, identity: { system: 'zz-system-2' } }));
+  assert.equal(noted.thinkingStrip, undefined, 'premise: the noted reply keeps its thinking');
   assert.ok(penaltyOf(manager)! > 1.5 * thinkingTokens);
+  // Another reply after it, not noted, adds nothing to the count.
+  manager.addMessage('User', [text('U3')]);
+  manager.addMessage('Claude', [thought(3), text('A3')]);
+  const before = penaltyOf(manager)!;
+  const again = await manager.compile(BIG, [], { ...bind({ dropBlock: true, identity: { system: 'zz-system-2' } }), dryRun: true });
+  assert.ok(again.renderStats!.planVsActual!.changePenalty! <= before, 'only the noted reply is priced, a little further back now');
   manager.close();
 });
 
-test('without thinkingLambda, or with one that is not above 0, thinking costs nothing', async () => {
-  for (const thinkingLambda of [undefined, 0, -1, Number.NaN]) {
+test('without thinkingLambda, or with it at 0, thinking costs nothing and the record is not read for the select', async () => {
+  for (const thinkingLambda of [undefined, 0]) {
     if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
-    const manager = await ContextManager.open({ path: STORE, strategy: new Probe(thinkingLambda === undefined ? {} : { thinkingLambda }, 100_000) });
+    const strategy = new Probe(thinkingLambda === undefined ? {} : { thinkingLambda }, 100_000);
+    const seen: (SelectOptions | undefined)[] = [];
+    const select = strategy.select.bind(strategy);
+    strategy.select = (store, log, budget, opts) => { seen.push(opts); return select(store, log, budget, opts); };
+    const manager = await ContextManager.open({ path: STORE, strategy });
     manager.addMessage('User', [text('U1')]);
     manager.addMessage('Claude', [thought(1), text('A1')]);
     await manager.compile(BIG, [], bind({ dropBlock: true }));
     assert.equal(penaltyOf(manager), undefined, String(thinkingLambda));
+    assert.equal(strategy.readsThinkingStanding(), false);
+    assert.ok(seen.length > 0 && seen.every((opts) => opts === undefined || !('thinkingStanding' in opts)), 'no select is handed a standing');
     manager.close();
   }
+});
+
+test('a thinkingLambda or half-life that is not a number the option takes is refused at the compile', async () => {
+  const cases: Array<[Record<string, unknown>, RegExp]> = [
+    [{ thinkingLambda: -1 }, /kvUnified\.thinkingLambda must be a finite number of 0 or more, got -1/],
+    [{ thinkingLambda: Number.NaN }, /kvUnified\.thinkingLambda must be a finite number of 0 or more/],
+    [{ thinkingLambda: '1' }, /kvUnified\.thinkingLambda must be a finite number of 0 or more, got "1"/],
+    [{ thinkingLambda: 1, thinkingHalfLifeTokens: 0 }, /kvUnified\.thinkingHalfLifeTokens must be a finite number above 0, got 0/],
+    [{ thinkingLambda: 1, thinkingHalfLifeTokens: 'far' }, /kvUnified\.thinkingHalfLifeTokens must be a finite number above 0, got "far"/],
+  ];
+  for (const [kvUnified, message] of cases) {
+    if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
+    const manager = await ContextManager.open({ path: STORE, strategy: new Probe(kvUnified, 100_000) });
+    manager.addMessage('User', [text('U1')]);
+    manager.addMessage('Claude', [thought(1), text('A1')]);
+    await assert.rejects(manager.compile(BIG, [], bind({ dropBlock: true })), message, JSON.stringify(kvUnified));
+    manager.close();
+  }
+});
+
+test('a preview is priced as the next compile is, and a caller\'s standing is dropped', async (t) => {
+  const planLines: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[plan-vs-actual]')) planLines.push(line);
+    else original(...args);
+  });
+  const strategy = new Probe({ thinkingLambda: 2, thinkingHalfLifeTokens: 200 }, 100_000);
+  const manager = await ContextManager.open({ path: STORE, strategy });
+  manager.addMessage('User', [text('U1')]);
+  manager.addMessage('Claude', [thought(1), text('A1')]);
+  manager.addMessage('User', [text('U2')]);
+  await manager.compile(BIG, [], bind({ dropBlock: true }));
+  const live = penaltyOf(manager)!;
+  assert.ok(live > 0, 'premise: the compile prices A1\'s thinking');
+  const binding = { thinkingBinding: { binds: true, dropBlock: true, participant: 'Claude' } };
+  // A preview names no head: it is priced under the record's own.
+  planLines.length = 0;
+  assert.ok(manager.previewContext(BIG, undefined, binding));
+  assert.match(planLines.at(-1) ?? '', new RegExp(` changePenalty=${live} .*dryRun=true`), 'the preview carries the same penalty');
+  planLines.length = 0;
+  assert.ok(manager.previewContext(BIG, undefined, { ...binding, thinkingStanding: { none: true, without: new Set() } }));
+  assert.match(planLines.at(-1) ?? '', new RegExp(` changePenalty=${live} .*dryRun=true`), 'whatever standing the caller passed');
+  manager.close();
 });

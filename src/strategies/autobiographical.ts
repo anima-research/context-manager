@@ -17851,7 +17851,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * middle back to the first chunk carried folded (thinking older than that
    * has a fold between it and now), or to seven half-lives, where the
    * weight is under 1%. A reply counts when it is the binding's participant's
-   * own and the record still has its thinking as sent: its thinking blocks at
+   * own and the record still has its thinking as sent, which a reply stored
+   * past the record's end never has (`ThinkingStanding.recordedThrough`): its
+   * thinking goes whatever this compile selects. Its thinking blocks count at
    * the store's price, weighted by 2^(-d / half-life), d the raw tokens
    * between it and the newest message.
    */
@@ -17863,21 +17865,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     tailCount: number,
     opts?: SelectOptions,
   ): number {
-    const kv = this.config.kvUnified;
-    const lambda = kv?.thinkingLambda;
-    if (lambda === undefined || !Number.isFinite(lambda) || lambda <= 0) return 0;
+    const priced = this.thinkingPrice();
+    if (priced === null) return 0;
+    const { lambda, halfLife } = priced;
     const standing = opts?.thinkingStanding;
     const participant = opts?.thinkingBinding?.participant;
     if (opts?.thinkingBinding?.binds !== true || !standing || standing.none || !participant) return 0;
-    const configured = kv?.thinkingHalfLifeTokens;
-    const halfLife = configured !== undefined && Number.isFinite(configured) && configured > 0 ? configured : 50_000;
     const reach = halfLife * 7;
     let distance = 0;
     let value = 0;
     const visit = (chunk: PickerChunk): void => {
       const msg = messages[chunk.sequence];
       if (msg && msg.id === chunk.id && msg.participant === participant && !standing.without.has(msg.id) &&
-          (standing.recordedAfter === undefined || msg.sequence > standing.recordedAfter)) {
+          (standing.recordedAfter === undefined || msg.sequence > standing.recordedAfter) &&
+          (standing.recordedThrough === undefined || msg.sequence <= standing.recordedThrough)) {
         const thinking = msg.content.filter(isThinkingBlock);
         if (thinking.length > 0) {
           const tokens = store.estimateTokens({ content: thinking } as unknown as StoredMessage);
@@ -17894,7 +17895,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunk.currentResolution > 0) break;
       visit(chunk);
     }
-    return lambda * value;
+    // A product past what a double holds is still a cost, not none.
+    return Math.min(lambda * value, Number.MAX_VALUE);
+  }
+
+  /**
+   * kv-unified's `thinkingLambda` and `thinkingHalfLifeTokens` as set, or
+   * null where thinking isn't priced (no kv-unified, the lambda absent or
+   * 0). A value that isn't a number the option can take is refused here, at
+   * the compile that would have read it, rather than read as off.
+   */
+  private thinkingPrice(): { lambda: number; halfLife: number } | null {
+    if (this.config.foldingStrategy !== 'kv-unified') return null;
+    const kv = this.config.kvUnified as { thinkingLambda?: unknown; thinkingHalfLifeTokens?: unknown } | undefined;
+    const lambda = kv?.thinkingLambda;
+    const halfLife = kv?.thinkingHalfLifeTokens;
+    if (lambda !== undefined && (typeof lambda !== 'number' || !Number.isFinite(lambda) || lambda < 0)) {
+      throw new Error(`kvUnified.thinkingLambda must be a finite number of 0 or more, got ${JSON.stringify(lambda) ?? String(lambda)}`);
+    }
+    if (halfLife !== undefined && (typeof halfLife !== 'number' || !Number.isFinite(halfLife) || halfLife <= 0)) {
+      throw new Error(`kvUnified.thinkingHalfLifeTokens must be a finite number above 0, got ${JSON.stringify(halfLife) ?? String(halfLife)}`);
+    }
+    if (lambda === undefined || lambda === 0) return null;
+    return { lambda, halfLife: halfLife ?? 50_000 };
+  }
+
+  /** The manager reads the branch's binding record for a select only where
+   *  thinking is priced (`ContextStrategy.readsThinkingStanding`). */
+  readsThinkingStanding(): boolean {
+    return this.thinkingPrice() !== null;
   }
 
   /**

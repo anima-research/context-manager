@@ -72,6 +72,7 @@ import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } 
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  recordedThrough,
   bindingStateId, refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
@@ -3225,14 +3226,7 @@ export class ContextManager {
       const { messageInjections: _callers, ...rest } = opts;
       selectOpts = rest;
     }
-    // What the branch's record says of its replies' thinking is the
-    // manager's to give, as the injections are: a caller's value is dropped.
-    if (opts?.thinkingBinding?.binds === true) {
-      selectOpts = { ...selectOpts, thinkingStanding: this.thinkingStandingFor(opts) };
-    } else if (selectOpts?.thinkingStanding !== undefined) {
-      const { thinkingStanding: _callers, ...rest } = selectOpts;
-      selectOpts = rest;
-    }
+    selectOpts = this.withThinkingStanding(selectOpts, false);
     const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
@@ -3490,7 +3484,7 @@ export class ContextManager {
    * record that can't be read is read as none, without a line: the
    * compile's own read (bindThinkingIn) says so.
    */
-  private thinkingStandingFor(opts: SelectOptions): ThinkingStanding {
+  private thinkingStandingFor(opts: SelectOptions, sameHeadAssumed = false): ThinkingStanding {
     const dropBlock = opts.thinkingBinding?.dropBlock === true;
     let record: BindingRecord | null = null;
     try {
@@ -3500,13 +3494,34 @@ export class ContextManager {
     }
     if (record === null) return { none: !dropBlock, without: new Set() };
     const identity = opts.identity;
-    const sameHead = identity !== undefined && IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]);
+    const sameHead = sameHeadAssumed || (identity !== undefined && IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]));
     if (!sameHead || record.sent[0] === UNVOUCHED) return { none: true, without: new Set() };
     return {
       none: false,
       without: new Set([...record.without, ...(record.dropped ?? [])]),
       ...(dropBlock ? {} : { recordedAfter: record.recordedAfter }),
+      recordedThrough: recordedThrough(record),
     };
+  }
+
+  /**
+   * `opts` as a select takes them: with what the branch's record says of
+   * its replies' thinking where the request binds it and the strategy reads
+   * that (`ContextStrategy.readsThinkingStanding`), and without the field
+   * otherwise. It is the manager's to give, as the injections are: a
+   * caller's value is dropped. A preview names no head (`identity`), and is
+   * priced as the next compile under the record's own head would be.
+   */
+  private withThinkingStanding<T extends { thinkingBinding?: SelectOptions['thinkingBinding']; thinkingStanding?: ThinkingStanding }>(
+    opts: T | undefined,
+    sameHeadAssumed: boolean,
+  ): T | undefined {
+    if (opts?.thinkingBinding?.binds === true && this.strategy.readsThinkingStanding?.() === true) {
+      return { ...opts, thinkingStanding: this.thinkingStandingFor(opts as SelectOptions, sameHeadAssumed) };
+    }
+    if (opts?.thinkingStanding === undefined) return opts;
+    const { thinkingStanding: _callers, ...rest } = opts;
+    return rest as T;
   }
 
   /**
@@ -3930,10 +3945,16 @@ export class ContextManager {
     const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
     let next = 0;
     const continued: string[] = [];
+    // How far the note vouches: the newest row before the first it can't
+    // vouch for. A row after that one is compared against the marker's place
+    // and keeps no thinking, whatever it is.
+    let continuedThrough: Sequence | undefined;
+    let unvouched = false;
     for (const row of rows) {
       const stored = typeof row === 'string' ? view.get(row) : null;
       if (stored === null) {
         continued.push(UNVOUCHED);
+        unvouched = true;
         continue;
       }
       // With no renderAsNewest, a row is its stored content, which for a body
@@ -3942,15 +3963,17 @@ export class ContextManager {
       next++;
       if (content === null || content === undefined) {
         continued.push(UNVOUCHED);
+        unvouched = true;
         continue;
       }
       // As the compile turns it into messages: a tool result under another
       // participant goes as the user's, and a bundled tool cycle as each of
       // its parts.
       for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
+      if (!unvouched && (continuedThrough === undefined || stored.sequence > continuedThrough)) continuedThrough = stored.sequence;
     }
     return this.writeBindingRecordFor(
-      continueRecord(record, continued, identity),
+      continueRecord(record, continued, identity, continuedThrough),
       'this note is lost: the record stands as the last one written, so the rows this note adds go without their thinking unless a later note of the stream writes',
     );
   }
@@ -4106,7 +4129,7 @@ export class ContextManager {
         this.contextLog.createView(),
         budget,
         overrides,
-        opts,
+        this.withThinkingStanding(opts, true),
       );
     } catch (err) {
       if (err instanceof NoFoldPlanToPreviewError) return null;

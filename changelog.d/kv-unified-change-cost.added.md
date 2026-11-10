@@ -25,18 +25,35 @@
     which change. It is counted from what the branch's binding record still
     vouches for, weighted by how far back each reply is, so it is zero
     once the thinking is gone anyway (another system text or tool list),
-    and a transition that was waiting comes then. `[plan-vs-actual]` shows
-    it as `changePenalty=`, and `RenderStats.planVsActual.changePenalty`
-    carries it.
+    and a transition that was waiting comes then. A reply stored past the
+    record's end doesn't count: until a host notes it as a row its stream
+    sent (`noteRequestSent`), the next compile sends it without its
+    thinking whatever it selects. `[plan-vs-actual]` shows the cost as
+    `changePenalty=`, and `RenderStats.planVsActual.changePenalty` carries
+    it. It is an upper bound: a change that begins after some raw replies
+    keeps their thinking, and they are priced all the same. A value that
+    isn't a finite number of 0 or more (above 0 for the half-life) is
+    refused at the compile, not read as off.
   - The context manager gives the select of a binding compile what the
     record says of its replies' thinking before anything is selected
     (`SelectOptions.thinkingStanding`, a new `ThinkingStanding`), as it
-    gives `messageInjections`: a caller's value is dropped. It changes
-    nothing about what a compile leaves out.
+    gives `messageInjections`: a caller's value is dropped. It does so
+    only for a strategy that says it reads it
+    (`ContextStrategy.readsThinkingStanding`, which the memory strategy
+    answers true to while `thinkingLambda` is set), and a preview gets it
+    too, priced under the record's own head. It changes nothing about what
+    a compile leaves out.
+  - The binding record says how far it reaches: `through`, the sequence of
+    the newest stored body its compile sent, and `continuedThrough`, the
+    newest row a note vouches for after that. Both are new and optional,
+    are written for every binding compile whether or not thinking is
+    priced, and an earlier release reads a record that has them.
   - Latent demand is decided without either price, so the same merges are
-    demanded as without them. Where the live solve priced a change and was
-    not certified, that costs one more base solve over the same labels on
-    a compile with merge candidates.
+    demanded as without them. A change's fixed cost alone costs demand no
+    solve: the ranking reads the live solve's pool, which that cost
+    doesn't alter. With `rewriteLambda`, where the live solve was not
+    certified and a merge can be produced, demand solves the base once
+    more without the rewrite's price.
   - The hysteresis certificate counts the least rewrite a change pays
     (`certificate.rewriteFloor`), which is the rewrite of the recent
     window, so it decides more of the compiles in which a priced layout

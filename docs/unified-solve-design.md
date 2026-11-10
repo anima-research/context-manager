@@ -475,8 +475,14 @@ the newest message, times `thinkingLambda`. It is zero on a compile for a
 model that doesn't bind thinking, and zero again once the record no longer
 vouches for the thinking (another system text or tool list, or a change
 the provider already set it aside for), which is when a transition that
-was waiting comes. Hard-wall priority is unchanged: nothing here retains
-`R > W`.
+was waiting comes. A reply stored past the record's end
+(`ThinkingStanding.recordedThrough`) isn't counted: nothing vouches for it
+until a host notes it as a row its stream sent, and the next compile
+sends it without its thinking whatever it selects. The cost is an upper
+bound: a change that begins after some raw replies leaves their thinking
+standing, and they are priced all the same, since one number can't depend
+on where a change begins (the rewrite's price does). Hard-wall priority is
+unchanged: nothing here retains `R > W`.
 
 **Neither enters latent demand (§8).** A merge is worth producing when the
 layout the policy would move to is better with it, and that is asked

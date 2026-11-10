@@ -237,7 +237,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
       );
     }
     // Demand is gated against the policy's best cut, which a fallback isn't.
-    const base = this.options.latentDemand && !live ? this.demandBase(solver, result, budget) : null;
+    const base = this.options.latentDemand && !live ? this.demandBase(inputs, forest, solver, result, budget) : null;
     const produced = base ? this.rankLatentDemand(inputs, forest, solver, base, budget) : [];
     this.requests = produced;
     this.timings = {
@@ -266,18 +266,30 @@ export class KvUnifiedStrategy implements FoldingSolver {
     };
   }
 
-  /** The base solve latent demand is measured against: the live result where
-   * the options price no change, and where the live solve was certified (its
-   * pool is the carried family, whose churn is zero, so it scores the same
-   * under `demand`). Otherwise the base solved again under `demand`: the
-   * same labels, scored without the change's price. Null where the label
-   * ceiling stopped that solve; then nothing is demanded this compile. */
+  /** The base solve latent demand is measured against, which is the live
+   * result in every case but one:
+   * - the options price no change;
+   * - the live solve was certified (its pool is the carried family, whose
+   *   churn is zero, so it scores the same under `demand`);
+   * - the only price is a change's fixed cost (`changePenalty`). The ranking
+   *   reads a base's pool, never the layout hysteresis chose from it, and
+   *   `adoptEpsilon` decides only that choice and the certificate, so the
+   *   live solve's pool is the one `demand` would build;
+   * - nothing can be produced this compile, so no base is read at all.
+   * With `rewriteLambda` the pool was built under another cache term, and the
+   * base is solved again under `demand`. Null where the label ceiling stopped
+   * that solve; then nothing is demanded this compile. */
   private demandBase(
+    inputs: PickerInputs,
+    forest: CanonicalSummaryForest,
     solver: ParetoKvUnifiedPolicySolver,
     result: Extract<ParetoPolicySolveResult, { feasible: true }>,
     budget: FoldingBudget,
   ): Extract<ParetoPolicySolveResult, { feasible: true }> | null {
     if (this.demand === this.options || result.certificate) return result;
+    if (!((this.options.policy?.rewriteLambda ?? 0) > 0)) return result;
+    const config = this.demand.latentDemand!;
+    if (Math.floor(config.maxCandidates) <= 0 || latentHigherLevelCandidates(inputs, forest, config).length === 0) return result;
     this.demandSolves++;
     try {
       const base = solver.solve({ ...this.demand, maxTokens: budget.totalBudget });

@@ -358,6 +358,20 @@ test('latent demand is decided without what a change costs', () => {
       assert.deepEqual([...pricedSolution.frontier], [...frontier], `${mode}: the carried layout stays`);
       assert.deepEqual(pricedSolution.produced, plainSolution.produced, `${mode}: and the same merges are demanded`);
       assert.deepEqual(priced.lastDemandEvaluations, plain.lastDemandEvaluations, mode);
+      // A change's fixed cost alone leaves the pool as it was, so demand reads
+      // the live solve: no solve more than without it.
+      const penalized = new KvUnifiedStrategy({ ...base, hysteresisCertificate, latentDemand, changePenalty: 1_000_000 });
+      const penalizedSolution = penalized.solve(inputs, budget);
+      assert.deepEqual(penalizedSolution.produced, plainSolution.produced, `${mode}: the same merges under a penalty alone`);
+      assert.deepEqual(penalized.lastDemandEvaluations, plain.lastDemandEvaluations, mode);
+      assert.equal(penalized.lastTimings?.demandSolves, plain.lastTimings?.demandSolves, `${mode}: and no solve more for them`);
+      // With nothing to produce, a priced rewrite solves no base either.
+      const idle = { mergeThreshold: 99, fallbackRecallTokens: 30, maxCandidates: 4, mode };
+      const idlePlain = new KvUnifiedStrategy({ ...base, hysteresisCertificate, latentDemand: idle });
+      const idlePriced = new KvUnifiedStrategy({ ...base, hysteresisCertificate, latentDemand: idle, policy: { ...base.policy, rewriteLambda: 1_000_000 } });
+      assert.deepEqual(idlePlain.solve(inputs, budget).produced, []);
+      assert.deepEqual(idlePriced.solve(inputs, budget).produced, []);
+      assert.equal(idlePriced.lastTimings?.demandSolves, idlePlain.lastTimings?.demandSolves, `${mode}: nothing to produce, no base solve`);
     }
   }
 });
