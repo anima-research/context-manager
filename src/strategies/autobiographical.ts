@@ -20982,25 +20982,81 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return chunk.messages.some((m) => blocked.has(m.id));
   }
 
+  /**
+   * Index of the first message of the recent window, before compression
+   * holds (clampRecentStartToHolds).
+   *
+   * The token-derived boundary is priced with the live calibration multiplier
+   * and with what the strips leave of each message (postStripEstimates), so a
+   * fall of either moves it back. See anchorRecentToCoverage.
+   */
   protected getUnheldRecentWindowStart(store: MessageStoreView): number {
     const messages = store.getAll();
     const pse = this.postStripEstimates(store);
     let tokens = 0;
+    let boundary = 0;
 
     for (let i = messages.length - 1; i >= 0; i--) {
       tokens += pse[i];
       if (tokens > this.config.recentWindowTokens) {
-        let boundary = i + 1;
+        boundary = i + 1;
         // Don't split a tool_use/tool_result pair: if the message at the boundary
         // is a tool_result, include the preceding tool_use with it (retreat by 1).
         if (boundary > 0 && boundary < messages.length && this.hasToolResult(messages[boundary])) {
           boundary--;
         }
-        return boundary;
+        break;
       }
     }
 
-    return 0;
+    return this.anchorRecentToCoverage(messages, pse, boundary);
+  }
+
+  /**
+   * Whether a window whose token boundary went over messages a chunk owns
+   * holds its edge at them instead (headHoldsAtCoverage,
+   * anchorRecentToCoverage). A subclass that wants each window by its token
+   * count alone returns false; the head still extends to coverage it fell
+   * short of (anchorHeadToCoverage).
+   */
+  protected windowsHoldAtCoverage(): boolean {
+    return true;
+  }
+
+  /**
+   * Recent-window guard, the mirror of the head's (anchorHeadToCoverage). A
+   * chunk closes only over messages outside the recent window, so the last
+   * message a chunk owns records where the window started when that chunk
+   * was laid. When the token boundary falls back over it, the price of the
+   * window's messages fell (a calibration fall, a strip) and the window's
+   * count now reaches messages the middle already has. Taking them back
+   * leaves out every summary over them (summariesAcross): the chunk they are
+   * in goes out raw, and each summary above it gives way to the ones it
+   * merged, for a few tokens' difference in a count. Keep them in the
+   * middle: start the window after the last owned message.
+   *
+   * The hold is bounded as the head's is. A window that was really widened
+   * (recentWindowTokens raised, or a store chunked with a smaller window)
+   * takes what its count says: when the messages after the last owned one
+   * come to less than half of recentWindowTokens, the stock boundary stands.
+   * So does one that would start the window on a tool_result whose call the
+   * middle has.
+   */
+  private anchorRecentToCoverage(messages: StoredMessage[], pse: ArrayLike<number>, boundary: number): number {
+    if (!this.windowsHoldAtCoverage()) return boundary;
+    const owned = this.ownedMessageIds();
+    if (owned.size === 0) return boundary;
+    let tokens = 0;
+    for (let i = messages.length - 1; i >= boundary; i--) {
+      if (owned.has(messages[i].id)) {
+        const start = i + 1;
+        if (tokens * 2 < this.config.recentWindowTokens) return boundary;
+        if (start < messages.length && this.hasToolResult(messages[start])) return boundary;
+        return start;
+      }
+      tokens += pse[i];
+    }
+    return boundary;
   }
 
   /**
@@ -21167,7 +21223,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * one-message L1s that sit at the start of the chronicle but are created
    * late, so they merge with whatever frontier is open (merge adjacency follows
    * chunk-record order), yielding L2/L3s that mix the opening with weeks-later
-   * material (issue #122). See anchorHeadToCoverage.
+   * material (issue #122). Moving it UP takes messages a chunk owns into the
+   * head, which sends them raw and leaves out every summary over them
+   * (summariesAcross). The guard holds the head at coverage against both.
+   * See anchorHeadToCoverage.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
     return this.headWindowEndFrom(store, store.getAll(), this.getHeadWindowStartIndex(store));
@@ -21180,9 +21239,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected headWindowEndFrom(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
     if (this.config.headWindowTokens <= 0) return 0;
+    const owned = this.ownedMessageIds();
     let tokens = 0;
+    // The first message a chunk owns from the start on, and the tokens
+    // before it: where coverage begins (anchorHeadToCoverage).
+    let covered = -1;
+    let tokensBeforeCovered = 0;
 
     for (let i = startIdx; i < messages.length; i++) {
+      if (covered < 0 && owned.size > 0 && owned.has(messages[i].id)) {
+        covered = i;
+        tokensBeforeCovered = tokens;
+      }
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
         let boundary = i;
@@ -21192,27 +21260,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           boundary--;
           tokens -= store.estimateTokens(messages[i]);
         }
+        if (covered >= 0 && covered < boundary && this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered)) return covered;
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
     }
 
+    if (covered >= 0 && this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered)) return covered;
     return messages.length;
   }
 
   /**
-   * Head-boundary ratchet guard. When the token boundary lands on an UNOWNED
-   * message and chunk coverage resumes later, the messages in between are the
-   * head's own tail that a calibration rise pushed out. They were never
-   * chunked, and chunking them now would mint out-of-order L1s. Keep them in
-   * the head: extend the boundary to the first owned message after it.
+   * The other direction of the head-boundary guard (anchorHeadToCoverage):
+   * whether a head whose token boundary passed the first message a chunk
+   * owns ends at that message instead. It does while the head that leaves is
+   * at least half of headWindowTokens, and doesn't end between a tool_use
+   * and what follows it.
+   */
+  private headHoldsAtCoverage(messages: StoredMessage[], startIdx: number, covered: number, tokensBeforeCovered: number): boolean {
+    if (covered <= startIdx || !this.windowsHoldAtCoverage()) return false;
+    if (tokensBeforeCovered * 2 < this.config.headWindowTokens) return false;
+    return !this.hasToolUse(messages[covered - 1]);
+  }
+
+  /**
+   * Head-boundary guard: the head ends where chunk coverage begins. A chunk
+   * closes only over messages outside the head, so the first message a chunk
+   * owns records where the head ended when the chunks were laid, and a
+   * token boundary that the live multiplier has moved off it is put back.
    *
-   * Only this direction is touched. A boundary already on an owned message,
-   * a store with no coverage after the boundary (fresh session, or the
-   * uncovered run is the live frontier), and a head that grew over owned
-   * messages ("ownership wins", issue #42) all keep the stock boundary. The
-   * extension is bounded: the head is a hard reservation in selectAdaptive,
-   * so if reaching coverage would take more than 2× headWindowTokens, the
-   * gap is not the head's tail and the stock boundary stands.
+   * A boundary that lands on an UNOWNED message, with chunk coverage resuming
+   * later: the messages in between are the head's own tail that a calibration
+   * rise pushed out. They were never chunked, and chunking them now would
+   * mint out-of-order L1s (the ratchet of issue #122). Keep them in the head:
+   * extend the boundary to the first owned message after it.
+   *
+   * A boundary that passed the first owned message (headWindowEndFrom reads
+   * this before it gets here, headHoldsAtCoverage): a calibration fall let
+   * the head's count reach messages the middle already has. Sending them raw
+   * from the head leaves out every summary over them (summariesAcross), from
+   * their L1 up to the summary the whole opening merged into, and what those
+   * recalled goes out some other way from the first tokens of the request
+   * on. Keep them in the middle: end the head at the first owned message.
+   *
+   * Both are bounded, by a factor of two of headWindowTokens. The head is a
+   * hard reservation in selectAdaptive, so if reaching coverage would take
+   * more than 2× headWindowTokens, the gap is not the head's tail and the
+   * stock boundary stands. And a head that was really widened
+   * (headWindowTokens raised, a reset onto owned messages) takes what its
+   * count says: when the messages before the first owned one come to less
+   * than half of headWindowTokens, the stock boundary stands, and a message
+   * of the head that a summary covers goes out raw, once (summariesAcross).
+   * The multiplier stays within 0.6 and CALIBRATION_CEILING, so a
+   * recalibration alone moves the boundary across neither bound from where a
+   * multiplier of 1 put it.
+   *
+   * A boundary already on an owned message and a store with no coverage
+   * after the boundary (fresh session, or the uncovered run is the live
+   * frontier) keep the stock boundary.
    */
   private anchorHeadToCoverage(
     store: MessageStoreView,

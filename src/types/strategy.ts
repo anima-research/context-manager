@@ -1763,11 +1763,20 @@ export interface AutobiographicalConfig {
   quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */
   targetChunkTokens: number;
-  /** Recent tokens to keep uncompressed (~30000) */
+  /** Recent tokens to keep uncompressed (~30000). Counted at the live
+   *  calibration multiplier. Once chunks exist, the window starts no earlier
+   *  than after the last message a chunk owns while that leaves it at least
+   *  half this size: a recalibration doesn't take chunked messages back into
+   *  the window, and a raised value fills from new messages. A value raised
+   *  to more than twice what the chunks left takes effect at once. */
   recentWindowTokens: number;
   /** Tokens at the head of the conversation to preserve verbatim (default: 0).
    *  Messages within this window are never chunked or compressed — they survive
-   *  as raw copies so initial instructions retain full granularity. */
+   *  as raw copies so initial instructions retain full granularity. Counted at
+   *  the live calibration multiplier. Once chunks exist, the head ends at the
+   *  first message a chunk owns while that keeps it between half and twice
+   *  this size, so a recalibration doesn't move it; past either bound the
+   *  token count decides. */
   headWindowTokens: number;
   /** Always break at message boundaries */
   chunkOnMessageBoundary: boolean;
