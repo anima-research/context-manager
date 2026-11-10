@@ -12,7 +12,7 @@
     one resident's store, with a transition forced by a steeper over-budget
     penalty than deployments run, the first changed token moved from 3k to
     232k (a rewrite of 262k tokens instead of 505k), and the layout held
-    four turns longer, to 581k from 564k. The same copy kept its first
+    four turns longer, moving at 590k instead of 564k. The same copy kept its first
     change at the new fold with `cacheScale` lowered to 10,000 or 20,000
     and no code change, so the quadratic's scale is the other remedy; it
     was not measured what that does to which merges are demanded.
