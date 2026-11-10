@@ -126,6 +126,7 @@ export type {
   RenderedSummaryInfo,
   ImageCeilings,
   ThinkingBinding,
+  ThinkingStanding,
   RequestIdentity,
 } from './types/index.js';
 

@@ -36,6 +36,7 @@ import type {
   HotContextSettingsUpdate,
   RequestIdentity,
   SelectOptions,
+  ThinkingStanding,
   PreviewResult,
   HotContextSettingsStatus,
 } from './types/index.js';
@@ -70,7 +71,8 @@ import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-pr
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
-  UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  recordedThrough,
   bindingStateId, refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
@@ -3224,6 +3226,7 @@ export class ContextManager {
       const { messageInjections: _callers, ...rest } = opts;
       selectOpts = rest;
     }
+    selectOpts = this.withThinkingStanding(selectOpts, false);
     const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
     const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
@@ -3468,6 +3471,60 @@ export class ContextManager {
         pending = null;
       },
     });
+  }
+
+  /**
+   * `SelectOptions.thinkingStanding` for a binding compile: which stored
+   * replies' thinking the branch's record still has as sent, read before
+   * the select. It follows `bindThinking`'s rules for what no compile could
+   * keep (another head, a record that vouches for nothing, no record and no
+   * drop control, a body already sent without its thinking or noted as set
+   * aside, a reply stored before the record began), and leaves the rest to
+   * the comparison `bindThinking` makes of what the select returns. A
+   * record that can't be read is read as none, without a line: the
+   * compile's own read (bindThinkingIn) says so.
+   */
+  private thinkingStandingFor(opts: SelectOptions, sameHeadAssumed = false): ThinkingStanding {
+    const dropBlock = opts.thinkingBinding?.dropBlock === true;
+    let record: BindingRecord | null = null;
+    try {
+      record = readBindingRecord(this.store, this.strategyNamespace).record;
+    } catch {
+      record = null;
+    }
+    if (record === null) return { none: !dropBlock, without: new Set() };
+    const identity = opts.identity;
+    const sameHead = sameHeadAssumed || (identity !== undefined && IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]));
+    if (!sameHead || record.sent[0] === UNVOUCHED) return { none: true, without: new Set() };
+    return {
+      none: false,
+      without: new Set([...record.without, ...(record.dropped ?? [])]),
+      ...(dropBlock ? {} : { recordedAfter: record.recordedAfter }),
+      recordedThrough: recordedThrough(record),
+    };
+  }
+
+  /**
+   * `opts` as a select takes them: with what the branch's record says of
+   * its replies' thinking where the request binds it and the strategy reads
+   * that (`ContextStrategy.readsThinkingStanding`), and without the field
+   * otherwise. It is the manager's to give, as the injections are: a
+   * caller's value is dropped. A preview names no head (`identity`), and is
+   * priced as the next compile under the record's own head would be; it
+   * gets the standing `whatever` the strategy says of its live config, since
+   * the preview's overrides may be what prices thinking.
+   */
+  private withThinkingStanding<T extends { thinkingBinding?: SelectOptions['thinkingBinding']; thinkingStanding?: ThinkingStanding }>(
+    opts: T | undefined,
+    sameHeadAssumed: boolean,
+    whatever = false,
+  ): T | undefined {
+    if (opts?.thinkingBinding?.binds === true && (whatever || this.strategy.readsThinkingStanding?.() === true)) {
+      return { ...opts, thinkingStanding: this.thinkingStandingFor(opts as SelectOptions, sameHeadAssumed) };
+    }
+    if (opts?.thinkingStanding === undefined) return opts;
+    const { thinkingStanding: _callers, ...rest } = opts;
+    return rest as T;
   }
 
   /**
@@ -3891,10 +3948,19 @@ export class ContextManager {
     const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
     let next = 0;
     const continued: string[] = [];
+    // How far the note vouches, for `BindingRecord.continuedThrough`: the
+    // rows it names, in order, for as long as each is the window's next row
+    // after the newest body the record's compile sent. It ends at the first
+    // row it can't vouch for, and at the first window row it doesn't name (a
+    // message another writer stored mid-stream sits where the record has
+    // the row after it, and the next compile diverges there).
+    const vouchedRows: StoredMessage[] = [];
+    let unvouched = false;
     for (const row of rows) {
       const stored = typeof row === 'string' ? view.get(row) : null;
       if (stored === null) {
         continued.push(UNVOUCHED);
+        unvouched = true;
         continue;
       }
       // With no renderAsNewest, a row is its stored content, which for a body
@@ -3903,15 +3969,31 @@ export class ContextManager {
       next++;
       if (content === null || content === undefined) {
         continued.push(UNVOUCHED);
+        unvouched = true;
         continue;
       }
       // As the compile turns it into messages: a tool result under another
       // participant goes as the user's, and a bundled tool cycle as each of
       // its parts.
       for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
+      if (!unvouched) vouchedRows.push(stored);
+    }
+    let continuedThrough: Sequence | undefined;
+    if (record.through !== undefined && vouchedRows.length > 0) {
+      const window = view.getAll();
+      // The window's first row after the newest body that compile sent.
+      let at = window.length;
+      while (at > 0 && window[at - 1]!.sequence > record.through) at--;
+      for (const row of vouchedRows) {
+        if (window[at]?.id !== row.id) break;
+        continuedThrough = row.sequence;
+        at++;
+        // A body stored as shards is one row of the note and several of the window.
+        while (row.bodyGroupId !== undefined && window[at]?.bodyGroupId === row.bodyGroupId) at++;
+      }
     }
     return this.writeBindingRecordFor(
-      continueRecord(record, continued, identity),
+      continueRecord(record, continued, identity, continuedThrough),
       'this note is lost: the record stands as the last one written, so the rows this note adds go without their thinking unless a later note of the stream writes',
     );
   }
@@ -4067,7 +4149,7 @@ export class ContextManager {
         this.contextLog.createView(),
         budget,
         overrides,
-        opts,
+        this.withThinkingStanding(opts, true, true),
       );
     } catch (err) {
       if (err instanceof NoFoldPlanToPreviewError) return null;

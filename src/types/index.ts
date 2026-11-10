@@ -92,6 +92,7 @@ export type {
   RenderedSummaryInfo,
   ImageCeilings,
   ThinkingBinding,
+  ThinkingStanding,
   RequestIdentity,
 } from './strategy.js';
 
