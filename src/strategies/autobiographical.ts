@@ -21242,14 +21242,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const owned = this.ownedMessageIds();
     let tokens = 0;
     // The first message a chunk owns from the start on, and the tokens
-    // before it: where coverage begins (anchorHeadToCoverage).
+    // before it: where coverage begins (anchorHeadToCoverage). And the
+    // messages after it that no chunk owns, which a head ending there would
+    // hand to the chunker (headHoldsAtCoverage).
     let covered = -1;
     let tokensBeforeCovered = 0;
+    const unownedAfterCovered: number[] = [];
 
     for (let i = startIdx; i < messages.length; i++) {
-      if (covered < 0 && owned.size > 0 && owned.has(messages[i].id)) {
-        covered = i;
-        tokensBeforeCovered = tokens;
+      if (owned.size > 0) {
+        const isOwned = owned.has(messages[i].id);
+        if (covered < 0 && isOwned) {
+          covered = i;
+          tokensBeforeCovered = tokens;
+        } else if (covered >= 0 && !isOwned) {
+          unownedAfterCovered.push(i);
+        }
       }
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
@@ -21260,26 +21268,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           boundary--;
           tokens -= store.estimateTokens(messages[i]);
         }
-        if (covered >= 0 && covered < boundary && this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered)) return covered;
+        if (covered >= 0 && covered < boundary &&
+            this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered, unownedAfterCovered, boundary)) return covered;
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
     }
 
-    if (covered >= 0 && this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered)) return covered;
+    if (covered >= 0 &&
+        this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered, unownedAfterCovered, messages.length)) return covered;
     return messages.length;
   }
 
   /**
    * The other direction of the head-boundary guard (anchorHeadToCoverage):
    * whether a head whose token boundary passed the first message a chunk
-   * owns ends at that message instead. It does while the head that leaves is
-   * at least half of headWindowTokens, and doesn't end between a tool_use
+   * owns ends at that message instead. It does while the head that remains
+   * is at least half of headWindowTokens, and doesn't end between a tool_use
    * and what follows it.
+   *
+   * And only while every message from there to the token boundary is owned,
+   * or kept raw by a pin: a message there that no chunk owns would leave the
+   * head for the middle, where the chunker cuts it into a chunk of its own,
+   * late and at the opening, which is the ratchet the guard is there to stop
+   * (issue #122). Ownership with such a gap (records an import or a store
+   * repair left) keeps the stock boundary.
    */
-  private headHoldsAtCoverage(messages: StoredMessage[], startIdx: number, covered: number, tokensBeforeCovered: number): boolean {
+  private headHoldsAtCoverage(
+    messages: StoredMessage[],
+    startIdx: number,
+    covered: number,
+    tokensBeforeCovered: number,
+    unownedAfterCovered: readonly number[],
+    boundary: number,
+  ): boolean {
     if (covered <= startIdx || !this.windowsHoldAtCoverage()) return false;
     if (tokensBeforeCovered * 2 < this.config.headWindowTokens) return false;
-    return !this.hasToolUse(messages[covered - 1]);
+    if (this.hasToolUse(messages[covered - 1])) return false;
+    const released = unownedAfterCovered.filter((at) => at < boundary);
+    if (released.length === 0) return true;
+    const keptRaw = this.forceRawPinPositions(messages);
+    return released.every((at) => keptRaw.has(at));
   }
 
   /**
@@ -21310,9 +21338,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count says: when the messages before the first owned one come to less
    * than half of headWindowTokens, the stock boundary stands, and a message
    * of the head that a summary covers goes out raw, once (summariesAcross).
-   * The multiplier stays within 0.6 and CALIBRATION_CEILING, so a
-   * recalibration alone moves the boundary across neither bound from where a
-   * multiplier of 1 put it.
+   * The multiplier stays within 0.6 and CALIBRATION_CEILING, so for chunks
+   * cut at a multiplier of 1 a recalibration alone moves the boundary across
+   * neither bound. Chunks cut at another multiplier have less room on one
+   * side: cut at 1.6, a fall below 0.8 lets the head by its count again.
    *
    * A boundary already on an owned message and a store with no coverage
    * after the boundary (fresh session, or the uncovered run is the live

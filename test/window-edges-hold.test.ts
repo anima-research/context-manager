@@ -284,6 +284,48 @@ describe('a hold that would part a call from its result gives way', () => {
   });
 });
 
+describe('a head hold that would hand unowned messages to the chunker gives way', () => {
+  async function gapped() {
+    const path = `${STORE}-${process.pid}-${stores++}`;
+    made.push(path);
+    const strategy = new Held({ targetChunkTokens: 1e9, headWindowTokens: 0, recentWindowTokens: 0, autoTickOnNewMessage: false, hierarchical: true } as never);
+    const manager = await ContextManager.open({ path, strategy });
+    const ctx = contextOf(manager);
+    for (let i = 0; i < 14; i++) manager.addMessage(i % 2 ? 'agent' : 'user', text(`turn ${i} ` + 'words about what happened in this turn '.repeat(4)));
+    const all = ctx.messageStore.getAll();
+    const tokens = (from: number, to: number): number => {
+      let sum = 0;
+      for (let i = from; i < to; i++) sum += ctx.messageStore.estimateTokens(all[i]!);
+      return sum;
+    };
+    // Message 6 is owned, the three after it are not, and the head's count ends at 10.
+    strategy.seedL1('L1-A', [all[6]!.id]);
+    strategy.set('headWindowTokens', tokens(0, 10));
+    assert.ok(tokens(0, 6) * 2 >= tokens(0, 10), 'premise: the head before the owned message is at least half the window');
+    return { manager, strategy, ctx, all };
+  }
+
+  it('messages past the first owned one that no chunk owns stay in the head', async () => {
+    const { manager, strategy, ctx } = await gapped();
+    assert.strictEqual(strategy.edges(ctx).headEnd, 10, 'the head ends where its count does');
+    await manager.close();
+  });
+
+  it('pinned raw, they leave nothing for the chunker, and the head holds', async () => {
+    const { manager, strategy, ctx, all } = await gapped();
+    manager.pinRange(all[7]!.id, all[9]!.id);
+    assert.strictEqual(strategy.edges(ctx).headEnd, 6, 'the head ends at the first owned message');
+    await manager.close();
+  });
+
+  it('owned through to the token boundary, the head holds', async () => {
+    const { manager, strategy, ctx, all } = await gapped();
+    strategy.seedL1('L1-B', [all[7]!.id, all[8]!.id, all[9]!.id]);
+    assert.strictEqual(strategy.edges(ctx).headEnd, 6);
+    await manager.close();
+  });
+});
+
 describe('a store with no chunk in the way', () => {
   it('both windows go by their token counts', async () => {
     const path = `${STORE}-${process.pid}-${stores++}`;

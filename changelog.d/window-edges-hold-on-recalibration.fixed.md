@@ -16,5 +16,7 @@
   `headWindowTokens` or `recentWindowTokens` raised to more than twice what
   the chunks left applies at once. A smaller raise of `recentWindowTokens`
   now fills from new messages, and a smaller change of `headWindowTokens`
-  moves nothing. A subclass turns the holds off by overriding
-  `windowsHoldAtCoverage`.
+  moves nothing. Neither hold parts a tool call from its result, and the
+  head's doesn't apply where it would move a message no chunk owns out of
+  the head, to be chunked late. A subclass turns the holds off by
+  overriding `windowsHoldAtCoverage`.
