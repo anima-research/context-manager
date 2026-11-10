@@ -694,7 +694,12 @@ export class ParetoKvUnifiedPolicySolver {
     );
     const cachePrice = Math.max(0, policy.cacheWritePrice - policy.cacheReadPrice);
     const maxCache = options.maxTokens * cachePrice;
-    const cacheSlope = (2 * policy.cacheLambda * maxCache) / (policy.cacheScale ** 2);
+    // The cache term's steepest slope in churn: constant where the rewrite is
+    // priced linearly (see `cacheCost`), and the quadratic's at its largest
+    // churn otherwise.
+    const cacheSlope = policy.rewriteLambda > 0
+      ? policy.rewriteLambda / policy.cacheScale
+      : (2 * policy.cacheLambda * maxCache) / (policy.cacheScale ** 2);
     const maxContinuity = this.leaves.reduce(
       (total, leaf) => {
         const previousLevel = options.presentation?.leaves.get(leaf.id)?.level ?? 0;

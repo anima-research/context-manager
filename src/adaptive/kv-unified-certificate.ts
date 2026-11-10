@@ -6,14 +6,19 @@ import { TerminalPolicyEvaluator, presentedLeavesByIndex } from './kv-unified-te
 import {
   ExactKvUnifiedPolicySolver,
   budgetPenalty,
+  cacheCost,
   fidelityLeafLoss,
   normalizePolicy,
   type ExactPolicySolveOptions,
   type ExactPolicySolveResult,
 } from './kv-unified-policy.js';
+import { tailUnits } from './render-offsets.js';
 
 export interface HysteresisCertificate {
   readonly kind: 'budget-tangent';
+  /** A lower bound on F + B over every cut. Where the rewrite is priced
+   * linearly (`rewriteLambda`), a cut outside the carried family scores at
+   * least this plus `rewriteFloor`. */
   readonly lowerBound: number;
   readonly carriedScore: number;
   readonly maxImprovement: number;
@@ -21,6 +26,9 @@ export interface HysteresisCertificate {
   readonly passes: number;
   readonly nodes: number;
   readonly roundoffAllowance: number;
+  /** The least cache term a cut outside the carried family pays, counted
+   * beside `lowerBound` in the proof; 0 unless `rewriteLambda` prices it. */
+  readonly rewriteFloor?: number;
 }
 
 export type CertifiedPolicyResult = Extract<ExactPolicySolveResult, { feasible: true }> & {
@@ -626,6 +634,25 @@ export function certifyCarriedLayout(
   // Both true floors are now exactly zero. Scoring this one candidate cannot
   // renormalize either penalty or hide a floor witness.
 
+  // With the rewrite priced linearly (`rewriteLambda`), every cut outside the
+  // carried family pays for what it makes the provider compute again, and
+  // that is never less than the tail the receipt already held. Such a cut
+  // puts some old leaf at another level, so a unit of the middle differs
+  // from the receipt's (an unpinned middle leaf's unit is its level's, and
+  // the carried family, whose churn is zero, emits the receipt's units to
+  // the end). Its matched prefix then ends inside the middle, no extension
+  // unit is in a matched prefix, and so every old tail unit comes after the
+  // last breakpoint it keeps. The bound below is on F + B alone; this adds
+  // the least a change's cache term can be.
+  let rewriteFloor = 0;
+  if (policy.rewriteLambda > 0 && evaluator.cacheRelevant) {
+    let oldTail = 0;
+    for (const unit of tailUnits(inputs)) {
+      if (unit.kind !== 'raw' || presentation.leaves.has(unit.key)) oldTail += unit.tokens;
+    }
+    rewriteFloor = cacheCost(oldTail * Math.max(0, policy.cacheWritePrice - policy.cacheReadPrice), 0, policy);
+  }
+
   const low = policy.budgetLowRatio * options.maxTokens;
   const high = policy.budgetHighRatio * options.maxTokens;
   const underScale = low > 0 ? low : 1;
@@ -697,7 +724,7 @@ export function certifyCarriedLayout(
     maxRoundoff = Math.max(maxRoundoff, roundoff);
     const bound = linearCost + intercept - roundoff;
     if (Number.isFinite(bound)) bestBound = Math.max(bestBound, bound);
-    if (scored.selected.score - bestBound <= epsilon) {
+    if (scored.selected.score - (bestBound + rewriteFloor) <= epsilon) {
       return {
         ...scored,
         enumeration: { ...scored.enumeration, statesVisited: pass * nodes.length },
@@ -707,6 +734,7 @@ export function certifyCarriedLayout(
           maxImprovement: scored.selected.score - bestBound,
           adoptEpsilon: epsilon, passes: pass, nodes: nodes.length,
           roundoffAllowance: maxRoundoff,
+          ...(rewriteFloor > 0 ? { rewriteFloor } : {}),
         },
       };
     }
