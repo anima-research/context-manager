@@ -23,10 +23,14 @@
  * fields membrane's ToolDefinition types and sends to the provider with every
  * later request: a non-empty string `name`, a string `description` and an
  * object `inputSchema` whose `type` is `'object'`, which the API requires.
- * One stands alone in its message, at
- * its top level: membrane sends such a message as a system message of its
- * own, and refuses one that mixes it with other blocks. A write refuses one
- * that doesn't, and a read leaves it out. A
+ * Or it carries `effort`, one of the levels membrane's type and the API name
+ * (`low`, `medium`, `high`, `xhigh`, `max`), beside no change of tools or
+ * system text (an empty array changes nothing). One stands alone in its
+ * message, at its top level, and one carrying effort holds its message
+ * alone: membrane sends such a message as a system message of its own, and
+ * refuses one that mixes it with other blocks, and an effort change beside
+ * another change, in its block or its message. A write refuses one that
+ * doesn't, and a read leaves it out. A
  * block of a type none of these names passes as it is, since membrane adds
  * types: whether a provider can take one is the provider's to say. One type is the
  * store's own: a `blob_ref`, which the store writes in place of inline media.
@@ -182,9 +186,30 @@ const SYSTEM_CHANGE_FIELDS: ReadonlyArray<readonly [
   ['addSystem', isString, 'an array of strings', (v, at, places) => stringPlaces(v, at, places, 'a string')],
 ];
 
+/**
+ * The levels membrane's SystemChangeContent takes for `effort`, which the API
+ * lists for `output_config.effort`. Kept here, not read from membrane, since
+ * the membrane releases this package's range admits have no such list.
+ */
+const EFFORT_LEVELS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function carriesEffort(value: unknown): boolean {
+  return isSystemChange(value) && (value as Record<string, unknown>).effort !== undefined;
+}
+
+/**
+ * The fields of a change that change tools or system text and hold something,
+ * in SYSTEM_CHANGE_FIELDS' order: membrane counts such a field as a change
+ * beside `effort` only when it holds something.
+ */
+function changesBesideEffort(block: Record<string, unknown>): string[] {
+  return SYSTEM_CHANGE_FIELDS.map(([field]) => field)
+    .filter((field) => Array.isArray(block[field]) && (block[field] as unknown[]).length > 0);
+}
+
 function systemChangeWellFormed(block: Record<string, unknown>): boolean {
   for (const [field, each] of SYSTEM_CHANGE_FIELDS) if (!absentOrArrayOf(block[field], each)) return false;
-  return true;
+  return block.effort === undefined || (EFFORT_LEVELS.has(block.effort as string) && changesBesideEffort(block).length === 0);
 }
 
 function systemChangePlaces(block: Record<string, unknown>, at: string, places: string[]): void {
@@ -198,6 +223,16 @@ function systemChangePlaces(block: Record<string, unknown>, at: string, places: 
     for (let i = 0; i < value.length; i++) {
       if (!each(value[i])) elementPlaces(value[i], `${at}.${field}[${i}]`, places);
     }
+  }
+  const effort = block.effort;
+  if (effort === undefined) return;
+  if (!EFFORT_LEVELS.has(effort as string)) {
+    places.push(`${at}.effort is ${typeof effort === 'string' ? JSON.stringify(effort) : kindOf(effort)}, not low, medium, high, xhigh or max`);
+  }
+  const beside = changesBesideEffort(block);
+  if (beside.length > 0) {
+    const named = beside.length === 1 ? beside[0] : `${beside.slice(0, -1).join(', ')} and ${beside.at(-1)}`;
+    places.push(`${at} carries effort beside ${named}; a system change carrying effort changes nothing else`);
   }
 }
 
@@ -266,12 +301,14 @@ function storeRefuses(block: unknown): boolean {
 
 function allWellFormed(content: readonly unknown[], side: Side): boolean {
   let changes = 0;
+  let effort = false;
   for (let i = 0; i < content.length; i++) {
     if (!wellFormed(content[i], side) || (side === 'write' && storeRefuses(content[i]))) return false;
     if (isSystemChange(content[i])) changes++;
+    if (carriesEffort(content[i])) effort = true;
   }
-  // A message holding a system change holds nothing else.
-  return changes === 0 || changes === content.length;
+  // A message holding a system change holds nothing else, and one holding an effort change holds only it.
+  return changes === 0 || (changes === content.length && (!effort || content.length === 1));
 }
 
 /**
@@ -405,6 +442,8 @@ function malformedPlaces(content: readonly unknown[], side: Side, at = 'content'
     if (side === 'write') storePlacesIn(content[i], `${at}[${i}]`, places);
     if (mixed && isSystemChange(content[i])) {
       places.push(`${at}[${i}] is a system_change beside other blocks; a system change goes in a message of its own`);
+    } else if (content.length > 1 && carriesEffort(content[i])) {
+      places.push(`${at}[${i}] carries effort beside other blocks; a system change carrying effort goes in a message of its own`);
     }
   }
   return places;
@@ -480,7 +519,8 @@ export function blockForWrite(block: ContentBlock, what: string): ContentBlock {
  */
 function transformed(content: readonly unknown[], side: Side, nested = false): ContentBlock[] {
   // A system change that doesn't stand alone in its message, at its top
-  // level, is left out by a read, and a write has refused it already.
+  // level, or carries effort beside another block there, is left out by a
+  // read, and a write has refused it already.
   const changesStand = !nested && standsAlone(content);
   const before: ContentBlock[] = [];
   const after: ContentBlock[] = [];
@@ -490,7 +530,9 @@ function transformed(content: readonly unknown[], side: Side, nested = false): C
     // read leaves it out, and a write has refused it already.
     if (!isRecord(block)) continue;
     before.push(block as unknown as ContentBlock);
-    const out = isSystemChange(block) && !changesStand ? undefined : side === 'write' ? writeBlock(block) : readBlock(block);
+    const out = isSystemChange(block) && (!changesStand || (content.length > 1 && carriesEffort(block)))
+      ? undefined
+      : side === 'write' ? writeBlock(block) : readBlock(block);
     if (out) after.push(out);
   }
   return releaseEditedRawForms(before, after);
@@ -524,8 +566,9 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
  * `mediaType`, and a `system_change` whose `removeTools`, `defineTools` or
  * `addSystem` isn't the array its content needs (one element of
  * `defineTools` that isn't a tool definition leaves the whole change out),
- * or that doesn't stand alone in its message, at its top level
- * (transformed).
+ * whose `effort` isn't one of membrane's levels or sits beside a change of
+ * tools or system text, or that doesn't stand alone in its message, at its
+ * top level, or carries effort beside another block there (transformed).
  */
 function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
   if (wellFormed(block, 'read')) return block as unknown as ContentBlock;

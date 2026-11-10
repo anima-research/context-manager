@@ -85,6 +85,13 @@ export interface OverBudgetDiagnostics {
    * isn't expected to be cleared by draining the queue alone.
    */
   queuedReliefTokens?: number;
+  /**
+   * Under `SelectOptions.requestLimitTokens`, the limit, and what it left
+   * the window once the reply's reserve, the request overhead and the
+   * message injections were kept (0 or less where it left none).
+   */
+  requestLimitTokens?: number;
+  requestAllowanceTokens?: number;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
@@ -296,6 +303,8 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.inputBudget === undefined ? '' : `, input budget=${opts.diagnostics.inputBudget}`) +
         (opts.diagnostics.floorTokens === undefined ? '' : `, floor=${opts.diagnostics.floorTokens}`) +
         (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
+        (opts.diagnostics.requestLimitTokens === undefined ? '' : `, request limit=${opts.diagnostics.requestLimitTokens}`) +
+        (opts.diagnostics.requestAllowanceTokens === undefined ? '' : `, request allowance=${opts.diagnostics.requestAllowanceTokens}`) +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across

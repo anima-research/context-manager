@@ -51,6 +51,53 @@ test('kv-unified receipts clear single flight on failure without changing baseli
   assert.equal(chain.inFlightSubmissionId, 's2');
 });
 
+test('kv-unified receipts keep the last accepted cache reference through a failed submission', () => {
+  const chain = new KvUnifiedReceiptChain();
+  const cache = {
+    immutablePrefixHash: 'tools',
+    layout: { units: [], totalTokens: 0 },
+    markers: [],
+  };
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  chain.accept('s1', 100, cache);
+  chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
+  chain.fail('s2');
+  assert.deepEqual(chain.cache, cache, 'a failed submission leaves the accepted cache reference');
+});
+
+test('kv-unified receipts: a failed submission keeps the snapshot the last acceptance left', () => {
+  const chain = new KvUnifiedReceiptChain();
+  const cache = {
+    immutablePrefixHash: 'tools',
+    layout: { units: [], totalTokens: 0 },
+    markers: [],
+  };
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  chain.accept('s1', 100, cache, { requestHash: 'r1', markers: [{ ordinal: 0, prefixHash: 'p', estimatedOffset: 1 }] });
+  // snapshot(), not serialize(): the failure rightly adds s2 to the settled
+  // ids, which serialize() carries and snapshot() doesn't.
+  const accepted = chain.snapshot();
+  chain.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
+  chain.fail('s2');
+  assert.deepEqual(chain.snapshot(), accepted, 'a failed submission leaves the snapshot the acceptance left');
+  assert.equal(chain.inFlightSubmissionId, null);
+});
+
+test('kv-unified receipts: a repeated fail of a settled id, with nothing in flight, changes no state', () => {
+  const chain = new KvUnifiedReceiptChain();
+  const cache = {
+    immutablePrefixHash: 'tools',
+    layout: { units: [], totalTokens: 0 },
+    markers: [],
+  };
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  chain.accept('s1', 100, cache, { requestHash: 'r1', markers: [{ ordinal: 0, prefixHash: 'p', estimatedOffset: 1 }] });
+  const before = chain.serialize();
+  chain.fail('s1');
+  assert.deepEqual(chain.serialize(), before, 'a repeated fail of a settled id is a no-op');
+  assert.equal(chain.inFlightSubmissionId, null);
+});
+
 test('kv-unified keepalive leaves continuity head unchanged but refreshes cache state', () => {
   const chain = new KvUnifiedReceiptChain();
   chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'same', leaves: leaves('raw:a') });

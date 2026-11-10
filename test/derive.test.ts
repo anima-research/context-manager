@@ -676,6 +676,24 @@ describe('ContextManager.derive', () => {
     await resumed.compile(BUDGET);
   });
 
+  it('reopening a derived context creates no branch', { skip }, async () => {
+    const path = storePath();
+    const parent = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
+    const derivation = child.getDerivation()!;
+    parent.close();
+
+    const reopened = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(reopened);
+    const store = reopened.getStore();
+    const branches = () => store.listBranches().map((b) => b.name).sort();
+    const before = branches();
+    const resumed = await ContextManager.reopenDerived({ store, derivation, strategy: folding(), membrane: mockMembrane() as never });
+    assert.equal(resumed.currentBranch().name, 'dendrite/child', 'premise: it reopened the child\'s branch');
+    assert.deepEqual(branches(), before);
+  });
+
   it('a derived context can itself be derived from', { skip }, async () => {
     const { parent, ids } = await foldedParent();
     const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
@@ -913,6 +931,26 @@ describe('MessageStore coherence across handles on one branch', () => {
       resident.append('user', [{ type: 'text', text: 'after-edit' }]);
       assert.equal((resident.getAll()[0]!.content[0] as { text: string }).text, 'edited-by-surgeon');
       assert.equal((resident.get(target.id)!.content[0] as { text: string }).text, 'edited-by-surgeon');
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('MessageStore.deriveOnto from a seed', () => {
+  it("a store its parent seeds starts at its parent's calibration multiplier", { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-derive-seeded-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const parent = new MessageStore(root);
+      parent.append('user', [{ type: 'text', text: 'before the fork' }]);
+      parent.setTokenCalibration(1.3);
+      root.createBranchAt('seeded-child', root.currentBranch().name, root.currentSequence());
+      const derived = parent.deriveOnto((root as ViewStore).view('seeded-child'));
+      assert.equal(derived.getAll()[0], parent.getAll()[0], 'premise: the parent seeded the child, which shares its message object');
+      assert.equal(derived.getTokenCalibration(), 1.3);
     } finally {
       root.close();
       rmSync(dir, { recursive: true, force: true });

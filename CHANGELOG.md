@@ -12,6 +12,103 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.27.0 — 2026-11-09
+
+### Changed
+
+- System changes: a `system_change` block carrying only `effort` (`SystemChangeContent.effort`, added in membrane 0.10.0) changes, from its place on, the effort the model answers with. membrane 0.10.0 sends one only through its native formatter and Anthropic adapter, at its place, or right after the turn its place falls inside where membrane merges turns. On any other formatter or adapter it refuses the whole request, and it refuses an effort change that would end a request after an assistant turn. Every strategy keeps it as it keeps any system change: compiled unaltered, in its place among the raw messages, never dropped, and left out of what compression reads. A write refuses a change carrying `effort` beside a change of tools or system text (a non-empty `removeTools`, `defineTools` or `addSystem`), or beside another block in its message, and one whose `effort` isn't `low`, `medium`, `high`, `xhigh` or `max`, each by name; a read leaves such a change out. An effort-only change between a tool call and its result is refused like any other change: kept raw, it would part the call from its result in the same way. The refusal now gives membrane's placement as its reason for a change of tools or system text only: membrane sends one of those after the call's result anyway.
+
+- **Hosts:** context-manager accepts `@animalabs/membrane`
+  `^0.8.0 || ^0.9.0 || ^0.10.0` (was `^0.8.0 || ^0.9.0`), so a host whose
+  own membrane is 0.10.0 shares it with context-manager, where before
+  context-manager installed its own 0.9.0 beside it. A lockfile's 0.8.0 or
+  0.9.0 is still admitted. membrane 0.10.0 is the release whose system
+  changes carry `effort`, which an effort-only system change needs to reach
+  the model; membrane 0.9.0 leaves such a block out as empty. membrane's
+  changelog for 0.10.0 lists its other changes.
+
+## 0.26.0 — 2026-11-09
+
+### Added
+
+- `compile`'s `requestLimitTokens` option keeps the whole request within a provider's limit: the context, with any tool-result stubs the autobiographical strategy's pairing repair adds, the message-position injections, `requestOverhead` and the budget's `reserveForResponse`, in the context's units, the strategy's over-budget grace included. While the autobiographical strategy's multiplier is provisional, it prices the request at the calibration's ceiling by scaling its price at the provisional multiplier. The store rounds each block's price at that multiplier, by up to half a token, so for any true rate up to the ceiling a request while the multiplier is provisional can pass the limit by up to half a token a block, scaled by the ceiling over the provisional multiplier. That request's sample, where the calibration's band accepts it, then replaces the provisional multiplier, or confirms it where the two are within 2%. `RequestOverhead` gains `messages`, the content of each message a request sends besides the context and its message-position injections, such as a tool result a caller adds after the compile. It's priced as the context prices the same blocks sent whole, and counted wherever the overhead is: against the limit, in `RenderStats.request.overheadTokens`, and in a calibration sample given it. The strategy's target and hard bound are each lowered only where the limit is below them, which `RenderStats.request` reports as `limitTokens` and `allowanceTokens`, with the stubs' price as `stubTokens`. Where the stubs take the window past the limit, the strategy selects once more with their price reserved, and refuses for the stubs only if that select can't make room. A limit that leaves the context no room, or a request a strategy compiles past it, is refused with an `OverBudgetError`. Passthrough and windowed-passthrough keep within it as a cap on their room, as the store's estimator prices the request, since they don't calibrate. A limit needs `requestOverhead`: one without it, or one that isn't a positive finite number, is refused with a `TypeError` before anything is selected. The autobiographical strategy's over-budget refusals under a limit, the no-room one included, name it in their diagnostics as `requestLimitTokens`, and, where the limit lowered the target or the bound, what it left the context as `requestAllowanceTokens`; so does the compile's own refusal of a request past the limit, and a preview that reports a refusal carrying them copies them. A refusal the limit made, by its bound, by leaving no room or by the stubs past what it left, keeps a provisional multiplier, since a lower one can't make the context fit there. Without `requestLimitTokens`, every select is as it was.
+
+- `ContextEntry.relocatedBlocks` holds the result blocks pairing repair placed
+  for an entry's `relocatedResults`, one for each move. Where it's set, compile
+  provenance credits a moved result only through one of those blocks still in
+  the request, unaltered, or through a result with its id still in the entry
+  that isn't among the blocks repair recorded as placed for any entry.
+  `AutobiographicalStrategy` and `KnowledgeStrategy` set it.
+
+### Changed
+
+- Where a later tool call reuses an earlier call's id,
+  `AutobiographicalStrategy` and `KnowledgeStrategy` pair each tool result with
+  the nearest call before it with that id, as with distinct ids, in pairing
+  repair (`enforceToolPairing`) and in `toolResultMaxLastN`'s count, and so does
+  `stripUnpairedToolBlocks`, which every summariser request that carries tool blocks goes through. Where
+  each of two responses streams one tool call without an id, membrane's
+  OpenAI-compatible adapter gives both the id `call_1`. Where the earlier call
+  had no result and the later call's result lay within the repair's look-ahead,
+  the repair moved that result up to answer the earlier call and sent the later
+  call, which made it, with a stub; now the earlier call goes with the stub.
+  `toolResultMaxLastN`'s doc said a result answers the earliest call with its id
+  before it that no result has answered.
+- Where one message holds several calls with one id and no result with the id
+  between them, pairing repair keeps only the last, with every result with the
+  id after them, up to the next call with the id and within the repair's
+  look-ahead. So `NativeFormatter`, which refused such a request, sends it, with
+  the further results as `[duplicate tool_result for …]` text. Compile
+  provenance reports such a message's body as not complete
+  (`missing: ['content']`).
+- Where a host stores a call's result after a later call has reused the call's
+  id, that result now goes with the later call, beside the later call's own,
+  and the earlier call goes with a stub. Where the earlier call's result was
+  stored first, the later call now goes out with it first, where each call went
+  with its own before; where the later call's was stored first, the two no
+  longer go crossed.
+- A store in which a later call reuses a call's id can compile a different
+  request where a compile sends the earlier call without its own result, and
+  where it does, the prompt cache can't serve that request from the first
+  message that differs. A store with several calls with one id in one message
+  now compiles requests membrane sends. Every other store compiles what it
+  compiled. A summariser request changes only where the strip now drops a call
+  or result it kept.
+
+### Fixed
+
+- `compile()` no longer passes a caller's own `SelectOptions.messageInjections` to the select. The field holds the compile's own injections, as its doc says.
+
+- Compile provenance attributes a moved result of an entry that sets
+  `relocatedResults` and no `relocatedBlocks` by tool_use id, as the field's
+  doc says, against every result with that id in the request. It checked only
+  the first, so where a later call reused the id, a moved result that sat
+  unaltered in the request could read as missing.
+
+## 0.25.1 — 2026-11-08
+
+### Added
+
+- `ContextManager.noteThinkingDropped(messageIds, compileId)` (new): a host calls it with the stored replies whose thinking the provider set aside under the drop control (`ThinkingBinding.dropBlock`), in a request of a stream built from the branch's last committing compile with `binds`, naming that compile's `provenance.compileId`. Each id is a body's head as the compile's provenance names it (`RawBodySource.messageId`), the id `addMessage` returned. The record then holds them as set aside, so from the next compile on each goes without it, and the replies after it keep theirs, unless it has changed since it was sent or compiles into one message with a body the note didn't name: that message and the replies after it then go without theirs. A noted reply isn't reported in a later `thinkingStrip`, unless a committing compile came between that didn't leave its thinking out. A repeated note writes nothing. It returns false, writing nothing, when `compileId` isn't the compile that wrote the branch's record, and on a branch with no record or one it can't read, or when the store can't write it, as `noteRequestSent` does.
+
+### Changed
+
+- **Under the drop control, a reply whose thinking the provider set aside goes without it from the compile after a host notes so** with `noteThinkingDropped`. Before, nothing told the record of a block the provider set aside: a reply stored before its branch's record began, which the drop control leaves for the provider to judge, was sent with its thinking at every request and set aside every time. A host that doesn't call `noteThinkingDropped` sees no change.
+  - **The replies after a noted one keep their thinking.** A noted reply that hasn't changed since it was sent, sent without its thinking, still matches the record's form of it as it was sent, so the replies after it keep their thinking, for the provider to judge. A message that differs from the record still takes the thinking of every reply after it, and so does a compiled message holding a body the note didn't name, which is then reported in `thinkingStrip`.
+  - **`thinkingStrip` doesn't report a noted reply,** unless a committing compile came between that didn't leave its thinking out. Its `newly` leaves out the replies a host noted, though the compile that wrote the branch's record sent them with their thinking, and a compile that newly leaves out only noted replies sets no `thinkingStrip`.
+  - **Prompt cache:** a request's bytes change where a noted reply's thinking leaves it, so the cache may be written once from the earliest such reply.
+
+### Fixed
+
+- `AutobiographicalStrategy.reportRealInputTokens` now spends the compile's
+  one calibration sample on a report whose total is 0, negative, NaN or
+  infinite, and learns nothing from it. Before, such a report left the
+  sample to the next report. When that report came from a later call built
+  on the same compile, whose request the turn's tool rounds and
+  continuations had grown since, the sample compared the grown request with
+  the compile's estimate, the comparison one sample per compile exists to
+  prevent. The next compile still takes its own sample.
+
 ## 0.25.0 — 2026-11-07
 
 ### Breaking

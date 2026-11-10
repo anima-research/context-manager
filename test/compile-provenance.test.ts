@@ -567,6 +567,157 @@ describe('a tool result moved by repair is still carried', () => {
     assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
   });
 
+  it('credits a body whose later result with the moved result\'s id stays with its own call', async () => {
+    const c = msg('c', 1, [use('x')]);
+    const t = msg('t', 2, [text('an aside')]);
+    const m = msg('m', 3, [result('x', 'small'), text('and then'), use('x'), result('x', 'large')]);
+    const entries = await repaired([copy(c), copy(t), copy(m)]);
+    const own = entries.find((e) => e.sourceMessageId === 'm')!;
+    assert.deepEqual(own.relocatedResults, ['x'], 'premise: repair moved the first result');
+    assert.ok(own.content.some((b) => b.type === 'tool_result'), 'premise: the later result stays with its own call');
+    const body = attributeEntries(entries, [c, t, m]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'm');
+    assert.deepEqual(body, { messageId: 'm', sequence: 3, complete: true });
+  });
+
+  it('doesn\'t credit two identical results with the one block repair placed when the other is dropped', async () => {
+    const u = msg('u', 1, [use('x')]);
+    const r = msg('r', 3, [result('x', 'SAME'), result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const placed = entries.filter((e) => e.content.some((b) => b.type === 'tool_result'));
+    assert.equal(placed.flatMap((e) => e.content).filter((b) => b.type === 'tool_result').length, 1, 'premise: one of the two results reaches the request');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: false, missing: ['content'] });
+  });
+
+  it('doesn\'t credit a moved result that was altered before repair moved it', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const sent = copy(r);
+    sent.content = [result('tu-1', '[result left out]'), ...sent.content.slice(1)];
+    const entries = await repaired([copy(u), recall, sent]);
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r')!.relocatedResults, ['tu-1'], 'premise: repair moved the altered result');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: false, missing: ['content'] });
+  });
+
+  it('credits the body with its result where repair moves it out of a message it cut at a tool cycle', async () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), use('y'), result('y', 'the cycle\'s output')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(u), recall, copy(r)]);
+    const moved = entries.find((e) => e.sourceMessageId === 'r')!;
+    assert.deepEqual(moved.relocatedResults, ['tu-1'], 'premise: repair moved the result out of the message it cut');
+    const body = attributeEntries(entries, [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 3, complete: true });
+  });
+
+  it('doesn\'t credit a moved result that was altered afterwards with another result of its id and identical content', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const r1 = msg('r1', 3, [result('x', 'SAME')]);
+    const b = msg('b', 4, [use('x')]);
+    const r2 = msg('r2', 5, [result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), recall, copy(r1), copy(b), copy(r2)]);
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r1')!.relocatedResults, ['x'], 'premise: repair moved r1\'s result up to a');
+    const placed = entries.find((e) => e.content.some((block) => block.type === 'tool_result'))!;
+    const i = placed.content.findIndex((block) => block.type === 'tool_result');
+    placed.content[i] = result('x', 'ALTERED');
+    const body = attributeEntries(entries, [a, r1, b, r2]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r1');
+    assert.deepEqual(body, { messageId: 'r1', sequence: 3, complete: false, missing: ['content'] });
+  });
+
+  it('counts a result the repair moved within its own cut message once, so an identical result it dropped reads as missing', async () => {
+    const m = msg('m', 1, [use('x'), use('y'), result('y', 'y out'), text('note'), result('x', 'SAME'), result('x', 'SAME')]);
+    const entries = await repaired([copy(m), { index: 0, participant: 'Claude', content: [text('done')] } as ContextEntry]);
+    assert.deepEqual(entries[0]!.relocatedResults, ['x'], 'premise: repair moved a result within the message');
+    assert.equal(entries.flatMap((e) => e.content).filter((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'x').length, 1, 'premise: one of the two identical results reaches the request');
+    const body = attributeEntries(entries, [m]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'm');
+    assert.deepEqual(body, { messageId: 'm', sequence: 1, complete: false, missing: ['content'] });
+  });
+
+  it('attributes by tool_use id an entry that names its moved results and no placed blocks', () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const answering: ContextEntry = { index: 0, participant: 'user', sourceRelation: 'derived', content: [result('tu-1', 'the real output')] };
+    const moved: ContextEntry = { ...copy(r, [text('and a note')]), relocatedResults: ['tu-1'] };
+    const bodies = attributeEntries([copy(u), answering, moved], [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
+  });
+
+  it('attributes by tool_use id against every result with the moved id in the request, not only the first', () => {
+    const u = msg('u', 1, [use('tu-1')]);
+    const r = msg('r', 3, [result('tu-1', 'the real output'), text('and a note')]);
+    const earlier: ContextEntry = { index: 0, participant: 'user', sourceRelation: 'derived', content: [result('tu-1', 'another output')] };
+    const answering: ContextEntry = { index: 0, participant: 'user', sourceRelation: 'derived', content: [result('tu-1', 'the real output')] };
+    const moved: ContextEntry = { ...copy(r, [text('and a note')]), relocatedResults: ['tu-1'] };
+    const bodies = attributeEntries([copy(u), earlier, answering, moved], [u, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
+  });
+
+  it('doesn\'t credit a moved result whose stored block another moved result shares, once its own placement was altered', async () => {
+    const shared = result('x', 'SAME');
+    const a = msg('a', 1, [use('x')]);
+    const r1 = msg('r1', 3, [shared]);
+    const b = msg('b', 4, [use('x')]);
+    const r2 = msg('r2', 6, [shared]);
+    const recall = (): ContextEntry => ({ index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] });
+    const entries = await repaired([copy(a), recall(), copy(r1), copy(b), recall(), copy(r2)]);
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r1')!.relocatedResults, ['x'], 'premise: repair moved r1\'s result up to a');
+    assert.deepEqual(entries.find((e) => e.sourceMessageId === 'r2')!.relocatedResults, ['x'], 'premise: repair moved r2\'s result up to b');
+    const placed = entries.find((e) => e.content.some((block) => block.type === 'tool_result'))!;
+    const i = placed.content.findIndex((block) => block.type === 'tool_result');
+    placed.content[i] = result('x', 'ALTERED');
+    const bodies = attributeEntries(entries, [a, r1, b, r2]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'r1'), { messageId: 'r1', sequence: 3, complete: false, missing: ['content'] });
+    assert.deepEqual(bodies.find((x) => x.messageId === 'r2'), { messageId: 'r2', sequence: 6, complete: true });
+  });
+
+  it('doesn\'t credit a cut message\'s moved result, once its own placement was altered, with a result the repair placed for another entry inside that message', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const m = msg('m', 3, [result('x', 'SAME'), text('note'), use('x'), use('y'), result('y', 'y out')]);
+    const s = msg('s', 4, [result('x', 'SAME')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), recall, copy(m), copy(s)]);
+    const forM = entries.find((e) => e.sourceMessageId === 'm')!;
+    const forS = entries.find((e) => e.sourceMessageId === 's')!;
+    assert.deepEqual([forM.relocatedResults, forS.relocatedResults], [['x'], ['x']], 'premise: repair moved m\'s result up to a, and s\'s into m');
+    assert.ok(forM.content.includes(forS.relocatedBlocks![0]!), 'premise: the result placed for s sits in m\'s folded content');
+    const own = forM.relocatedBlocks![0]!;
+    const holder = entries.find((e) => e.content.includes(own))!;
+    holder.content[holder.content.indexOf(own)] = result('x', 'ALTERED');
+    const bodies = attributeEntries(entries, [a, m, s]).sources.flatMap((x) => (x.kind === 'raw' ? x.bodies : []));
+    assert.deepEqual(bodies.find((x) => x.messageId === 'm'), { messageId: 'm', sequence: 3, complete: false, missing: ['content'] });
+    assert.deepEqual(bodies.find((x) => x.messageId === 's'), { messageId: 's', sequence: 4, complete: true });
+  });
+
+  it('credits the body with its result where a later call reuses an unanswered call\'s id and repair moves the result to the later call', async () => {
+    const a = msg('a', 1, [use('x')]);
+    const n = msg('n', 2, [text('never mind')]);
+    const b = msg('b', 3, [use('x')]);
+    const r = msg('r', 5, [result('x', 'what the later call returned')]);
+    const recall: ContextEntry = { index: 0, participant: 'Context Manager', sourceRelation: 'derived', content: [text('What do you remember?')] };
+    const entries = await repaired([copy(a), copy(n), copy(b), recall, copy(r)]);
+    const results = entries.flatMap((e) => e.content).filter((block) => block.type === 'tool_result').map((block) => String((block as { content: unknown }).content));
+    assert.equal(results.length, 2, 'premise: a stub for the earlier call, and the moved result for the later one');
+    assert.equal(results[1], 'what the later call returned', 'premise: the later call goes with its own result');
+    const body = attributeEntries(entries, [a, n, b, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : [])).find((x) => x.messageId === 'r');
+    assert.deepEqual(body, { messageId: 'r', sequence: 5, complete: true });
+  });
+
+  it('reports a message whose calls sharing an id repair cut to the last as not complete, since the calls it drops aren\'t sent', async () => {
+    const call = (n: number): ContentBlock => ({ type: 'tool_use', id: 'A', name: 'fn', input: { n } } as ContentBlock);
+    const u = msg('u', 1, [text('look')]);
+    const a = msg('a', 2, [text('trying'), call(1), call(2)], { participant: 'Claude' });
+    const r = msg('r', 3, [result('A', 'out')]);
+    const entries = await repaired([copy(u), copy(a), copy(r)]);
+    const bodies = attributeEntries(entries, [u, a, r]).sources.flatMap((s) => (s.kind === 'raw' ? s.bodies : []));
+    assert.deepEqual(bodies.find((b) => b.messageId === 'a'), { messageId: 'a', sequence: 2, complete: false, missing: ['content'] });
+    assert.deepEqual(bodies.find((b) => b.messageId === 'r'), { messageId: 'r', sequence: 3, complete: true });
+    assert.equal(entries.flatMap((e) => e.content).filter((b) => b.type === 'tool_use').length, 1, 'repair keeps the last call');
+  });
+
   it('still reports missing content when the moved result was altered afterwards, or is not in the request', async () => {
     const u = msg('u', 1, [use('tu-1')]);
     const r = msg('r', 3, [result('tu-1', 'the real output')]);

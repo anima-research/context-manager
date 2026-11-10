@@ -432,6 +432,67 @@ There is no single linear change exchange rate: the discrete tree-cut
 frontier is non-convex, and linear scalarization reaches only supported
 points.
 
+**A linear rewrite price (`policy.rewriteLambda`, off unless set; added
+2026-11).** The quadratic `f_K` is only as steep as its scale makes it. At
+the scale deployments ran (`cacheScale` 100,000 with `cacheLambda` 1) two
+cuts that differ by a few hundred thousand tokens of rewrite score within
+a few dozen points, against fidelity and occupancy differences in the
+thousands, so `K` rarely decided anything: on a copy of one resident's
+store a forced transition folded six raw messages at the very start of
+history beside the new fold, which moved the first changed token from
+about 250k to 3k and doubled the rewrite, and other transitions re-leveled
+old summaries, some of them back and forth on successive transitions
+(context-manager #412 reports the same flip). On that copy, `cacheScale`
+10,000 or 20,000 was enough to keep the first change at the new fold, so
+the quadratic's scale is one remedy. `rewriteLambda` is the other: with it
+the cache term is `rewriteLambda · K(x) / cacheScale`, linear in the churn
+itself, in place of `f_K(K_excess)`. It is the provider's own cost model
+(a rewritten token is billed the same wherever it is), it needs no floor
+(a floor is one constant per pool in a linear term, so it decides nothing
+and scores from two pools compare without a shared frame), and what it
+charges for reaching further back is in proportion to what that rewrites,
+where the quadratic charges four times as much for twice the rewrite: old
+history still returns to a shallower level where its fidelity is worth
+that rewrite. The remark above stands: a linear term selects only
+supported points of the (welfare, churn) frontier. Marker quantization is
+unchanged: `K` is measured from the last marker a cut keeps, so cuts that
+first change between the same two markers cost alike.
+
+**A change penalty (`KvUnifiedOptions.changePenalty`; the memory
+strategy's `thinkingLambda`).** Some of what a change costs is the same
+for every cut outside the carried family. On a model that binds signed
+thinking to the request that minted it, a block is dropped once anything
+before it differs, and the thinking still in play sits in the newest raw
+messages, after everything a fold or an unfold touches: any change of
+layout drops all of it, wherever the change begins. Such a cost can't
+choose between changes, only between changing and holding, so it is added
+to `adoptEpsilon` for the live solve. The memory strategy prices it per
+compile from what the branch's binding record still vouches for
+(`SelectOptions.thinkingStanding`): each of the agent's own replies still
+rendered raw, its thinking at the store's price, weighted by
+`2^(−d / thinkingHalfLifeTokens)` for the raw tokens `d` between it and
+the newest message, times `thinkingLambda`. It is zero on a compile for a
+model that doesn't bind thinking, and zero again once the record no longer
+vouches for the thinking (another system text or tool list, or a change
+the provider already set it aside for), which is when a transition that
+was waiting comes. A reply stored past the record's end
+(`ThinkingStanding.recordedThrough`) isn't counted: nothing vouches for it
+until a host notes it as a row its stream sent, and the next compile
+sends it without its thinking whatever it selects. The cost is an upper
+bound: a change that begins after some raw replies leaves their thinking
+standing, and they are priced all the same, since one number can't depend
+on where a change begins (the rewrite's price does). Hard-wall priority is
+unchanged: nothing here retains `R > W`.
+
+**Neither enters latent demand (§8).** A merge is worth producing when the
+layout the policy would move to is better with it, and that is asked
+before a transition is due. Priced at what a change costs now, the best
+cut of both pools is the carried one for as long as holding is cheaper, no
+merge would be demanded until a transition is forced, and that transition
+would find none of the summaries it needs. The demand solves, and the base
+they are measured against, therefore run with `rewriteLambda` 0 and no
+change penalty: the same labels, scored as before.
+
 **Explicit continuity relaxation.** `ρ(reason) ∈ [0,1]` is supplied by a
 reason-coded, time-bounded transition policy, not inferred from a large diff.
 Normal operation and tool/system changes use `ρ = 1`: a cold cache does not
@@ -973,6 +1034,8 @@ Bedrock return equivalent receipts for equivalent normalized requests.
 | `kvUnifiedLambdaF` | 0 (v1) | recipe | future-churn price |
 | `kvUnifiedBeta` | 0.9/event | recipe | churn discount |
 | `kvUnifiedAdoptEpsilon` | 0.005·W | recipe | anti-cycle margin |
+| `kvUnified.policy.rewriteLambda` | 0 (off) | recipe | linear price of cache churn, per `cacheScale`, in place of the quadratic cache policy (§3.2) |
+| `kvUnified.thinkingLambda` / `kvUnified.thinkingHalfLifeTokens` | 0 (off) / 50,000 | recipe | points per token of thinking a change would drop on a model that binds it, and the half-life of its weight (§3.2) |
 | `cacheMarkers` | `membrane-system` | recipe | `cm-owned` hands all four slots to CM, less any the caller declares (§5A.3) |
 | W (`contextBudgetTokens`) | existing | existing | the wall |
 

@@ -14,6 +14,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../src/index.js';
+import { answeredCallIndexes } from '../src/normalize-tool-messages.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 function mkBlocks(spec: string): ContentBlock[] {
@@ -163,6 +164,68 @@ describe('stripUnpairedToolBlocks', () => {
     assert.deepEqual(out[1].content.map((b) => (b as { toolUseId?: string }).toolUseId ?? b.type), ['B', 'C']);
   });
 
+  it('strips a call whose id a later call reuses before any result, and keeps the later call with its result', () => {
+    const input = [
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [t('never mind')] },
+      { participant: 'agent', content: [t('again'), u('A')] },
+      { participant: 'user', content: [r('A')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text'],
+      ['text', 'tool_use'],
+      ['tool_result'],
+    ]);
+  });
+
+  it('strips a result whose only call with its id comes after it, and that call when no result follows it', () => {
+    const input = [
+      { participant: 'user', content: [r('A')] },
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [t('next')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text'],
+      ['text'],
+    ]);
+    assert.equal((out[0].content[0] as { text: string }).text, '[tool call omitted]');
+  });
+
+  it('keeps a later call with its result and a further result after an orphan result with its id', () => {
+    const input = [
+      { participant: 'user', content: [r('A'), t('thanks')] },
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [r('A')] },
+      { participant: 'user', content: [r('A')] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text', 'tool_use'],
+      ['tool_result'],
+      ['tool_result'],
+    ]);
+  });
+
+  it('judges a block that occurs at two places at each of them', () => {
+    const orphan = r('A');
+    const input = [
+      { participant: 'user', content: [orphan, t('thanks')] },
+      { participant: 'agent', content: [t('looking'), u('A')] },
+      { participant: 'user', content: [orphan] },
+    ];
+    const out = stripUnpairedToolBlocks(input);
+    assert.deepEqual(out.map((m) => m.content.map((b) => b.type)), [
+      ['text'],
+      ['text', 'tool_use'],
+      ['tool_result'],
+    ]);
+  });
+
   it('replaces empty content with a placeholder text block', () => {
     const input = [{ participant: 'agent', content: [u('A')] }];
     const out = stripUnpairedToolBlocks(input);
@@ -180,5 +243,16 @@ describe('stripUnpairedToolBlocks', () => {
     const msg = { participant: 'user', content: [t('hello')] };
     const out = stripUnpairedToolBlocks([msg]);
     assert.deepStrictEqual(out[0].content, [t('hello')]);
+  });
+});
+
+describe('answeredCallIndexes', () => {
+  const u = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'fn', input: {} });
+  const r = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'res' });
+  const t = (text: string): ContentBlock => ({ type: 'text', text });
+
+  it('pairs each result with the nearest call before it with its id, and a result with no call before it with none', () => {
+    const blocks = [r('A'), u('A'), r('A'), t('again'), u('A'), r('A'), r('A'), u('B'), r('A'), r('B')];
+    assert.deepStrictEqual(answeredCallIndexes(blocks), [undefined, undefined, 1, undefined, undefined, 4, 4, undefined, 4, 7]);
   });
 });
