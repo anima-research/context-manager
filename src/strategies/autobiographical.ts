@@ -93,7 +93,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
-import { withoutThinking } from '../thinking-binding.js';
+import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
@@ -2414,6 +2414,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  markers whose prefix has changed in place since it was accepted are left
    *  out (kvUnifiedCacheForSolve). Set by selectAdaptive before buildPicker. */
   private kvUnifiedSolveCache: ProviderCacheReference | null = null;
+  /** What a change of layout would cost this compile in dropped thinking
+   *  (thinkingAtStake), in the solver's points; 0 where it prices none. Set
+   *  by selectAdaptive before buildPicker, and reported with the plan. */
+  private kvUnifiedChangePenalty = 0;
   /** Content arrays' and blocks' hashes (kvUnifiedEntryFingerprint), by the
    *  object: the store and the passes replace one rather than change it. It
    *  keeps what this compile and the one before fingerprinted, so it follows
@@ -10660,6 +10664,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const solveMs = kt ? Math.round(kt.forestMs + kt.baseSolveMs + kt.demandMs) : undefined;
       // What the label ceiling stopped in that solve (#252).
       const ceiling = ceilingMark(kt?.ceiling);
+      // What a change of layout was priced at in dropped thinking (kv-unified's thinkingLambda).
+      const changePenalty = m?.solver === 'kv-unified' ? Math.round(this.kvUnifiedChangePenalty) : 0;
       const messages = this._selectMessages;
       // Dry runs and previews log the line too, and skip work a live compile
       // does, so a journal reader must be able to drop them.
@@ -10676,6 +10682,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         compileMs,
         ...(solveMs !== undefined ? { solveMs } : {}),
         ...(ceiling ? { ceiling } : {}),
+        ...(changePenalty > 0 ? { changePenalty } : {}),
         ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
         ...(floor ? { floorTokens: floor.floorTokens, hardBudget: floor.hardBudget, queuedReliefTokens: queuedRelief } : {}),
@@ -10689,6 +10696,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
         (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
         (ceiling ? ` ceiling=${ceiling}` : '') +
+        (changePenalty > 0 ? ` changePenalty=${changePenalty}` : '') +
         (floor ? ` floor=${floor.floorTokens} hardBudget=${floor.hardBudget} queuedRelief=${queuedRelief}` : '') +
         (dryRun ? ' dryRun=true' : '');
       if (loud) this.diag.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
@@ -15460,6 +15468,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         l1Id: undefined,
       });
     }
+    // The middle's chunks come first, then the head's, then the recent
+    // window's (thinkingAtStake reads the newest raw run from both ends).
+    const middleCount = pickerChunks.length - head.length;
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
@@ -15535,6 +15546,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? this.kvUnifiedCacheForSolve(store, messages, { headStart, headEnd, recentStart: effectiveRecentStart, msgCap })
       : null;
     this.kvUnifiedSolveCache = kvUnifiedCheck?.cache ?? null;
+    this.kvUnifiedChangePenalty = this.config.foldingStrategy === 'kv-unified'
+      ? this.thinkingAtStake(store, messages, pickerChunks, middleCount, messages.length - effectiveRecentStart, opts)
+      : 0;
     const picker = this.buildPicker(
       pickerInputs,
       preparedTotal === undefined
@@ -17827,6 +17841,93 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * kv-unified's `thinkingLambda`: what a change of layout would cost this
+   * compile in thinking a binding model drops, in the solver's points
+   * (`KvUnifiedOptions.changePenalty`). 0 unless the option is set, the
+   * select is for a model that binds thinking, and the manager gave what the
+   * branch's record still vouches for (`SelectOptions.thinkingStanding`).
+   *
+   * Counted over the newest run of raw messages: the recent window, then the
+   * middle back to the first chunk carried folded (thinking older than that
+   * has a fold between it and now), or to seven half-lives, where the
+   * weight is under 1%. A reply counts when it is the binding's participant's
+   * own and the record still has its thinking as sent, which a reply stored
+   * past the record's end never has (`ThinkingStanding.recordedThrough`): its
+   * thinking goes whatever this compile selects. Its thinking blocks count at
+   * the store's price, weighted by 2^(-d / half-life), d the raw tokens
+   * between it and the newest message.
+   */
+  private thinkingAtStake(
+    store: MessageStoreView,
+    messages: readonly StoredMessage[],
+    chunks: readonly PickerChunk[],
+    middleCount: number,
+    tailCount: number,
+    opts?: SelectOptions,
+  ): number {
+    const priced = this.thinkingPrice();
+    if (priced === null) return 0;
+    const { lambda, halfLife } = priced;
+    const standing = opts?.thinkingStanding;
+    const participant = opts?.thinkingBinding?.participant;
+    if (opts?.thinkingBinding?.binds !== true || !standing || standing.none || !participant) return 0;
+    const reach = halfLife * 7;
+    let distance = 0;
+    let value = 0;
+    const visit = (chunk: PickerChunk): void => {
+      const msg = messages[chunk.sequence];
+      if (msg && msg.id === chunk.id && msg.participant === participant && !standing.without.has(msg.id) &&
+          (standing.recordedAfter === undefined || msg.sequence > standing.recordedAfter) &&
+          (standing.recordedThrough === undefined || msg.sequence <= standing.recordedThrough)) {
+        const thinking = msg.content.filter(isThinkingBlock);
+        if (thinking.length > 0) {
+          const tokens = store.estimateTokens({ content: thinking } as unknown as StoredMessage);
+          if (Number.isFinite(tokens) && tokens > 0) value += tokens * 2 ** (-distance / halfLife);
+        }
+      }
+      distance += chunk.rawTokens;
+    };
+    // The recent window's chunks are the last ones (after the middle and the
+    // head), oldest first; the middle's are the first ones.
+    for (let k = chunks.length - 1; k >= chunks.length - tailCount && distance < reach; k--) visit(chunks[k]!);
+    for (let k = middleCount - 1; k >= 0 && distance < reach; k--) {
+      const chunk = chunks[k]!;
+      if (chunk.currentResolution > 0) break;
+      visit(chunk);
+    }
+    // A product past what a double holds is still a cost, not none.
+    return Math.min(lambda * value, Number.MAX_VALUE);
+  }
+
+  /**
+   * kv-unified's `thinkingLambda` and `thinkingHalfLifeTokens` as set, or
+   * null where thinking isn't priced (no kv-unified, the lambda absent or
+   * 0). A value that isn't a number the option can take is refused here, at
+   * the compile that would have read it, rather than read as off.
+   */
+  private thinkingPrice(): { lambda: number; halfLife: number } | null {
+    if (this.config.foldingStrategy !== 'kv-unified') return null;
+    const kv = this.config.kvUnified as { thinkingLambda?: unknown; thinkingHalfLifeTokens?: unknown } | undefined;
+    const lambda = kv?.thinkingLambda;
+    const halfLife = kv?.thinkingHalfLifeTokens;
+    if (lambda !== undefined && (typeof lambda !== 'number' || !Number.isFinite(lambda) || lambda < 0)) {
+      throw new Error(`kvUnified.thinkingLambda must be a finite number of 0 or more, got ${JSON.stringify(lambda) ?? String(lambda)}`);
+    }
+    if (lambda === undefined || lambda === 0) return null;
+    // The half-life is read only where thinking is priced, and checked there.
+    if (halfLife !== undefined && (typeof halfLife !== 'number' || !Number.isFinite(halfLife) || halfLife <= 0)) {
+      throw new Error(`kvUnified.thinkingHalfLifeTokens must be a finite number above 0, got ${JSON.stringify(halfLife) ?? String(halfLife)}`);
+    }
+    return { lambda, halfLife: halfLife ?? 50_000 };
+  }
+
+  /** The manager reads the branch's binding record for a select only where
+   *  thinking is priced (`ContextStrategy.readsThinkingStanding`). */
+  readsThinkingStanding(): boolean {
+    return this.thinkingPrice() !== null;
+  }
+
+  /**
    * Build the picker for this compile. Instance folding strategies (kv-stable)
    * need the per-compile `PickerInputs` at construction, so they're built fresh
    * here; stateless ones (flat-profile / oldest-first) reuse the memoized picker.
@@ -17911,6 +18012,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
         ...(this.kvUnifiedSolveCache ? { cache: this.kvUnifiedSolveCache } : {}),
         ...(immutablePrefixHash ? { currentImmutablePrefixHash: immutablePrefixHash } : {}),
+        ...(this.kvUnifiedChangePenalty > 0 ? { changePenalty: this.kvUnifiedChangePenalty } : {}),
         requireExplicitPolicy: true,
         // A solve past the label ceiling takes the minimum-token cut (#252),
         // in any pick: the live one, a dry run's, a production-budget shadow
