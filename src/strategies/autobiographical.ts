@@ -21067,8 +21067,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (recentWindowTokens raised, or a store chunked with a smaller window)
    * takes what its count says: when the messages after the last owned one
    * come to less than half of recentWindowTokens, the stock boundary stands.
-   * So does one that would start the window on a tool_result whose call the
-   * middle has.
+   * So does one whose start would part a call from what answers it, as
+   * turnStart reads an edge.
    */
   private anchorRecentToCoverage(messages: StoredMessage[], pse: ArrayLike<number>, boundary: number): number {
     if (!this.windowsHoldAtCoverage()) return boundary;
@@ -21079,7 +21079,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (owned.has(messages[i].id)) {
         const start = i + 1;
         if (tokens * 2 < this.config.recentWindowTokens) return boundary;
-        if (start < messages.length && this.hasToolResult(messages[start])) return boundary;
+        if (start < messages.length && this.turnStart(messages, start) !== start) return boundary;
         return start;
       }
       tokens += pse[i];
@@ -21323,23 +21323,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       tokens += store.estimateTokens(messages[i]);
       if (tokens > this.config.headWindowTokens) {
-        let boundary = i;
-        // Don't split a tool_use/tool_result pair: if the boundary message's
-        // predecessor has tool_use, pull back by one so the pair stays
-        // together; if it is a later shard of a body whose first shard has
-        // one (as turnStart reads it), pull back to that first shard. Then
-        // again from there, until the message before holds no call answered
-        // after it.
-        for (let first = true; boundary > startIdx; first = false) {
-          const calls = (m: StoredMessage): boolean => (first ? this.hasToolUse(m) : this.callsElsewhere(m));
-          const body = Math.max(startIdx, bodyStart((k) => messages[k], boundary - 1));
-          const back = calls(messages[body]) ? body : calls(messages[boundary - 1]) ? boundary - 1 : boundary;
-          if (back === boundary) break;
-          for (; boundary > back; boundary--) tokens -= store.estimateTokens(messages[boundary]);
-        }
+        const boundary = this.headEdge(messages, startIdx, i);
+        for (let k = i; k > boundary; k--) tokens -= store.estimateTokens(messages[k]);
         if (covered >= 0 && covered < boundary &&
             this.headHoldsAtCoverage(messages, startIdx, covered, tokensBeforeCovered, unownedAfterCovered, boundary)) return covered;
-        return this.anchorHeadToCoverage(store, messages, boundary, tokens);
+        return this.anchorHeadToCoverage(store, messages, startIdx, boundary, tokens);
       }
     }
 
@@ -21349,11 +21337,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Where a head window ending at `b` ends so that it doesn't part a tool_use
+   * from what answers it: back one from a message after a call; if that
+   * message is a later shard of a body whose first shard holds one (as
+   * turnStart reads it), back to that first shard. Then again from there,
+   * until the message before holds no call answered after it. Never before
+   * `startIdx`.
+   */
+  private headEdge(messages: readonly StoredMessage[], startIdx: number, b: number): number {
+    let boundary = b;
+    for (let first = true; boundary > startIdx; first = false) {
+      const calls = (m: StoredMessage): boolean => (first ? this.hasToolUse(m) : this.callsElsewhere(m));
+      const body = Math.max(startIdx, bodyStart((k) => messages[k], boundary - 1));
+      const back = calls(messages[body]!) ? body : calls(messages[boundary - 1]!) ? boundary - 1 : boundary;
+      if (back === boundary) break;
+      boundary = back;
+    }
+    return boundary;
+  }
+
+  /**
    * The other direction of the head-boundary guard (anchorHeadToCoverage):
    * whether a head whose token boundary passed the first message a chunk
    * owns ends at that message instead. It does while the head that remains
-   * is at least half of headWindowTokens, and doesn't end between a tool_use
-   * and what follows it.
+   * is at least half of headWindowTokens, and doesn't end between a call and
+   * what answers it (headEdge).
    *
    * And only while every message from there to the token boundary is owned,
    * or kept raw by a pin: a message there that no chunk owns would leave the
@@ -21372,7 +21380,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): boolean {
     if (covered <= startIdx || !this.windowsHoldAtCoverage()) return false;
     if (tokensBeforeCovered * 2 < this.config.headWindowTokens) return false;
-    if (this.hasToolUse(messages[covered - 1])) return false;
+    if (this.headEdge(messages, startIdx, covered) !== covered) return false;
     const released = unownedAfterCovered.filter((at) => at < boundary);
     if (released.length === 0) return true;
     const keptRaw = this.forceRawPinPositions(messages);
@@ -21389,7 +21397,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * later: the messages in between are the head's own tail that a calibration
    * rise pushed out. They were never chunked, and chunking them now would
    * mint out-of-order L1s (the ratchet of issue #122). Keep them in the head:
-   * extend the boundary to the first owned message after it.
+   * extend the boundary to the first owned message after it at which the
+   * head parts no call from what answers it (headEdge).
    *
    * A boundary that passed the first owned message (headWindowEndFrom reads
    * this before it gets here, headHoldsAtCoverage): a calibration fall let
@@ -21419,6 +21428,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private anchorHeadToCoverage(
     store: MessageStoreView,
     messages: StoredMessage[],
+    startIdx: number,
     boundary: number,
     tokensThroughBoundary: number,
   ): number {
@@ -21428,7 +21438,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const cap = 2 * this.config.headWindowTokens;
     let tokens = tokensThroughBoundary;
     for (let j = boundary + 1; j < messages.length; j++) {
-      if (owned.has(messages[j].id)) return j;
+      if (owned.has(messages[j].id) && this.headEdge(messages, startIdx, j) === j) return j;
       tokens += store.estimateTokens(messages[j]);
       if (tokens > cap) return boundary;
     }
