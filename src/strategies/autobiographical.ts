@@ -21067,8 +21067,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (recentWindowTokens raised, or a store chunked with a smaller window)
    * takes what its count says: when the messages after the last owned one
    * come to less than half of recentWindowTokens, the stock boundary stands.
-   * So does one whose start would part a call from what answers it, as
-   * turnStart reads an edge.
+   * A start that would part a call from what answers it, as turnStart reads
+   * an edge, moves back as turnStart moves it, to the latest edge before it
+   * that parts nothing, which is never before the stock boundary.
    */
   private anchorRecentToCoverage(messages: StoredMessage[], pse: ArrayLike<number>, boundary: number): number {
     if (!this.windowsHoldAtCoverage()) return boundary;
@@ -21079,8 +21080,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (owned.has(messages[i].id)) {
         const start = i + 1;
         if (tokens * 2 < this.config.recentWindowTokens) return boundary;
-        if (start < messages.length && this.turnStart(messages, start) !== start) return boundary;
-        return start;
+        return this.turnStart(messages, start);
       }
       tokens += pse[i];
     }
