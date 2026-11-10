@@ -47,6 +47,14 @@ const SELECTS = {
 } as const;
 
 class Edges extends AutobiographicalStrategy {
+  // These fixtures put a window's edge a message or two inside a summary, by
+  // a fall of the multiplier or by setting the window there. The windows'
+  // holds at chunk coverage undo exactly that, so they are off here: each
+  // edge goes by its token count, as the edge of a window widened past the
+  // holds' bound does (test/window-edges-hold.test.ts has the holds).
+  protected override windowsHoldAtCoverage(): boolean {
+    return false;
+  }
   ruleOff = false;
   produced: unknown[] = [];
   leftOut = 0;
