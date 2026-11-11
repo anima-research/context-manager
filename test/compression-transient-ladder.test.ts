@@ -34,7 +34,7 @@ const result = (id: string, content: string): ContentBlock =>
   ({ type: 'tool_result', toolUseId: id, content } as ContentBlock);
 const DIARY = 'I weighed the thread and decided to stay quiet. '.repeat(12);
 
-const REFUSAL = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+const REFUSAL = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } };
 const OK = (t: string) => ({ content: [text(t)], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } });
 const failure = (type: string, extra: Record<string, unknown> = {}) =>
   Object.assign(new Error(`zz ${type} failure`), { type, retryable: type !== 'context_length' && type !== 'invalid_request', ...extra });
@@ -200,13 +200,14 @@ const progressSlot = (manager: ContextManager): unknown[] => {
   return Array.isArray(value) ? value : [];
 };
 
-interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; path?: string; budget?: number }
+interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; split?: boolean; path?: string; budget?: number }
 function config(opts: Opts) {
   return {
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99, quarantineAlarmIntervalMs: 0,
     compressionRefusalCurveFallbacks: 0,
     compressionSourceOnlyFallback: opts.sourceOnlyFallback,
+    ...(opts.split ? { compressionSplitFallback: true } : {}),
     ...(opts.hoist ? { compressionToolProseFallback: { intoTool: 'journal', fromTools: ['skip_reply'] } } : {}),
     ...(opts.budget !== undefined ? { compressionContextBudgetTokens: opts.budget } : {}),
   } as never;
@@ -3427,4 +3428,88 @@ describe("a host's withdrawal is taken as an abort (CompressionWithdrawn)", () =
       fx.manager.close();
     });
   }
+});
+
+// A refusal the provider reports as `reasoning_extraction` is kept as any
+// refusal is, and the request that would have followed it is not sent in the
+// same pass: the lane pauses, and a later pass goes on from that request.
+// Before, the ladder's requests followed one another within seconds.
+describe('compression ladder: after a reasoning_extraction refusal the next request waits', () => {
+  const HELD = { ...REFUSAL, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+  const held = /refused as reasoning_extraction/;
+
+  it('the ladder stops for this pass with the refusal kept, the lane pauses 5 s, and a later pass goes on from the next rung', async () => {
+    const mock = scripted([HELD, OK('hoisted memory')]);
+    const fx = await build(mock.membrane, { hoist: true });
+    const start = Date.now();
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), held);
+    const end = Date.now();
+    assert.deepEqual(mock.calls.map(toolNames), ['skip_reply'], 'the hoist is not sent in the pass the canonical was refused in');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is exhausted');
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.failures, 1);
+    assert.equal(pause.model, 'same-model');
+    assert.equal(pause.source, 'backoff');
+    assert.ok(pause.until - end <= 5_000 && 5_000 <= pause.until - start, `a 5 s hold (${pause.until - end}..${pause.until - start} ms)`);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.deepEqual(mock.calls.map(toolNames), ['skip_reply', 'journal+skip_reply'], 'the refused canonical is not sent again; the hoist is');
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'hoisted memory'));
+    assert.equal(fx.strategy.pause(), null, 'an answer that is no such refusal ends the pause');
+    fx.manager.close();
+  });
+
+  it('the backoff grows while such refusals are all that comes back: the refusal itself does not end the pause', async () => {
+    const mock = scripted([HELD, HELD, OK('source-only memory')]);
+    const fx = await build(mock.membrane, { hoist: true, sourceOnlyFallback: true });
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), held);
+    assert.equal(fx.strategy.pause()!.failures, 1);
+    const start = Date.now();
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), held);
+    const end = Date.now();
+    assert.deepEqual(mock.calls.map(toolNames), ['skip_reply', 'journal+skip_reply'], 'the hoist is sent and refused; source-only-final waits');
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.failures, 2);
+    assert.ok(pause.until - end <= 10_000 && 10_000 <= pause.until - start, `a 10 s hold (${pause.until - end}..${pause.until - start} ms)`);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3);
+    assert.equal(isCanonical(mock.calls[2]!), false, 'the third request is source-only-final');
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'source-only memory'));
+    assert.equal(fx.strategy.pause(), null);
+    fx.manager.close();
+  });
+
+  it("a refusal of the ladder's last request ends the ladder as before: nothing waits and the lane is not paused", async () => {
+    const mock = scripted([HELD]);
+    const fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the family is exhausted');
+    assert.equal(fx.strategy.pause(), null);
+    fx.manager.close();
+  });
+
+  it('a refusal of another category is followed by the next rung in the same pass, as before', async () => {
+    const mock = scripted([REFUSAL, OK('hoisted memory')]);
+    const fx = await build(mock.membrane, { hoist: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.deepEqual(mock.calls.map(toolNames), ['skip_reply', 'journal+skip_reply']);
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'hoisted memory'));
+    fx.manager.close();
+  });
+
+  it('the split rung waits as a whole, and its pieces then follow one another within its one attempt', async () => {
+    const mock = scripted([HELD, HELD, OK('left piece'), OK('right piece')]);
+    const fx = await build(mock.membrane, { sourceOnlyFallback: true, split: true });
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), held);
+    assert.equal(mock.calls.length, 1, 'canonical refused; source-only-final waits');
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), held);
+    assert.equal(mock.calls.length, 2, 'source-only-final refused; the split rung waits');
+    assert.equal(fx.strategy.pause()!.failures, 2);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 4, 'the rung sends its two pieces, one after the other, in this pass');
+    const stitched = fx.strategy.summariesView().find((s) => s.content.includes('left piece'));
+    assert.ok(stitched && stitched.content.includes('right piece'), 'one summary over the chunk, from both pieces');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    fx.manager.close();
+  });
 });
