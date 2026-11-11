@@ -1,5 +1,6 @@
 import type { Mode } from './compression-instructions-harness.js';
 
+// Historical reading/mixed keys are inherited aliases, not straddling coverage.
 export const mainScenarios = [
   ...(['base', 'reminders', 'knowledge'] as const).flatMap(variant =>
     (['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const)

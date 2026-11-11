@@ -103,6 +103,8 @@ The existing merge retry did not call ordinary `getMergeInstruction` or
 `getReadingMergeInstruction` overrides. It still does not; a new protected
 `getSourceMergeInstruction` hook covers that distinct payload. Ordinary merge
 hooks receive an optional final shown-level argument for selected wording.
+The source-retry hook takes only `(targetLevel, sources, targetTokens)`; it
+ignores reading mode and has no reading-body `totalTokens` argument.
 The new `getCompressionOpening` hook handles the L1 marker. Transition
 customization is inside `generateTransitionSummary`; overriding that method
 still owns the whole operation.

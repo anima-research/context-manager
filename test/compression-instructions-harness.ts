@@ -91,6 +91,8 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
     strategy.pin(pin === 'inherited' ? messages.at(-1)!.sequence + 1 : messages[pin === 'mixed' ? 2 : 0]!.sequence);
     const before = structuredClone(messages);
     if (['chunk', 'reading', 'split', 'readingSplit'].includes(mode)) {
+      // reading/mixed is an inherited alias: its single shard precedes the pin.
+      // Keep this historical fixture stable; readingSplit/mixed spans the pin.
       const chosen = reading && !split ? messages.slice(0, 1) : messages.slice(0, 4);
       await strategy.compress({ index: 0, startIndex: 0, endIndex: chosen.length,
         messages: chosen, tokens: 100, compressed: false }, ctx);

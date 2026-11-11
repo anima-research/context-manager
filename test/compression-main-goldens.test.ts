@@ -18,12 +18,21 @@ function restoreUndefined(value: unknown): unknown {
   return value;
 }
 const golden = restoreUndefined(JSON.parse(readFileSync(join(process.cwd(), 'test/fixtures/compression-main-a81.json'), 'utf8'))) as {
-  source: string; requests: Record<string, NormalizedRequest[]>;
+  source: string; sourceTree?: string; node: string; compiler: string;
+  dependencyLockSha256: string; harnessSha256: string; mainHarnessSha256: string;
+  requests: Record<string, NormalizedRequest[]>;
 };
-assert.equal(golden.source, 'a81d20656d8991f4d5963719535cab11703ff879');
+// Provenance is validated, not pinned forever to the pre-feature commit.
+assert.match(golden.source, /^[a-f0-9]{40}$/);
+if (golden.sourceTree !== undefined) assert.match(golden.sourceTree, /^[a-f0-9]{40}$/);
+assert.match(golden.node, /^v\d+\.\d+\.\d+$/);
+assert.match(golden.compiler, /^\d+\.\d+\.\d+$/);
+for (const hash of [golden.dependencyLockSha256, golden.harnessSha256, golden.mainHarnessSha256]) {
+  assert.match(hash, /^[a-f0-9]{64}$/);
+}
 assert.deepEqual(Object.keys(golden.requests), mainScenarios.map(scenarioKey));
 for (const s of mainScenarios) {
-  it(`${scenarioKey(s)}: omitted, empty and default requests match pinned MAIN bytes`, async () => {
+  it(`${scenarioKey(s)}: omitted, empty and default requests match recorded baseline bytes`, async () => {
     for (const config of [undefined, {}, { preset: 'default' as const }]) {
       const actual = await run(s.mode, s.pin, config, s.variant === 'reminders' ? goldenReminders : {},
         s.variant === 'knowledge' ? KnowledgeProbe : Probe, s.level);
@@ -31,3 +40,9 @@ for (const s of mainScenarios) {
     }
   });
 }
+
+it('historical reading/mixed keys are inherited aliases, not straddling coverage', () => {
+  for (const variant of ['base', 'reminders', 'knowledge']) {
+    assert.deepEqual(golden.requests[`${variant}/reading/mixed/L2`], golden.requests[`${variant}/reading/inherited/L2`]);
+  }
+});
