@@ -160,3 +160,13 @@ export {
   isRenderingFrontierStrategy,
   isDerivationManifestStrategy,
 } from './types/index.js';
+
+export type {
+  CompressionQuarantineBinding,
+  CompressionQuarantineRecordView,
+  CompressionQuarantineInspection,
+  CompressionQuarantineReleaseSelection,
+  CompressionQuarantineReleaseResult,
+  KeyedCompressionQuarantineStrategy,
+} from './types/compression-quarantine.js';
+export { isKeyedCompressionQuarantineStrategy } from './types/compression-quarantine.js';
