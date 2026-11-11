@@ -1,0 +1,2 @@
+- Make quarantine-empty alarms neutral about coverage/debt, with optional episode-end `clearReason` metadata for known waiver requests; existing callback fields remain compatible.
+- Refuse selected native waivers lacking a valid family digest, validate projected digest metadata, narrow unknown capability checks to the two checked methods, and run preservation-first native checkpoint hygiene before acknowledgement.

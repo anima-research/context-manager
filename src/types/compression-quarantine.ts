@@ -11,6 +11,7 @@ export interface CompressionQuarantineRecordView {
   key: string;
   /** Actual native event/claim identity; null for synthetic legacy lineage. */
   generation: string | null;
+  /** Trustworthy native generation/key/family, not coverage or eligibility. */
   selectable: boolean;
   chunkSourceHash: string;
   familyKey: string | null;
@@ -72,7 +73,9 @@ export interface KeyedCompressionQuarantineStrategy extends ContextStrategy {
   releaseCompressionRefusalQuarantine(selection: CompressionQuarantineReleaseSelection): Promise<CompressionQuarantineReleaseResult>;
 }
 
-export function isKeyedCompressionQuarantineStrategy(strategy: unknown): strategy is KeyedCompressionQuarantineStrategy {
+/** Checks only the two methods: unknown input is not established as a full ContextStrategy. */
+export function isKeyedCompressionQuarantineStrategy(strategy: unknown): strategy is Pick<KeyedCompressionQuarantineStrategy,
+  'inspectCompressionRefusalQuarantine' | 'releaseCompressionRefusalQuarantine'> {
   const candidate = strategy as Partial<KeyedCompressionQuarantineStrategy>;
   return candidate !== null && typeof candidate === 'object' && typeof candidate.inspectCompressionRefusalQuarantine === 'function' &&
     typeof candidate.releaseCompressionRefusalQuarantine === 'function';
