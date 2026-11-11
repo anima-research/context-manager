@@ -51,9 +51,12 @@ const placeholders: { [K in Slot]: readonly (keyof CompressionInstructionValues[
 // `default` deliberately delegates to the existing phase formatters.
 const presets: readonly string[] = ['default'];
 
-function invalid(): never {
+type Path = 'configuration' | 'preset' | 'participant' | 'templates' | `templates.${Slot}`;
+type Reason = 'expected object' | 'unknown key' | 'unsupported preset' | 'expected nonblank string'
+  | 'expected nonempty object' | 'malformed braces' | 'unsupported placeholder' | 'context must appear once' | 'participant required';
+function invalid(path: Path, reason: Reason): never {
   // Do not echo template text, participant names, unknown keys or payloads.
-  throw new TypeError('Invalid compressionInstructions configuration');
+  throw new TypeError(`Invalid compressionInstructions configuration: ${path}: ${reason}`);
 }
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -65,25 +68,29 @@ function record(value: unknown): value is Record<string, unknown> {
  */
 export function validateCompressionInstructions(value: unknown): asserts value is CompressionInstructions | undefined {
   if (value === undefined) return;
-  if (!record(value) || Object.keys(value).some(k => !['preset', 'participant', 'templates'].includes(k))) invalid();
-  if (value.preset !== undefined && (typeof value.preset !== 'string' || !presets.includes(value.preset))) invalid();
-  if (value.participant !== undefined && (typeof value.participant !== 'string' || !value.participant.trim())) invalid();
+  if (!record(value)) invalid('configuration', 'expected object');
+  if (Object.keys(value).some(k => !['preset', 'participant', 'templates'].includes(k))) invalid('configuration', 'unknown key');
+  if (value.preset !== undefined && (typeof value.preset !== 'string' || !presets.includes(value.preset))) invalid('preset', 'unsupported preset');
+  if (value.participant !== undefined && (typeof value.participant !== 'string' || !value.participant.trim())) invalid('participant', 'expected nonblank string');
   let needsParticipant = false;
   if (value.templates !== undefined) {
-    if (!record(value.templates) || Object.keys(value.templates).length === 0) invalid();
+    if (!record(value.templates) || Object.keys(value.templates).length === 0) invalid('templates', 'expected nonempty object');
     for (const [slot, template] of Object.entries(value.templates)) {
-      if (!Object.hasOwn(placeholders, slot) || typeof template !== 'string' || !template.trim()) invalid();
+      if (!Object.hasOwn(placeholders, slot)) invalid('templates', 'unknown key');
+      const path: Path = `templates.${slot as Slot}`;
+      if (typeof template !== 'string' || !template.trim()) invalid(path, 'expected nonblank string');
       const names: string[] = [];
       const remainder = template.replace(/\{([a-zA-Z]+)\}/g, (_, name: string) => {
         names.push(name);
         return '';
       });
-      if (/[{}]/.test(remainder) || names.some(name => !(placeholders[slot as Slot] as readonly string[]).includes(name))) invalid();
-      if (slot === 'transition' && names.filter(name => name === 'context').length !== 1) invalid();
+      if (/[{}]/.test(remainder)) invalid(path, 'malformed braces');
+      if (names.some(name => !(placeholders[slot as Slot] as readonly string[]).includes(name))) invalid(path, 'unsupported placeholder');
+      if (slot === 'transition' && names.filter(name => name === 'context').length !== 1) invalid(path, 'context must appear once');
       needsParticipant ||= names.includes('participant');
     }
   }
-  if (needsParticipant && value.participant === undefined) invalid();
+  if (needsParticipant && value.participant === undefined) invalid('participant', 'participant required');
 }
 
 /** One substitution pass over trusted template text, never over inserted data. */
@@ -98,7 +105,8 @@ export function compressionInstruction<K extends Slot>(
   values: Omit<CompressionInstructionValues[K], 'participant'>,
 ): string | undefined {
   const all = { ...values, participant: config?.participant } as CompressionInstructionValues[K];
-  const template = config?.templates?.[slot];
+  const templates = config?.templates;
+  const template = templates && Object.hasOwn(templates, slot) ? templates[slot] : undefined;
   if (template !== undefined) return substitute(template, all);
   return undefined;
 }

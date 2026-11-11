@@ -2563,6 +2563,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _previewInFlight = false;
 
   constructor(config: AutobiographicalOptions = {}) {
+    // Retain TypeError for malformed caller settings before structuredClone runs.
     validateCompressionInstructions(config.compressionInstructions);
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
@@ -2596,11 +2597,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // AutobiographicalConfig that the caller did not itself override, which is
     // what makes this narrowing as sound as the spread it replaces.
     this.config = resolved.effective as unknown as AutobiographicalConfig;
-    validateCompressionInstructions(this.config.compressionInstructions);
     // Snapshot JSON settings so caller mutation cannot invalidate a checked template.
     if (this.config.compressionInstructions !== undefined) {
       this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
     }
+    validateCompressionInstructions(this.config.compressionInstructions);
     if (this.config.witnessedInstruction && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
       throw new TypeError('Conflicting witnessed instruction configuration');
     }
@@ -19396,8 +19397,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Source-only merge retry. Existing retries use base wording, not the
    * ordinary merge override. This separate hook preserves that contract while
-   * allowing an override that knows the actual payload level. Reading sources
-   * retain reading attribution under selected instructions. */
+   * allowing an override that knows the actual payload level. Reading mode is
+   * ignored: this request shows summaries, not the raw shards they narrate. */
   protected getSourceMergeInstruction(
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
@@ -19406,9 +19407,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): string {
     const sourceLevelShown = sources[0].level;
     const witnessed = sources.every(s => s.witnessed);
-    const selected = totalTokens !== undefined
-      ? compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown, targetTokens, totalTokens })
-      : compressionInstruction(this.config.compressionInstructions, witnessed ? 'witnessedMerge' : 'merge', { targetLevel, sourceLevelShown, targetTokens });
+    const selected = compressionInstruction(this.config.compressionInstructions, witnessed ? 'witnessedMerge' : 'merge', { targetLevel, sourceLevelShown, targetTokens });
     return selected ?? (witnessed
       ? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens)
       : formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens));
