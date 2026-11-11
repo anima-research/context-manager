@@ -1187,6 +1187,28 @@ class CompressionSplitWindowWait extends Error {
   }
 }
 
+/** The refusal category after which compression sends nothing more for a while (CompressionRefusalHold). */
+const HELD_REFUSAL_CATEGORY = 'reasoning_extraction';
+
+/**
+ * Thrown where compression would send another request right after one was
+ * refused as `reasoning_extraction`. The refusal is recorded as any refusal
+ * is, and the request that would have followed is not sent in this pass: the
+ * lane pauses as after a transient failure (pauseCompressionLane), and a
+ * later tick goes on from the request after the refused one, so a ladder's
+ * requests no longer follow one another within seconds. An answer that is
+ * such a refusal doesn't end the lane's pause, so the backoff grows while
+ * these refusals are all that comes back, and any other answer ends it. The
+ * message is the same every time: a host that alerts on a changed failure
+ * text alerts once.
+ */
+class CompressionRefusalHold extends Error {
+  override name = 'CompressionRefusalHold';
+  constructor() {
+    super(`a compression request was refused as ${HELD_REFUSAL_CATEGORY}; the request that follows it waits for the lane's pause`);
+  }
+}
+
 /** A deferral that made no call: the caller's admission refused it, or the split rung's window had no room. */
 function isNoCallDeferral(error: unknown): boolean {
   return isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait;
@@ -1197,6 +1219,8 @@ class MergeDispositionRejection extends Error {
   readonly stopReason?: string;
   readonly errorType?: string;
   readonly requestHash: string;
+  /** The answer was a refusal the lane holds after (CompressionRefusalHold): the merge's next attempt waits for the lane's pause. */
+  readonly heldRefusal: boolean;
 
   constructor(
     targetLevel: number,
@@ -1204,6 +1228,7 @@ class MergeDispositionRejection extends Error {
     requestHash: string,
     stopReason?: string,
     errorType?: string,
+    heldRefusal = false,
   ) {
     super(
       `L${targetLevel} merge response rejected by terminal-disposition gate: ` +
@@ -1212,6 +1237,7 @@ class MergeDispositionRejection extends Error {
     this.name = 'MergeDispositionRejection';
     this.outcome = outcome;
     this.requestHash = requestHash;
+    this.heldRefusal = heldRefusal;
     if (stopReason !== undefined) this.stopReason = stopReason;
     if (errorType !== undefined) this.errorType = errorType;
   }
@@ -4588,6 +4614,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return typeof category === 'string' ? category : undefined;
   }
 
+  /** Whether `response` is a refusal after which the lane holds its next request (CompressionRefusalHold). */
+  private isHeldRefusal(response: unknown): boolean {
+    return this.compressionResponseStopReason(response) === 'refusal' &&
+      this.refusalCategory(response as NormalizedResponse) === HELD_REFUSAL_CATEGORY;
+  }
+
   private compressionResponseStopReason(response: unknown): string | undefined {
     if (!response || typeof response !== 'object') return undefined;
     const stopReason = (response as { stopReason?: unknown }).stopReason;
@@ -6884,7 +6916,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * An answer to one of the lane's calls ends its route's pause and backoff:
    * the pause of the membrane instance and model the answered call went
    * through, on whatever branch. Another route's answer says nothing about this one, so
-   * its pause stands.
+   * its pause stands. The callers leave out one answer: a refusal the lane
+   * holds after (CompressionRefusalHold).
    */
   private resumeCompressionLane(membrane: object, model: string | undefined): void {
     const pause = this.compressionPause;
@@ -9231,6 +9264,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           this.mergeFailureOrder.delete(mergeFailureKey(merge));
           this.recordMergeRejection(merge, error);
+          // The attempt is counted as any rejected one is. After a refusal
+          // the lane holds after, the merge's next attempt, or any other
+          // compression call, waits for the lane's pause.
+          if (error.heldRefusal) {
+            this.pauseCompressionLane(
+              sourceBranch, ctx, error, 'merge',
+              `the L${merge.level} merge of ${merge.sourceIds.length} summaries from ${merge.sourceIds[0] ?? '?'}`,
+            );
+          }
           return;
         }
         // A request-attributable rejection (compressionFailureKind's
@@ -11982,8 +12024,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
           response = await this.callProvider(ctx.membrane!, attemptRequest);
-          // An answer ends its route's pause, on whatever branch.
-          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
+          // An answer ends its route's pause, on whatever branch, unless it is
+          // a refusal the lane holds after (CompressionRefusalHold).
+          if (!this.isHeldRefusal(response)) this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
@@ -12038,7 +12081,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             throw retryError;
           }
           if (response && typeof response === 'object') countedStripped.add(response);
-          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
+          if (!this.isHeldRefusal(response)) this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         }
         // An answer ends the run of failures of the rung that gave it.
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
@@ -12255,6 +12298,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         persistProgress();
         throw error;
       };
+      // Set by a rung's answer that is a held refusal: the ladder's next
+      // request is not sent in this pass (CompressionRefusalHold).
+      let refusalHold: CompressionRefusalHold | undefined;
       type LadderStep =
         | { kind: 'answered'; response: unknown }
         | { kind: 'decided'; outcome: CompressionRefusalOutcomeRecord; reused: boolean };
@@ -12283,8 +12329,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           endRungRuns(curveLabel);
           return { kind: 'decided', outcome: known, reused: true };
         }
+        // The rung before this one was refused in a way the lane holds after:
+        // its outcome is in the family's progress, and this rung's request
+        // waits for a later tick.
+        if (refusalHold) throw refusalHold;
         try {
-          return { kind: 'answered', response: await call() };
+          const response = await call();
+          if (this.isHeldRefusal(response)) {
+            refusalHold = new CompressionRefusalHold();
+            // The pause is the lane's of the model that refused.
+            noteDispatchedModel(refusalHold, attemptRequestsByHash.get(attemptTraces[attemptTraces.length - 1]!.requestHash)!);
+          }
+          return { kind: 'answered', response };
         } catch (error) {
           if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
           // A host's withdrawal records nothing and propagates as it is, on
@@ -12987,6 +13043,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
             return true;
           };
+          // Its pieces follow one another within one attempt, so the rung
+          // as a whole waits when the rung before it was refused in a way
+          // the lane holds after.
+          if (refusalHold) throw refusalHold;
           let complete = false;
           try {
             // A rung starts only when its window has room for a whole attempt.
@@ -14469,9 +14529,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       // Any answer from the provider ends its route's pause and backoff,
-      // whatever the disposition gate below makes of it (a refusal included),
-      // and on whatever branch: the pause is the route's, not the branch's.
-      this.resumeCompressionLane(ctx.membrane, this.compressionRequestModel(acceptedRequest));
+      // whatever the disposition gate below makes of it, and on whatever
+      // branch: the pause is the route's, not the branch's. The one answer
+      // that doesn't is a refusal the lane holds after (CompressionRefusalHold).
+      const heldRefusal = this.isHeldRefusal(response);
+      if (!heldRefusal) this.resumeCompressionLane(ctx.membrane, this.compressionRequestModel(acceptedRequest));
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
       // the request that authored it: sha256 of the accepted request's JSON,
@@ -14517,9 +14579,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             model: this.requireCompressionModel(),
           },
         }, this.ns);
-        throw new MergeDispositionRejection(
-          targetLevel, assessment.outcome, requestHash, stopReason, errorType,
+        const rejection = new MergeDispositionRejection(
+          targetLevel, assessment.outcome, requestHash, stopReason, errorType, heldRefusal,
         );
+        noteDispatchedModel(rejection, acceptedRequest);
+        throw rejection;
       }
 
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
