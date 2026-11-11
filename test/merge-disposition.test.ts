@@ -731,6 +731,36 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('a merge refused as reasoning_extraction counts its attempt and pauses the lane: its next attempt waits, and the backoff grows', async () => {
+    const held = { raw: {
+      stopReason: 'refusal', content: [], usage: { inputTokens: 100, outputTokens: 0 },
+      raw: { response: { stop_details: { category: 'reasoning_extraction' } } },
+    } };
+    const mock = scripted([held, held, { stop: 'end_turn', text: 'merged memory' }]);
+    const fx = await fixture(mock.membrane);
+    const lane = fx.strategy as unknown as { compressionPause: { backoffUntil: number; failures: number; model: string | undefined } | null };
+    const pause = () => lane.compressionPause;
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 1);
+    assert.equal(fx.strategy.mergeQueueView()[0]!.attempts, 1, 'the refusal is one of the merge\'s bounded attempts, as before');
+    assert.equal(pause()?.failures, 1);
+    assert.equal(pause()?.model, MODEL);
+    assert.ok(pause()!.backoffUntil > Date.now(), 'the lane is paused');
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 1, 'paused: the next attempt is not sent');
+    pause()!.backoffUntil = 0;
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.equal(fx.strategy.mergeQueueView()[0]!.attempts, 2);
+    assert.equal(pause()?.failures, 2, 'the refusal did not end the pause, so the backoff grows');
+    pause()!.backoffUntil = 0;
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(mock.calls.length, 3);
+    assert.ok(fx.strategy.summariesView().some((summary) => summary.content === 'merged memory'));
+    assert.equal(pause(), null, 'the landing ended the pause');
+    await fx.manager.close();
+  });
+
   it("the merge's compression-log record bounds its error", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'merge-log-'));
     const logPath = join(dir, 'compression.jsonl');
