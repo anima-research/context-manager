@@ -3,7 +3,7 @@
  * WindowIndex.write).
  *
  * - Through chronicle's identity-stamped batched append, which
- *   context-manager requires (chronicle ^0.6.0), a write-down, the rows of
+ *   context-manager requires (chronicle 0.6.0 or later), a write-down, the rows of
  *   one presentRows call and the tombstones of one call are one record
  *   each, at one sequence. A single row is one record through the
  *   single form, as before, and a store all of whose writes are single (the
@@ -680,7 +680,7 @@ describe('a store handle without the batched append', () => {
       const sequence = store.currentSequence();
       await assert.rejects(
         ContextManager.open({ store, namespace: 'zz-agent', strategy: new Hearing() }),
-        /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install @animalabs\/chronicle \^0\.6\.0/,
+        /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install a release of @animalabs\/chronicle that context-manager's range admits \(0\.6\.0 or newer within it\)/,
       );
       assert.equal(store.currentSequence(), sequence, 'the refusal appends no record');
     } finally {
@@ -718,7 +718,7 @@ describe('a store handle without the batched append', () => {
         delete handle.appendManyToStateJsonWithIdentity;
       };
     };
-    const refused = /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install @animalabs\/chronicle \^0\.6\.0/;
+    const refused = /ContextManager: the store handle has no appendManyToStateJsonWithIdentity, .*install a release of @animalabs\/chronicle that context-manager's range admits \(0\.6\.0 or newer within it\)/;
 
     let restore = older();
     const head = cm.getStore().currentSequence();

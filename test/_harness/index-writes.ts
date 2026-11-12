@@ -3,7 +3,7 @@
  * A write of several items (a write-down, one presentRows call's rows, one
  * call's tombstones) is one record, through chronicle's
  * `appendManyToStateJsonWithIdentity`, which the store keeps or loses
- * whole; context-manager requires it (chronicle ^0.6.0) and has no
+ * whole; context-manager requires it (chronicle 0.6.0 or later) and has no
  * one-record-per-item path. Pre-release builds of the index, before
  * batched writes, wrote each item as one record, and the manager still
  * reads and finishes what those left: a write-down cut short without its
