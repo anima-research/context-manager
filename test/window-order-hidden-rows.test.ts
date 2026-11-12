@@ -368,6 +368,58 @@ describe("the open's demote, where a summary above L1 holds its L1s out of order
     assert.deepEqual(kept.map((s) => s.id).sort(), ['L1-a', 'L1-b'], 'as the store holds them');
     cm.close();
   });
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): a summary above
+  // L1 whose leaves are out of order because a summary under it is (goesWith)
+  // goes with that one (unfold drops what is above), and isn't named
+  // separately, so the warning counts the lowest causes.
+  it('names only the lowest such summary: one above it, whose leaves are out of order through it, goes with it unnamed', async () => {
+    const path = freshPath();
+    const seed = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    seed.presentRows([]);
+    const [a, b, c, d] = ['TAG0', 'TAG1', 'TAG2', 'TAG3'].map((tag) => {
+      const row = seed.addMessage('User', [text(`${tag} ` + 'word '.repeat(60))]);
+      seed.presentRows([row]);
+      return row;
+    }) as [MessageId, MessageId, MessageId, MessageId];
+    seed.retractRows([a], { undone: true });
+    seed.presentRows([a]);
+    seed.retractRows([c, d], { undone: true });
+    seed.presentRows([c, d]);
+    assert.deepEqual(seed.getPresentedMessages().map((m) => m.id), [b, a, c, d], 'premise: the window holds B, A, C, D');
+    const summary = (id: string, level: number, sourceIds: string[], first: MessageId, last: MessageId, mergedInto?: string): SummaryEntry => ({
+      id, level, content: `s ${id}`, tokens: 50, sourceLevel: level - 1, sourceIds,
+      sourceRange: { first, last }, created: level, ...(mergedInto ? { mergedInto } : {}),
+    } as SummaryEntry);
+    // L2-zz holds its L1s out of order; L2-yy holds its in order; the L3 over
+    // both reads its leaves A, B, C, D, out of order only through L2-zz.
+    const store = seed.getStore();
+    store.registerState({ id: 'agent/autobio:summaries', strategy: 'snapshot' });
+    store.registerState({ id: 'agent/autobio:chunks', strategy: 'snapshot' });
+    store.setStateJson('agent/autobio:summaries', [
+      summary('L1-a', 1, [a], a, a, 'L2-zz'),
+      summary('L1-b', 1, [b], b, b, 'L2-zz'),
+      summary('L1-c', 1, [c], c, c, 'L2-yy'),
+      summary('L1-d', 1, [d], d, d, 'L2-yy'),
+      summary('L2-zz', 2, ['L1-a', 'L1-b'], a, b, 'L3-zz'),
+      summary('L2-yy', 2, ['L1-c', 'L1-d'], c, d, 'L3-zz'),
+      summary('L3-zz', 3, ['L2-zz', 'L2-yy'], a, d),
+    ]);
+    store.setStateJson('agent/autobio:chunks', [a, b, c, d].map((row, i) => (
+      { id: `c-${i}`, sourceIds: [row], compressed: true, summaryId: `L1-${'abcd'[i]}` }
+    )));
+    seed.close();
+
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    let cm!: ContextManager;
+    const lines = await linesDuring(async () => {
+      cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane().membrane });
+    });
+    assert.ok(lines.some((line) => line.includes('the window holds the leaves of 1 summary apart or out of order [L2-zz]')), lines.join('\n'));
+    assert.ok(lines.some((line) => line.includes('dropped [') && line.includes('L3-zz')), `the L3 goes with it: ${lines.join('\n')}`);
+    assert.deepEqual(internals(strategy).summaries.map((s) => s.id).sort(), ['L1-a', 'L1-b', 'L1-c', 'L1-d', 'L2-yy'], 'L2-zz and the L3 are dropped, and the rest stay');
+    cm.close();
+  });
 });
 
 describe("a merge's entry check over sources that cross", () => {
