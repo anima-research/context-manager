@@ -237,6 +237,19 @@ export interface ReadinessState {
 }
 
 /**
+ * A host's clause saying how to read what the per-message cap elided, which
+ * follows the cap's marker after `; `: for a message or summary from its
+ * first elided character (`offsetChars`), for a call's input by the call's
+ * id (`toolUseId`). `offsetChars`, like the marker's offsets, counts UTF-16
+ * code units (JavaScript string indices) from 0. It must be pure, the same
+ * arguments giving the same text, since every compile writes it into the
+ * request again. One that
+ * throws fails no compile: that marker names the stored message or summary
+ * by id alone, as with no hint, and the strategy says the first throw.
+ */
+export type CapReadHint = (at: { id: string; offsetChars?: number; toolUseId?: string }) => string;
+
+/**
  * Pluggable strategy for context management.
  * Strategies control how context is selected, compressed, and maintained.
  */
@@ -300,6 +313,21 @@ export interface ContextStrategy {
    * change what a later compile sends.
    */
   renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
+
+  /**
+   * The text the per-message cap measures for a message or summary `at.id`,
+   * read through `store`, the agent's view, or with `at.toolUseId` the JSON
+   * of that call's input: the text a capped message's marker gives offsets
+   * into, so a reader paging it from the marker's first offset reads exactly
+   * what the cap elided. Null where the view holds no such row, for a
+   * summary the strategy doesn't have, for a call the message doesn't
+   * hold, and, under a strategy that never cuts a call's input, such as
+   * windowed passthrough, for any call. A strategy with no per-message cap
+   * has none. See
+   * `ContextManager.capMeasuredText` for what the offsets count and when
+   * they stop indexing it.
+   */
+  capMeasuredText?(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null;
 
   /**
    * Initialize the strategy with context.
@@ -2056,7 +2084,11 @@ export interface AutobiographicalConfig {
    * enveloped afterwards, so opener and closer survive every cap; the tags
    * themselves are not charged against that cap (they are priced in the
    * recall-pair budget instead), so a cap smaller than the tag text still
-   * renders intact tags around the few characters it bought.
+   * renders intact tags around what the cut kept. A positioned answer wraps
+   * whatever its cut leaves: the marker alone where the cap is smaller than
+   * the marker and the summary longer than it. The combined answer leaves out
+   * a summary whose cut keeps nothing that holds anything but the marker
+   * (`positionedRecallPairs`).
    */
   recallEnvelope?: RecallEnvelopeMode;
 
@@ -2137,10 +2169,32 @@ export interface AutobiographicalConfig {
    * already in quarantine stay there until their records are cleared.
    */
   recoverLiteralThinkingWrappedCompression?: boolean;
-  /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. A value that
+  /** Maximum tokens per individual message in compiled output. A message
+   *  exceeding this limit keeps the head and the tail of its text and string
+   *  tool results, around one marker naming the characters it elided and the
+   *  stored message whose whole holds them (`capContent`). Each summary in a
+   *  recall answer is cut so too, its marker naming the summary, so the
+   *  combined recall answer of `positionedRecallPairs: false` can pass the
+   *  limit as a whole. A message comes back whole where its cut that keeps
+   *  nothing, the marker and a notice for each later string tool result,
+   *  would cost at least as much as the text it stands for, and loses only
+   *  its text blocks that hold nothing where that alone brings it under the
+   *  limit. Blocks the cut passes through, such as thinking, can keep a
+   *  message over it, and so can the cut that keeps nothing, on a limit
+   *  smaller than that, though a cut keeping a short result whole could
+   *  fit. The cut halves over how much it keeps, and keeping more can cost
+   *  less, so it can keep less than the largest cut that fits. A value that
    *  isn't a positive number, such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
+
+  /**
+   * The host's clause for reading what `maxMessageTokens` and
+   * `toolUseInputMaxTokens` leave out, which follows each marker after `; `
+   * (see `CapReadHint`). It must be pure: the same arguments give the same
+   * text, since every compile writes it into the request again. Without it
+   * a marker names the stored message or summary by id alone.
+   */
+  capReadHint?: CapReadHint;
 
   /**
    * Fractional grace above the configured hard context budget before a
@@ -2743,8 +2797,11 @@ export interface AutobiographicalConfig {
   /**
    * Truncate `tool_use` block inputs whose serialized JSON exceeds this
    * many tokens, at four characters a token. The truncated input becomes
-   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...] }`, `_keys`
-   * holding the original input's first five keys. The plan and the render
+   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...], "_whole": "…" }`,
+   * `_keys` holding the original input's first five keys and `_whole` saying
+   * how long the input is and where its whole is stored (the message and the
+   * call), with `capReadHint`'s clause after it. An input whose stub would be
+   * no shorter than its JSON is sent whole. The plan and the render
    * stats price the truncated input, and the stored message is unchanged.
    * Default: 0 (no truncation).
    */

@@ -94,6 +94,7 @@ export type {
   ThinkingBinding,
   ThinkingStanding,
   RequestIdentity,
+  CapReadHint,
 } from './strategy.js';
 
 export {

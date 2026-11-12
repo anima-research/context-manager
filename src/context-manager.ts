@@ -3870,6 +3870,32 @@ export class ContextManager {
   }
 
   /**
+   * The text the per-message cap measures for a message or summary, read
+   * through this agent's view (see `ContextStrategy.capMeasuredText`): the
+   * text whose characters a capped message's marker names, so a reader that
+   * pages it from the marker's first offset reads exactly what the cap
+   * elided. Give a message by the id `addMessage` returned, or a summary by
+   * its id; with `toolUseId`, that call's input as JSON. Null for a row this
+   * agent's view doesn't hold, such as one the view filter leaves out or one
+   * not yet presented, for an id nothing has, for a call the message doesn't
+   * hold, for any call under windowed passthrough, which never cuts a call's
+   * input, and under a strategy with no per-message cap.
+   *
+   * The marker's offsets, `chars H to T of M`, count UTF-16 code units
+   * (JavaScript string indices) from 0: H is the first elided, T the first
+   * kept after them. They index the text as the compile that wrote the
+   * marker sent it. Where tool pruning has since replaced a result of that
+   * message, the text read now differs, so a reader whose text's length
+   * isn't the marker's M doesn't page it. A replacement of the same length
+   * passes that check.
+   */
+  capMeasuredText(at: { id: string; toolUseId?: string }): string | null {
+    this.requireInitialized('capMeasuredText');
+    if (typeof this.strategy.capMeasuredText !== 'function') return null;
+    return this.strategy.capMeasuredText(this.strategyMessageView(), at);
+  }
+
+  /**
    * Note what a stream built from this branch's last committing compile with
    * `binds` sent
    * after the compiled messages (see `SelectOptions.thinkingBinding`): as it

@@ -39,6 +39,7 @@ import type {
   DerivationManifest,
   DerivationManifestOptions,
   RenderedSummaryInfo,
+  CapReadHint,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -97,7 +98,8 @@ import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import { CAP_OMISSION_TEXT, capContent, capMeasuredTextOf, cappedPriceExtra, cappedWhole, cutInputText, guardedHint, isCapMarker, isEmptyTextBlock, type CapClause } from './message-cap.js';
+import type { CapWhole } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
   DEFAULT_IMAGE_BYTE_CEILING,
@@ -524,11 +526,9 @@ const EXPECTED_PAIR_SAMPLE = 12;
 
 /**
  * The interstitial text between two summaries in the legacy combined recall
- * answer (`positionedRecallPairs: false`). Hoisted out of
- * `renderCombinedRecallAnswer` because the shared-budget path must PRICE it
- * before deciding whether the next summary can be admitted, and the tests that
- * pin that arithmetic derive their caps from this same string: one source of
- * truth for the separator's bytes, and therefore for its cost.
+ * answer (`positionedRecallPairs: false`). Exported so the tests that count
+ * the answer's summaries match this same string. It isn't charged against
+ * `maxMessageTokens`, which cuts each summary on its own.
  */
 export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
@@ -728,17 +728,35 @@ function sameMarkers(a: ReadonlyMap<number, string> | undefined, b: ReadonlyMap<
   return true;
 }
 
+/** Whether `block`'s serialized input is over `cap` tokens
+ *  (`toolUseInputMaxTokens`), at four characters a token. */
+function inputOverCap(block: Extract<ContentBlock, { type: 'tool_use' }>, cap: number): boolean {
+  return Math.ceil(JSON.stringify(block.input).length / 4) > cap;
+}
+
 /** `block` with its input truncated, when its serialized input is over
  *  `cap` tokens (`toolUseInputMaxTokens`), at four characters a token: the
- *  input becomes `{ _truncated, _originalTokens, _keys }`, `_keys` holding
- *  its first five keys. Null when the input fits. */
-function truncatedToolUse(block: Extract<ContentBlock, { type: 'tool_use' }>, cap: number): ContentBlock | null {
-  const inputTokens = Math.ceil(JSON.stringify(block.input).length / 4);
-  if (inputTokens <= cap) return null;
-  return {
-    ...block,
-    input: { _truncated: true, _originalTokens: inputTokens, _keys: Object.keys(block.input).slice(0, 5) },
+ *  input becomes `{ _truncated, _originalTokens, _keys, _whole }`, `_keys`
+ *  holding its first five keys and `_whole` saying where the whole is stored
+ *  (`cutInputText`), with the host's clause for reading it. Null when the
+ *  input fits, or when that stub would be no shorter than the input, which
+ *  then goes whole. */
+function truncatedToolUse(
+  block: Extract<ContentBlock, { type: 'tool_use' }>,
+  cap: number,
+  messageId: string,
+  hint: CapClause | undefined,
+): ContentBlock | null {
+  if (!inputOverCap(block, cap)) return null;
+  const serialized = JSON.stringify(block.input);
+  const input = {
+    _truncated: true,
+    _originalTokens: Math.ceil(serialized.length / 4),
+    _keys: Object.keys(block.input).slice(0, 5),
+    _whole: cutInputText(serialized.length, messageId, block.id, hint),
   };
+  if (JSON.stringify(input).length >= serialized.length) return null;
+  return { ...block, input };
 }
 
 /** Standard compression instruction for chat/general chunks. */
@@ -2366,6 +2384,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected ns: string = '';
   /** stderr lines about this strategy's work, each naming its namespace (#239). */
   protected readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
+  /** `capReadHint`'s clause for a marker, or none where it throws, which is said once. */
+  protected readonly capClause: CapClause = guardedHint(() => this.config.capReadHint, (line, thrown) => this.diag.warn(line, thrown));
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
@@ -16800,7 +16820,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (!(pruning.inputCap > 0)) return false;
-      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap) !== null));
+      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && inputOverCap(b, pruning.inputCap)));
     },
     // 5: generated images, which estimated as 0 before (an unknown block) and
     // are now priced as an image, wherever MessageStore prices them.
@@ -19036,21 +19056,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // after it counts in its prefix.
         let pairSummaries: SummaryEntry[] = [];
         if (selectedSummaries.length > 0) {
-          // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
-          // budgets defaulting to 30k each, an unconstrained concatenation can push
-          // a single assistant turn past 90k tokens, eating the inference budget
-          // and starving recent messages (postmortem 2026-05-04, bug B).
-          //
           // Per-summary blocks (verbatim reasoning + text when captured) are
           // concatenated with the legacy '---' separators as interstitial
           // text blocks — signed thinking must ride along here too.
           const combinedRender = this.renderCombinedRecallAnswer(selectedSummaries, msgCap);
           const combined = combinedRender.content;
           const combinedRefs = combinedRender.refs;
-          // The summaries the answer holds: every one the flat cap left
-          // something of, since it passes every carrier through, cut text or
-          // not (capContent), and under an envelope those its cap
-          // admitted, which ends at the first summary it cuts.
           const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
           const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
           pairSummaries = admitted;
@@ -19098,7 +19109,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           entries.push(questionEntry);
           entries.push(answerEntry);
           totalTokens += pairTokens;
-          for (const s of selectedSummaries) this.rsSummary(s.level, s.tokens, s.id);
+          for (const s of admitted) this.rsSummary(s.level, s.tokens, s.id);
         }
 
         // Sort by position so uncompressed-middle messages and pins both
@@ -22012,18 +22023,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * `msg` as this strategy sends it before any cut: each `tool_result`
    * toolPruning replaces carries its marker, and each `tool_use` input over
-   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys }`
+   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys, _whole }`
    * (its first five keys as stored: in the order written on chronicle 0.5.1
    * or later, sorted for an input chronicle before 0.5.1 stored or reads
-   * back). `msg` itself when
+   * back), unless that stub would be no shorter than the input. `msg` itself when
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
    * middle's shard path, which sends a shard's text. A raw replay form an edit changes is released
    * (see raw-forms.ts). The store's own message is never written: chunking
    * and compression read it. Each message's form is kept with the
-   * replacements and input cap it was made for, so a later decision that
-   * leaves the message as it was gives the same form, with its estimates
+   * replacements, input cap and `capReadHint` it was made for, so a later
+   * decision that leaves the message as it was gives the same form, and a
+   * preview with another hint makes its own, with its estimates
    * cached as the message's own are, for as long as the store keeps the
    * message's object (across an append; an edit or a branch switch gives
    * every message a new one). An override must likewise give one
@@ -22035,7 +22047,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const results = pruning.replaced.get(msg.id);
     if (!results && !(pruning.inputCap > 0)) return msg;
     const kept = this._prunedForSend.get(msg);
-    if (kept && kept.inputCap === pruning.inputCap && sameMarkers(kept.results, results)) return kept.sent;
+    const hint = this.config.capReadHint;
+    if (kept && kept.inputCap === pruning.inputCap && kept.hint === hint && sameMarkers(kept.results, results)) return kept.sent;
     let content: ContentBlock[] | null = null;
     let inputs = false;
     for (let i = 0; i < msg.content.length; i++) {
@@ -22043,7 +22056,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let next: ContentBlock = block;
       if (block.type === 'tool_use' && pruning.inputCap > 0) {
         inputs = true;
-        next = truncatedToolUse(block, pruning.inputCap) ?? block;
+        next = truncatedToolUse(block, pruning.inputCap, msg.id, this.capClause) ?? block;
       } else if (block.type === 'tool_result') {
         const marker = results?.get(i);
         if (marker !== undefined) next = { ...block, content: marker };
@@ -22053,13 +22066,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sent = content ? { ...msg, content: releaseEditedRawForms(msg.content, content) } : msg;
     // A message with no tool call to measure and nothing replaced costs a
     // scan, so only the others are kept.
-    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, results, sent });
+    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, hint, results, sent });
     return sent;
   }
 
   private readonly _prunedForSend = new WeakMap<
     StoredMessage,
-    { inputCap: number; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
+    { inputCap: number; hint: CapReadHint | undefined; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
   >();
 
   /** Hold `store`'s decision while `fn` prices it. A selection and
@@ -22347,197 +22360,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The legacy combined recall answer (`positionedRecallPairs: false`): every
-   * selected summary concatenated into one assistant turn with `---`
-   * separators, under a single `maxMessageTokens` cap.
-   *
-   * With the envelope off this is the pre-existing expression: concatenate,
-   * then truncate the whole turn, so its bytes are exactly what the flat
-   * truncator writes. That is the compatibility promise. The truncator now
-   * writes an omission marker where it drops text, so a capped answer differs
-   * from earlier versions' by that one block.
-   *
-   * With the envelope on the cap is spent summary by summary instead, each
-   * summary's prose truncated against what the earlier ones left and then
-   * enveloped intact. The emission shape matches the flat truncator's —
-   * whole summaries until the budget runs out, the one that straddles it
-   * with its prose cut inside an intact envelope (a truncation suffix on the
-   * block the cap crosses, or the omission marker where the cap ends on a
-   * block boundary), then one omission marker for what the cap left out,
-   * unless that answer's own cut already wrote it. The answer ends at the
-   * summary where the cap ended, whatever budget the blocks the cap left out
-   * didn't spend, and a summary isn't admitted where the cap reaches it and
-   * leaves nothing of it that holds anything, as for a prose that holds
-   * nothing. An answer the cap admits no summary to is the marker alone.
-   * Before the cap ends, a summary is left out
-   * whole only where the budget can't pay for the separator in front of it
-   * and a token of its prose, below.
-   *
-   * The drop-whole boundary sits at the SEPARATOR: a summary is admitted only
-   * when the remaining budget can pay for the separator in front of it AND buy
-   * at least one token of prose behind it. Deciding the other way round — the
-   * separator charged after the summary it precedes was already emitted —
-   * spends past the cap by the separator's own width plus whatever prose the
-   * exhausted budget still bought, which is how one shared cap stops being
-   * shared.
-   *
-   * Returns the answer together with what of it survived the cap: each
-   * summary whose prose reached the answer, marked `partial` when the cap
-   * took something of it that held anything. A summary the cap dropped
-   * entirely is not listed, nor one that lost something that held anything
-   * while only text blocks of it that hold nothing reached the answer, so the
-   * rendered layout never claims history is represented by a summary the
-   * resident was not shown.
+   * selected summary's prose cut to `maxMessageTokens` on its own, as
+   * `renderSummaryAnswer` cuts a positioned pair's, then wrapped in the recall
+   * envelope, joined with `---` separators. A summary whose cut leaves nothing
+   * of it that holds anything is left out and not listed, since it would show
+   * the resident none of its history. Returns the answer with each summary it
+   * holds, `partial` where its cut took something that held anything; an
+   * answer that holds no summary is the omission marker alone.
    */
   protected renderCombinedRecallAnswer(
     summaries: SummaryEntry[],
     maxTokens: number,
   ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
-    // A separator follows the answer before it on the wire, so the reasoning at
-    // that answer's end gives up its id first (see raw-forms.ts).
-    const separated = (content: ContentBlock[]): ContentBlock[] => [
-      ...releaseTrailingReasoning(content),
-      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
-    ];
-    if (!isRecallEnveloped(this.config.recallEnvelope)) {
-      let content: ContentBlock[] = [];
-      // Which summary each text block of the full answer belongs to (-1 for
-      // separators), so a flat truncation can be read back per summary.
-      // releaseTrailingReasoning keeps every block's position, so the two
-      // stay aligned.
-      const owners: number[] = [];
-      summaries.forEach((s, idx) => {
-        if (idx > 0) {
-          content = separated(content);
-          owners.push(-1);
-        }
-        for (const block of this.liveWindowAnswerContent(s)) {
-          content.push(block);
-          owners.push(idx);
-        }
-      });
-      const out = maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
-      if (out === content) {
-        return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
-      }
-      // truncateContent keeps blocks in order: text until the budget runs
-      // out (the straddling block cut), the omission marker where the first
-      // dropped text block that held anything was, a text block that holds
-      // nothing (isEmptyTextBlock) only before the cap, as it was or as a
-      // copy that gave up a raw form, and every
-      // non-text block, before the cap or past it (a tool_result possibly
-      // shortened). Align the two arrays: an unchanged block is the same
-      // object, and a cut, shortened or copied one (a copy that gave up a
-      // raw form) is a new block of the same type in the same position. A
-      // block that holds nothing loses nothing either way: kept, it may be
-      // such a copy, which holds nothing too, and left out across or past
-      // the cap, it has no counterpart. It's kept only where every block
-      // before it was kept, as it was or as a copy, since across the cap the
-      // cap ends there, so a counterpart that holds nothing is never a later
-      // block's. The marker shows none of the block it replaces, and any
-      // other dropped block has no counterpart. A text block that holds
-      // nothing shows the resident nothing, so it counts as neither shown nor
-      // lost. A block that holds anything is lost unless it reached the
-      // answer as it was: a cut, or a copy that gave up its raw form and so no
-      // longer replays as its item, loses something. A summary is listed whole
-      // when it lost nothing and some block of it reached the answer, so one
-      // that holds nothing is listed whole before the cap and absent once the
-      // cap left it out. It's listed partial when it lost something and a
-      // block of it that holds anything reached the answer, as it was, cut or
-      // as a copy, including a retained thinking block whose text was
-      // dropped. Otherwise it's absent: one the marker alone replaced, or of
-      // which only blocks that hold nothing came before the marker, shows the
-      // resident none of its history. The marker is told apart by identity
-      // (isCapMarker), so a block whose text equals it, a copy included,
-      // counts as the block it is.
-      const kept = new Map<number, { whole: number; reached: number; shown: number; total: number }>();
-      let j = 0;
-      content.forEach((block, i) => {
-        const owner = owners[i]!;
-        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, reached: 0, shown: 0, total: 0 }) : null;
-        if (tally) tally.total++;
-        const counterpart = out[j];
-        const blank = isEmptyTextBlock(block);
-        if (counterpart === block) {
-          j++;
-          if (tally) { tally.whole++; tally.reached++; if (!blank) tally.shown++; }
-        } else if (blank) {
-          if (counterpart && isEmptyTextBlock(counterpart)) {
-            j++;
-            if (tally) tally.reached++;
-          }
-          if (tally) tally.whole++;
-        } else if (counterpart && counterpart.type === block.type) {
-          j++;
-          if (tally && !isCapMarker(counterpart)) { tally.reached++; tally.shown++; }
-        }
-        if (tally) kept.set(owner, tally);
-      });
-      const refs: Array<{ id: string; level: number; partial?: true }> = [];
-      summaries.forEach((s, idx) => {
-        const tally = kept.get(idx);
-        if (!tally) return;
-        if (tally.whole === tally.total) {
-          if (tally.reached > 0) refs.push({ id: s.id, level: s.level });
-        } else if (tally.shown > 0) {
-          refs.push({ id: s.id, level: s.level, partial: true });
-        }
-      });
-      return { content: out, refs };
-    }
-
     let content: ContentBlock[] = [];
     const refs: Array<{ id: string; level: number; partial?: true }> = [];
-    const separatorCost = this.estimateTextOnlyTokens(
-      { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
-    );
-    let remainingTokens = maxTokens;
-    let admitted = 0;
-    let omissionMarked = false;
-    for (const [idx, s] of summaries.entries()) {
-      const separatorTokens = idx > 0 ? separatorCost : 0;
-      const proseBudget = remainingTokens - separatorTokens;
-      if (maxTokens > 0 && proseBudget <= 0) break;
+    for (const s of summaries) {
       const prose = this.liveWindowAnswerProse(s);
-      const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      // The cap reached this summary and left nothing of it that shows: every
-      // block that survived holds nothing, besides the truncator's marker.
-      // That's so for a prose that holds nothing, which comes back as the
-      // marker alone, and for one whose only blocks before the cap hold
-      // nothing. It isn't admitted, and the answer ends at it.
-      if (capped !== prose && capped.every((b) => isEmptyTextBlock(b) || isCapMarker(b))) break;
-      // Whether this answer, so far the last, carries the truncator's own
-      // marker, told apart by identity from a block of the prose whose text
-      // equals it (isCapMarker).
-      omissionMarked = capped.some(isCapMarker);
-      if (idx > 0) content = separated(content);
+      const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens, undefined, { kind: 'summary', id: s.id }) : prose;
+      if (capped !== prose && capped.every((b) => isEmptyTextBlock(b) || isCapMarker(b))) continue;
+      // A separator follows the answer before it on the wire, so the reasoning at
+      // that answer's end gives up its id first (see raw-forms.ts).
+      if (refs.length > 0) content = [...releaseTrailingReasoning(content), { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }];
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       refs.push(cappedWhole(prose, capped) ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
-      admitted++;
-      // The cap ended inside this answer, where it cut, dropped or left out a
-      // block, so the answer ends with it: no later summary is admitted,
-      // whatever budget the blocks it left out didn't spend.
-      if (capped !== prose) break;
-      if (maxTokens > 0) {
-        remainingTokens -=
-          this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
-      }
     }
-    // Summaries the cap left out are said once, as the flat truncator says
-    // what it drops: after the last answer, whose trailing reasoning gives up
-    // its id first, as it does before a separator. Not again if the last
-    // answer's own prose already carries the marker, and not for summaries
-    // whose prose held nothing, which a store can still keep from before
-    // empty summaries were refused.
-    const leftOutContent = summaries.slice(admitted)
-      .some((s) => this.liveWindowAnswerProse(s).some((b) => !isEmptyTextBlock(b)));
-    if (leftOutContent && !omissionMarked) {
-      content = [...releaseTrailingReasoning(content), { type: 'text', text: CAP_OMISSION_TEXT }];
-    }
-    // The cap admitted no summary: nothing of the first that holds anything
-    // survived it, and the cap ended there. The answer is the marker alone, as
-    // the truncator gives content that holds nothing, so it's never empty, and
-    // it lists none.
-    if (admitted === 0 && summaries.length > 0) content = [{ type: 'text', text: CAP_OMISSION_TEXT }];
+    if (refs.length === 0 && summaries.length > 0) content = [{ type: 'text', text: CAP_OMISSION_TEXT }];
     return { content, refs };
   }
 
@@ -22571,32 +22418,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the recall envelope. The cap is spent on the PROSE, and the envelope is
    * applied to what survives.
    *
-   * Ordering is the whole point. Truncating an enveloped answer retains a
-   * prefix and appends the truncator's own marker, which drops the closing
-   * tag and — under a cap smaller than the opener — emits a half-written one:
-   * a delimiter convention that sometimes lies is worse than no convention,
-   * because the reader learns to distrust the tags that ARE intact. Wrapping
-   * last makes opener and closer survive every cap by construction.
+   * Ordering is the whole point. Cutting an enveloped answer would cut into
+   * its tags, and under a cap smaller than the opener emit a half-written
+   * one: a delimiter convention that sometimes lies is worse than no
+   * convention, because the reader learns to distrust the tags that ARE
+   * intact. Wrapping last makes opener and closer survive every cap by
+   * construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
    * capped enveloped answer runs over the cap by its own tag text, and the
-   * legacy combined answer under an envelope (`'xml'` or `'bare'`) also by the omission
-   * marker it writes after its last envelope when summaries that hold anything
-   * are left out, unless that answer's own cut already wrote it inside its
-   * envelope. That is
-   * the same soft-cap overshoot the truncator already takes for granted — it
-   * appends its `[truncated — original was N tokens]` marker AFTER spending
-   * the budget — and the envelope is priced where the accounting is load
-   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
-   * the render is opener + whatever prose the cap bought + marker + closer:
-   * never an empty envelope, never a torn one.
+   * envelope is priced where the accounting is load bearing, in
+   * `capRecallPairs`. At a cap smaller than the envelope overhead the render
+   * is opener + whatever head and tail the cap kept around its marker +
+   * closer: never an empty envelope, never a torn one.
    */
   protected renderSummaryAnswer(
     summary: SummaryEntry,
     maxTokens: number,
   ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
     const prose = this.liveWindowAnswerProse(summary);
-    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens, undefined, { kind: 'summary', id: summary.id }) : prose;
     return {
       content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
       refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
@@ -22651,14 +22492,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries alike go through it, so an override changes both, and the
    * price of a raw message follows what the override sends. A compile cuts
    * each message more than once, to price it and to send it, so an override
-   * must answer the same arguments with the same content.
+   * must answer the same arguments with the same content. `whole` names the
+   * stored message or summary the cut comes from, which its marker names,
+   * with `capReadHint`'s clause after it. An override that rewrites the
+   * content it cuts overrides `capMeasuredText` too, so a reader pages the
+   * text the marker's offsets index.
    */
   protected truncateContent(
     content: ContentBlock[],
     maxTokens: number,
     estimate?: (content: ContentBlock[]) => number,
+    whole?: CapWhole,
   ): ContentBlock[] {
-    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)));
+    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)), {
+      ...(whole ? { whole } : {}),
+      hint: this.capClause,
+    });
+  }
+
+  /**
+   * The text the per-message cap measures for `at`, read through `store`, the
+   * agent's view (see `ContextStrategy.capMeasuredText`): a message's text
+   * blocks and string tool results as this strategy sends it before the cut
+   * (prunedForSend), so a result tool pruning leaves out reads as its marker;
+   * a summary's answer prose (liveWindowAnswerProse), as every recall answer
+   * cuts it; with `toolUseId`, the JSON of that call's input as stored, which
+   * `toolUseInputMaxTokens` measures. Null for an id `store` holds no message
+   * for and no summary of the loaded branch has, and for a call the message
+   * doesn't hold.
+   */
+  capMeasuredText(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null {
+    this.requireLoadedBranch('capMeasuredText');
+    const msg = store.get(at.id as MessageId);
+    if (at.toolUseId !== undefined) {
+      const call = msg?.content.find((b) => b.type === 'tool_use' && b.id === at.toolUseId) as Extract<ContentBlock, { type: 'tool_use' }> | undefined;
+      return call ? JSON.stringify(call.input) : null;
+    }
+    if (msg) return capMeasuredTextOf(this.prunedForSend(store, msg).content);
+    const summary = this.summaries.find((s) => s.id === at.id);
+    return summary ? capMeasuredTextOf(this.liveWindowAnswerProse(summary)) : null;
   }
 
   /**
@@ -22699,7 +22571,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // override's rewrite passed on to this class's cut.
     const sent = this.prunedForSend(store, msg);
     const content = this.truncateContent(sent.content, msgCap, (blocks) =>
-      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage),
+    { kind: 'message', id: msg.id });
     return { content, extra: cappedPriceExtra(store, sent, content) };
   }
 

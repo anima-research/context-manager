@@ -7,22 +7,22 @@
  * capped answer is the only render where wrapping and truncating can fight.
  * Each case pins one truncation regime:
  *
- *  - `*TightCap` uses a cap of 1 token (4 characters), far SMALLER than the
- *    envelope's own tag text. That is the boundary case: the envelope is not
- *    charged against the cap, so what renders is opener + the few characters
- *    the cap bought + the truncator's marker + closer.
- *  - the ordinary caps sit mid-prose, so an answer is cut but not obliterated.
- *  - the `combined*` cases drive the legacy `positionedRecallPairs: false`
- *    path, whose single turn concatenates every selected summary and is
- *    therefore the one place a cap can fall BETWEEN two envelopes.
+ *  - `*TightCap` uses a cap of 1 token, far SMALLER than the envelope's own
+ *    tag text and the cut's marker. That is the boundary case: the envelope
+ *    is not charged against the cap, and the cut is never longer than the
+ *    whole, so a summary no longer than its marker, as the fixture's are,
+ *    renders whole: opener + prose + closer.
+ *  - the ordinary caps leave the fixture's summaries whole too, for the same
+ *    reason.
+ *  - `hierarchicalCombinedUncut` drives the legacy
+ *    `positionedRecallPairs: false` path at a cap that cuts nothing. Every
+ *    recall answer's cuts, each summary's head and tail inside its own
+ *    envelope, are pinned with summaries longer than the marker in
+ *    test/combined-recall-answer.test.ts.
  */
 
-import { AutobiographicalStrategy } from '../../src/index.js';
-import { COMBINED_RECALL_SEPARATOR_TEXT } from '../../src/strategies/autobiographical.js';
-import type { AutobiographicalOptions, StoredMessage } from '../../src/types/index.js';
+import type { AutobiographicalOptions } from '../../src/types/index.js';
 import {
-  HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE,
-  HIERARCHICAL_FIXTURE_PLAIN_PROSE,
   renderAdaptiveFixture,
   renderHierarchicalFixture,
   type FixtureRender,
@@ -46,13 +46,9 @@ export const CAPPED_RENDER_CASES = {
     path: 'hierarchical',
     options: { maxMessageTokens: 1 },
   },
-  hierarchicalCombined: {
+  hierarchicalCombinedUncut: {
     path: 'hierarchical',
-    options: { maxMessageTokens: 12, positionedRecallPairs: false },
-  },
-  hierarchicalCombinedTightCap: {
-    path: 'hierarchical',
-    options: { maxMessageTokens: 1, positionedRecallPairs: false },
+    options: { maxMessageTokens: 60, positionedRecallPairs: false },
   },
   adaptive: {
     path: 'adaptive',
@@ -61,9 +57,10 @@ export const CAPPED_RENDER_CASES = {
   adaptiveTightCap: {
     path: 'adaptive',
     options: { maxMessageTokens: 1 },
-    // A raw message capped at 1 token renders a few characters and the cut's
-    // suffix, and is priced as it renders (#223), so the fixture's 30 fit 900
-    // tokens raw. A smaller budget makes the render fold, as the case needs.
+    // A raw message capped at 1 token renders as the cut's marker alone, or
+    // whole where it's no longer than that marker, and is priced as it
+    // renders (#223), so the fixture's 30 fit 900 tokens raw. A smaller
+    // budget makes the render fold, as the case needs.
     maxTokens: 300,
   },
 } as const satisfies Record<string, CappedRenderCase>;
@@ -89,98 +86,4 @@ export async function renderCappedCase(
   return testCase.path === 'hierarchical'
     ? renderHierarchicalFixture(options)
     : renderAdaptiveFixture(options, undefined, testCase.maxTokens);
-}
-
-/** Reaches the production token estimator the combined path spends through. */
-class CombinedRecallProsePricer extends AutobiographicalStrategy {
-  priceProse(text: string): number {
-    return this.estimateTextOnlyTokens({ content: [{ type: 'text', text }] } as StoredMessage);
-  }
-}
-
-export interface CombinedSharedBudgetPrices {
-  firstSummary: number;
-  separator: number;
-  secondSummary: number;
-}
-
-/**
- * What the combined xml path spends on the first two hierarchical-fixture
- * summaries and on the separator between them, priced by the estimator the
- * render itself uses. Every cap below is arithmetic over these three numbers,
- * so the cases keep meaning what they say when the fixture prose changes.
- */
-export function combinedSharedBudgetPrices(): CombinedSharedBudgetPrices {
-  const pricer = new CombinedRecallProsePricer({});
-  return {
-    firstSummary: pricer.priceProse(HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE),
-    separator: pricer.priceProse(COMBINED_RECALL_SEPARATOR_TEXT),
-    secondSummary: pricer.priceProse(HIERARCHICAL_FIXTURE_PLAIN_PROSE),
-  };
-}
-
-/** What the render owes at a given cap, once the first summary is fully in. */
-export type CombinedSharedBudgetExpectation =
-  | 'bothSummariesWhole'
-  | 'separatorThenTruncatedSecond'
-  | 'stopsAfterFirstSummary';
-
-export interface CombinedSharedBudgetCase {
-  name: string;
-  maxMessageTokens: number;
-  expectation: CombinedSharedBudgetExpectation;
-}
-
-/**
- * Caps that land in the seam the `CAPPED_RENDER_CASES` cannot reach: every one
- * of them fully admits the first summary, so what the render does next is
- * decided by the SEPARATOR arithmetic rather than by a cut inside summary one.
- * (`hierarchicalCombined` caps at 12 against a 13-token first summary, so its
- * cap never survives to meet a separator at all.)
- *
- * These are deliberately NOT members of `CAPPED_RENDER_CASES`: that record is
- * enumerated by the default-mode golden capture, so adding a key there would
- * move the golden. The shared-budget seam is xml-only — the flat path spends
- * its cap through one `truncateContent` call over the whole concatenation —
- * so these cases render in xml mode and leave the pinned bytes alone.
- */
-export function combinedSharedBudgetCases(): CombinedSharedBudgetCase[] {
-  const { firstSummary, separator, secondSummary } = combinedSharedBudgetPrices();
-  return [
-    {
-      name: 'bothSummariesAndTheSeparatorFitExactly',
-      maxMessageTokens: firstSummary + separator + secondSummary,
-      expectation: 'bothSummariesWhole',
-    },
-    {
-      name: 'separatorPlusOneTokenOfTheSecondSummary',
-      maxMessageTokens: firstSummary + separator + 1,
-      expectation: 'separatorThenTruncatedSecond',
-    },
-    {
-      name: 'exactlyTheFirstSummary',
-      maxMessageTokens: firstSummary,
-      expectation: 'stopsAfterFirstSummary',
-    },
-    {
-      name: 'oneTokenPastTheFirstSummary',
-      maxMessageTokens: firstSummary + 1,
-      expectation: 'stopsAfterFirstSummary',
-    },
-    {
-      name: 'separatorAffordableButNoProseBehindIt',
-      maxMessageTokens: firstSummary + separator,
-      expectation: 'stopsAfterFirstSummary',
-    },
-  ];
-}
-
-export async function renderCombinedSharedBudgetCase(
-  testCase: CombinedSharedBudgetCase,
-): Promise<FixtureRender> {
-  return renderHierarchicalFixture({
-    maxMessageTokens: testCase.maxMessageTokens,
-    positionedRecallPairs: false,
-    recallEnvelope: 'xml',
-  });
 }

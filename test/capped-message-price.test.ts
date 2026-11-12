@@ -3,7 +3,7 @@
  * (#223): what the strategy counts for the message in its plan, its budget
  * checks and its render stats is its path's price for it uncapped, plus the
  * store's estimate of what the cut changed. The cap cuts text and string tool
- * results only, at four characters a token, so a capped message's images,
+ * results only, by the strategy's estimate, so a capped message's images,
  * tool calls and thinking go out whole, and its kept text is priced at the
  * store's own rate. Where no image is stripped, that sum is the store's
  * estimate of what's sent, except where the strategy joins a body's shards
@@ -69,9 +69,11 @@ const CASES: Record<string, Case> = {
       ['u', [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock]],
     ],
   },
+  // The cut keeps head, marker and tail within the cap by the strategy's
+  // estimate, which the store prices under the old cap plus 50.
   'text alone past the cap': {
     cap: 100,
-    old: 'too little',
+    old: 'too much',
     messages: [['u', [{ type: 'text', text: 'r'.repeat(2000) }]]],
   },
   // The cap leaves this message whole, since its text is under the cap and an
@@ -81,8 +83,9 @@ const CASES: Record<string, Case> = {
     old: 'too little',
     messages: [['u', [{ type: 'text', text: 'a short note' }, IMAGE]]],
   },
-  // connectome-host's default cap. The cap keeps four characters a token,
-  // which the store prices at its own rates.
+  // connectome-host's default cap. The cut keeps what fits the cap, marker
+  // included, by the strategy's estimate, which the store prices at its own
+  // rates.
   'prose alone past a cap of 10,000': {
     cap: 10_000,
     old: 'too little',
@@ -98,8 +101,8 @@ const CASES: Record<string, Case> = {
       ['u', [{ type: 'tool_result', toolUseId: 't1', content: 'z'.repeat(80_000) } as ContentBlock]],
     ],
   },
-  // A cap of 1 keeps four characters and the suffix, which estimate well
-  // under the 51 the old price charged.
+  // A cap of 1 is smaller than the marker, which goes alone, and estimates
+  // well under the 51 the old price charged.
   'three texts past a cap of 1': {
     cap: 1,
     old: 'too much',
@@ -440,11 +443,13 @@ describe("an override of truncateContent is the cut a raw message is priced and 
       return super.truncateContent(rewritten, maxTokens, estimate);
     }
   }
-  const rewrites: Array<[string, typeof AutobiographicalStrategy]> = [
-    ['that adds a block', AddsNote],
-    ['that keeps the block count', ReplacesText],
+  // The marker counts the measured text of what the override passed on:
+  // 'hello' and the note, or the note in its place.
+  const rewrites: Array<[string, typeof AutobiographicalStrategy, number]> = [
+    ['that adds a block', AddsNote, 4005],
+    ['that keeps the block count', ReplacesText, 4000],
   ];
-  for (const [how, Rewrites] of rewrites) for (const [mode, config] of SELECTIONS) {
+  for (const [how, Rewrites, total] of rewrites) for (const [mode, config] of SELECTIONS) {
     it(`autobiographical, ${mode}: a rewrite ${how}, passed on to the cut, is cut by its own estimate, and the render stats count it`, async () => {
       // 'hello' alone is 2 tokens to the cut's estimate, under a cap of 100,
       // and with the override's 4,000 characters it is past 1,000.
@@ -453,7 +458,7 @@ describe("an override of truncateContent is the cut a raw message is priced and 
       try {
         const compiled = await manager.compile(BIG);
         const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
-        assert.ok(texts.some((text) => text.includes('[truncated — original was 1000 tokens]')),
+        assert.ok(texts.some((text) => new RegExp(`\\[truncated — chars \\d+ to \\d+ of ${total} elided here`).test(text)),
           `the rewrite is cut: ${JSON.stringify(texts.map((text) => text.slice(0, 60)))}`);
         assert.ok(!texts.some((text) => text.includes('n'.repeat(4000))), 'nothing sends the rewrite whole');
         const sent = rendered(compiled);
@@ -492,8 +497,13 @@ describe("the cut asks about a stored message's own content through the message'
         const store = (manager as unknown as { messageStore: { getAll(): StoredMessage[] } }).messageStore;
         const stored = new Map(store.getAll().map((m) => [m.id, m]));
         assert.ok(strategy.asked.length > 0, 'premise: the cut asked for estimates');
-        const apart = strategy.asked.filter((m) => stored.get(m.id) !== m);
-        assert.equal(apart.length, 0, `estimated apart from the stored messages: ${apart.length} of ${strategy.asked.length}`);
+        // The cut also estimates the head and tail it tries, which are no
+        // stored message and carry no id; what it mustn't do is estimate a
+        // stored message through any object but the message, a copy of it
+        // or of its content included.
+        const apart = strategy.asked.filter((m) => m.id !== undefined && stored.has(m.id) && stored.get(m.id) !== m);
+        assert.equal(apart.length, 0, `a stored message estimated apart from itself: ${apart.length} of ${strategy.asked.length}`);
+        for (const m of stored.values()) assert.ok(strategy.asked.includes(m), `premise: stored message ${m.id} was estimated through itself`);
       } finally {
         await close();
       }
@@ -516,7 +526,7 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
     message.content.map((block) => (block as { text?: string }).text ?? '').join('');
   // The strategy merges a run of a body's raw shards into one entry, their
   // texts joined into one block (mergeAdjacentBodyGroupRaw), so the cut
-  // shards are counted by their truncation suffixes.
+  // shards are counted by their markers.
   const cutShards = (compiled: { messages: Array<{ content: ContentBlock[] }> }): number =>
     compiled.messages.map(textOf).join('').split('[truncated').length - 1;
   type Sent = { messages: Array<{ content: ContentBlock[] }> };
@@ -524,9 +534,10 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
   // A text block's estimate is its characters over a rate the store picks
   // from its first 2,000 characters, rounded up. The strategy counts each
   // shard on its own, in the head and recent windows and in the middle's
-  // joined run alike, so where the request joins the shards into one block,
-  // the render stats come to between 0 and 6 tokens over the store's
-  // estimate of what's sent, and the plan is what the emitter counted.
+  // joined run alike, and a cut shard as its head, marker and tail, so where
+  // the request joins the shards into one block, the render stats come to
+  // between 0 and 3 tokens a shard over the store's estimate of what's sent,
+  // and the plan is what the emitter counted.
   // Shards of different densities are body-run-price's cases.
   const windows: Array<[string, Record<string, unknown>, (compiled: Sent, stats: Stats) => void]> = [
     ['in the middle, uncut', { headWindowTokens: 0, recentWindowTokens: 2000 }, (compiled) =>
@@ -550,7 +561,7 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
         premise(compiled, stats);
         const sent = rendered(compiled);
         const price = stats.total.tokens;
-        assert.ok(price - sent >= 0 && price - sent <= 6, `render stats ${price}, sent ${sent}`);
+        assert.ok(price - sent >= 0 && price - sent <= 21, `render stats ${price}, sent ${sent}`);
         const { planned, actual } = stats.planVsActual!;
         assert.equal(planned, actual, `planned ${planned}, emitted ${actual}`);
         assert.equal(await attempt(price), sent, `a budget of ${price} sends all of it`);

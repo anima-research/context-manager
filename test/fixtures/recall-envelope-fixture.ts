@@ -57,7 +57,7 @@ export interface FixtureRender {
 }
 
 /** Strategy subclass that can seed summaries without an LLM round trip. */
-class SeedableStrategy extends AutobiographicalStrategy {
+export class SeedableStrategy extends AutobiographicalStrategy {
   seedSummary(entry: Omit<SummaryEntry, 'id' | 'created'> & { id?: string }): SummaryEntry {
     const seeded: SummaryEntry = {
       ...entry,
@@ -106,10 +106,8 @@ export const HIERARCHICAL_FIXTURE_SUMMARY_IDS = ['L2-100', 'L1-101', 'L1-102'] a
 
 /**
  * The prose of the first two recall answers the hierarchical fixture renders,
- * in render order. Hoisted because the combined-path budget cases price these
- * exact strings through the production estimator to DERIVE their caps: a cap
- * written as a literal would silently stop landing where it means to the first
- * time this prose is edited.
+ * in render order. Hoisted because the combined-path cases compare these
+ * exact strings, and decide from their length which ones a cap cuts.
  */
 export const HIERARCHICAL_FIXTURE_MERGED_LEVEL_PROSE =
   'zz-memory-merged-level covering the first two turns';
@@ -123,9 +121,10 @@ export const HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT = 'zz-turn-latest ' + 'Z'.rep
  */
 export async function renderHierarchicalFixture(
   options: AutobiographicalOptions = {},
+  Strategy: typeof SeedableStrategy = SeedableStrategy,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
-    const strategy = new SeedableStrategy({
+    const strategy = new Strategy({
       headWindowTokens: 0,
       recentWindowTokens: 8,
       ...options,
@@ -194,10 +193,12 @@ export async function renderHierarchicalFixture(
       ],
     });
 
-    const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
-    const summaries = summariesOf(strategy);
-    manager.close();
-    return { messages: project(compiled.messages), summaries, compressionRequests: [] };
+    try {
+      const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      return { messages: project(compiled.messages), summaries: summariesOf(strategy), compressionRequests: [] };
+    } finally {
+      manager.close();
+    }
   });
 }
 
