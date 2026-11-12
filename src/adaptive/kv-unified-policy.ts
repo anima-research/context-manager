@@ -86,6 +86,19 @@ export interface KvUnifiedWelfarePolicy {
    * half-life after a move and read at whole doublings from there, and
    * recency is the floor from eight half-lives out (see continuityLeafBase). */
   readonly ageBandSteps: number;
+  /** Linear price of a rewrite: points per `cacheScale` of cache churn (the
+   * tokens a candidate makes the provider compute again that the carried
+   * layout wouldn't, times `cacheWritePrice - cacheReadPrice`). Above 0 it
+   * takes the place of the `cacheLambda` term, which is quadratic and
+   * measured from the cheapest candidate of the pool: that term is nearly
+   * flat where candidates differ by a few hundred thousand tokens of
+   * rewrite, so a plan that also changes old history costs about what one
+   * that only folds new history does. Priced linearly, each token a change
+   * rewrites costs the same, a change that leaves the earlier cache
+   * breakpoints standing is cheaper by what it leaves, and the carried
+   * layout, which rewrites nothing, is cheaper than any change by that
+   * change's whole rewrite. 0 (the default) keeps the `cacheLambda` term. */
+  readonly rewriteLambda: number;
 }
 
 export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
@@ -107,6 +120,7 @@ export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
   // Exact at the solver level; the strategy built from a recipe fills in
   // its own default (see KvUnifiedConfig.policy.ageBandSteps).
   ageBandSteps: 0,
+  rewriteLambda: 0,
 };
 
 /** The finest banding the policy accepts: 64 bands per doubling is a
@@ -514,6 +528,7 @@ export function normalizePolicy(
     'cacheReadPrice',
     'cacheWritePrice',
     'continuityLambda',
+    'rewriteLambda',
   ];
   for (const key of finiteNonNegative) {
     if (!Number.isFinite(policy[key]) || policy[key] < 0) {
@@ -680,8 +695,19 @@ export function withBestScoreUnder<T extends object>(
 
 export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,
   cacheFloor: number, continuityFloor: number, policy: KvUnifiedWelfarePolicy, multiplier: number): number {
-  return fidelity + budget + quadratic(Math.max(0, cache - cacheFloor), policy.cacheScale, policy.cacheLambda) +
+  return fidelity + budget + cacheCost(cache, cacheFloor, policy) +
     multiplier * quadratic(Math.max(0, continuity - continuityFloor), policy.continuityScale, policy.continuityLambda);
+}
+
+/** What a candidate's cache churn costs: with `rewriteLambda`, linear in the
+ * churn itself, whatever the pool's cheapest candidate rewrites (the floor
+ * is the same for every candidate of a pool, so it decides nothing in a
+ * linear term, and scores from two pools then compare without a shared
+ * frame); without it, quadratic in the churn above that floor. */
+export function cacheCost(cache: number, cacheFloor: number, policy: KvUnifiedWelfarePolicy): number {
+  return policy.rewriteLambda > 0
+    ? policy.rewriteLambda * (Math.max(0, cache) / positive(policy.cacheScale))
+    : quadratic(Math.max(0, cache - cacheFloor), policy.cacheScale, policy.cacheLambda);
 }
 
 export function frontierSignature(

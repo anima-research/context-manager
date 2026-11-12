@@ -53,12 +53,25 @@ export interface ContextEntry {
   /**
    * The tool_use ids whose results a structural repair moved out of this
    * entry into the entry that answers their tool_use. The request still
-   * carries each result, in that other entry: attribution looks for it
-   * there by its tool_use id, so moving a result is not a loss, while a
-   * moved result that was later altered, or is missing from the request,
-   * still is.
+   * carries each result, in that other entry: attribution looks for it by
+   * its tool_use id among every result in the request, so moving a result
+   * is not a loss, while a moved result that was later altered, or is
+   * missing from the request, still is. Where `relocatedBlocks` is set,
+   * attribution looks for those blocks instead, and for a result with the
+   * id still in this entry.
    */
   relocatedResults?: string[];
+  /**
+   * The result blocks that repair placed for `relocatedResults`, as it
+   * placed them, one block of its own for each move. Where it's set,
+   * attribution credits a moved result only through one of these blocks
+   * still in the request, unaltered, or through a result with its id still
+   * in this entry that isn't among the blocks repair recorded as placed for
+   * any entry. A stub repair generated, or a copy that releasing a raw form
+   * made of a block it placed, isn't recorded, so either counts as a carrier
+   * wherever it covers the moved result.
+   */
+  relocatedBlocks?: ContentBlock[];
 }
 
 /**
@@ -110,12 +123,37 @@ export interface WaitingWork {
 /**
  * An injection into the compiled context.
  * Source-agnostic: may come from MCPL servers, local strategies, or application code.
+ *
+ * Injections are never stored: `compile()` places them afresh each time it
+ * runs. What each position costs is on `position`, where `beforeUser` is
+ * deprecated (anima-research/agent-framework#171); `system` and `afterUser`
+ * are supported.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
   namespace: string;
 
-  /** Where to inject in the message array */
+  /**
+   * Where to inject:
+   * - `system`: comes back in `CompileResult.systemInjections`, for the
+   *   caller's system prompt, and isn't stored. A change to its text changes
+   *   the system prompt, so the request misses the prompt cache from the
+   *   system prompt on, and on a model that binds a reply's thinking to
+   *   everything before it, every earlier reply loses its thinking
+   *   (`thinkingBinding`), since the system prompt comes before them all.
+   * - `afterUser`: placed again after the last user message at every compile
+   *   (at the end when there is none), so it moves as newer user messages
+   *   arrive: the request misses the cache from its old place on, and on a
+   *   model that binds a reply's thinking to everything before it, every
+   *   reply after its old place loses its thinking (`thinkingBinding`). It's
+   *   for text that must stay near the end, such as instructions.
+   * - `beforeUser`: deprecated (anima-research/agent-framework#171). It's
+   *   placed again before the last user message at every compile, so it moves
+   *   as `afterUser` does, at the same costs, and since a tool's result is
+   *   carried in a user message, after a tool call it lands between the call
+   *   and its result. Store the content as an ordinary message
+   *   (`ContextManager.addMessage`) instead, where it stays.
+   */
   position: 'system' | 'beforeUser' | 'afterUser';
 
   /** Content blocks to inject (multimodal) */
@@ -153,9 +191,11 @@ export interface CompileResult {
   messages: NormalizedMessage[];
 
   /**
-   * System-position injections, grouped by namespace.
+   * The content blocks of the `system`-position injections, flattened in the
+   * order given; their namespaces aren't kept.
    * Caller should append these to the system prompt.
    * Separated because the system prompt is outside context-manager's scope.
+   * Empty when no `system`-position injection is passed.
    */
   systemInjections: ContentBlock[];
 

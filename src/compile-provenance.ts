@@ -154,7 +154,8 @@ export function attributeEntries(
 
   // Pass 1: which members each raw entry carries, and whether it carried
   // them unaltered.
-  let resultsByUse: ReadonlyMap<string, ContentBlock> | undefined;
+  let inRequest: ReadonlySet<ContentBlock> | undefined;
+  let placedByRepair: ReadonlySet<ContentBlock> | undefined;
   const entryBodies: Array<BodyState[] | null> = [];
   for (const entry of entries) {
     if (!isRawEntry(entry)) {
@@ -171,7 +172,12 @@ export function attributeEntries(
       if (!states.includes(state)) states.push(state);
     }
     const unaltered = entry.relocatedResults?.length
-      ? carriesWithRelocated(entry, sourceMessages, resultsByUse ??= toolResultsByUse(entries))
+      ? carriesWithRelocated(
+        entry,
+        sourceMessages,
+        inRequest ??= new Set(entries.flatMap((e) => e.content)),
+        placedByRepair ??= new Set(entries.flatMap((e) => e.relocatedBlocks ?? [])),
+      )
       : carries(entry.content, sourceMessages);
     if (!unaltered) for (const state of states) state.contentOk = false;
     entryBodies.push(states);
@@ -383,37 +389,28 @@ function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage
   return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
 }
 
-/** Every tool_result block of the compile, by the tool_use it answers. */
-function toolResultsByUse(entries: readonly ContextEntry[]): ReadonlyMap<string, ContentBlock> {
-  const out = new Map<string, ContentBlock>();
-  for (const entry of entries) {
-    for (const block of entry.content) {
-      if (block.type === 'tool_result' && !out.has(block.toolUseId)) out.set(block.toolUseId, block);
-    }
-  }
-  return out;
-}
-
-/**
- * An entry a structural repair moved tool results out of carries its body
- * when it carries the rest unaltered and each moved result reached the
- * request unaltered where the repair put it. A result altered there, or
- * missing from the request, does not carry it.
- */
 function carriesWithRelocated(
   entry: ContextEntry,
   sourceMessages: readonly StoredMessage[],
-  resultsByUse: ReadonlyMap<string, ContentBlock>,
+  inRequest: ReadonlySet<ContentBlock>,
+  placedByRepair: ReadonlySet<ContentBlock>,
 ): boolean {
   const moved = new Set(entry.relocatedResults);
   const isMoved = (b: ContentBlock): boolean => b.type === 'tool_result' && moved.has(b.toolUseId);
   const rest = sourceMessages.map((m) => ({ ...m, content: m.content.filter((b) => !isMoved(b)) }));
   if (!carries(entry.content, rest)) return false;
+  if (!entry.relocatedBlocks) {
+    const sent = [...inRequest].filter(isMoved);
+    return sourceMessages.every((m) => m.content.every((block) => !isMoved(block) || sent.some((result) => covers(result, block))));
+  }
+  const placed = entry.relocatedBlocks.filter((b) => inRequest.has(b));
+  const carriers = [...placed, ...entry.content.filter((b) => isMoved(b) && !placedByRepair.has(b))];
   for (const m of sourceMessages) {
     for (const block of m.content) {
       if (!isMoved(block)) continue;
-      const placed = resultsByUse.get((block as { toolUseId: string }).toolUseId);
-      if (!placed || !covers(placed, block)) return false;
+      const k = carriers.findIndex((result) => covers(result, block));
+      if (k === -1) return false;
+      carriers.splice(k, 1);
     }
   }
   return true;

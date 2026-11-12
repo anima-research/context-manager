@@ -94,6 +94,16 @@ export interface BindingRecord {
   /** The branch's sequence (`JsStore.currentSequence`) when the record
    *  began: a message at or below it was stored before. */
   recordedAfter: Sequence;
+  /** The sequence of the newest stored body that compile sent: where `sent`
+   *  ends in the store. Absent in a record an earlier release wrote, and
+   *  where that compile sent no stored body. */
+  through?: Sequence;
+  /** The sequence of the newest stored row a note vouches for after `sent`:
+   *  the last one before the first row it couldn't vouch for. Absent until
+   *  a note vouches for a row. A reply stored after the later of the two is
+   *  past the record's end, and the next compile sends it without its
+   *  thinking whatever else it sends (`recordedThrough`). */
+  continuedThrough?: Sequence;
   /** The `provenance.compileId` of the committing compile that wrote it: a
    *  note is for that compile's stream only. */
   compileId: string;
@@ -173,6 +183,8 @@ function isBindingRecord(value: unknown): value is BindingRecord {
   if (!isStringArray(v.sent) || !isStringArray(v.continued) || !isStringArray(v.without)) return false;
   if (v.dropped !== undefined && !isStringArray(v.dropped)) return false;
   if (!isSequence(v.recordedAfter) || typeof v.compileId !== 'string') return false;
+  if (v.through !== undefined && !isSequence(v.through)) return false;
+  if (v.continuedThrough !== undefined && !isSequence(v.continuedThrough)) return false;
   if (typeof v.identity !== 'object' || v.identity === null || Array.isArray(v.identity)) return false;
   const identity = v.identity as Record<string, unknown>;
   return IDENTITY_KEYS.every((key) => typeof identity[key] === 'string');
@@ -292,10 +304,12 @@ export function bindThinking(input: BindInput): BindOutcome {
   let newlyBeforeRecord = false;
   const leftOut: ContentBlock[] = [];
   const stripped = (message: NormalizedMessage): NormalizedMessage => ({ ...message, content: withoutThinking(message.content) });
+  let through: Sequence | undefined;
 
   for (let i = 0; i < input.messages.length; i++) {
     const message = input.messages[i]!;
     const bodies = rawBodies(input.sources[i]);
+    for (const body of bodies) if (through === undefined || body.sequence > through) through = body.sequence;
     const thinking = message.content.some(isThinkingBlock);
     // The participant's own reply, from stored bodies, not left out before.
     const owned = thinking && bodies.length > 0 && message.participant === participant &&
@@ -340,6 +354,7 @@ export function bindThinking(input: BindInput): BindOutcome {
       without: [...without],
       identity: copyIdentity(identity),
       recordedAfter,
+      ...(through !== undefined ? { through } : {}),
       compileId: input.compileId,
     },
     leftOut,
@@ -358,7 +373,28 @@ function copyIdentity(identity: RequestIdentity): RequestIdentity {
  * vouches for nothing until a compile writes it again, so the next compile
  * under the new head reports the head change.
  */
-export function continueRecord(record: BindingRecord, continued: string[], identity: RequestIdentity): BindingRecord {
+export function continueRecord(
+  record: BindingRecord,
+  continued: string[],
+  identity: RequestIdentity,
+  continuedThrough?: Sequence,
+): BindingRecord {
   const sameHead = IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]);
-  return sameHead ? { ...record, continued } : { ...record, sent: [UNVOUCHED], continued: [] };
+  // Each note gives every row so far, so its reach replaces the last note's.
+  const { continuedThrough: _last, ...rest } = record;
+  return sameHead
+    ? { ...rest, continued, ...(continuedThrough !== undefined ? { continuedThrough } : {}) }
+    : { ...rest, sent: [UNVOUCHED], continued: [] };
+}
+
+/**
+ * The sequence of the newest stored row the record vouches for, by `sent`
+ * and then by a note: a reply stored after it is past the record's end. The
+ * record's `recordedAfter` where it doesn't say (one an earlier release
+ * wrote, or a compile that sent no stored body): nothing stored since the
+ * record began is then known to be within it.
+ */
+export function recordedThrough(record: BindingRecord): Sequence {
+  const sent = record.through ?? record.recordedAfter;
+  return record.continuedThrough !== undefined && record.continuedThrough > sent ? record.continuedThrough : sent;
 }

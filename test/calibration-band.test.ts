@@ -529,6 +529,30 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
+  it('a report with no usable total spends the compile\'s sample, and the next compile samples again', async () => {
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      const { cm, strategy, internals } = await openManager(`unusable-total-${unusable}`);
+      await cm.compile(BUDGET);
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        strategy.reportRealInputTokens(unusable);
+      } finally {
+        console.error = error;
+      }
+      assert.deepEqual(logged.filter((line) => line.includes('[estimator-calibration]')), [], `${unusable} isn't read as a sample`);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+      await cm.compile(BUDGET);
+      assert.equal(cm.getRenderStats()!.calibration!.multiplier, 1, `nothing learned after ${unusable}`);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+      await cm.compile(BUDGET);
+      const { multiplier } = cm.getRenderStats()!.calibration!;
+      assert.ok(Math.abs(multiplier - 1.4) < 1e-9, `the next compile's first report is its sample, after ${unusable}: got ${multiplier}`);
+      cm.close();
+    }
+  });
+
   it('a store with no calibration record is still provisional after a restart before its first sample', async () => {
     const first = await openManager('fresh-restart');
     await first.cm.compile(BUDGET);
