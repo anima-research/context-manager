@@ -617,24 +617,29 @@ describe('KnowledgeStrategy', () => {
 
     for (const [phase, tool] of [['research', 'find_papers'], ['subagent', 'spawn_reader']] as const) {
       it(`by default, a ${phase} chunk's size limit is twice targetChunkTokens`, async () => {
-        cleanup();
-        const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
-        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        for (const [length, held, chunked, what] of [
+          [700, 199, [4], 'one token under twice the target, the chunk takes the next call'],
+          [704, 200, [2, 2], 'at twice the target, the chunk closes before the next call'],
+        ] as const) {
+          cleanup();
+          const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
+          const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
 
-        for (const id of ['tu1', 'tu2', 'tu3']) {
-          manager.addMessage('Claude', [{ type: 'tool_use', id, name: tool, input: {} }]);
-          manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Done ${id} ` + 'x'.repeat(480) }]);
-        }
-        for (let i = 0; i < 8; i++) {
-          manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
-        }
+          for (const id of ['tu1', 'tu2']) {
+            manager.addMessage('Claude', [{ type: 'tool_use', id, name: tool, input: {} }]);
+            manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Done ${id} ` + 'x'.repeat(length) }]);
+          }
+          for (let i = 0; i < 8; i++) {
+            manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+          }
 
-        await manager.compile();
-        const chunks = getStrategyState(strategy).chunks.filter((c) => c.phaseType === phase);
-        assert.deepStrictEqual(chunks.map((c) => c.messages.length), [4, 2], 'two calls and their results, then the third');
-        assert.ok(chunks[0]!.tokens >= 200, `premise: the first chunk reached 2x the target (${chunks[0]!.tokens})`);
-        assert.ok(chunks[1]!.tokens >= 100 && chunks[1]!.tokens < 200, `premise: one call and its result reach 1x and stay under 2x (${chunks[1]!.tokens})`);
-        manager.close();
+          await manager.compile();
+          const chunks = getStrategyState(strategy).chunks.filter((c) => c.phaseType === phase);
+          const tokens = chunks.reduce((sum, c) => sum + c.tokens, 0);
+          assert.strictEqual(tokens, 2 * held, `premise: each call and its result hold ${held} tokens`);
+          assert.deepStrictEqual(chunks.map((c) => c.messages.length), chunked, what);
+          manager.close();
+        }
       });
     }
 
@@ -683,7 +688,7 @@ describe('KnowledgeStrategy', () => {
       const membrane = {
         complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${++calls}` }] }),
       };
-      const options = { targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0, mergeThreshold: 99 };
+      const options = { targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model' };
       const hasChunkState = (manager: ContextManager) => manager.getStore().listStates().some((s) => s.id.endsWith('autobio:chunks'));
 
       let manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new KnowledgeStrategy(options), membrane: membrane as any });
