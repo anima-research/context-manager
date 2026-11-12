@@ -25,6 +25,7 @@ import {
 } from '@animalabs/membrane';
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import { drainRecipeOptions } from './drain-recipe-options.js';
 import { DEFAULT_RUNS_CONFIG } from '../src/repair/topology.js';
 
 const args = process.argv.slice(2);
@@ -82,34 +83,7 @@ const recipe = recipePath
     }
   : undefined;
 const recipeStrategy = recipe?.agent?.strategy ?? {};
-const passthroughKeys = [
-  'compressionMaxTokens',
-  'compressionRefusalCurveFallbacks',
-  'compressionContextBudgetTokens',
-  'compressionSourceOnly',
-  'compressionSourceOnlyFallback',
-  'compressionMergeSourceOnly',
-  'compressionMergeSourceOnlyFallback',
-  'compressionToolProseFallback',
-  'compressionSplitFallback',
-  'compressionSplitPlaceholder',
-  'compressionSplitMaxCallsPerChunk',
-  'compressionSplitMaxCallsPer10Min',
-  'compressionRecallBudgetTokens',
-  'recoverLiteralThinkingWrappedCompression',
-  'mergeHoldSummaryIds',
-  'mergeMaxSourceSpanMessages',
-  'l1HoldbackChunks',
-  'summaryTargetTokens',
-  'identityReminder',
-  'witnessedIdentityReminder',
-  'witnessedBeforeSequence',
-  'witnessedInstruction',
-] as const;
-const recipeOptions: Record<string, unknown> = {};
-for (const key of passthroughKeys) {
-  if (recipeStrategy[key] !== undefined) recipeOptions[key] = recipeStrategy[key];
-}
+const recipeOptions = drainRecipeOptions(recipeStrategy);
 class DrainStrategy extends AutobiographicalStrategy {
   protected override landsAsPlanned(): boolean {
     return true;

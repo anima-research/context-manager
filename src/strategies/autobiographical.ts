@@ -1,3 +1,4 @@
+import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
@@ -2562,6 +2563,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _previewInFlight = false;
 
   constructor(config: AutobiographicalOptions = {}) {
+    // Retain TypeError for malformed caller settings before structuredClone runs.
+    validateCompressionInstructions(config.compressionInstructions);
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
       { source: 'caller', values: config as Record<string, unknown> },
@@ -2594,6 +2597,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // AutobiographicalConfig that the caller did not itself override, which is
     // what makes this narrowing as sound as the spread it replaces.
     this.config = resolved.effective as unknown as AutobiographicalConfig;
+    // Snapshot JSON settings so caller mutation cannot invalidate a checked template.
+    if (this.config.compressionInstructions !== undefined) {
+      this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
+    }
+    validateCompressionInstructions(this.config.compressionInstructions);
+    if (this.config.witnessedInstruction && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
+      throw new TypeError('Conflicting witnessed instruction configuration');
+    }
     this.configProvenance = resolved.provenance;
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
     // The solver committed to at construction. buildPicker compares the live
@@ -11442,7 +11453,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sourceOnlyStartIndex = llmMessages.length;
       llmMessages.push({
         participant: 'Context Manager',
-        content: [{ type: 'text', text: COMPRESSION_MARKER }],
+        content: [{ type: 'text', text: this.getCompressionOpening() }],
       });
 
       // ---- 5. Chunk messages raw ----
@@ -12823,7 +12834,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           };
           const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
             const msgs = [
-              { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
+              { participant: 'Context Manager', content: [{ type: 'text', text: this.getCompressionOpening() }] as ContentBlock[] },
               ...subset.map((m) => ({ participant: m.participant, content: compressionInputContent(m.content) })),
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target), this.chunkIsWitnessed(chunk)) }] as ContentBlock[] },
             ];
@@ -14233,22 +14244,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     let mergeInstructionText = this.applyIdentityReminder(
       refusalFallback
-        ? // Fallback payload shows the sources THEMSELVES, so the "content
-          // one level deeper" description the standard getters derive would
-          // be wrong — call the formatters with the sources' own level.
-          // Reading-mode is skipped too: it narrates raw shards the model
-          // is no longer being shown.
-          sources.length > 0 && sources.every((s) => s.witnessed)
-          ? formatWitnessedMergeInstruction(targetLevel, sources[0].level, targetTokens)
-          : formatMergeInstruction(targetLevel, sources[0].level, targetTokens)
+        ? this.getSourceMergeInstruction(targetLevel, sources, targetTokens)
         : mergeReadingContext
           ? this.getReadingMergeInstruction(
               targetLevel,
               sources,
               mergeReadingContext.totalTokens,
               targetTokens,
+              sourceLevelShown,
             )
-          : this.getMergeInstruction(targetLevel, sources, targetTokens),
+          : this.getMergeInstruction(targetLevel, sources, targetTokens, sourceLevelShown),
       // Only a merge whose every source is witnessed takes the witnessed
       // reminder. A mixed merge takes the live instruction and reminder, and
       // its request shows inherited and lived material together, with no
@@ -14258,8 +14263,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // instruction only through getMergeInstruction: reading mode's
       // instruction has no witnessed variant, and an override that doesn't
       // read them, such as KnowledgeStrategy's, keeps its own. A refusal
-      // fallback calls the base formatters directly, so there they choose it
-      // whatever the mode or the override.
+      // fallback uses getSourceMergeInstruction; without selected wording its
+      // base implementation keeps the original witnessed/general formatter.
       sources.length > 0 && sources.every((s) => s.witnessed),
     );
     if (mergeSourceOnly) {
@@ -19220,13 +19225,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return reminder ? `${instruction}\n\n${reminder}` : instruction;
   }
 
+  protected getCompressionOpening(): string {
+    return compressionInstruction(this.config.compressionInstructions, 'opening', {}) ?? COMPRESSION_MARKER;
+  }
+
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
     if (this.chunkIsWitnessed(chunk)) {
       const custom = this.config.witnessedInstruction;
       if (custom) return custom.replace('{targetTokens}', String(targetTokens));
-      return formatWitnessedInstruction(targetTokens);
+      return compressionInstruction(this.config.compressionInstructions, 'witnessedChunk', { targetTokens })
+        ?? formatWitnessedInstruction(targetTokens);
     }
-    return formatInstruction(targetTokens);
+    return compressionInstruction(this.config.compressionInstructions, 'chunk', { targetTokens })
+      ?? formatInstruction(targetTokens);
   }
 
   /**
@@ -19244,7 +19255,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     totalTokens: number,
     targetTokens: number,
   ): string {
-    return formatReadingChunkInstruction(totalTokens, targetTokens);
+    return compressionInstruction(this.config.compressionInstructions, 'readingChunk', { totalTokens, targetTokens })
+      ?? formatReadingChunkInstruction(totalTokens, targetTokens);
   }
 
   /**
@@ -19369,15 +19381,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected getMergeInstruction(
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
-    targetTokens: number
+    targetTokens: number,
+    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
     // Witnessed pin propagation: consolidating all-witnessed sources must keep
     // the witnessed voice, or the merge re-first-persons inherited lives.
     if (sources.length > 0 && sources.every((s) => s.witnessed)) {
-      return formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
+        ?? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
     }
-    return formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
+      ?? formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
+  }
+
+  /** Source-only merge retry. Existing retries use base wording, not the
+   * ordinary merge override. This separate hook preserves that contract while
+   * allowing an override that knows the actual payload level. Reading mode is
+   * ignored: this request shows summaries, not the raw shards they narrate. */
+  protected getSourceMergeInstruction(
+    targetLevel: SummaryLevel,
+    sources: SummaryEntry[],
+    targetTokens: number,
+  ): string {
+    const sourceLevelShown = sources[0].level;
+    const witnessed = sources.every(s => s.witnessed);
+    const selected = compressionInstruction(this.config.compressionInstructions, witnessed ? 'witnessedMerge' : 'merge', { targetLevel, sourceLevelShown, targetTokens });
+    return selected ?? (witnessed
+      ? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens)
+      : formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens));
   }
 
   /**
@@ -19391,9 +19423,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sources: SummaryEntry[],
     totalTokens: number,
     targetTokens: number,
+    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
-    return formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
+    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, totalTokens, targetTokens })
+      ?? formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 
   /**
@@ -19525,7 +19559,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .map(s => s.content)
       .join('\n\n---\n\n');
 
-    const instruction = [
+    const instruction = compressionInstruction(this.config.compressionInstructions, 'transition', {
+      targetTokens: 1500,
+      context: headContent + (topSummaries ? `\nHigher-level summaries:\n${topSummaries}` : ''),
+    }) ?? [
       'Summarize the prior conversation context in 2-3 paragraphs, focusing on:',
       '- What was the original objective and what was accomplished',
       '- Key findings, decisions, and unresolved questions',
