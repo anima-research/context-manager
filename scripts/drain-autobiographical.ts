@@ -12,9 +12,10 @@
  * read), --tools-log a log of the resident's requests for a summarizer that
  * needs tool definitions, and --clear-merge-quarantine a merge-quarantine
  * key to clear before the first tick (repeatable). Its finish line says why
- * it stopped (`stopped`): drained, waiting-on-tools, max-steps, tick-error or
- * debt-unreadable.
- * Run again, it goes on from the store as it stands.
+ * it stopped (`stopped`): drained, waiting-on-tools, max-steps, tick-error,
+ * chunk-records or debt-unreadable.
+ * Run again, it goes on from the store as it stands; after chunk-records, the
+ * debt report it prints says what has to change first.
  */
 
 import {
@@ -172,7 +173,7 @@ const compact = () => {
     mergesUnpicked: strategy.mergesUnpicked,
     frontier: debt.unmergedFrontier,
     tools: tools.length,
-    ...(debt.error !== undefined ? { debtError: debt.error } : {}),
+    ...(debt.error !== undefined ? { debtError: debt.error, debtFailure: debt.failure } : {}),
   };
 };
 
@@ -213,12 +214,16 @@ try {
 } finally {
   manager.close();
 }
-const stopped = completed ? 'drained' : tickError !== undefined ? 'tick-error' : final.debtError !== undefined ? 'debt-unreadable'
+const stopped = completed ? 'drained' : tickError !== undefined ? 'tick-error'
+  : final.debtFailure === 'chunk-records' ? 'chunk-records' : final.debtError !== undefined ? 'debt-unreadable'
   : waiting ? 'waiting-on-tools' : 'max-steps';
 console.log(JSON.stringify({ event: 'finish', completed, stopped, ...final, ...(tickError !== undefined ? { tickError } : {}) }));
 if (stopped === 'waiting-on-tools') {
   console.error(`not drained (waiting-on-tools): ${final.waitingOnTools} chunks and merges wait on the resident's tool definitions; ` +
     'run the drain again with --tools-log=<a log of its requests>');
+} else if (stopped === 'chunk-records') {
+  console.error('not drained (chunk-records): the chain-break guard has stopped compression, and this drain takes no step once it finds it holding, queued merges included; any step it took before then stands. ' +
+    `Its debt report says what has to change before a drain can go on:\n${final.debtError}`);
 } else if (!completed) {
   console.error(`not drained (${stopped}): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands` +
     (stopped === 'debt-unreadable' ? ', once the debt report can be read' : ''));

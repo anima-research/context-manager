@@ -93,11 +93,13 @@ export function runsAtLevel<S extends RunSummary>(
   for (const s of unmerged) {
     const at = placeOf(s, position);
     if (!at) {
-      // Pruned/missing source messages: the candidate can NEVER merge.
+      // Source messages pruned or hidden: the candidate can't merge while
+      // their positions don't resolve, for good after a removal, and until a
+      // filter shows them again.
       // This was a silent drop (rev-5 review: "frontier debt, no log").
       excluded.push({
         id: s.id,
-        detail: `L${s.level ?? 1} ${s.id}: source position unresolved (pruned or hidden source messages?) — permanently unmergeable, frontier debt`,
+        detail: `L${s.level ?? 1} ${s.id}: source position unresolved (pruned or hidden source messages?) — unmergeable while its source positions don't resolve, frontier debt`,
       });
       continue;
     }

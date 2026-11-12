@@ -49,6 +49,10 @@ class Probe extends AutobiographicalStrategy {
   mendLedger(): void {
     this.ledgerHolding(0);
   }
+  /** The chain-break guard's flag, as rebuildChunks sets and clears it. */
+  setCompressionStopped(stopped: boolean): void {
+    (this as unknown as { chunkRecordsOrphaned: boolean }).chunkRecordsOrphaned = stopped;
+  }
   /** The namespace its diagnostics name, as a store gives it. */
   setNamespace(ns: string): void {
     this.ns = ns;
@@ -412,6 +416,12 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     assert.equal(ledger.length, 4);
     assert.equal(ledger[1], `Cause: the store couldn't read this agent's compression quarantine ledger (${'x'.repeat(170)} end of a…).`);
     assert.equal(ledger[3], 'Fix: fix what the cause names; compression then resumes by itself.');
+    const guarded = fresh();
+    guarded.setCompressionStopped(true);
+    guarded.breakLedger(long);
+    const [, held] = (guarded.getCompressionDebt(NOW).error ?? '').split('\n\n');
+    assert.ok(held!.length < 500, `with the chain-break guard holding: ${held!.length} characters`);
+    assert.match(held!, /\nFix: fix the cause; it resumes once the chain-break guard clears\.$/);
     const t = fresh();
     Object.defineProperty(t, 'chunks', { get() { throw long; }, configurable: true });
     const outright = (t.getCompressionDebt(NOW).error ?? '').split('\n');
@@ -461,5 +471,52 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       console.warn = warn;
     }
     assert.equal(calls, 2, 'the report tried to log the failure and the recovery');
+  });
+});
+
+describe('getCompressionDebt while the chain-break guard has stopped compression', () => {
+  const NOW = 1_800_000_000_000;
+  // The guard's flag set with its default cause, the off-chain one.
+  const STOPPED = [
+    'Compression of new conversation has stopped.',
+    "Cause: most chunk records name no message in view, and the oldest or newest names one off this branch's messages chain: a message slot left unopened, a chain broken under chronicle before 0.5.0, or a store rebuilt under new ids.",
+    'Effect: no new chunk is sent to be summarized; merges run as usual.',
+    "Fix: change nothing until the emptied records' messages, read by id, are compared with this chain; the FAIL-CLOSED log line gives each next step.",
+  ].join('\n');
+
+  it('reads critical, saying what stopped it, with every count still reported', () => {
+    const s = fresh();
+    s.setCompressionStopped(true);
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'critical', 'nothing pends while no chunk forms, so nothing else would show it');
+    assert.equal(d.failure, 'chunk-records');
+    assert.equal(d.error, STOPPED);
+    assert.equal(d.pendingChunks, 0);
+    assert.equal(d.compressionQuarantineCount, 0);
+  });
+
+  it('with the ledger unreadable too, holds both errors, the guard\'s first', () => {
+    const s = fresh();
+    s.setCompressionStopped(true);
+    s.breakLedger();
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'critical');
+    assert.equal(d.failure, 'chunk-records');
+    const [guard, ledger, ...rest] = d.error!.split('\n\n');
+    assert.equal(guard, STOPPED);
+    assert.match(ledger!, /^Compression of new conversation has stalled\.\nCause: the store couldn't read this agent's compression quarantine ledger/);
+    assert.deepEqual(rest, []);
+    assert.equal(d.compressionQuarantineCount, null);
+  });
+
+  it('reads as the rest decides once the guard clears', () => {
+    const s = fresh();
+    s.setCompressionStopped(true);
+    assert.equal(s.getCompressionDebt(NOW).state, 'critical');
+    s.setCompressionStopped(false);
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'healthy');
+    assert.equal(d.error, undefined);
+    assert.equal(d.failure, undefined);
   });
 });

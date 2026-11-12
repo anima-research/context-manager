@@ -369,6 +369,13 @@ export interface TokenEstimatorOptions {
 }
 
 /**
+ * Chronicle's record ids are decimal numbers, and it throws for an id of any
+ * other form, which names no message here; `onBranch` answers no for one
+ * without asking, so every throw it lets through is a read that failed.
+ */
+const RECORD_ID = /^\d+$/;
+
+/**
  * Wrapper around Chronicle append_log state for message storage.
  * Handles blob extraction and provides a clean interface for message operations.
  */
@@ -1172,6 +1179,26 @@ export class MessageStore {
   }
 
   /**
+   * Whether this branch's messages chain holds the message `messageId`
+   * names: true for a live message, one removed since (its append stays in
+   * the chronicle under the removal's redaction) and one inherited through a
+   * fork; false for one another branch wrote after the fork, for one in a
+   * chain a lost state index left behind (chronicle before 0.5.0 began a new
+   * chain then), and for an id this slot never gave a message. A message not
+   * in the listing costs one reconstruction of the messages state as it
+   * stood at its append, which grows with that state, and a read that fails
+   * throws its error rather than answering.
+   */
+  onBranch(messageId: MessageId): boolean {
+    if (this.lookupIndex(messageId) !== undefined) return true;
+    if (!RECORD_ID.test(messageId)) return false;
+    const record = this.store.getRecord(messageId);
+    if (record === null) return false;
+    const atAppend = this.store.getStateJsonAt(this.stateId, Number(record.sequence));
+    return Array.isArray(atAppend) && atAppend.some((m) => (m as { id?: unknown } | null)?.id === messageId);
+  }
+
+  /**
    * Get a message as it was at a specific sequence (time travel).
    */
   getAt(messageId: MessageId, atSequence: Sequence): StoredMessage | null {
@@ -1546,6 +1573,7 @@ export class MessageStore {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
       sequenceOf: (id) => this.sequenceOf(id),
+      onBranch: (id) => this.onBranch(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
