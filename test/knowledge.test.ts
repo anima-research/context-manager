@@ -612,6 +612,108 @@ describe('KnowledgeStrategy', () => {
     });
   });
 
+  describe('Chunk sizes, boundaries and persistence', () => {
+    const names = { researchToolPrefixes: ['find_'], subagentToolPrefixes: ['spawn_'], lessonToolNames: ['note_save'] };
+
+    for (const [phase, tool] of [['research', 'find_papers'], ['subagent', 'spawn_reader']] as const) {
+      it(`by default, a ${phase} chunk's size limit is twice targetChunkTokens`, async () => {
+        for (const [length, held, chunked, what] of [
+          [700, 199, [4], 'one token under twice the target, the chunk takes the next call'],
+          [704, 200, [2, 2], 'at twice the target, the chunk closes before the next call'],
+        ] as const) {
+          cleanup();
+          const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
+          const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+          for (const id of ['tu1', 'tu2']) {
+            manager.addMessage('Claude', [{ type: 'tool_use', id, name: tool, input: {} }]);
+            manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Done ${id} ` + 'x'.repeat(length) }]);
+          }
+          for (let i = 0; i < 8; i++) {
+            manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+          }
+
+          await manager.compile();
+          const chunks = getStrategyState(strategy).chunks.filter((c) => c.phaseType === phase);
+          const tokens = chunks.reduce((sum, c) => sum + c.tokens, 0);
+          assert.strictEqual(tokens, 2 * held, `premise: each call and its result hold ${held} tokens`);
+          assert.deepStrictEqual(chunks.map((c) => c.messages.length), chunked, what);
+          manager.close();
+        }
+      });
+    }
+
+    it('a phase change alone doesn\'t close a chunk of one message', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      manager.addMessage('User', [{ type: 'text', text: 'Look this up for me.' }]);
+      manager.addMessage('Claude', [{ type: 'tool_use', id: 'tu1', name: 'find_papers', input: {} }]);
+      manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu1', content: 'found' }]);
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const chunks = getStrategyState(strategy).chunks;
+      const call = chunks.find((c) => c.messages.some((m: any) => m.content[0].type === 'tool_use'));
+      assert.strictEqual(call?.phaseType, 'research', 'premise: the call is research, so the phase changes after the text');
+      assert.deepStrictEqual(chunks[0]!.messages.map((m: any) => m.content[0].type), ['text', 'tool_use', 'tool_result']);
+      manager.close();
+    });
+
+    it('a last run of one message in the compressible span becomes a chunk', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      manager.addMessage('Claude', [{ type: 'tool_use', id: 'tu1', name: 'find_papers', input: {} }]);
+      manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu1', content: 'found' }]);
+      const last = manager.addMessage('Claude', [{ type: 'text', text: `What the search shows ${'y'.repeat(240)}` }]);
+      manager.addMessage('User', [{ type: 'text', text: 'ok' }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'ok' }]);
+
+      await manager.compile();
+      const chunks = getStrategyState(strategy).chunks;
+      assert.deepStrictEqual(chunks[0]?.messages.length, 2, 'premise: the call and its result close a chunk at the phase change');
+      const holding = chunks.filter((c) => c.messages.some((m: any) => m.id === last));
+      assert.deepStrictEqual(holding.map((c) => c.messages.length), [1]);
+      manager.close();
+    });
+
+    it('persists no chunk records, including on reopening a store with summaries', async () => {
+      cleanup();
+      let calls = 0;
+      const membrane = {
+        complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${++calls}` }] }),
+      };
+      const options = { targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model' };
+      const hasChunkState = (manager: ContextManager) => manager.getStore().listStates().some((s) => s.id.endsWith('autobio:chunks'));
+
+      let manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new KnowledgeStrategy(options), membrane: membrane as any });
+      try {
+        for (let i = 0; i < 24; i++) {
+          manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(120)}` }]);
+        }
+        await manager.compile();
+        for (let i = 0; i < 100 && !manager.isReady(); i++) await manager.tick();
+        assert.ok(manager.getSummariesInRange({ level: 1 }).length > 0, 'premise: the store holds summaries');
+        assert.strictEqual(hasChunkState(manager), false);
+      } finally {
+        manager.close();
+      }
+
+      manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new KnowledgeStrategy(options), membrane: membrane as any });
+      try {
+        assert.ok(manager.getSummariesInRange({ level: 1 }).length > 0, 'premise: the reopened store holds the summaries');
+        assert.strictEqual(hasChunkState(manager), false, 'after reopening');
+      } finally {
+        manager.close();
+      }
+    });
+  });
+
   describe('Compression Prompts', () => {
     it('should produce phase-specific compression instructions', async () => {
       cleanup();
