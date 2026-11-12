@@ -12,6 +12,585 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.27.0 — 2026-11-09
+
+### Changed
+
+- System changes: a `system_change` block carrying only `effort` (`SystemChangeContent.effort`, added in membrane 0.10.0) changes, from its place on, the effort the model answers with. membrane 0.10.0 sends one only through its native formatter and Anthropic adapter, at its place, or right after the turn its place falls inside where membrane merges turns. On any other formatter or adapter it refuses the whole request, and it refuses an effort change that would end a request after an assistant turn. Every strategy keeps it as it keeps any system change: compiled unaltered, in its place among the raw messages, never dropped, and left out of what compression reads. A write refuses a change carrying `effort` beside a change of tools or system text (a non-empty `removeTools`, `defineTools` or `addSystem`), or beside another block in its message, and one whose `effort` isn't `low`, `medium`, `high`, `xhigh` or `max`, each by name; a read leaves such a change out. An effort-only change between a tool call and its result is refused like any other change: kept raw, it would part the call from its result in the same way. The refusal now gives membrane's placement as its reason for a change of tools or system text only: membrane sends one of those after the call's result anyway.
+
+- **Hosts:** context-manager accepts `@animalabs/membrane`
+  `^0.8.0 || ^0.9.0 || ^0.10.0` (was `^0.8.0 || ^0.9.0`), so a host whose
+  own membrane is 0.10.0 shares it with context-manager, where before
+  context-manager installed its own 0.9.0 beside it. A lockfile's 0.8.0 or
+  0.9.0 is still admitted. membrane 0.10.0 is the release whose system
+  changes carry `effort`, which an effort-only system change needs to reach
+  the model; membrane 0.9.0 leaves such a block out as empty. membrane's
+  changelog for 0.10.0 lists its other changes.
+
+## 0.26.0 — 2026-11-09
+
+### Added
+
+- `compile`'s `requestLimitTokens` option keeps the whole request within a provider's limit: the context, with any tool-result stubs the autobiographical strategy's pairing repair adds, the message-position injections, `requestOverhead` and the budget's `reserveForResponse`, in the context's units, the strategy's over-budget grace included. While the autobiographical strategy's multiplier is provisional, it prices the request at the calibration's ceiling by scaling its price at the provisional multiplier. The store rounds each block's price at that multiplier, by up to half a token, so for any true rate up to the ceiling a request while the multiplier is provisional can pass the limit by up to half a token a block, scaled by the ceiling over the provisional multiplier. That request's sample, where the calibration's band accepts it, then replaces the provisional multiplier, or confirms it where the two are within 2%. `RequestOverhead` gains `messages`, the content of each message a request sends besides the context and its message-position injections, such as a tool result a caller adds after the compile. It's priced as the context prices the same blocks sent whole, and counted wherever the overhead is: against the limit, in `RenderStats.request.overheadTokens`, and in a calibration sample given it. The strategy's target and hard bound are each lowered only where the limit is below them, which `RenderStats.request` reports as `limitTokens` and `allowanceTokens`, with the stubs' price as `stubTokens`. Where the stubs take the window past the limit, the strategy selects once more with their price reserved, and refuses for the stubs only if that select can't make room. A limit that leaves the context no room, or a request a strategy compiles past it, is refused with an `OverBudgetError`. Passthrough and windowed-passthrough keep within it as a cap on their room, as the store's estimator prices the request, since they don't calibrate. A limit needs `requestOverhead`: one without it, or one that isn't a positive finite number, is refused with a `TypeError` before anything is selected. The autobiographical strategy's over-budget refusals under a limit, the no-room one included, name it in their diagnostics as `requestLimitTokens`, and, where the limit lowered the target or the bound, what it left the context as `requestAllowanceTokens`; so does the compile's own refusal of a request past the limit, and a preview that reports a refusal carrying them copies them. A refusal the limit made, by its bound, by leaving no room or by the stubs past what it left, keeps a provisional multiplier, since a lower one can't make the context fit there. Without `requestLimitTokens`, every select is as it was.
+
+- `ContextEntry.relocatedBlocks` holds the result blocks pairing repair placed
+  for an entry's `relocatedResults`, one for each move. Where it's set, compile
+  provenance credits a moved result only through one of those blocks still in
+  the request, unaltered, or through a result with its id still in the entry
+  that isn't among the blocks repair recorded as placed for any entry.
+  `AutobiographicalStrategy` and `KnowledgeStrategy` set it.
+
+### Changed
+
+- Where a later tool call reuses an earlier call's id,
+  `AutobiographicalStrategy` and `KnowledgeStrategy` pair each tool result with
+  the nearest call before it with that id, as with distinct ids, in pairing
+  repair (`enforceToolPairing`) and in `toolResultMaxLastN`'s count, and so does
+  `stripUnpairedToolBlocks`, which every summariser request that carries tool blocks goes through. Where
+  each of two responses streams one tool call without an id, membrane's
+  OpenAI-compatible adapter gives both the id `call_1`. Where the earlier call
+  had no result and the later call's result lay within the repair's look-ahead,
+  the repair moved that result up to answer the earlier call and sent the later
+  call, which made it, with a stub; now the earlier call goes with the stub.
+  `toolResultMaxLastN`'s doc said a result answers the earliest call with its id
+  before it that no result has answered.
+- Where one message holds several calls with one id and no result with the id
+  between them, pairing repair keeps only the last, with every result with the
+  id after them, up to the next call with the id and within the repair's
+  look-ahead. So `NativeFormatter`, which refused such a request, sends it, with
+  the further results as `[duplicate tool_result for …]` text. Compile
+  provenance reports such a message's body as not complete
+  (`missing: ['content']`).
+- Where a host stores a call's result after a later call has reused the call's
+  id, that result now goes with the later call, beside the later call's own,
+  and the earlier call goes with a stub. Where the earlier call's result was
+  stored first, the later call now goes out with it first, where each call went
+  with its own before; where the later call's was stored first, the two no
+  longer go crossed.
+- A store in which a later call reuses a call's id can compile a different
+  request where a compile sends the earlier call without its own result, and
+  where it does, the prompt cache can't serve that request from the first
+  message that differs. A store with several calls with one id in one message
+  now compiles requests membrane sends. Every other store compiles what it
+  compiled. A summariser request changes only where the strip now drops a call
+  or result it kept.
+
+### Fixed
+
+- `compile()` no longer passes a caller's own `SelectOptions.messageInjections` to the select. The field holds the compile's own injections, as its doc says.
+
+- Compile provenance attributes a moved result of an entry that sets
+  `relocatedResults` and no `relocatedBlocks` by tool_use id, as the field's
+  doc says, against every result with that id in the request. It checked only
+  the first, so where a later call reused the id, a moved result that sat
+  unaltered in the request could read as missing.
+
+## 0.25.1 — 2026-11-08
+
+### Added
+
+- `ContextManager.noteThinkingDropped(messageIds, compileId)` (new): a host calls it with the stored replies whose thinking the provider set aside under the drop control (`ThinkingBinding.dropBlock`), in a request of a stream built from the branch's last committing compile with `binds`, naming that compile's `provenance.compileId`. Each id is a body's head as the compile's provenance names it (`RawBodySource.messageId`), the id `addMessage` returned. The record then holds them as set aside, so from the next compile on each goes without it, and the replies after it keep theirs, unless it has changed since it was sent or compiles into one message with a body the note didn't name: that message and the replies after it then go without theirs. A noted reply isn't reported in a later `thinkingStrip`, unless a committing compile came between that didn't leave its thinking out. A repeated note writes nothing. It returns false, writing nothing, when `compileId` isn't the compile that wrote the branch's record, and on a branch with no record or one it can't read, or when the store can't write it, as `noteRequestSent` does.
+
+### Changed
+
+- **Under the drop control, a reply whose thinking the provider set aside goes without it from the compile after a host notes so** with `noteThinkingDropped`. Before, nothing told the record of a block the provider set aside: a reply stored before its branch's record began, which the drop control leaves for the provider to judge, was sent with its thinking at every request and set aside every time. A host that doesn't call `noteThinkingDropped` sees no change.
+  - **The replies after a noted one keep their thinking.** A noted reply that hasn't changed since it was sent, sent without its thinking, still matches the record's form of it as it was sent, so the replies after it keep their thinking, for the provider to judge. A message that differs from the record still takes the thinking of every reply after it, and so does a compiled message holding a body the note didn't name, which is then reported in `thinkingStrip`.
+  - **`thinkingStrip` doesn't report a noted reply,** unless a committing compile came between that didn't leave its thinking out. Its `newly` leaves out the replies a host noted, though the compile that wrote the branch's record sent them with their thinking, and a compile that newly leaves out only noted replies sets no `thinkingStrip`.
+  - **Prompt cache:** a request's bytes change where a noted reply's thinking leaves it, so the cache may be written once from the earliest such reply.
+
+### Fixed
+
+- `AutobiographicalStrategy.reportRealInputTokens` now spends the compile's
+  one calibration sample on a report whose total is 0, negative, NaN or
+  infinite, and learns nothing from it. Before, such a report left the
+  sample to the next report. When that report came from a later call built
+  on the same compile, whose request the turn's tool rounds and
+  continuations had grown since, the sample compared the grown request with
+  the compile's estimate, the comparison one sample per compile exists to
+  prevent. The next compile still takes its own sample.
+
+## 0.25.0 — 2026-11-07
+
+### Breaking
+
+- **Hosts and packages that install context-manager:** it now depends on `@animalabs/chronicle` `^0.6.0` (was `^0.5.1`). The window index writes a write-down, the rows of one `presentRows` call and the tombstones of one call as one record, through chronicle's identity-stamped batched append, `appendManyToStateJsonWithIdentity` (see the window index and window batches entries), and the published chronicle releases through 0.5.1 have none of the batched calls (`appendManyToStateJson`, `appendManyToStateJsonWithIdentity`, `getStateItemsJson`, `getRecords`): chronicle releases them as 0.6.0. The window index has no one-record-per-row path. So a manager made over a store handle without the batched append is refused: `ContextManager.open({ store })`, `derive()` and `reopenDerived()` throw `ContextManager: the store handle has no appendManyToStateJsonWithIdentity, …` before any record changes, in legacy mode too. Asked at a write instead, a removal of two or more presented rows would have changed the record before its tombstones' batched write could throw, leaving their ordinals issued with only a log line to say so.
+  **Who needs to act:** a host or package that depends on chronicle itself, such as agent-framework and connectome-host, which takes `^0.6.0` alongside this release so that npm installs one chronicle for both; and a host that opens its own `JsStore` and passes it as `store`, whose handle must come from chronicle 0.6.0 or later, whether or not it presents.
+  **Migration:** install `@animalabs/chronicle` 0.6.0 with this release.
+  **Unchanged:** a manager on a branch whose window was never written down (no host presented there; legacy mode) writes nothing to the window index, though it too needs a handle with the batched append to open. The store views `derive()` reads came with chronicle 0.5.0, in 0.24.0.
+
+- **Code that turns a fold receipt's run into rows by its sequences:** once a host presents rows on a branch (`presentRows`), a receipt's run (`FoldChange`, a baseline's `FoldLayoutRun`) is consecutive in the window's order, not the record's (agent-framework #291, see the fold receipts entry). `first` and `last` name its first and last messages, and the run can hold a message stored before `first` or after `last` that was presented between them, so `first.sequence` can exceed `last.sequence`. Receipts keep `v: 1`, and nothing in one says which order its run follows, so a reader that expands `first.sequence..last.sequence` over the record gets the wrong rows without an error.
+  **Who needs to act:** code that reads receipts (`listFoldReceipts`, `onFoldReceipt`) and finds a run's messages as the record's rows from `first.sequence` to `last.sequence`, such as a viewer or an export of what a fold covered.
+  **Migration:** read the run's messages from the window it was accepted over, from `first` to `last` in that window's order, as the compile the round carried listed them (`getPresentedMessages()` lists the window as it stands now, which rows taken out since have left), and count them with `messages`. A message only one of the two layouts held (new to the window, or gone from it) can stand between `first` and `last` without being in the run: the run is the messages between them that the previous accepted layout also held, which `messages` counts. A receipt carries neither layout (a change receipt lists only its runs, and an acceptance that changes no form writes none), so a reader with receipts alone can count such a run but not always name it: where the messages between `first` and `last` outnumber `messages`, some of them aren't in it. A host that keeps each accepted compile's provenance (its layout's `memberIds`) can name them. While the window is the record, that is the record's rows from `first.sequence` to `last.sequence`, as before, so one reading serves both modes.
+  **Unchanged:** in legacy mode, where no host presents, a run is the record's rows from `first.sequence` to `last.sequence` that both layouts held, as before, and the receipt format and its `v` don't change.
+
+- **Strategy authors who subclass `AutobiographicalStrategy` or `KnowledgeStrategy`, and hosts that match their failure log line:** `AutobiographicalStrategy` now defines `onPresented` (agent-framework #291), and the manager calls only `onPresented` on a strategy that has it, in legacy mode too. A subclass of `AutobiographicalStrategy` or of `KnowledgeStrategy` that overrides `onNewMessage` to hear each row is no longer called there, and nothing says so. A failed hook of a strategy with `onPresented` is logged as `Strategy onPresented failed for …`, not `Strategy onNewMessage failed for …`.
+  **Who needs to act:** a subclass of either strategy that overrides `onNewMessage`, and a host that matches the `Strategy onNewMessage failed for …` line for an autobiographical or knowledge strategy.
+  **Migration:** override `onPresented` instead, which is given the rows that entered the window, and call `super.onPresented` so the chunks are rebuilt and compression starts; match `Strategy onPresented failed for …` for those strategies.
+  **Unchanged:** `onNewMessage` on the class stays, for a caller that drives the strategy itself. A strategy with only `onNewMessage`, such as a `PassthroughStrategy` subclass, is called through it as before, but for a sharded body (it hears each shard in turn once the last is stored, where before it heard each shard from inside that shard's append; see the sharded `addMessage` entry under Fixed), and keeps the old log prefix.
+
+- **TypeScript code that builds or types a `RenderedLayout` by hand, such as a test double of a compile's provenance:** `RenderedLayout`, exported from the root, is now `v: 3` with two required fields (agent-framework #291, see the fold receipts entry): `keyedBy`, what `members` count (`'sequence'` while the window is the record, `'ordinal'` once rows are presented), and `memberSequences`, each member's store sequence, parallel to `members`. Every compile's `provenance.layout` has them, in legacy mode too, so a `v: 2` layout literal no longer type-checks, whether or not the host presents rows.
+  **Who needs to act:** code that builds a layout or a provenance by hand, or names a layout's type as `v: 2`, such as a test double that stands in for a compile or a fixture passed to `acceptRound`.
+  **Migration:** set `v: 3`, `keyedBy: 'sequence'` and `memberSequences` equal to `members`, for a layout of a window that is the record (legacy mode): its members are store sequences, as a `v: 2` layout's were. A layout of a presented window counts window-index ordinals (`keyedBy: 'ordinal'`, `members` as `ordinalOf` gives them) and names each member's store sequence in `memberSequences`.
+  **Unchanged:** `acceptRound` still takes, at run time, a `v: 2` layout, which has no `keyedBy`, such as a provenance an earlier release's compile returned and a host carried across the upgrade: it reads its members as store sequences, as they were, and records it in format 3. A `keyedBy` it doesn't know is refused, and so is a layout of any other version without `keyedBy`, whose members may be ordinals, writing nothing. The messages a compile returns are the same, and so is the receipt format.
+
+- **Authors of a custom `ContextStrategy` whose host presents rows (`presentRows`):** once a host presents rows on a branch, the view the strategy reads (`ctx.messageStore`) is the agent's window, in the order the rows were presented, not the record in store order (agent-framework #291, see the window index entry). A row stored and not presented isn't in it, a row presented after a newer one comes after it in `getAll()`, and when a row is taken out the rows after it move up one place. Code that assumes `getAll()` ascends by `sequence`, such as a binary search by sequence over it, or that keeps a row's position in it across calls, reads the wrong rows there, and nothing says so.
+  **Who needs to act:** the author of a strategy that reads its view by sequence or keeps positions in it, when the strategy runs under a host that presents rows, such as agent-framework's presentation index.
+  **Migration:** find a row in the view by its id, with `positionOf(id)` where the view gives it (the manager's unfiltered view does; a filtered one's positions are its own), not by its sequence; take a place in the window from `ctx.window` (`ordinals()`, `ordinalFrom(sequence)`, `sequenceFrom(ordinal)`), which never moves; and read a position again after the window changes rather than keep it.
+  **Unchanged:** in legacy mode, until a host's first `presentRows` (`presentRows([])` included) or a `retractRows` that names a row, the view is the merged record in store order, as before, so a strategy under a host that never presents reads what it read.
+
+- **Host operators (stores a host that presents writes):** the window index writes a write-down, the rows of one `presentRows` call and the tombstones of one call as one batched record, through chronicle's identity-stamped batched append, `appendManyToStateJsonWithIdentity` (see the window index entry and the chronicle entry), and the first such record moves the store's chronicle `MANIFEST` from format version 1 to version 2. Chronicle releases from before batched appends, 0.5.1 and earlier, refuse a version 2 store at open, with "Unsupported store version: 2". So once a write to the window holds two or more items (a write-down of a window with a row in it; a `presentRows`, `retractRows`, `retractRemoved` or `retractAbsentRows` call of two or more rows, a body's shards each counting; or a removal through the manager of two or more rows the window holds), the store no longer opens on an older chronicle, nor under a context-manager or host whose chronicle range resolves one, such as context-manager 0.24.1 (`^0.5.1`).
+  **Who needs to act:** a host that calls `presentRows` or `retractRows` (agent-framework's presentation index, #291), or that opens a store such a host wrote, and may roll back its chronicle or context-manager afterwards.
+  **Migration:** none going forward. Going back, there is none for a store that holds a batch: keep a copy of each store from before its first presenting boot on these versions if a rollback must stay possible.
+  **Unchanged:** a manager on a branch whose window was never written down (no host presented there) is in legacy mode and writes nothing to the window index, so a store no host has presented on keeps version 1. A host that doesn't present but opens a branch another host presented on is in presented mode there: its removal of two or more rows the window holds writes one batch. A window all of whose writes are single items (an empty record's write-down, which is its header alone, then one row per call, presented or taken out) is written one record each, and keeps version 1 too. Such a store opens under a release before this one. That release doesn't read the window index, so its compiles take the record in record order, rows taken out (an undone turn's among them) and rows never presented included, as legacy mode does; this release reads the window again at its next open. A window index a pre-release build wrote one record per row reads as one written in batches.
+
+- **Hosts that catch an `addMessage` error and check its class:** where an add fails with some of the message stored, or where the store can't be read to tell whether some of it is, `addMessage` throws `WriteLandedError` or `WriteOutcomeUnknownError` (agent-framework #844, see the write outcome entries) where it threw the write's own error, and `resetHeadWindow` rejects with them when its transition's add fails so. A check such as `err instanceof` the store's or a listener's error class no longer matches there: that error is the new error's `cause`.
+  **Who needs to act:** a host that catches what `addMessage` or `resetHeadWindow` throws and tells failures apart by the error's class or its own fields, or by its whole message or the message's start (a check that the message contains or ends with the write's own error's message still matches).
+  **Migration:** check for `WriteLandedError` and `WriteOutcomeUnknownError` first, both exported from the root, and inspect the write's own error as their `cause`; `landed` (and, on `WriteOutcomeUnknownError`, `unknown` and `unnamed`) says what of the message the store holds. Inspect any other error as before.
+  **Unchanged:** what the store holds after each failure, apart from the sharded-add changes in the fixed entry for them (a host's listener that moves the store's branch between a sharded add's shards, or adds a message through the same manager while they are stored, now stops or is refused (one through another manager sharing the slot isn't refused: `onMessage`'s contract rules it out), and a chunking whose body group id is empty or not a string is refused before any shard is stored): a failed write leaves the rows it left before, and only the error thrown changes. Their messages end with the write's own error's message, so a check that the message contains or ends with it still matches; one that compares the whole message, or is anchored at its start, doesn't. Every other failure of `addMessage` throws what it threw before, such as a write that fails before a row lands, or a sharded write that fails partway and removes the shards it stored.
+
+### Added
+
+- `ContextStrategy.onPresented(rows, ctx)`: the strategy hears rows as they enter the agent's window (agent-framework #291), with the rows that entered, in window order, every shard of a body, and a context whose view holds them, unless the manager's view filter leaves them out (such a row is given all the same, and the view neither lists it nor gives it a position). In legacy mode the window is the record, so the manager calls it from inside each add, as it called onNewMessage: after a holdCompression hold is placed and before `addMessage` returns. Once a host presents rows on a branch, a stored row isn't heard at its add; `presentRows` calls the hook once per call, after the rows are in the window and before it returns. Fire and forget as before (#288): a throw or a rejection is logged, naming the rows, and the rows stay presented. A `presentRows` call is one record (see the window index entry), so a call the store refuses presents nothing and calls nothing; one that completes a body partly in the window (in an index a pre-release build wrote one record per row) calls it with only the shards that enter then. The first `presentRows`, which writes the legacy window down, enters no new row and calls nothing; a row presented again after `retractRows` is heard again; an auxiliary slot's row is heard when a host presents it. Rows presented while the strategy is initializing are heard once it has initialized, those still in the window; they wait for the manager's strategy, whether or not the one initializing has a row hook, so one set with `setStrategy()` meanwhile hears them after its own initialize. In legacy mode a sharded add is heard once, after every shard is stored, with every shard (a sharded add that fails tells the strategy only of the shards it leaves stored); a strategy with only `onNewMessage` hears each shard in turn at that point, and when an earlier shard's hook started an initialization its later shards wait the same way, and are heard once it has, those the record still holds.
+  - What waits for the strategy's initialization (rows presented meanwhile, and `onRetracted` calls, see that entry) stays small and isn't lost. A row presented again and again while initialization stays failed waits once to be heard, and a waiting `onRetracted` call keeps each row's id, its ordinal and the identity of the record that presented it there, and the row itself only for a row a removal took; the rest are read from the record when the call is made. A delivery of the waiting calls whose read of the window throws keeps the calls it didn't make, logged, and the strategy's next notification makes them before its own, which waits behind them, so the strategy hears its own call after them, in the order the delivery makes them: the waiting `onRetracted` calls first, then the rows presented meanwhile. Nothing in a delivery fails the initialization that ran it, a throw from its read of the window's mode included.
+  - A strategy without `onPresented` hears each row through `onNewMessage` at the same points: at its add in legacy mode, and once per presented row, in window order, from `presentRows` once a host presents. A row's hook that closes the manager, sets a strategy or starts an initialization stops the calls for the rows after it, even an initialization that finishes before the hook returns (a strategy with no `initialize`): the strategy it let go hears no more, the rows wait for the initialization and so reach a replacement after its initialize, those the window of the branch it initialized on holds, and after `close()` nothing hears them. A strategy with `onPresented` isn't called through `onNewMessage`. `PassthroughStrategy` and `WindowedPassthroughStrategy` do nothing in either hook and define no `onPresented`, so a subclass that overrides their `onNewMessage` still hears every row.
+  - A row's `onNewMessage` hook that moves the store's branch itself, or, once a host presents, takes a later row of the call out of the window, stops the calls for the rows after it too: they are heard where the window of the branch the strategy is on holds them, so a row out of it isn't heard entering.
+  - A notification whose retry of calls that waited for the strategy (the delivery's read had failed) runs a hook that sets a strategy or starts an initialization waits for that initialization, as a call made then does; rows a hook presents while the rows that waited are heard are heard after them, in window order. Where such a hook moves the store's branch itself (`store.switchBranch`, or another manager on the store), which starts no initialization, or the store can't say its branch before the retry, so a move can't be seen, the notification's own call is made for the rows the window of the branch the store is on then holds (`onPresented`), or left (`onRetracted`); so too, once a host presents, where such a hook takes a row of the notification's out of the window again, moving nothing else, so a row out of it isn't heard entering.
+  - What a `presentRows` that threw `WindowWriteOutcomeUnknownError` did is heard at the next write on that branch with the rows as that call found them, read from its own record: a row removed meanwhile is heard entering as it was stored, then leaving (`onRetracted`, with `removed`), and a hook's failure is logged naming it. Where the store couldn't say which branch the write was made on, before it or after it, nothing waits: the error's message and a warning say so, and the strategy reads the window at its next select.
+  - A window write that threw `WindowWriteOutcomeUnknownError` (`presentRows`, `retractRows`, `retractRemoved`, `retractAbsentRows`) keeps, while its telling waits for the next write on its branch, only the rows it named: not the record its call read, nor the write's error, whose stack held the call's frames.
+  - Where the manager's own work around a `presentRows` or `retractRows` hook call fails (the context it builds for the strategy), the call logs it and returns, since its write has landed and a retry would be refused, and the rows wait to be heard at the strategy's next notification; an add still fails as before.
+  - `getSummariesInRange` (`AutobiographicalStrategy.listSummariesInRange`) gives a summary's span from the first and last messages it covers in the record (by sequence), its times and ids and sequences: a chunk folded once a host presented rows out of record order is in the window's order, and its `sourceRange` ends needn't be its earliest and latest messages. In legacy mode these are the `sourceRange` ends, as before.
+  - `AutobiographicalStrategy` rebuilds its chunks and starts background compression (`autoTickOnNewMessage`, which keeps its name) from `onPresented`. In legacy mode that is the same work at the same point as before, but for a sharded body: it is done once every shard is stored, where before it was done from inside each shard's append (see the sharded `addMessage` entry under Fixed). Once a host presents rows, a row stored and not presented is never chunked or folded, and presenting rows starts the drain. Its `onNewMessage` stays, for a caller that drives the strategy directly, and does the same work.
+  - A sharded `addMessage` in legacy mode whose call telling the strategy of the stored body fails in the manager's own work (the context it builds), and whose removal of the shards then fails, tells the strategy of the shards that stayed, as a sharded write that fails partway does.
+  - A `presentRows` that puts a body back whole calls `onRetracted` for the shards that move, then `onPresented` for the body; where that `onRetracted` hook takes the body out of the window again (`retractRows`), moving nothing else, the `onPresented` call waits and is made for the rows the window holds when it is delivered, at once where the strategy is initialized, so a row out of it isn't heard entering.
+
+- `ContextStrategy.onRetracted(rows, ctx, { undone, removed, ids })`: the strategy hears rows as they leave the agent's window (agent-framework #291), with the rows that left, in the order the window held them, every shard of a body, and a context whose view no longer holds them (except where a `presentRows` moves a body whole, below: the move is one write, so the view holds the shards that moved at their new places). `ids` names every row that left in the call, in the same order, and `rows` gives the ones the manager can give: a row the store holds, or one a removal through this manager read before it went. A row removed through another manager, which this one doesn't hear, has no row to give: it comes by its id alone, with `removed: true`, and `rows` can be empty, so a strategy that keeps rows by id lets go of it all the same.
+  - `retractRows` calls it once per call, after the rows are out and before it returns, with `undone` as given and `removed: false`; the rows the store no longer holds, which it takes out by their ids, are told in a second call of their own, by `ids` alone, with `removed: true`. `retractRemoved` and `retractAbsentRows` call it by `ids` alone, with `removed: true`. Where the manager's own work around such a call fails (the context it builds for the strategy), that is logged, and the call waits for the strategy's next notification instead of being made before the method returns; so does a removal's call, below. Once a host presents rows on a branch, a removal through the manager (`removeMessage`, `removeMessages`) of rows the window held calls it with the rows as they were before they went, `removed: true`, whether or not the window's tombstone could be written, since the removal stands; a row whose tombstone failed is told again, by its id, when `retractAbsentRows` takes it out. The exception is a removal whose release of holds runs the strategy's `onCompressionHoldsReleased` hook, where the hook moves the store's branch: the removal then takes nothing out of the window of the branch the store is on and tells no strategy (a warning says so), and on the branch it was made on the rows keep their ordinals until `retractAbsentRows` takes them out there and tells the strategy. Where the rows of a range can't be read before `removeMessages` takes it (the failed read is logged), the rows of it the window held keep their ordinals, untold, until `retractAbsentRows` takes them out and tells the strategy. Where the window index can't be read to tell which rows it held, or whether it is in legacy mode, a removal through the manager calls it with every row removed, in the order given and as they were before they went, with `removed: true`, and the rows keep their ordinals until `retractAbsentRows` takes them out, which tells the strategy again. A sharded `addMessage` that fails partway takes a shard a host's `onMessage` listener presented out of the window as it removes the shards it stored, and calls it, with `removed: true`, as `removeMessages` does. A `presentRows` that puts a body back whole, its first shard out and later ones in, calls it for those later shards before `onPresented` hears the body; where that call's hook moves the store's branch, sets a strategy, starts an initialization or closes the manager, the body waits, as rows a hook stopped do, and is heard once the strategy is initialized, where the window of the branch it initialized on holds it. `retractRows`' second call, for rows the store no longer holds, waits the same way after such a hook of its first. In legacy mode a removal calls nothing: the window is the record, and a strategy that folded the row keeps what it folded, as before.
+  - Fire and forget, as `onPresented` (#288): a throw or a rejection is logged as `Strategy onRetracted failed for …`, naming the rows, and the rows stay out. A call's tombstones are one record (see the window index entry), so a write the store refuses takes nothing out and tells the strategy nothing. While the strategy initializes, the calls wait and are made in order once it has, before the rows presented meanwhile are heard; they wait for the manager's strategy, whether or not the one initializing has the hook, so one set with `setStrategy()` meanwhile is told; a row presented again since is still given, and a row the initialized branch holds at the ordinal it left, in its window and its record (a branch made before it left), or any row while that branch is in legacy mode, is left out.
+  - `AutobiographicalStrategy` (and `KnowledgeStrategy`) let go of what covers a row that left, every row `ids` names: each L1 with the row among its sources is dropped, with every summary above it, and a summary the drop leaves without its parent renders and merges again; each chunk record holding the row gives it up and is compressed again over the rows it keeps (one left with none is removed). The summaries, chunk records and merge queue are written one after another, the summaries first, with one `[autobiographical] … row(s) left the window` warning naming what changed. Each write is of the whole state, so where another strategy instance sharing the store has written the summaries or chunk records since this one read them (its own let-go of a row, which this one doesn't hear), the strategy first takes the store's up and lets go, beside the rows it is told of, of each row out of the window that they still fold, with an `[autobiographical] the store's summaries or chunk records aren't as this instance holds them …` warning: it writes back nothing the other instance dropped. It reads a state for this only where the state's revision on the branch (`stateHeadOffset`) has moved since the strategy last held it as the store did (its load, its own writes, or such a read that found the two alike), so a retraction reads neither state while nothing else has written them; on a chronicle without `stateHeadOffset` it reads both at each retraction. A stored chunk record the load leaves out (with no id, or no rows) doesn't count as such a write. Nor does the strategy wait for a let-go of its own to take another manager's up: before each compile that isn't a dry run, and as rows enter its window, where the window's length has changed since it last looked, it lets go of each row out of the window that it still folds, taking the store's state up first, with one `[autobiographical] row(s) … are out of the window and still folded by this instance …` warning, so it doesn't render the summary over a row another manager took out. An audit-only strategy doesn't (its open leaves such rows folded for inspection, below), and a failure is logged and the compile goes ahead. Should the process stop between those writes, the next open repairs what is left: a chunk record whose L1 is gone is compressed again, a queued merge of a dropped summary goes, and, once a host presents, under `topologyPolicy` `'reject'`, a record whose rows the window holds apart is trimmed to its longest run, its other rows chunked again where the window holds them, with one `[autobiographical] the window holds the rows of … uncompressed chunk record(s) apart` warning, so it is not compressed across the window. A compression or merge in flight over the row writes nothing when it lands, also in another strategy instance sharing the store, which doesn't hear the row go: a merge reads the store's summaries before its call and again before it writes, and one with a source the store no longer holds writes nothing (found before the call, it makes none); an L1 reads its chunk record before it writes, and writes nothing unless the store still holds the record uncompressed, over the rows it held when the compression began. Either then takes up the store's state, with an `executeMerge: … source(s) dropped …` (found before the call, `… source(s) missing from the store (dropped by another instance sharing it, or a write of this one's that failed) …`) or `discarding L1: its chunk record … changed in the store mid-request` warning. So an undone turn's rows don't render folded after the undo, and a redo, which presents them again at the end of the window, renders each once, raw there until it is folded again. A removal through one manager unfolds the row on every reader the host repairs with `retractRemoved` or `retractAbsentRows`, not only on the manager that removed it. The cost is the fold work over those rows, on each reader: the summaries above them are written again. Under `autoTickOnNewMessage` it starts background compression from `onRetracted` too, as from `onPresented`, so a retraction, or a removal once a host presents, can start model calls. In legacy mode nothing changes. `PassthroughStrategy` and `WindowedPassthroughStrategy` define no `onRetracted`.
+  - A row that left and was presented again before the strategy heard it go (both while it initialized) is in the window again when it is told: what covered it at its old place goes all the same, and a chunk record made over it at its new place keeps it. Should the strategy never hear it go (the process stopped between the window's tombstone and the strategy's own writes), its next open, once a host presents, demotes the summary the row's new place leaves non-contiguous instead of refusing the store with `StoreTopologyError`: the summary is dropped with every summary above it, an L1's chunk record is compressed again over its longest run of rows the window holds together, and its other rows are chunked again where the window holds them, with one `[autobiographical] the window holds the leaves of … apart` warning. The demote takes every summary the open's topology audit names once a host presents, whatever made it non-contiguous, and the open throws `StoreTopologyError` only for what the audit still names after it: a store whose crossed ownership predates presentation (#122's cross-era merges, hand surgery) is demoted at its first open after a host presents, not refused, so an operator who wants it kept for a repair opens a copy with `topologyPolicy: 'report'` and `auditOnly: true` (a `'report'` open alone still lets go of what covers a row out of the window, below). The audit runs in the order of the strategy's view: record order in legacy mode, window order once a host presents. This applies under `topologyPolicy` `'reject'`, the default; `'report'` and an audit-only open record the summary and leave it as they find it, and a store in legacy mode is refused as before. `StoreTopologyError`'s message advises an open with `topologyPolicy: 'report'` and `auditOnly: true` to inspect a store it refuses, and says that such an open still writes the load-time repairs of what readers can't use (as every open does) and that a `'report'` open without `auditOnly` also lets go of what covers a row out of the window (only `'reject'` demotes), so a store is inspected as it is only through a copy.
+  - A row that left and stays out, which the strategy never heard go (the process stopped between the window's tombstone and the strategy's own writes, or a manager whose strategy has no `onRetracted`, such as `PassthroughStrategy`, took it out), is let go of at the strategy's next open once a host presents, as `onRetracted` lets go of it, with one `[autobiographical] … row(s) out of the window are still folded` warning naming the rows and what changed: it no longer renders inside its summary. The rows are those the window index took out and hasn't presented again (the new optional `WindowIndexView.left()`); a row removed before the window was written down was never in it, and what folded it stays, as in legacy mode. This applies under any `topologyPolicy`; an audit-only open changes nothing.
+  - Another strategy instance sharing the store also reads the window before it writes over a row: an L1 or a merge whose span holds a row out of the window (`WindowIndexView.left()`) writes nothing, also where the store's chunk record and summaries don't say so (a `KnowledgeStrategy`, which keeps no chunk records, or an instance whose own writes after the window's tombstone failed), and the instance lets go of the row as its `onRetracted` would have, with a `discarding L1: row(s) … left the window mid-request through another instance sharing the store` or `executeMerge: row(s) … under its sources left the window …` warning; found before a merge's call, it makes none. A chunk's compression makes the same reads, of its record and the window, before it begins: an adoption of an L1 the instance holds over the chunk's rows, a drop of a chunk that L1s already cover and a thin chunk's stub, which make no call, write nothing over a row another instance let go of, and no model call is made for such a chunk, with a `not compressing chunk …: … before its compression began …` warning; the instance takes the change up as after a call. After the call the same reads come before the adoption of an L1 the store holds over the chunk's rows, and a compression that waited on another instance's call over the same chunk asks the window before it adopts that call's L1: where a row of the span left the window, or left and was presented again, through a manager whose strategy didn't let go of that L1, nothing is adopted and the rows are let go of, with a `discarding L1: …` or `not adopting the L1 of the compression it waited on: …` warning. A merge whose call the provider rejects for the request (`context_length`, `invalid_request`, `safety`, `unsupported`), which counts an attempt against its queue entry and writes the queue, or quarantines the group at `mergeAttemptLimit`, first makes the checks it makes after an answer: where a source was parented or dropped while the call was out, or a row under one left the window, the rejection counts nothing and nothing is written, with an `executeMerge: … its rejection is not counted, and nothing is written` warning, so the queue entry another instance's let-go removed isn't written back and the obsolete group isn't quarantined.
+  - A compression that ends with no summary asks the same before it quarantines its span: where another instance sharing the store gave a row of the span up from its chunk record, or the row is out of the window, it writes no `exhausted` record and sends no alert, with an `[autobiographical] the ladder ended with no summary and quarantines nothing: …` warning, and takes the change up as an L1 does.
+  - The open's demote also takes an L1, or an uncompressed chunk record, whose rows the window holds together but in another order, as a row presented again right after the rest of them leaves them when the strategy never heard it go: the L1 is dropped, with every summary above it, and its record compressed again over the rows in window order, and such a record holds them in window order, with the `the window holds the leaves of … apart or out of order […]` (or `… uncompressed chunk record(s) apart or out of order`) warning. So does a summary above L1 whose leaves, read through its L1s in the order it holds them, the window holds in another order, though each L1 is in order and the leaves stand together (one L1's row presented again after a later L1's rows): it is dropped, with every summary above it, and its L1s and their records stay, with the same warning. The audit places only rows a chunk or an L1 owns, so the demote also parts an L1's rows, or a record's, at a row no chunk owns (one in the recent window, or kept raw by a pin) that the window holds between two of them and the record doesn't, as where a row was presented again after it: such an L1 is dropped and its record trimmed to its longest run, and such a record is trimmed, as for a hole. A row the record holds between them too is one a summary may have been minted across, which the audit leaves, and the demote does too.
+  - `StoreTopologyError`'s message also says that the open that threw it has already written its load-time repairs and, unless it is audit-only, once a host presents, what it demoted and let go of, so an operator who reads it knows the store was changed before the advice to inspect a copy.
+  - A removal of a range through the manager (`removeMessages`, or a sharded `addMessage` that fails partway removing what it stored) takes the window's rows out and tells the strategy even where pruning the `holdCompression` holds it ended throws, as `removeMessage` does where the context log's work throws.
+  - A sharded `addMessage` that fails partway, whose read of the shards it removes throws, still takes a shard a host's listener presented out of the window, and tells the strategy by the shard's id alone, with `removed: true`, as `removeMessage` tells a row it couldn't read.
+  - A call that waited for the strategy's initialization tells a row only where the window of the branch the strategy initialized on held it: where that branch's index took it out, holds it at another ordinal and its own index once gave it the call's, in the record that gave it there where the call left it (presented again since), or holds it where the record no longer does. A branch made before the row was presented never held it, or presented it on its own, in records of its own, at whatever ordinal, and isn't told.
+  - A row of a call that waited, which another manager removed before the call was made, is told by its id alone, with `removed: true`, in a call of its own after the rows of that call the store holds, as `retractRows` tells such a row.
+  - `scripts/repair-topology.ts` plans over the namespace's window once a host presents rows to it: the rows presented, in the order they were, as the strategy reads them (the `--messages-state` slot only: rows a manager merges from auxiliary slots aren't in the plan, as before). Over the record, a summary the window holds apart read as clean. The verification after `--apply` is a default open: it reads the shared `messages` slot whatever `--messages-state` names, so after a repair of another slot (an isolated manager's, `<namespace>/messages`) it doesn't audit the slot repaired, as before.
+  - The read of the window by which another strategy instance sharing the store finds a row of an L1's or a merge's span out of it (above) also finds one that left and was presented again through the other instance, which `WindowIndexView.left()` no longer names: an L1, and a merge after its call, compare the span's ordinals with those the window gave its rows when the work began, and each check, a merge's at its start too, finds a row the window holds past every later row of the span, where a presentation puts a row presented again. Either writes nothing, and the instance lets go of the row as its `onRetracted` would have, so its chunks are made again where the window now holds the row, with a `discarding L1: row(s) … left the window and were presented again elsewhere in it mid-request …` or `executeMerge: row(s) … (and […] were presented again elsewhere in it) …` warning. A span the window holds out of order with nothing moved, as the leaves of two summaries whose rows cross are, isn't read as moved, also where a row of one is a row the window doesn't hold (removed before the window was written down): a merge of such sources (kept under `topologyPolicy` `'report'`) is refused by its topology check, and nothing is unfolded. A summary over a row that stands past a run the next summary holds can't be told from a row presented again, and is read as one. A merge's check at its start, which has no reading from before to compare with, doesn't find a row presented again that is the last row under its sources, or that stands before a row under them the window doesn't hold; the check after its call does.
+  - A chunk record that keeps a row presented again, beside a row of its own that didn't leave, holds its rows in window order, a row the view filter hides (`viewFilter`) at its own place in the window, which the window's ordinals give before the filter; so the record's chunk stands in window order, and an L1 over it is written once. The open's demote keeps such a hidden row in the record it trims to its longest run: the view never lists the row, so released it would never be chunked again.
+  - A state write that throws while the strategy lets go of a row (the summaries', the chunk records' or the merge queue's) is read back, since a write can land and then throw: `AutobiographicalStrategy` holds what the write put where the store holds it (as the store keeps it: a lone surrogate half in a summary's text reads back as U+FFFD), and what it held before where the store doesn't. Where the store can't be read to tell, it holds what the write put, so it writes nothing back that it let go of; the next open repairs what the store may still hold. Its chunks are rebuilt over the window all the same: the failure is logged as `Strategy onRetracted failed for …`, the writes after it aren't made, and the next open, once a host presents, repairs what they would have done, as after a process stop between them.
+
+- Taking rows removed from the record out of a window that didn't hear them go (agent-framework #291). A removal through one manager takes the row out of that manager's window, but another manager whose window holds it (on the same slot, or merging it as an auxiliary one) isn't told: the row leaves its listing and its compile, while `ordinalOf` still gives its ordinal.
+  - `retractRemoved(ids)` takes out each named row the window holds and no merged slot holds any more on the store's branch, a tombstone at its ordinal, so no other row's ordinal moves, and returns the ids taken out, in window order. Every other id is passed over: one the window doesn't hold, and one the record still holds, such as a row a branch made before the removal keeps. A removed body is named by each of its shards.
+  - `retractAbsentRows()` takes out every row the window holds that no merged slot holds any more, for a host's boot pass over removals no live manager heard, and for a removal whose own tombstone couldn't be written.
+  - The strategy is told the rows that left (`onRetracted`), by their ids alone (`info.ids`, with `rows` empty) and `removed: true`, since the store holds no row of them to give, so a folding reader lets go of what it folded of them as the manager that removed them did: in presented mode a removal through one manager unfolds the summaries of every reader the host repairs this way. A reader not told would keep its summaries of the removed rows, and a large removal would leave most of its chunk records naming no row, which halts its compression (`FAIL-CLOSED`). The cost is a refold, on each such reader, of the rows its dropped summaries kept.
+  - Neither writes anything in legacy mode: they never write the window down, nor finish a write-down cut short, and they write nothing to an index in another version's format. A row of an auxiliary slot the manager no longer merges reads as removed, so open the manager with every slot its window was presented from before calling either.
+  - Where the manager's own work around the strategy's call fails (the context it builds), `retractRemoved` and `retractAbsentRows` log it and return the ids taken out, since the tombstones have landed and a later call passes over those rows, and the call waits, to be made at the strategy's next notification, as `retractRows`' does.
+
+- Each manager has a window: the stored rows its agent was shown, in the order it was shown them (agent-framework #291). Every strategy read and every compile follows the window, while the store's record keeps the order rows arrived in, so agents that share a slot, or one that merges another's with `auxiliaryMessageViews`, can each be sent what their own requests carried. Until a host's first `presentRows` (or a `retractRows` that names a row) writes the window down on a branch, the manager is in legacy mode: its window is the merged record itself, read live, compiles send byte for byte the messages they sent, and nothing new is written to the store. A compile's provenance does change: its rendered layout is `v: 3` (see the fold-journal entry).
+  - `presentRows(ids)` presents rows: they enter the window after the rows already there, in the order given, and it returns each one's index ordinal. A body stored as shards goes whole, named by the id `addMessage` returned for it. It refuses, presenting nothing, an id no merged slot holds, a row already in the window, a row named twice and a later shard named without its first. An index that pre-release builds wrote one record per row, before batched writes (below), can hold a body's first shards in the window and the rest out, left by a call cut short partway through the body or by a branch or `derive()` cut between its shards' presentations; naming the body again, by its first shard's id or by the first shard the window lacks (which `getUnpresentedMessages()` lists with the rest), presents only the shards it lacks, at the end of the window, and the shards in it keep their ordinals. A row presented in between stays between the two runs, and compile provenance then reports neither complete. A body such an index holds the other way round, its first shard out and later ones in (a `retractRows` cut short after the first shard's tombstone), is put back whole: naming it by its first shard's id takes its later shards out and presents the body at the end, in body order, in the call's one write, and the strategy hears those shards leave (`onRetracted`), then the body enter. The first call on a branch writes the window down as it stands (every row of the record, in record order, then a header), in one record, and finishes a write-down such an index holds interrupted; from then on the window grows only by presentation. A host that presents starts each agent's window at boot, with `presentRows([])`. The header is written last and is what switches the mode, so a write-down such an index holds cut short, by a failed append or a crash, leaves the manager in legacy mode, its window still the whole record, and the next `presentRows`, or a `retractRows` that names a row, writes only the rows still missing, then the header (a call that writes nothing in legacy mode, such as `retractRows([])`, leaves it as it is).
+  - `retractRows(ids, { undone? })` takes rows out. Each leaves a hole at its ordinal, so no other row's ordinal moves, and a row presented again takes a new ordinal at the end. With `undone`, they are an undone turn's rows, which `getUnpresentedMessages()` leaves out until a later `presentRows` names them. `retractRows([])` writes nothing, in either mode. Any other call in legacy mode is a mode switch: it writes the window down first, as `presentRows` does, so rows stored after it enter the window only when presented.
+  - Reads: `windowMode()` (`'legacy'` or `'presented'`), `ordinalOf(id)`, `indexLength()`, `presentedLength()`, `getPresentedMessages()` (the window before the view filter, the same array while it is unchanged), `getUnpresentedMessages()` (rows that arrived and weren't presented, in record order, with the shards lacking from a body whose first shards are in the window, even an undone turn's) and `newestWindowSequence()` (the newest store sequence among the rows in the window: a row's own, not the write that presented it, so not where the window reached; for that, compare ordinals). New exports: `windowIndexStateId(namespace)` and the `WindowMode` type. The mode, the newest row and the state are named by the window, apart from `acceptRound`'s `presentation`, which says how a provider round carried a compile and has nothing to do with `presentRows`.
+  - Once a host presents, the view filter applies to the window, `renderAsNewest` renders a row the window doesn't hold yet as null, and `noteRequestSent` vouches only for rows in the window: present the rows a request carried before noting them.
+  - The window is a Chronicle append-log state, `<namespace>/window`, registered at the first presentation, so it is per branch and survives a restart. An index in a format this version doesn't read (a header naming another format, or items it can't read and no header) reads as the record, with a warning, and `presentRows` and `retractRows` refuse to write to it. So does a window state that holds no list of items, such as an object another writer set there, and one whose value the store can't give as JSON: the window is the record (legacy mode), one warning says what the state holds (`holds an object ({"someone":"else"}), not a list of index items`, `holds a value that isn't JSON (…)` or `holds records the store can't read back as one value (…)`), and `presentRows` and `retractRows` refuse to write to it with an error that says the same. A read of the state that fails any other way is thrown, and the next read tries again.
+  - Each write to the window is one record, at one sequence, through chronicle's `appendManyToStateJsonWithIdentity` (the identity-stamped batched append of chronicle 0.6.0, which this release requires: a manager over a store handle without it is refused at open, `derive()` and `reopenDerived()` with `ContextManager: the store handle has no appendManyToStateJsonWithIdentity, …`, before any record changes; see the chronicle entry): the write-down, the rows of one `presentRows` call, and the tombstones of one `retractRows`, `retractRemoved` or `retractAbsentRows` call or of one removal. The store keeps or loses such a record whole, and a write it refuses has written nothing: a refused write-down leaves the manager in legacy mode, a refused `presentRows` enters no row and tells the strategy nothing, and a refused `retractRows` takes nothing out. After any throw the window index is read again from the store. A write of one row is one record, through the single form. A manager reads what another handle on the same namespace wrote to the window since its last reading, not the whole index again, where that reading is still a prefix of the index (the chain holds the record that wrote its last item, which also holds across a branch switch to a branch made after that item); otherwise, and on a store without chronicle's `getStateSlice`, it reads the index whole. `bench/window/reload-bench.mjs` measures the read that follows another handle's write, and checks both readers end with the writer's window: in one run on one machine (Node 26.5.0, a linked chronicle tree that reports 0.5.1), reading the index whole took 2.8 ms at 1,000 items and 57 ms at 50,000, against under 50 µs at either size reading what was appended since. These are one synthetic store's numbers, to be measured again against chronicle 0.6.0 as published. Pre-release builds, before batched writes, wrote every row presented, and every row of the write-down, as a record of its own; an index they wrote reads as one written in batches, and context-manager writes none. The first batched record moves the store to chronicle's `MANIFEST` version 2 (see Breaking). A batch is one presentation point: a cut at any row it presented keeps the whole batch (see the `branchAt` entry). `bench/window/write-down-bench.mjs` measures the write-down in one record and in one record per row, as those builds wrote it, and checks the two leave the same window; in one run on one synthetic store of 50,000 rows on one machine (an Apple M5, under other load), the write-down took 69 ms in one record against 4.2 s in 50,001, the log grew by 1.9 MB against 15.3 MB, and a reopen that reads the window took 0.05 s longer than one before the write-down against 0.6 s longer. These are one store's numbers, not a guarantee for a resident store. That run used a pre-release chronicle (a linked tree of chronicle#62, before 0.6.0 was published) whose commit wasn't recorded, and its Node version wasn't recorded either, so the figures are to be measured again against chronicle 0.6.0 as published; the harness now prints the Node version and the chronicle it loaded with its results.
+  - `presentRows`, `retractRows`, `retractRemoved` and `retractAbsentRows` throw `WindowWriteOutcomeUnknownError`, a new export from the root, when the store throws on the window index's write and the index then can't be read again to tell whether the write landed. Where it reads again, the write's own error is thrown, whether the store kept the write or refused it: `ordinalOf` or `windowStatusOf` tells which, the strategy has heard what a kept write did (where the manager's own work around the strategy's call fails, such as the context it builds, that is logged and the rows wait for the strategy's next notification), and a retry of one is refused (in the window already, or not in it). The error carries the write's own error as its `cause`, the failed read's as `readError`, the call as `operation`, and the rows the write would have put in and taken out as `entering` and `leaving`; its message ends with the cause's message. The write is one record, so the store holds all of it or none of it, and `windowStatusOf` tells which once the index reads: a row that entered is refused by `presentRows` as in the window already, and a row that left by `retractRows` as not in it. For `retractRemoved` and `retractAbsentRows`, whose rows the store no longer holds, `windowStatusOf` reads `'absent'` either way: `ordinalOf` tells (undefined once a row is taken out), and calling either again takes out only what is still there. So it does for a row a `retractRows` takes out by its id once another manager removed it, and the error's message says so. The strategy hears what the write did (`onPresented`, `onRetracted`) at the next write to the window on the branch it was made on, `presentRows([])` among them, before that call's own work, and hears nothing of a write the store didn't keep; where the store can't say which branch that was, nothing waits (below), and the error's message says so.
+  - A branch starts with the window as it stood at its branch point: `fork()` and `branchAt()` carry it, and `derive()` lists it among the states the manager owns, whatever the strategy's derivation manifest names. A manager derived at the head starts with its parent's window and its arrived-and-not-presented rows, from the parent's reading of the window rather than a new read of the store. One derived from `atSequence` starts with the window as it stood then, which names only rows stored by then. `reopenDerived()` finds the window on the derived branch. A parent that hadn't written its window down by the branch point (its first `presentRows`, `presentRows([])` among them, or a `retractRows` that names a row) has no window written there, and the branch is in legacy mode, its window the record up to the cut: a cut at the sequence of a row stored before the write-down holds that row in the child's window.
+  - A row removed with `removeMessage` or `removeMessages` leaves the window as `retractRows` takes a row out: a tombstone at its ordinal, so no other row's ordinal moves. In legacy mode nothing is written. A removal through another manager on the same slot isn't heard: a host takes that row out of each other window that holds it with `retractRemoved(ids)`, naming the rows the removal took, or with `retractAbsentRows()`, which finds every such row, at boot say (see the entry for them); each tells that manager's strategy, which lets go of what it folded of the row. `retractRows` takes a row the store no longer holds out by its id too, and also takes out a row the record still holds, which those two pass over. A tombstone that can't be written is logged, and the removal stands; so is a range whose rows can't be read before it is removed (its event names only its ends), and the strategy then isn't told of them either, until `retractAbsentRows` takes them out and tells it. Until one of those calls takes such a row out, it keeps its ordinal: the window's listing and the compile leave it out, but `ordinalOf` still gives its ordinal and a strategy's `StrategyContext.window.ordinals()` still maps it, so a host that keeps watermarks by ordinal takes it out of each window that holds it.
+- `MessageStoreView.positionOf(id)`, optional: a message's position in `getAll()`. Compile provenance finds a raw body by its position instead of its sequence, since a window needn't be in sequence order; a run of raw entries still costs one lookup and reads no stored message (#273).
+- A write to the window that first settles an earlier write whose outcome was unknown (`WindowWriteOutcomeUnknownError`) throws, writing nothing, when a strategy hook that hears what the earlier write did moves the store's branch: the call was given the record of the branch it was made on, and would have written that record down into the other branch's window, or taken out of that window every row the record lacks. Its error names both branches. The earlier write stays settled; one waiting behind it on the same branch isn't heard on the branch the store moved to, and waits for the next write on its own. A call made again works on the branch the store is on.
+- A window write whose outcome is unknown waits to be settled on the branch the store was on before the write, read then, so a store that can't say its branch once the write has thrown still settles it at the next write on that branch. Where the store can't say its branch before the write either, nothing waits: a warning says so, and so does the `WindowWriteOutcomeUnknownError`'s message, which says the strategy reads the window at its next select instead of that it hears at the next write. A later window write made while the store can't say its branch, where such a write waits, throws, writing nothing and settling nothing, since it can't tell whether the write waits on its branch; the write after it, once the store says its branch, settles it first.
+- A write-down (the first `presentRows` or `retractRows` on a branch in legacy mode) that the store throws on, where the window index then can't be read again to tell whether it landed, throws `WindowWriteOutcomeUnknownError` too, with `entering` and `leaving` empty and a message that says whether the window was written down is unknown; `windowMode()` tells which once the index reads. A write-down puts no row in the window and takes none out, so nothing waits to be heard.
+- A window state that holds JSON `null` reads as another version's index too, as one that holds an object or a string does (`holds null, not a list of index items`): the window is the record, with one warning, and `presentRows` and `retractRows` refuse to write to it. A state with no record at all is still no index, and the first presentation writes the window down.
+- Finishing a write-down that an index of pre-release builds holds cut short, where a slot merged since (`auxiliaryMessageViews`) holds rows stored before the ones it wrote, takes those out and writes every row of the record again, in record order, in the call's one record, so the window is the record as legacy mode read it, not the rows written first and the older ones after them.
+- A removal through the manager (`removeMessage`, `removeMessages`) whose telling of the strategy fails in the manager's own work (the context it builds) logs it, and the call waits, to be made at the strategy's next notification, with the rows as they were before they went.
+- A removal the strategy's `onCompressionHoldsReleased` hook makes through the manager, while a removal's release of holds runs it, leaves the outer removal's rows to leave the window and be told as that removal read them.
+- A `presentRows` whose write lands and whose read of the index after it, for the ordinals it returns, throws goes as a write that threw: the strategy hears the rows that entered before the read's error is thrown, where the index reads again, and otherwise the call throws `WindowWriteOutcomeUnknownError` and the strategy hears them at the next write on that branch.
+- Finishing a write-down that an index of pre-release builds holds cut short, where a row it wrote has since been removed in legacy mode, takes that row out without counting it among the rows that left the window (`WindowIndexView.left()`): it was never in a presented window, so a folding strategy keeps what folded it at its next open, as after any removal in legacy mode.
+- A removal through the manager whose settling of an earlier window write (one whose outcome was unknown) runs a strategy hook that takes the removed row out itself (`retractRows`) tells the strategy the row left once, by that hook's call.
+- A removal through the manager whose strategy's `onCompressionHoldsReleased` hook, which the removal's release of holds runs, moves the store's branch (`switchBranch`), or whose settling of an earlier window write runs a hook that does (the tombstones' write then refuses, writing nothing), takes nothing out of the window of the branch the store is on then, whose record may still hold the rows, and tells no strategy; it warns, and on the branch the removal was made on the rows keep their ordinals until `retractAbsentRows` takes them out there.
+
+- Window reads for a host that presents rows (agent-framework #291).
+  - `windowStatusOf(id)` says where a row stands with the manager's window, before the view filter, as the new exported `WindowStatus` type: `'in'` the window, `'out'` of it (stored and not presented, or taken out without `undone`: exactly the rows `getUnpresentedMessages()` lists, so an undone shard is `'out'` while a shard of its body before it is in the window), `'undone'` (an undone turn's row, which that list leaves out until a redo), or `'absent'` (no slot the manager merges holds it). In legacy mode every row the merged slots hold is `'in'`. A row removed through another manager reads `'absent'` while this manager's `ordinalOf` still gives its ordinal, so a host can tell which rows to take out of each other window. It looks the row up by its sequence (`MessageStoreView.sequenceOf`: from the store's listing while that is cached, as during a compile, and from the stored item otherwise) rather than reading it whole, reads the merged record's listing only for an undone turn's row, to find the shards of its body before it, and writes nothing.
+  - `branchSequenceOf(messageId)` gives the sequence `branchAt(messageId)` cuts at, without making a branch, for a host that accounts for a cut (the rows a rollback leaves out of the record, and those it keeps there but not in the window). It throws `Message not found` as `branchAt` does.
+  - `getUnpresentedMessages({ afterSequence })` lists only the rows stored after the sequence, the same rows the whole listing gives with a greater sequence, found by a binary search over the merged record's listing, so a call walks only the rows stored since in that listing, which is built once per change of the record (with auxiliary slots, merged and sorted), as a compile's reads are. It throws a `TypeError` for an `afterSequence` that isn't a number.
+  - `resetHeadWindow(text, { metadata })` stores the `[Topic Transition]` message with the metadata given. Once a host presents rows on the branch, the transition is presented before the head window is reset to start at it, so the head window starts at a row the window holds and the strategy hears it at its presentation. A transition a host's listener of its add (`onMessage`) presented already is left as it stands; one a strategy stores as shards is presented where any shard of it is out of the window, so a listener that presented its first shard before the rest was stored leaves the rest presented after it, and its hook taking a shard out again rejects as taking the transition out does. A presentation that fails rejects naming the stored message, without resetting the head window, with a message that begins `ContextManager.resetHeadWindow's presentation of its transition failed:` and says whether the window holds the transition: stored and presented, where the presentation landed before it threw; stored and out of the window; or stored and maybe presented, where the window can't be read. It rejects too, without resetting the head window, when the strategy's `onPresented` hook for the transition takes the transition out of the window again, since the head window can't start at a row the window lacks. In legacy mode nothing more is written.
+  - `resetHeadWindow` rejects in the same way, naming the stored transition as stored and maybe presented, without resetting the head window, where a read of the window before the transition's presentation or after it throws (its message begins `ContextManager.resetHeadWindow couldn't read the window`).
+  - Each of these rejections, and the one for a listener of the add that closes the manager, sets a strategy or moves the store's branch, says where the transition stands as the store and then the window tell it when the call rejects: no longer stored where a host's listener of its add or a hook its presentation ran removed it, through this manager or another on the slot (`presentRows` then refuses its id), not that it is stored; presented; presented in part, where a listener of a sharded transition's first shard's add presented the shards stored by then; or stored and out of the window (stored, in legacy mode, where the window is the record). Where they can't tell, because the store is on another branch than the add's, can't say its branch, or can't say whether it still holds the transition, it says what the call last knew of the add's branch, and, once a host presents, that it is what the call last knew (`was stored … as the call last knew`; in legacy mode it says `is stored`, as before). In legacy mode the reset reads no record first, as before.
+
+- `RenderStats.planVsActual` gains `floorTokens`, `hardBudget` and
+  `queuedReliefTokens` on adaptive compiles (#415), logged as `floor=`,
+  `hardBudget=` and `queuedRelief=` on the `[plan-vs-actual]` line. The
+  floor is the cheapest plan the summaries held allow, head and tail
+  included, whatever the folding strategy picked; a compile refuses once its
+  plan passes `hardBudget`, and every plan does once the floor does, so
+  `hardBudget - floorTokens` is how far the store is from the point where
+  every compile refuses. `queuedReliefTokens` estimates what the queued L1s
+  and merges would take off the floor once they land, each chunk priced as
+  the compile would send it, as the floor prices it. Work the gates tick
+  reads keep from a summary counts as zero: everything without a compression
+  model or a membrane, every chunk while the `maxSpeculativeL1s` cap holds, a
+  chunk the compression quarantine holds or deferred for the host's tools,
+  every chunk from the first a compression hold reaches, a merge holding a
+  source a hold or a merge-quarantine record keeps out or one already
+  merged, and every merge from the first a hold blocks. It doesn't replay
+  the rest of tick (an exact L1 the store holds, the overlap guard, a merge
+  whose covered messages a pin or a lock keeps in the floor), so it is an
+  estimate, not a promise. Under `kv-unified` the floor takes that solver's own constraints,
+  locks included, and is exact. The other folding strategies give pins
+  precedence over locks in ways those constraints don't follow, so there the
+  floor counts no lock. Outside `kv-unified` the floor is a lower bound: a
+  floor over `hardBudget` means every compile refuses, and one at or under it
+  doesn't promise a plan fits. A floor that can't be computed, or that no
+  cut can meet, leaves the fields out and is said once per cause, causes
+  that differ only in their numbers counting as one, and once more by each
+  load that meets it, as `[autobiographical] floor not computed`.
+- `OverBudgetDiagnostics` gains `floorTokens` and `queuedReliefTokens` on
+  the adaptive refusals that come once the plan is made, when its floor was
+  computed, and the refusal's message then names them as `floor=` and
+  `queued relief=`. The refusal for a head and tail that alone exceed the
+  budget comes before the plan, so it carries neither. Under `kv-unified`,
+  a floor at or under the budget means the refusal isn't for want of
+  summaries, since a plan that fits exists. Outside `kv-unified` the floor is
+  a lower bound: a floor over `hardBudget` means every compile refuses, and
+  one at or under it doesn't promise a plan fits. A floor still over
+  `hardBudget` once the queued relief is taken off means draining the queue
+  alone isn't expected to clear it, the relief being an estimate.
+
+- `ContextManager.generateTransitionSummary()`: the transition summary
+  `resetHeadWindow()` would write of the head window as it stands, storing
+  nothing (the strategy's `generateTransitionSummary` over the manager's own
+  strategy context, which a host reached before only through a cast). It
+  refuses as `resetHeadWindow()` does, before the manager is initialized and
+  for a strategy that can't reset its head window, and also when the manager
+  is initialized again or its branch moves while the summary is written. A
+  host that checks its own conditions between this call and
+  `resetHeadWindow(summary)` (an idle agent, nothing moved) stores a
+  transition only when they hold.
+
+- `WriteLandedError` and `WriteOutcomeUnknownError`, exported from the root:
+  what `addMessage` throws when it fails with some of the message stored, or
+  can't tell whether some is (agent-framework #844). What a failed
+  `addMessage` throws tells a host which of three things happened:
+  `WriteLandedError` means the store holds the rows of the message its
+  `landed` names, in store order, and no others; `WriteOutcomeUnknownError`
+  means the manager can't tell whether the store holds some row of the
+  message, because the read of the store that would tell threw, or the write's
+  branch moved, so the manager can't read it; any other error means the store
+  holds none of the message, so a host that stores the message another way
+  when an add throws can do so then, and not store it twice. Both carry the
+  write's own error as their `cause`, and their messages end with the cause's
+  message.
+  - `WriteLandedError` is thrown when a row stays: a message stored as one
+    row, whose append failed after the row landed (the manager's own store
+    listener failing inside it; a host's `onMessage` listener's throw is
+    logged and doesn't fail the write, unless that log throws too: see
+    `onMessage`), or the shards of a sharded write that failed partway and whose
+    removal of what it stored failed too, a body short of its `shardCount`.
+  - `WriteOutcomeUnknownError` names what the manager knows: `landed`, the
+    rows it knows are stored, possibly none; `unknown`, rows the write
+    stored that a removal that threw may have taken out, where the store
+    can't be read to tell which stayed (the removal is one write, so all of
+    them stayed or none did); and `unnamed`, 1 where the store can't be read
+    to tell whether the row of the append that failed the write landed (an
+    append that throws returns no id), else 0. It is thrown for a message
+    stored as one row, or a sharded write's first shard, whose append threw
+    where the store can't be read to tell whether its row landed (nothing is
+    removed, and the failed read is logged), and for a sharded write that
+    stored shards before the failing one, where that read failed and the
+    removal of what it stored failed too, or the read of what that removal
+    left failed. A read of the store, once it reads, tells the rest.
+  - A write that fails before a row lands throws its own error, unwrapped: a
+    refusal of the message or of a shard as chunked (`MalformedContentError`),
+    a chunking the manager refuses, a strategy not initialized, a store that
+    refuses the first append. So does a sharded write that fails partway,
+    once it has removed the shards it stored: the removal takes the failing
+    shard's row out with them where it landed, whether or not the store
+    could be read to tell that it did.
+  - The add may have gone unheard: a failure in the manager's own listener
+    ends the event before a host's `onMessage` listener hears it. A sharded
+    write's shards before the failing one were heard as each was stored, so a
+    listener that presents rows as they are added may have presented them.
+    Once a host presents rows, present the first row of `landed` that
+    `windowStatusOf` doesn't read `'in'` on the branch the store was on when
+    `addMessage` was called (read `currentBranch()` before the call; where a
+    listener's move stopped the write, switch back first, since the shards
+    are there, and a `WriteLandedError`'s `cause` names it too), if any,
+    which `presentRows` takes as naming the rest of the body: it refuses a
+    row already in the window, and a later shard whose earlier shards
+    aren't all in it (where a listener took a presented shard out again,
+    say). A `holdCompression` hold the add placed
+    on them stays until `releaseCompression(landed)`. `resetHeadWindow`
+    rejects with either error when its transition's add fails so, without
+    resetting the head window.
+
+### Changed
+
+- `branchAt(messageId)` finds a row of an auxiliary slot too, where it threw `Message not found` before (agent-framework #291). Once a host presents rows on the branch (`presentRows`), a row is in the window only from the write that presented it, so for a row the window holds the branch is cut at that write, the one that presented the last of its body's shards, rather than at the row's own sequence, and never before that last shard's own sequence, so the new branch's record holds the whole body. The new branch's window is then the window as that write left it: the row, and every row in the window then (a row taken out before it isn't). One `presentRows` call is one write (see the window index entry), so a row it presented is cut after the whole call, and the new branch's window holds the rows that call presented after the row too; a host that wants a cut at each of an agent's own rows presents each in a call of its own. Rows stored after the row but before that write, and not presented by it, are in the new branch's record, arrived and not presented; rows stored after the write are not. A row the window doesn't hold, and every row in legacy mode, is cut at its own sequence, as before: a row taken out of the window is cut there too, not at the write that presented it. A row the window holds from its write-down (the first `presentRows` on the branch) is cut at its own sequence too, since it was in the window from its own write: the new branch is in legacy mode, and its window is the record up to the row. A body stored as shards that the write-down entered is cut at its last shard, though, where legacy mode, and a branch made before the write-down, cut at the shard named, such as the first: the new branch's record holds the whole body.
+- `derive({ atSequence })` cuts at the sequence given. Once a host presents rows, a row stored after the window was written down enters it at a write after its own, so a cut at its own sequence holds the row in the child's record but not in its window: the child lists it among its arrived rows (`getUnpresentedMessages`). A row stored before the write-down was in the window from its own write, so a cut at its sequence comes before the write-down, and the child is in legacy mode, its window the record, which holds the row. A `presentRows` call written as one record is in the child's window whole or not at all. Give `atSequence` as a presentation boundary, such as `currentSequence()` read after a `presentRows`. Hosts that pass a row's own sequence, such as agent-framework's `inspectAgentContext({ atSequence })` and `inherit.atSequence` callers, need to change before they present.
+
+- Fold receipts follow a window a host presents (agent-framework #291). Once rows are presented on a branch (`presentRows`), a compile's rendered layout counts its members by window-index ordinal instead of store sequence, so a compile whose window was presented out of record order is accepted. `RenderedLayout` is now `v: 3`: `keyedBy` says what `members` count (`'sequence'` while the window is the record, `'ordinal'` once rows are presented), and `memberSequences`, parallel to `members`, gives each member's store sequence, which receipts still name a message by (`FoldSpanBound.sequence`). `acceptRound` checks each entry of a layout's `memberSequences`, not just their count: each must be a store sequence (a non-negative safe integer), and in a layout keyed by sequence each must be its member, so a receipt's run is always bounded by a store sequence. A layout that breaks this is refused, writing nothing, with an error that names the first entry that does (`its memberSequences[1] is "zz", not a store sequence …`); a compile's provenance, accepted as compile returned it, always passes. The receipt format doesn't change.
+  - `RenderedLayout`'s type changes with it, in legacy mode too: see the rendered layout entry under Breaking.
+  - Once rows are presented, a receipt's run (`FoldChange`, a baseline's `FoldLayoutRun`) is consecutive in the window's order, not the record's: `first` and `last` name its first and last messages, and the run can hold a message stored after `last` or before `first`, presented between them, and `first.sequence` can exceed `last.sequence`. A `FoldChange`'s run is consecutive among the messages both layouts hold, as before: a message only one of them holds (new to the window, or gone from it) can stand between `first` and `last` without being in the run, and `messages` counts the run's own. A reader that turns a run into the record's rows by sequence range reads a window's run wrongly: read the run's messages from the window.
+  - The fold journal records a layout keyed by ordinal as accepted-layout format 4, and one keyed by sequence as format 3, as before, so a manager on a branch whose window was never written down (no host presented there) writes what it wrote. A layout's members are never compared with those of a record of the other format: an acceptance whose layout's format differs from that of the branch's newest record writes a baseline there, and a warning says so (once per record). That is the first acceptance on a branch of a compile made after its first presentation, and again any acceptance that switches back, such as one of a compile made before the first presentation accepted after one made after it. Receipts are listed across both formats: that baseline links to the branch's receipts before it.
+  - A compile is recorded by what its layout counts, not by the window when it is accepted: one made before the first presentation and accepted after it is format 3, compared with the layout before it.
+  - Rollback, of a store a release before this one can still open (one at chronicle `MANIFEST` version 1, which holds no batched window write; one at version 2 doesn't open there at all, see the window batches entry): such a release reads a format-4 record as one of another format. While a branch's newest record is format 4, it lists none of that branch's receipts, the format-3 ones before the presentation included. Its first acceptance there writes a baseline that links to no receipt before it, so the branch's receipt history starts again from that baseline: every later release, this one included, lists only receipts from that point on, and the receipts before it stay in the record but aren't listed on that branch again, with no note to say so. Nor may such a release be given a compile's provenance made once rows are presented (`keyedBy: 'ordinal'`): it reads the layout's ordinals as store sequences, into a format-3 record and its receipt's bounds.
+
+- `WindowedPassthroughStrategy`'s anchor follows the agent's window (agent-framework #291). While the window is the record (legacy mode) the anchor is a sequence, and its slot holds `{ anchor }`, as before. Once a host presents rows on a branch (`presentRows`), the anchor is an index ordinal: the window is the row at it and every row presented after it, in window order. An ordinal counts the window before the view filter and never moves, so neither the filter nor a row taken out with `retractRows` shifts the anchor.
+  - A sequence anchor, from an earlier release or set before the first presentation, is converted when its branch is first read in presented mode, to the ordinal of the first row in the window stored at that sequence or after. The index is first written down in record order, so the window at the conversion is the one the sequence gave, and the messages compiled stay byte for byte the same, where no row stored before the sequence has been presented after the row it names since the write-down (below). Each branch's slot is converted where it is read, and the conversion is written to it then, as `{ anchor, ordinal, v: 2 }`, by the compile, `renderAsNewest` or `getAnchorOrdinal()` that made it; a preview (`dryRun`) converts for itself and writes nothing, and an anchor of 0, the start, is never written, since it converts to the whole window whenever it is converted. A write of the anchor that fails, the conversion's or a move's, is tried again at each compile or read of the anchor (`renderAsNewest`, `getAnchorOrdinal()`) until one lands; a preview doesn't try it. The conversion's failure is logged once; the failure of a move's write (`setAnchor`, `setAnchorOrdinal`, a re-anchor) reaches its caller, and it is tried again at each compile or read of the anchor until a write lands. Converting the same sequence again later could give another ordinal, and so another window with no move, once a row stored before it has been presented after the row it names (taken out and presented again, as an undo and its redo do), so a reload reads the ordinal the window was sent from. The conversion is exact until such a row is presented: a host that presents at boot converts at its first compile.
+  - `setAnchor(sequence)` converts the same way, at the call, or to the index's length when no row in the window is stored at the sequence or after (`WindowIndexView.length()`: every ordinal below it is issued, to rows, tombstones and the write-down's header, and a presentation's rows take theirs from it on, after any tombstones its write puts first). So a tune-out's start given as `currentSequence()` keeps every row presented to the agent from then on: a row stored before the anchor's sequence and presented later is in the window, where a sequence anchor left it out. The sequence the anchor already has changes nothing, so setting a tune-out's start again at a restart keeps the window, but only while the anchor hasn't moved since. Once a re-anchor on overflow or `setAnchorOrdinal` has moved the anchor, `setAnchor(sequence)` converts the sequence again, against the window as it stands, even where the row the anchor moved to was stored at that same sequence (a row taken out and presented again later, say). The slot records such a move as `moved: true` beside `{ anchor, ordinal, v: 2 }`, so a restart converts too; `setAnchor` clears it, and the same sequence set again after that changes nothing. A re-anchor on overflow gives the anchor the sequence of the row it starts the window at, so a tune-out's start set again after one, at a restart or when another tune-out starts, is converted again, against the window as it stands, and once rows have been presented out of record order that can leave out a row the first conversion's window held. A host that sets a place again keeps it by ordinal: record `indexLength()` at the tune-out's start and give it to `setAnchorOrdinal`.
+  - New: `setAnchorOrdinal(ordinal)`, which throws in legacy mode and for an ordinal outside the index, and `getAnchorOrdinal()`. `getAnchor()` still gives a sequence: the one `setAnchor` was given, or that of the row a re-anchor started the window at. A persisted ordinal past the branch's index length resets to 0 with a warning, as a sequence past the branch head does.
+  - `StrategyContext.window` (optional, type `WindowIndexView`): the manager's window index as a strategy reads it, with `mode()`, `ordinals()`, `length()`, `ordinalFrom(sequence)`, `sequenceFrom(ordinal)` and, optional, `left()` (the rows that left the window and haven't been presented again, which `AutobiographicalStrategy`'s open reads; see the `onRetracted` entry). A context built without one reads as legacy mode.
+  - Rollback, of a store a release before this one can still open (one at chronicle `MANIFEST` version 1; one at version 2 doesn't open there at all, see the window batches entry): the slot's `anchor` stays a sequence at or before the branch head, unless `setAnchor` was given one past it (stored as given; a load resets that to 0, as before), so such a release loads it and starts its window there, by sequence.
+  - A slot naming a `v` other than 2 is another version's: it loads as no anchor, so the window starts at the branch's start, with a warning, where before it was read by its `anchor` and written over by the next move. One naming a later version than 2 is never written over: the anchor's moves on that branch are kept in memory only, with one warning per branch load, so the version that wrote the slot reads it back as it wrote it. Any other is written over by the next move.
+  - A move retried with the place the anchor already has, after its write threw (`setAnchor` of the same sequence, `setAnchorOrdinal` of the same ordinal), writes the anchor again while it is unwritten, and a failure of that write reaches the caller. Before, the retry returned at the equality check, reporting success with the slot still unwritten, so a restart read the old anchor. A move whose lookup in the window throws (the index can't be read), which it makes before it changes anything, keeps nothing of the move, so a retry with the same place makes it and writes it.
+  - A slot in format 2 whose `ordinal` is missing or isn't a whole number from 0 is said on load, with a `[windowed-passthrough] persisted anchor ordinal … is not an ordinal, a whole number from 0 (…); its sequence … is converted again` warning, and its sequence is converted again.
+
+- `addMessage` throws `WriteLandedError` where it threw the write's own error
+  with some of the message stored: a message stored as one row whose append
+  failed after the row landed, and a sharded write whose removal of the
+  shards it stored failed. It throws `WriteOutcomeUnknownError` where it
+  threw the write's own error and the store couldn't be read to tell whether
+  some of the message was stored: the read of whether the failing append's
+  row landed threw, for a message stored as one row, a sharded write's first
+  shard, or a later shard where removing the shards before it failed too, or
+  the read of which shards a failed removal left threw. The
+  write's own error is the `cause` of both, and their messages end with that
+  error's message, so a check that the message contains or ends with it
+  still matches; one that compares the whole message, or is anchored at its
+  start, doesn't, and a check of the error's class meets the new classes
+  instead. Every other failure of
+  `addMessage` throws what it threw before.
+- A sharded `addMessage` whose first shard's append threw, where the store
+  couldn't be read to tell whether that shard landed, logged that removing
+  what it wrote threw, though no removal ran. It logs that the read threw,
+  so the shard may be stored.
+- One failure point of an add is new: after the row lands, the manager's own
+  add listener reads the window index, to tell whether a host presents rows
+  on the branch (in legacy mode the strategy hears the row there). Where
+  that read throws, an add that succeeded before fails after its row
+  landed: `addMessage` throws `WriteLandedError` naming the row
+  (`WriteOutcomeUnknownError`, with `unnamed` 1, where the read of whether
+  the row landed throws too), the
+  strategy isn't told the row entered, and an add listener registered
+  after the manager's doesn't hear it.
+- A sharded `addMessage` that fails partway where the store then can't say its
+  branch removes nothing, as after a branch move, and logs the failed read: it
+  throws `WriteLandedError` naming the shards stored, on the branch the write
+  started on (`WriteOutcomeUnknownError`, with `unnamed` 1, where a shard's
+  append threw). In legacy mode the strategy hears those shards once the store
+  reads again. In 0.24.2 the add's removal tried to read the branch, the read
+  failed, and it removed nothing; the add logged that removing what it wrote
+  threw, then threw the write's own error, which says none of the message was
+  stored.
+- `unnamed` is 1 only where a shard's append threw: a sharded `addMessage`
+  that fails once every shard is stored (in legacy mode, the manager's own
+  work telling the strategy of the body) and whose removal of them fails
+  names every shard, with `WriteLandedError`.
+- A sharded `addMessage` whose removal of the shards it stored fails after the
+  strategy's `onCompressionHoldsReleased` hook, which that removal runs for a
+  held shard, moved the store's branch throws `WriteOutcomeUnknownError`,
+  naming every shard the write stored as `unknown`: which of them stayed is a
+  question for the branch the write started on, which the store no longer
+  reads. In 0.24.2 the removal took the write's shards out of the branch the
+  write started on, before the removal's event ran the hook, and the add threw
+  the write's own error.
+- An `addMessage` of a message stored as one row whose append throws after
+  a listener of its add moved the store's branch, or where the store then
+  can't say its branch, throws `WriteOutcomeUnknownError` with `unnamed` 1:
+  the row landed on the branch the add started on, if it did, which the
+  store no longer reads, or may not. A host listener's throw is caught and
+  logged, so this takes a log that throws too. In 0.24.2 a single-row add
+  that failed threw the write's own error, whatever the store then held.
+
+### Fixed
+
+- Under adaptive resolution, `AutobiographicalStrategy`'s queued merges no
+  longer wait behind every queued L1 (#412, #415). `tick()` runs one
+  compression at a time and ran each queued chunk's L1 before any merge, so
+  an agent closing chunks as fast as calls completed, such as one reading a
+  document a tool result at a time, kept a chunk queued at every tick and no
+  merge ran for as long as it read: the pyramid stopped deepening, unmerged
+  L1s filled the middle, and compiles refused at their deepest available
+  level until the agent went idle. Now the merge at the head of the queue
+  goes first when it would take more off the plan's floor than the next
+  chunk's L1: its sources' recall pairs less the one its parent renders as,
+  against the chunk's messages as the last compile priced them to send
+  (pruned, capped and stripped, a message a raw pin keeps raw at nothing)
+  less the pair its L1 renders as, each new summary priced at the mean of
+  the latest at its level. With the default `summaryTargetTokens` of 2,000
+  and 3,000-token chunks, that is nearly always the merge. A merge whose
+  last attempt was rejected, cut off or refused, or whose call failed, gives
+  the lane to one L1 and then competes again, so a failure costs one L1's
+  turn and not the rest of the backlog; `mergeAttemptLimit` still bounds a
+  merge that keeps failing. A merge that waits on a hold or on the host's
+  tools, or holds a source a hold or a merge-quarantine record keeps out,
+  keeps its place behind the L1s, as does every merge under
+  `scripts/drain-autobiographical.ts` except while its `maxSpeculativeL1s`
+  cap holds. The same code paths run, in a different order, and only while
+  both kinds of work are queued; a merge that lands before an L1 changes
+  what that L1's request recalls.
+- Each merge that lands logs `[autobiographical] L<n> merge landed over <k>
+  summaries`, ending `, ahead of queued L1 work (relief | after a failed L1
+  | speculative cap)` where it ran before queued L1 work, and a failed merge
+  giving the lane to one L1 logs `[autobiographical] L<n> merge gives the
+  lane to one L1 after …`, so a journal shows the merges and why each ran
+  when it did.
+
+- kv-unified: only the first accepted call of a compile sets its cache
+  reference. The native tool loop's later calls in the same turn each report a
+  receipt. Under `cacheMarkers: 'cm-owned'`, membrane can float markers of its
+  own onto those calls (membrane's `floatingCacheMarker` says when;
+  antra-tess/membrane#239 brings it to `cm-owned`), so their marker count can
+  differ from the compile's. Every accepted call took the count check before,
+  so each such call would clear the reference, with at most one
+  marker-mismatch line per strategy, and the next compile would weigh no cache
+  costs. Now, once one of a compile's calls is accepted, later calls leave the
+  reference and the recorded wire receipt as they stood once that call was
+  accepted.
+  If the compile's own request is never accepted (superseded or failed), the
+  first accepted later call takes the count check in its place: one whose
+  count differs from the compile's fails it, so that compile holds no
+  reference. The check counts markers, not where they sit. A compile's calls
+  are those begun after it and before the next compile; one still in flight
+  when the next compile runs stays its own compile's. Calls begun after the
+  next compile are that compile's: the first of them accepted before the
+  compile's own request begins is its first accepted call, so its count
+  check sets the reference or none, its wire receipt is the one recorded,
+  and the compile's own request then leaves both. A call whose count
+  differs, such as a floated one, then leaves that compile no reference. One
+  still in flight when the compile's own request begins is superseded, so
+  that request, once accepted, is the first accepted call.
+  agent-framework starts a stream only when the agent is idle, so its tool
+  loop's calls end before its next stream compiles. Only a draft's first
+  submission logs a marker mismatch.
+
+- `AutobiographicalStrategy`, and `KnowledgeStrategy`, which extends it, no
+  longer send the messages of a chunk the compression quarantine holds in the
+  requests that compress the chunks after it, in merges over them, or in a
+  transition summary (`generateTransitionSummary()`). Those requests could
+  carry the held chunk, which stays raw: between the head window and the chunk
+  or merge range (the raw middle), and in the head window itself where the
+  head had grown over the chunk, as reopening a store with a larger
+  `headWindowTokens` can make it, and a transition summary quotes that head
+  window. Where the summarizer had refused the held chunk for its content, it
+  could refuse those requests too, and the recall-curve retries reuse the rest
+  of the request, so unless `compressionSourceOnlyFallback` was on, the chunks
+  after it could be quarantined in turn and stay raw. Those requests now leave
+  the held chunk's messages out, as they already left out what a summary
+  covers, including after a host removes one of its messages, apart from the
+  case below where the paid-off sweep clears the chunk's record first. A
+  pinned message inside a held chunk is left out too, also where a refused
+  compile decides whether to name `compression` in its `clearedBy`. A store
+  whose quarantine holds no chunk sends the same requests as before. Once the
+  quarantine no longer holds the chunk, as after
+  `clearCompressionRefusalQuarantine()`, the requests after it no longer leave
+  its messages out.
+- A quarantine record now keeps its chunk's message ids, so a held chunk's
+  messages stay out of those requests wherever they now sit, also where a
+  reopen has cut the chunks again, as `KnowledgeStrategy`'s reopen does, since
+  it keeps no chunk records. A transition summary leaves out every message a
+  record keeps until the record clears, one a later chunk's summary covers
+  included; under `KnowledgeStrategy`, once a reopen has cut the chunks again,
+  that means until an operator clears it with
+  `clearCompressionRefusalQuarantine()`, or until a later reopen cuts that
+  chunk as it was and it compresses. A record written before this release
+  keeps only the hash of its chunk's ids, and is matched against the chunks as
+  they are now, as before, so under `KnowledgeStrategy` it can stop holding
+  them once a reopen cuts the chunks again, or once a host removes one of the
+  held chunk's messages. Where a reopen puts a held message inside a later
+  chunk, that chunk's own request carries it, and the chunk is tried as a new
+  chunk.
+- A chunk quarantined because its request carried a held chunk now has a
+  request of another shape, so its next compression is a fresh attempt,
+  unless the quarantine already holds that request or its family, or the
+  chunk has reached
+  `AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP` quarantined shapes in
+  its request regime.
+- Once the chunks after a held chunk compress, merges can change the held
+  chunk's own request, so it is tried again in each new shape, up to
+  `CHUNK_QUARANTINE_SHAPE_CAP` (3) shapes in its request regime, after which
+  it is held whatever its request. Each new shape the summarizer refuses
+  costs its refused call, plus any fallback calls the ladder makes after it.
+- Under `AutobiographicalStrategy`, a held chunk a host has removed a
+  message from is a new chunk to tick, as it was before this change: its
+  refusals are recorded under the messages it has left, which the paid-off
+  sweep can clear as orphaned, so its own retries can go past the cap. It
+  is tried again each time it is queued again, after each new message and
+  at each reopen, as in 0.24.2, and each try the summarizer refuses costs
+  its refused call, plus any fallback calls the ladder makes after it.
+- Under `AutobiographicalStrategy`, while the compression-quarantine alarm is
+  on, as it is by default, the paid-off sweep can clear a held chunk's record
+  once the chunk's messages change, as when a host removes one of them, or,
+  once a host presents rows (#350), takes one of them out of the window. Where
+  the sweep comes before the chunk is tried again in its new shape, the
+  chunk's other messages aren't held until that try is refused and recorded,
+  so a transition summary asked in between can carry those of them in the head
+  window, and the summarizer can refuse it for them.
+- A merge an earlier release quarantined because its request carried a held
+  chunk stays quarantined after the upgrade: a merge's record holds its group
+  while the group stands and can still merge as it is, whatever request the
+  merge would now send. `clearMergeQuarantine()` of the group's key lets it be
+  tried again, with a request that leaves the held chunk out.
+
+- A sharded `addMessage` keeps a body's shards together, as one body:
+  - It refuses a `chunkIngressMessage` decision whose `bodyGroupId` is empty
+    or not a string, before any shard is stored. With an empty id, such shards
+    didn't read as one body, so a write that failed partway removed only the
+    first of them and threw as if none stayed.
+  - An `addMessage` on the same manager made while a sharded `addMessage` of
+    its stores its shards (from an `onMessage` listener of a shard's add, or
+    a strategy hook that listener runs by presenting a shard) is refused (one
+    through another manager sharing the slot isn't: `onMessage`'s contract
+    rules it out, as the listener's to avoid), with an error that says
+    its row would land between the shards and split the body. Before, it
+    landed there, and the cleanup of a write that then failed left the
+    shards after it stored.
+  - In legacy mode the strategy hears a sharded body once every shard is
+    stored, in one `onPresented` call with every shard, as `presentRows`
+    gives a body (a strategy with only `onNewMessage` hears each shard in
+    turn then). It heard each shard from inside that shard's append, so a
+    hook of its could add a message or move the store between the shards. A
+    sharded write that fails tells it only of the shards it leaves stored
+    (`WriteLandedError`), once it has tried to remove them, in one call: on a
+    branch the write's listener moved to, once the strategy is initialized
+    there, where that branch's window holds them; where the manager's own
+    work telling it fails (the context it builds), they wait for its next
+    notification. Where the manager can't
+    tell which shards stayed (`WriteOutcomeUnknownError`), every shard the
+    window took in waits, and the strategy hears, in one call, those the
+    window's listing holds when they are delivered: at once where the store
+    reads, and at its next notification where it doesn't.
+  - A listener that moves the store's branch between shards stops the write
+    before the next shard, and `addMessage` throws `WriteLandedError` naming
+    the shards stored, which stay on the branch the write started on, with a
+    `cause` that says the branch moved (`WriteOutcomeUnknownError`, with
+    `unnamed` 1, where a shard's append threw after the move). Before, the
+    later shards landed on the other branch, and the cleanup of a write that
+    failed looked for the first shard there.
+  - A `removeMessage` or `removeMessages` on the same manager made while a
+    sharded `addMessage` of its stores its shards (from an `onMessage`
+    listener of a shard's add) is refused (one through another manager sharing
+    the slot isn't: `onMessage`'s contract rules it out), with an error that
+    says a removal then could split the body or move the rows the write
+    removes if it fails. Before, a `removeMessages` over the shards stored so
+    far was taken: the body's later shards stayed with no first shard, and a
+    write that then failed left them stored and threw as if none stayed. A
+    `removeMessage` naming a shard was already refused in 0.24.2, with the
+    store's error that a shard isn't removed alone.
+  - A `branchAt` or `branchSequenceOf` on the same manager made then (from
+    such a listener, after it presents a shard) is refused too, with an error
+    that says the cut would come before the body's later shards. Before, a
+    `branchAt` was taken, at the named message's own sequence, so the new
+    branch's record held the body only up to that message. A `fork` and a
+    `derive` on the same manager made then are refused too, before either
+    makes a branch: each cuts at the head, which holds only the shards stored
+    so far. Before, a fork moved the store, so the body's later shards landed
+    on the new branch and the branch the write started on kept only the first,
+    and a derive's child held part of the body.
+
 ## 0.24.2 — 2026-10-30
 
 ### Added

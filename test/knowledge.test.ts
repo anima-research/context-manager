@@ -273,6 +273,83 @@ describe('KnowledgeStrategy', () => {
     });
   });
 
+  describe('Phase Classification by configured tool names', () => {
+    const names = { researchToolPrefixes: ['find_'], subagentToolPrefixes: ['spawn_'], lessonToolNames: ['note_save'] };
+
+    it('classifies a message with both a subagent call and a research call as subagent', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      manager.addMessage('Claude', [
+        { type: 'tool_use', id: 'tu1', name: 'find_papers', input: {} },
+        { type: 'tool_use', id: 'tu2', name: 'spawn_reader', input: {} },
+      ]);
+      manager.addMessage('User', [
+        { type: 'tool_result', toolUseId: 'tu1', content: 'found' },
+        { type: 'tool_result', toolUseId: 'tu2', content: 'spawned' },
+      ]);
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const state = getStrategyState(strategy);
+      assert.ok(state.chunks.length > 0, 'premise: a chunk formed');
+      assert.strictEqual(state.chunks[0].phaseType, 'subagent');
+      manager.close();
+    });
+
+    it('matches lesson tool names exactly, not as prefixes', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 200, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      const call = (id: string, name: string): void => {
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name, input: {} }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Result ${id}` }]);
+      };
+      call('tu1', 'note_save');
+      manager.addMessage('Claude', [{ type: 'text', text: 'Saved. Now a draft.' }]);
+      manager.addMessage('User', [{ type: 'text', text: 'Go ahead' }]);
+      call('tu2', 'note_save_draft');
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const chunks = getStrategyState(strategy).chunks;
+      const holding = (name: string) => chunks.find((c) => c.messages.some((m: any) =>
+        m.content.some((b: any) => b.type === 'tool_use' && b.name === name)));
+      assert.strictEqual(holding('note_save')?.phaseType, 'lesson', 'premise: the configured name is a lesson');
+      assert.strictEqual(holding('note_save_draft')?.phaseType, 'synthesis');
+      manager.close();
+    });
+
+    it('by default, a lesson chunk\'s size limit is targetChunkTokens', async () => {
+      cleanup();
+      const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50, ...names });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+
+      for (let i = 1; i <= 9; i++) {
+        const id = `tu${i}`;
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name: 'note_save', input: {} }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Saved ${id} ` + 'x'.repeat(64) }]);
+      }
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage('User', [{ type: 'text', text: `Padding ${i} ${'x'.repeat(20)}` }]);
+      }
+
+      await manager.compile();
+      const lessons = getStrategyState(strategy).chunks.filter((c) => c.phaseType === 'lesson');
+      assert.deepStrictEqual(lessons.map((c) => c.messages.length), [6, 6, 6], 'each lesson chunk closes at its third call and result, the first to reach the target');
+      for (const c of lessons) {
+        assert.ok(c.tokens >= 100 && (c.tokens / 3) * 2 < 100, `premise: two calls and their results stay under the target and three reach it (${c.tokens})`);
+      }
+      manager.close();
+    });
+  });
+
   describe('Semantic Chunking', () => {
     it('should create chunk boundaries at phase transitions', async () => {
       cleanup();
@@ -325,6 +402,52 @@ describe('KnowledgeStrategy', () => {
       }
 
       manager.close();
+    });
+  });
+
+  describe('Rebuilds', () => {
+    it('after a message is removed inside a summary\'s span, later compiles serve the rest of the span as that summary, not raw', async () => {
+      cleanup();
+      let calls = 0;
+      const membrane = {
+        complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: `Summary ${++calls}` }] }),
+      };
+      const strategy = new KnowledgeStrategy({
+        targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0, mergeThreshold: 99,
+      });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+      const settle = async () => {
+        for (let i = 0; i < 100 && !manager.isReady(); i++) await manager.tick();
+        assert.ok(manager.isReady(), 'premise: the strategy settled');
+      };
+      const texts = (messages: Array<{ content: ContentBlock[] }>) => messages
+        .map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(''));
+      const raw = (messages: Array<{ content: ContentBlock[] }>) => texts(messages).filter((text) => /^Talk [0-4] /.test(text));
+      try {
+        const ids: string[] = [];
+        for (let i = 0; i < 24; i++) {
+          ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(120)}` }]));
+        }
+        await manager.compile();
+        await settle();
+        const first = manager.getSummariesInRange({ level: 1 }).find((s) => s.sourceIds.includes(ids[3]!));
+        assert.deepStrictEqual(first?.sourceIds, ids.slice(0, 5), 'premise: one summary covers messages 0 to 4');
+        const before = (await manager.compile()).messages;
+        assert.deepStrictEqual(raw(before), [], 'premise: they are served as that summary');
+        assert.ok(texts(before).includes(first!.content), 'premise: the summary is in the context');
+
+        manager.removeMessage(ids[3]!);
+        await manager.compile();
+        await settle();
+
+        for (const label of ['the compile after the strategy settles', 'the compile after that']) {
+          const { messages } = await manager.compile();
+          assert.deepStrictEqual(raw(messages), [], label);
+          assert.ok(texts(messages).includes(first!.content), `${label} carries the summary`);
+        }
+      } finally {
+        manager.close();
+      }
     });
   });
 
@@ -776,6 +899,198 @@ describe('KnowledgeStrategy', () => {
 
       manager.close();
     });
+  });
+});
+
+describe('KnowledgeStrategy defaults and options', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  const l1 = (id: string, phaseType: SummaryEntry['phaseType'], tokens: number): SummaryEntry => ({
+    id, level: 1, content: id, tokens, sourceLevel: 0, sourceIds: [id],
+    sourceRange: { first: id, last: id }, created: Date.now(), phaseType,
+  });
+  const select = (strategy: KnowledgeStrategy, summaries: SummaryEntry[], room: number) =>
+    (strategy as any).selectL1Summaries(summaries, room, room) as { selected: SummaryEntry[]; tokensUsed: number };
+  const tokensOf = (summaries: SummaryEntry[], phase: string) =>
+    summaries.filter((s) => s.phaseType === phase).reduce((sum, s) => sum + s.tokens, 0);
+  const tens = (phase: SummaryEntry['phaseType'], n: number, from = 0) =>
+    Array.from({ length: n }, (_, i) => l1(`${phase}${from + i}`, phase, 10));
+
+  function recordingMembrane() {
+    const requests: string[] = [];
+    return {
+      requests,
+      complete: async (request: any) => {
+        requests.push(request.messages.map((m: any) => m.content.map((b: any) => b.text ?? '').join('')).join('\n'));
+        return { stopReason: 'end_turn', content: [{ type: 'text', text: 'Summary' }] };
+      },
+    };
+  }
+  async function settle(manager: ContextManager): Promise<void> {
+    for (let i = 0; i < 200 && !manager.isReady(); i++) await manager.tick();
+    assert.ok(manager.isReady(), 'premise: compression finished');
+  }
+
+  it('by default, research takes at most 0.3 of the L1 room', () => {
+    const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50 });
+    const { selected } = select(strategy, tens('research', 100), 1000);
+    assert.equal(tokensOf(selected, 'research'), 300);
+  });
+
+  it('by default, synthesis that has reached its floor takes no summary that would put it past 0.7 of the L1 room', () => {
+    const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50 });
+    const { selected } = select(strategy, tens('synthesis', 100), 1000);
+    assert.equal(tokensOf(selected, 'synthesis'), 700);
+  });
+
+  it('by default, synthesis under 0.4 of the L1 room takes its next summary past the cap if it fits the room, and at 0.4 it does not', () => {
+    const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50 });
+    const under = select(strategy, [...tens('synthesis', 39), l1('big', 'synthesis', 400)], 1000);
+    assert.ok(under.selected.some((s) => s.id === 'big'), 'at 390 of 1,000, under the floor, the 400-token summary goes in');
+    const at = select(strategy, [...tens('synthesis', 40), l1('big', 'synthesis', 400)], 1000);
+    assert.equal(tokensOf(at.selected, 'synthesis'), 400, 'premise: the small summaries reach the floor');
+    assert.ok(!at.selected.some((s) => s.id === 'big'), 'at 400 of 1,000, the floor, the cap keeps it out');
+  });
+
+  it('a configured synthesis floor and cap replace the defaults', () => {
+    const strategy = new KnowledgeStrategy({
+      targetChunkTokens: 100, recentWindowTokens: 50,
+      synthesisL1BudgetFloor: 0.5, synthesisL1BudgetCap: 0.6,
+    });
+    const under = select(strategy, [...tens('synthesis', 49), l1('big', 'synthesis', 300)], 1000);
+    assert.ok(under.selected.some((s) => s.id === 'big'), 'at 490 of 1,000, under the 0.5 floor, the 300-token summary goes in');
+    const at = select(strategy, [...tens('synthesis', 50), l1('big', 'synthesis', 300)], 1000);
+    assert.equal(tokensOf(at.selected, 'synthesis'), 500, 'premise: the small summaries reach the floor');
+    assert.ok(!at.selected.some((s) => s.id === 'big'), 'at 500 of 1,000, the floor, the 0.6 cap keeps it out');
+    assert.equal(tokensOf(select(strategy, tens('synthesis', 100), 1000).selected, 'synthesis'), 600, 'past the floor, selection stops at the 0.6 cap');
+  });
+
+  it('research selection stops at the first summary past the research cap, keeping later ones out', () => {
+    const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50 });
+    assert.deepEqual(select(strategy, [l1('r1', 'research', 100)], 1000).selected.map((s) => s.id), ['r1'], 'premise: the 100-token summary alone is selected');
+    const { selected } = select(strategy, [l1('r0', 'research', 400), l1('r1', 'research', 100)], 1000);
+    assert.deepEqual(selected.map((s) => s.id), []);
+  });
+
+  it('reports the tokens of the summaries it selects', () => {
+    const strategy = new KnowledgeStrategy({ targetChunkTokens: 100, recentWindowTokens: 50 });
+    const summaries = [l1('s0', 'synthesis', 120), l1('l0', 'lesson', 80), l1('r0', 'research', 50)];
+    const { selected, tokensUsed } = select(strategy, summaries, 1000);
+    assert.equal(selected.length, 3, 'premise: every summary fits');
+    assert.equal(tokensUsed, 250);
+  });
+
+  it('a chunk that opens the store with tool results, before any call, gets the dialogue instruction', async () => {
+    cleanup();
+    const membrane = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    try {
+      manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'before-1', content: 'Earlier output ' + 'x'.repeat(120) }]);
+      manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'before-2', content: 'More earlier output ' + 'x'.repeat(120) }]);
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage(i % 2 ? 'User' : 'Claude', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(60)}` }]);
+      }
+      await manager.compile();
+      await settle(manager);
+      assert.ok(membrane.requests.length > 0, 'premise: compression requests were sent');
+      assert.ok(membrane.requests[0].includes('Capture the reasoning and conclusions'),
+        "the store's first chunk, which holds the results, gets the dialogue instruction");
+      assert.ok(!membrane.requests.some((r) => r.includes('Summarize the research performed')),
+        'and no request gets the research instruction: nothing in the store is a research call');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('a research chunk closes once it reaches maxResearchChunkTokens, when set', async () => {
+    cleanup();
+    const membrane = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0,
+      maxResearchChunkTokens: 50, mergeThreshold: 99,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    manager.setToolDefinitions([{ name: 'mcpl:search', description: 'search', inputSchema: { type: 'object' } }] as never);
+    try {
+      for (let i = 0; i < 6; i++) {
+        manager.addMessage('Claude', [{ type: 'tool_use', id: `tu${i}`, name: 'mcpl:search', input: { q: `query ${i}` } }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: `tu${i}`, content: `Result ${i} ` + 'x'.repeat(200) }]);
+      }
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage(i % 2 ? 'User' : 'Claude', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(60)}` }]);
+      }
+      await manager.compile();
+      await settle(manager);
+      const all = manager.getAllMessages();
+      const position = new Map(all.map((m, i) => [m.id, i]));
+      const research = manager.getSummariesInRange({ level: 1 })
+        .filter((s) => position.get(s.firstMessageId)! < 12);
+      assert.ok(research.length > 0, 'premise: the research calls were summarized');
+      for (const s of research) {
+        const span = position.get(s.lastMessageId)! - position.get(s.firstMessageId)! + 1;
+        assert.equal(span, 2, `each call and its result pass the 50 tokens set, so each research summary covers one of them (${s.id} covers ${span})`);
+      }
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('a chunk with too little text for a summary call gets a stub summary that carries the chunk\'s phase', async () => {
+    cleanup();
+    const membrane = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      targetChunkTokens: 100, recentWindowTokens: 50, compressionModel: 'test-model', l1HoldbackChunks: 0, mergeThreshold: 99,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    manager.setToolDefinitions([{ name: 'mcpl:search', description: 'search', inputSchema: { type: 'object' } }] as never);
+    try {
+      const call = (id: string) => {
+        manager.addMessage('Claude', [{ type: 'tool_use', id, name: 'mcpl:search', input: { q: id } }]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: id, content: `Result ${id} ` + 'x'.repeat(200) }]);
+      };
+      call('tu1');
+      manager.addMessage('Claude', [{ type: 'text', text: 'ok' }]);
+      manager.addMessage('User', [{ type: 'text', text: '.' }]);
+      call('tu2');
+      for (let i = 0; i < 8; i++) {
+        manager.addMessage(i % 2 ? 'User' : 'Claude', [{ type: 'text', text: `Talk ${i} ${'y'.repeat(60)}` }]);
+      }
+      await manager.compile();
+      await settle(manager);
+      const stubs = manager.getSummariesInRange({ level: 1 }).filter((s) => s.content.startsWith('(A quiet stretch'));
+      assert.equal(stubs.length, 1, 'premise: the two near-empty messages became one stub summary');
+      assert.equal(manager.getSummary(stubs[0]!.id)?.phaseType, 'synthesis');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('under adaptive resolution, a portion of a large message is summarized with the reading instruction', async () => {
+    cleanup();
+    const membrane = recordingMembrane();
+    const strategy = new KnowledgeStrategy({
+      adaptiveResolution: true, targetChunkTokens: 60, headWindowTokens: 0, recentWindowTokens: 0,
+      compressionModel: 'test-model', autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, membrane: membrane as any });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'Here is the paper I mentioned.' }]);
+      const paper = Array.from({ length: 4 }, (_, i) => `Paragraph ${i}. ` + 'The argument continues with evidence and claims. '.repeat(4)).join('\n\n');
+      manager.addMessage('User', [{ type: 'text', text: paper }]);
+      manager.addMessage('Claude', [{ type: 'text', text: 'Thanks, reading it now.' }]);
+      assert.ok(manager.getAllMessages().some((m) => m.bodyGroupId), 'premise: the paper is stored in shards');
+      await manager.compile();
+      await settle(manager);
+      assert.ok(membrane.requests.length > 0, 'premise: compression requests were sent');
+      assert.ok(membrane.requests.some((r) => r.includes('You have just been reading a substantial body of text')),
+        'a shard of the paper is summarized as reading');
+    } finally {
+      manager.close();
+    }
   });
 });
 

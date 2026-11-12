@@ -2345,3 +2345,69 @@ test('joint latent demand falls back to the individual ranking when the joint fo
   assert.equal(joint.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves + 1, 'the joint attempt, then the individual solves');
   assert.equal(build('joint', 10_000).strategy.lastTimings?.demandSolves, 1, 'with room, the set is measured once');
 });
+
+// Hysteresis holds the presented layout only where every leaf the forest still
+// holds is presented as the candidate would render it: at its level and with
+// that level's representation.
+const OVER_HIGH = { budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 1_000, cacheLambda: 0, continuityLambda: 0 };
+
+test('a presented leaf the forest no longer holds is skipped, so the rest of the presentation is still held', () => {
+  const { inputs } = fixture();
+  const presentation = rawPresentation(inputs);
+  const best = new ExactKvUnifiedPolicySolver(inputs).solve({ maxTokens: 400, policy: OVER_HIGH });
+  assert.equal(best.feasible, true);
+  if (!best.feasible) return;
+  assert.ok(best.selected.renderedTokens < 360, 'premise: without hysteresis a fold scores best');
+  const leaves = new Map(presentation.leaves);
+  leaves.set('removed-message', { repHash: 'summary:gone', level: 1, lastChangedSeq: 0 });
+  const held = new ExactKvUnifiedPolicySolver(inputs).solve({
+    maxTokens: 400, presentation: { ...presentation, leaves }, adoptEpsilon: 1_000_000_000, policy: OVER_HIGH,
+  });
+  assert.equal(held.feasible, true);
+  if (!held.feasible) return;
+  assert.ok(isOnlyFolded(held.selected, []), 'the raw presentation is held');
+});
+
+test('a leaf presented at the same level with another representation is not the same presentation', () => {
+  const { inputs } = fixture();
+  const presentation = rawPresentation(inputs);
+  const leaves = new Map(presentation.leaves);
+  for (const id of ['c-0000', 'c-0001']) leaves.set(id, { repHash: 'summary:rewritten', level: 1, lastChangedSeq: 0 });
+  const result = new ExactKvUnifiedPolicySolver(inputs).solve({
+    maxTokens: 400, presentation: { ...presentation, leaves }, adoptEpsilon: 1_000_000_000,
+    policy: { budgetLowRatio: 0, budgetHighRatio: 1, budgetUnderLambda: 0, budgetOverLambda: 0, cacheLambda: 0, continuityLambda: 0 },
+  });
+  assert.equal(result.feasible, true);
+  if (!result.feasible) return;
+  assert.ok(result.candidates.some((candidate) => candidate.frontier.size === inputs.chunks.length && isOnlyFolded(candidate, ['c-0000', 'c-0001'])), 'premise: the presented levels are a candidate');
+  assert.equal(result.selected.frontier.size, inputs.chunks.length, 'premise: the selection names every leaf');
+  assert.ok(isOnlyFolded(result.selected, []), 'the best cut, all raw, is selected rather than the stale presentation');
+  const forest = new CanonicalSummaryForest(inputs);
+  const current = (id: string) => `summary:${forest.leaf(id)!.summaryIds.find((summary) => forest.summary(summary)!.level === 1)}`;
+  const held = (repHash: (id: string) => string) => Object.fromEntries((['default', 'dag'] as const).map((engine) => {
+    const shown = new Map(presentation.leaves);
+    for (const id of ['c-0000', 'c-0001']) shown.set(id, { repHash: repHash(id), level: 1, lastChangedSeq: 0 });
+    const frontier = new Map(new KvUnifiedStrategy({
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      ...(engine === 'dag' ? { engine } : {}),
+      presentation: { ...presentation, leaves: shown }, adoptEpsilon: 1_000_000_000,
+      policy: { budgetLowRatio: 0, budgetHighRatio: 1, budgetUnderLambda: 0, budgetOverLambda: 0, cacheLambda: 0, continuityLambda: 0 },
+    }).solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 }).frontier);
+    return [engine, inputs.chunks.every((chunk) => frontier.get(chunk.id) === (chunk.id === 'c-0000' || chunk.id === 'c-0001' ? 1 : 0))];
+  }));
+  assert.deepEqual(held(current), { default: true, dag: true }, 'premise: on each engine the presentation at its own representations is held');
+  assert.deepEqual(held(() => 'summary:rewritten'), { default: false, dag: false }, "on each engine the stale presentation isn't held");
+});
+
+test("a pool's best is its lowest score", () => {
+  const { inputs } = fixture();
+  const result = new ExactKvUnifiedPolicySolver(inputs).solve({ maxTokens: 400, policy: OVER_HIGH });
+  assert.equal(result.feasible, true);
+  if (!result.feasible) return;
+  const scores = result.candidates.map((candidate) => candidate.score);
+  assert.ok(Math.max(...scores) > Math.min(...scores), 'premise: the pool holds different scores');
+  assert.ok(result.bestUnder, 'premise: the pool carries its scorer');
+  const best = result.bestUnder(result.cacheFloor, result.continuityFloor);
+  assert.equal(best.score, Math.min(...scores));
+  assert.deepEqual(best.frontier, result.selected.frontier, 'the cut the solve selected');
+});

@@ -695,8 +695,14 @@ export class MessageStore {
     // Single atomic op: chronicle peeks the next record id+sequence under its
     // write lock, splices them into the payload as `id` and `sequence`, and
     // writes one record. The reconstructed state sees a fully-populated
-    // StoredMessageInternal, and `branchAt(messageId)` forks at this
-    // message's own sequence — exactly the post-fork-visible point.
+    // StoredMessageInternal, and a branch cut at this message's own
+    // sequence holds it: exactly the post-fork-visible point. That is where
+    // `branchAt(messageId)` forks in legacy mode and for a row the window
+    // doesn't hold. Once a host presents rows, it forks at the write that
+    // presented a row the window holds, and at the last shard of a body the
+    // write-down entered, and never before its body's last shard's own
+    // sequence, so the new branch's record holds the whole body (see
+    // ContextManager.branchAt).
     //
     // Whether this instance's caches reflected every write to the slot
     // BEFORE this append, including writes made through other handles to
@@ -819,10 +825,12 @@ export class MessageStore {
    * message a `tool_use` that a change follows before the call's results.
    * The API takes a system message with content only after a user turn, or an
    * assistant turn ending in a server tool result, so membrane sends a change
-   * stored after a call after the call's result anyway, and one written after
-   * the result goes out the same. Stored between them, a change parts them:
-   * the autobiographical and Knowledge strategies keep a change raw and close
-   * a chunk at it, so the call and its result would be folded into different
+   * of tools or system text stored after a call after the call's result
+   * anyway, and one written after the result goes out the same. An
+   * effort-only change, which membrane sends at its place, is refused
+   * there as well. Stored between them, a change parts them: the
+   * autobiographical and Knowledge strategies keep a change raw and close a
+   * chunk at it, so the call and its result would be folded into different
    * summaries, and a compile's pairing repair (enforceToolPairing) would drop
    * the result once the call was folded.
    *
@@ -887,7 +895,7 @@ export class MessageStore {
           if (open.length > 0) {
             throw new Error(
               `${what}: a system change can't go between a tool call and its result, and message ${open[0]![1]} holds a tool_use ` +
-                `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.`,
+                `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.`,
             );
           }
         } else if (changeBetween) {

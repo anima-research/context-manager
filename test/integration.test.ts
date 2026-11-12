@@ -1255,8 +1255,11 @@ describe('ContextManager', () => {
       manager.addMessage('assistant', [{ type: 'text', text: 'Reply to first message' }]);
       manager.addMessage('user', [{ type: 'text', text: 'Second user message' }]);
       manager.addMessage('assistant', [{ type: 'text', text: 'Reply to second message' }]);
+      manager.addMessage('user', [{ type: 'text', text: `Third user message ${'x'.repeat(22_000)}` }]);
+      manager.addMessage('assistant', [{ type: 'text', text: `Reply to third message ${'x'.repeat(22_000)}` }]);
 
       const { messages } = await manager.compile();
+      assert.strictEqual(messages.length, 6, 'All six messages should be sent');
 
       // At least one message should have cacheBreakpoint
       const markedMessages = messages.filter(m => m.cacheBreakpoint);
@@ -1264,6 +1267,7 @@ describe('ContextManager', () => {
 
       // Exactly one cache breakpoint should be placed (at the head window boundary)
       assert.strictEqual(markedMessages.length, 1, 'Exactly one cacheBreakpoint should be placed');
+      assert.strictEqual(messages.indexOf(markedMessages[0]!), 3, 'The cacheBreakpoint should be on the last head window message');
     });
 
     it('should place cacheBreakpoint even when all messages fit in head window', async () => {

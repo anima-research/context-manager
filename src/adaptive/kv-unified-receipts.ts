@@ -174,7 +174,10 @@ export class KvUnifiedReceiptChain {
    * turned every such transient into a second, self-inflicted failure of the
    * retry ("… is still in flight", devops agent 2026-09-16). The superseded
    * id is returned so the strategy can log it; a late accept/fail for it is a
-   * duplicate no-op, never a state change. */
+   * duplicate no-op, never a state change. The one duplicate that changes
+   * state is an accept or fail carrying the in-flight submission's own id,
+   * begun again after that id settled (outside the unique-id contract): it
+   * ends that flight. */
   begin(submission: PendingPresentationSubmission): { superseded: string | null } {
     if (!submission.submissionId) throw new Error('kv-unified submissionId must be non-empty');
     let superseded: string | null = null;
@@ -193,7 +196,11 @@ export class KvUnifiedReceiptChain {
     cache: ProviderCacheReference | null,
     wireReceipt?: Omit<ObservedCacheWireReceipt, 'acceptedAt'>,
   ): { presentationAdvanced: boolean; duplicate: boolean } {
-    if (this.settled.has(submissionId)) return { presentationAdvanced: false, duplicate: true };
+    if (this.settled.has(submissionId)) {
+      // A duplicate carrying the in-flight id ends that flight (begin).
+      if (this.pending?.submissionId === submissionId) this.pending = null;
+      return { presentationAdvanced: false, duplicate: true };
+    }
     const pending = this.requirePending(submissionId);
     this.pending = null;
     this.markSettled(submissionId);
@@ -223,7 +230,10 @@ export class KvUnifiedReceiptChain {
   }
 
   fail(submissionId: string): void {
-    if (this.settled.has(submissionId)) return;
+    if (this.settled.has(submissionId)) {
+      if (this.pending?.submissionId === submissionId) this.pending = null;
+      return;
+    }
     this.requirePending(submissionId);
     this.pending = null;
     this.markSettled(submissionId);

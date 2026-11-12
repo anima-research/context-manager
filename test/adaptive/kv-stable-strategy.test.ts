@@ -61,6 +61,41 @@ test('kv-stable strategy: picker walks to exactly the planned frontier and fits 
   assert.equal(renderLayout(inputs, tree, result.finalResolutions).totalTokens, result.finalTokens);
 });
 
+test('kv-stable strategy: a locked chunk with a pin-max-level is held at its cap, below its carried level', () => {
+  const store = (locked: boolean) => {
+    const ch = buildChronicleWithChain({ chunkCount: 48, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+    for (const c of ch.chunks.slice(0, 36)) c.currentResolution = 2;
+    ch.chunks[5].pinMaxLevel = 1; ch.chunks[5].lockedByAgent = locked;
+    return ch;
+  };
+  const locked = store(true);
+  const result = new Picker(new KvStableStrategy({})).run(inputsOf(locked), BUDGET(100_000));
+  assert.equal(result.finalResolutions.get(locked.chunks[5].id), 1);
+  const unlocked = store(false);
+  const control = new Picker(new KvStableStrategy({})).run(inputsOf(unlocked), BUDGET(100_000));
+  assert.equal(control.finalResolutions.get(unlocked.chunks[5].id), 0, 'unlocked, the same chunk un-folds under this budget');
+});
+
+test("kv-stable strategy: a pin-at-level on a chunk holds a locked sibling under its node at the pin's level, whether it was carried raw or deeper", () => {
+  for (const carried of [0, 2]) {
+    const ch = buildChronicleWithChain({ chunkCount: 48, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+    ch.chunks[2].pinLevel = 1;
+    ch.chunks[4].lockedByAgent = true; ch.chunks[4].currentResolution = carried;
+    const result = new Picker(new KvStableStrategy({})).run(inputsOf(ch), BUDGET(100_000));
+    assert.equal(result.finalResolutions.get(ch.chunks[4].id), 1, `carried at ${carried}`);
+  }
+});
+
+test("kv-stable strategy: a locked chunk's own pin-at-level holds it at the pin's level, whether it was carried raw or deeper", () => {
+  for (const carried of [0, 2]) {
+    const ch = buildChronicleWithChain({ chunkCount: 48, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+    ch.chunks[4].pinLevel = 1;
+    ch.chunks[4].lockedByAgent = true; ch.chunks[4].currentResolution = carried;
+    const result = new Picker(new KvStableStrategy({})).run(inputsOf(ch), BUDGET(100_000));
+    assert.equal(result.finalResolutions.get(ch.chunks[4].id), 1, `carried at ${carried}`);
+  }
+});
+
 test('kv-stable strategy: converges to null and leaves a small budget untouched', () => {
   const ch = buildChronicleWithChain({ chunkCount: 8, tokensPerChunk: 500, mergeThreshold: 6, recallPairTokens: 200 });
   const inputs = inputsOf(ch); // 4k raw
@@ -68,6 +103,16 @@ test('kv-stable strategy: converges to null and leaves a small budget untouched'
   for (const c of inputs.chunks) {
     assert.equal(result.finalResolutions.get(c.id), 0, 'nothing folded under a generous budget');
   }
+});
+
+test('kv-stable strategy: a goal total below the budget is where it folds, so a store between the two folds under the goal', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 8, tokensPerChunk: 500, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const goal = { goalTotalTokens: 2_000, goalTargetTokens: 1_800 };
+  const result = new Picker(new KvStableStrategy(goal)).run(inputs, BUDGET(8_000));
+  assert.ok(result.finalTokens <= goal.goalTotalTokens, `folds under the goal: ${result.finalTokens} ≤ ${goal.goalTotalTokens}`);
+  const targetOnly = new Picker(new KvStableStrategy({ goalTargetTokens: goal.goalTargetTokens })).run(inputs, BUDGET(8_000));
+  assert.ok([...targetOnly.finalResolutions.values()].every((level) => level === 0), 'nothing folds under the budget without a goal total');
 });
 
 test('kv-stable strategy: pinned chunks stay raw, locked chunks keep their resolution', () => {

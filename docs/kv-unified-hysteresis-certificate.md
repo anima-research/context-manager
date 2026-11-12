@@ -22,6 +22,20 @@ The policy retains it when `S <= bestScore + epsilon`. Cache and continuity
 penalties are nonnegative, so any lower bound `L <= min(F + B(T))` also bounds
 `bestScore`. Thus `S - L <= epsilon` proves the policy's selection.
 
+Where the policy prices the rewrite linearly (`rewriteLambda`), a cut
+outside the carried family pays at least the rewrite of the tail the
+receipt already held, and the proof counts it: `S - (L + rewriteFloor) <=
+epsilon`. Such a cut puts some old leaf at another level, so a unit of the
+middle differs from the receipt's (the carried family, whose churn is
+zero, emits the receipt's units to the end); its matched prefix ends
+inside the middle, no extension unit is in a matched prefix, and so every
+old tail unit comes after the last marker it keeps. `rewriteFloor` is
+`rewriteLambda` times that tail's tokens times the write price less the
+read price, over `cacheScale`; it is zero without `rewriteLambda` and
+where the receipt doesn't apply. The result's `certificate.rewriteFloor`
+reports it. A change penalty (`KvUnifiedOptions.changePenalty`) reaches
+the proof as part of `epsilon`.
+
 For the existing convex, two-sided budget penalty, every tangent is a global
 lower bound:
 

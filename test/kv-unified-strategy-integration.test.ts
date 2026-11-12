@@ -117,6 +117,25 @@ test('a live solve past the label ceiling compiles anyway, warns once and marks 
   for (const line of planLines) assert.ok(line.includes(' ceiling=live'), line);
 });
 
+test('discarding the rendering frontier forgets the receipt chain, in memory as well as in the store', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  const persisted = selected as unknown as { store: { getStateJson(id: string): unknown }; kvUnifiedReceiptStateId: string };
+  const chain = () => {
+    const held = receipts(selected);
+    return [held.head, held.leaves.size, held.cache, persisted.store.getStateJson(persisted.kvUnifiedReceiptStateId)] as const;
+  };
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', pendingOf(selected).markers) });
+  const [head, leaves, cache, stored] = chain();
+  assert.ok(head !== null && leaves > 0 && cache !== null && stored !== null, 'premise: a chain to forget');
+  selected.discardRenderingFrontier();
+  assert.deepEqual(chain(), [null, 0, null, null]);
+  manager.close();
+});
+
 test('kv-unified presentation commits only after acceptance and survives restart', async () => {
   const first = strategy();
   const manager = await ContextManager.open({ path: STORE, strategy: first });
@@ -169,6 +188,36 @@ test('kv-unified failed submission clears single flight without committing', asy
   assert.equal(receipts(selected).head, null);
   assert.equal(receipts(selected).inFlightSubmissionId, null);
   manager.close();
+});
+
+test('a receipt hash covers which leaves changed, so receipts whose changes differ only in the leaves they name differ in hash', async () => {
+  const secondReceipt = async (removed: 0 | 1) => {
+    rmSync(STORE, { recursive: true, force: true });
+    const selected = strategy();
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    const ids = [
+      manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]),
+      manager.addMessage('assistant', [{ type: 'text', text: 'hello again' }]),
+    ];
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1 });
+    manager.removeMessage(ids[removed]);
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    selected.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout2' });
+    selected.reportKvUnifiedAccepted({ submissionId: 's2', acceptedAt: 2 });
+    const head = receipts(selected).head;
+    manager.close();
+    assert.ok(head);
+    return head;
+  };
+  const { receiptHash: hashA, changes: changesA, ...restA } = await secondReceipt(0);
+  const { receiptHash: hashB, changes: changesB, ...restB } = await secondReceipt(1);
+  assert.equal(restA.sequence, 2);
+  assert.deepEqual(restA, restB);
+  assert.deepEqual(changesA.map((c) => c.value), changesB.map((c) => c.value));
+  assert.notDeepEqual(changesA.map((c) => c.leafId), changesB.map((c) => c.leafId));
+  assert.notEqual(hashA, hashB);
 });
 
 /** The pending compile a begun submission carries, as its acceptance will read it. */
@@ -457,7 +506,7 @@ test('kv-unified fails closed when the gap-bearing policy is omitted', async () 
 test('kv-unified continuity relaxation is audited, expiring, and fail-closed', () => {
   const selected = strategy() as unknown as {
     kvUnifiedContinuityMultiplier: (value?: {
-      reason: 'surgery' | 'budget-transition' | 'infrastructure';
+      reason: string;
       multiplier: number;
       expiresAt: number;
     }) => number;
@@ -477,6 +526,21 @@ test('kv-unified continuity relaxation is audited, expiring, and fail-closed', (
     reason: 'infrastructure',
     multiplier: Number.NaN,
     expiresAt: Date.now() + 60_000,
+  }), 1);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'operator',
+    multiplier: 0.25,
+    expiresAt: Date.now() + 60_000,
+  }), 1);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'surgery',
+    multiplier: 1.5,
+    expiresAt: Date.now() + 60_000,
+  }), 1);
+  assert.equal(selected.kvUnifiedContinuityMultiplier({
+    reason: 'surgery',
+    multiplier: 0.25,
+    expiresAt: Number.POSITIVE_INFINITY,
   }), 1);
 });
 
@@ -940,6 +1004,8 @@ const PVA_OPENING =
  * the line names, which follows its fields and the note (#239).
  */
 const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)? ns=default$`;
+// The floor beside the hard budget, and the queued relief (#415).
+const PVA_FLOOR = String.raw` floor=\d+ hardBudget=\d+ queuedRelief=\d+`;
 
 test('a kv-stable compile after a preview that solved with kv-unified logs no solveMs', async () => {
   // buildPicker's kv-stable branch leaves _lastKvUnified as the preview's pick
@@ -953,9 +1019,9 @@ test('a kv-stable compile after a preview that solved with kv-unified logs no so
     manager.close();
   }, ['[picker-config-drift]']);
   assert.equal(lines.length, 2, `one line for each compile: ${JSON.stringify(lines)}`);
-  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+` + PVA_FLOOR + ' dryRun=true' + PVA_OVERRUN),
     'premise: the preview solved with kv-unified');
-  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_OVERRUN), 'the live kv-stable compile');
+  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_FLOOR + PVA_OVERRUN), 'the live kv-stable compile');
 });
 
 test('compileMs spans the select from its start, chunk rebuild included, and no more than the compile call', async () => {
@@ -993,7 +1059,7 @@ test('a preview marks its plan-vs-actual line and its own stats dryRun, and a dr
   });
   assert.equal(preview!.stats?.planVsActual?.dryRun, true, "the preview's own stats are marked");
   assert.equal(lines.length, 3, `one line for each compile: ${JSON.stringify(lines)}`);
-  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+` + PVA_FLOOR + ' dryRun=true' + PVA_OVERRUN),
     "the preview's line");
 });
 
@@ -1085,4 +1151,163 @@ test('a dry select logs no continuity-relaxation line, and a committing compile 
     console.error = error;
     console.warn = warn;
   }
+});
+
+const BUDGET = { maxTokens: 10_000, reserveForResponse: 0 };
+const PREFIX = { kvUnifiedImmutablePrefixHash: 'immutable-v1' };
+const NO_DRAFT = /No kv-unified presentation draft is available for submission/;
+
+function receiptStore(selected: AutobiographicalStrategy): { get(): unknown; set(value: unknown): void } {
+  const inner = selected as unknown as {
+    store: { getStateJson(id: string): unknown; setStateJson(id: string, value: unknown): void };
+    kvUnifiedReceiptStateId: string;
+  };
+  return {
+    get: () => inner.store.getStateJson(inner.kvUnifiedReceiptStateId),
+    set: (value) => inner.store.setStateJson(inner.kvUnifiedReceiptStateId, value),
+  };
+}
+
+async function acceptedStore(): Promise<{ write(value: unknown): void; written(): unknown }> {
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile(BUDGET, undefined, PREFIX);
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  first.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', pendingOf(first).markers) });
+  assert.equal(receipts(first).head?.sequence, 1, 'premise: the presentation was accepted');
+  const state = receiptStore(first);
+  return {
+    written: () => state.get(),
+    write: (value) => {
+      state.set(value);
+      manager.close();
+    },
+  };
+}
+
+test('a submission with an empty id is refused', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile(BUDGET, undefined, PREFIX);
+  assert.throws(
+    () => selected.beginKvUnifiedSubmission({ submissionId: '', requestHash: 'wire1', layoutHash: 'layout1' }),
+    /submissionId must be non-empty/,
+  );
+  manager.close();
+});
+
+test("a draft compiled on one branch can't be submitted after the strategy is initialized for another", async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile(BUDGET, undefined, PREFIX);
+  assert.ok((selected as unknown as { kvUnifiedDraft: unknown }).kvUnifiedDraft, 'premise: the compile left a draft');
+  await manager.fork('side');
+  assert.throws(() => selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' }), NO_DRAFT);
+  manager.close();
+});
+
+test('a presentation compiled with no immutable prefix hash keeps no cache reference when accepted', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile(BUDGET, undefined, PREFIX);
+  selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', pendingOf(selected).markers) });
+  assert.notEqual(receipts(selected).cache, null, 'premise: a presentation compiled with the prefix hash keeps a cache reference');
+  manager.addMessage('assistant', [{ type: 'text', text: 'and again' }]);
+  await manager.compile(BUDGET);
+  selected.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout2' });
+  selected.reportKvUnifiedAccepted({ submissionId: 's2', acceptedAt: 2, wireReceipt: wireReceiptFor('wire2', pendingOf(selected).markers) });
+  assert.equal(receipts(selected).head?.sequence, 2, 'premise: the presentation was accepted');
+  assert.equal(receipts(selected).cache, null);
+  manager.close();
+});
+
+test('kv-unified with no kvUnified configuration is refused by name', async () => {
+  const unconfigured = new AutobiographicalStrategy({
+    adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 100,
+  });
+  const manager = await ContextManager.open({ path: STORE, strategy: unconfigured });
+  manager.addMessage('user', [{ type: 'text', text: 'fail closed' }]);
+  await assert.rejects(manager.compile(BUDGET), /requires a complete kvUnified configuration; live defaults are forbidden/);
+  manager.close();
+});
+
+test('a persisted receipt in the current format whose head has no string layout hash is refused when the store opens', async () => {
+  const stored = await acceptedStore();
+  const state = stored.written() as { head: Record<string, unknown> };
+  assert.equal(typeof state.head.layoutHash, 'string', 'premise: the head as written names its layout hash');
+  stored.write({ ...state, head: { ...state.head, layoutHash: 42 } });
+  await assert.rejects(ContextManager.open({ path: STORE, strategy: strategy() }), /malformed head receipt/);
+});
+
+test('a persisted receipt state that is not an object opens as an empty chain', async () => {
+  for (const value of ['not a receipt', 7]) {
+    const first = strategy();
+    const manager = await ContextManager.open({ path: STORE, strategy: first });
+    receiptStore(first).set(value);
+    manager.close();
+    const second = strategy();
+    const reopened = await ContextManager.open({ path: STORE, strategy: second });
+    assert.deepEqual(receiptStore(second).get(), value, `premise: the reopened store holds ${JSON.stringify(value)}`);
+    assert.deepEqual(receipts(second).snapshot(), receipts(strategy()).snapshot(), `${JSON.stringify(value)} opens as a new chain`);
+    reopened.close();
+    rmSync(STORE, { recursive: true, force: true });
+  }
+});
+
+async function latentDemandOf(overrides: Record<string, unknown> = {}): Promise<{ mergeThreshold?: number; fallbackRecallTokens?: number; maxCandidates?: number }> {
+  const selected = strategy(overrides);
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+  await manager.compile(BUDGET);
+  const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: Record<string, number> } } })._lastKvUnified;
+  manager.close();
+  rmSync(STORE, { recursive: true, force: true });
+  return solver.options.latentDemand ?? {};
+}
+
+test("latent demand's settings the recipe leaves unset: merge threshold 6, fallback recall cost the summary target plus 20, and 16 candidates", async () => {
+  const defaults = await latentDemandOf();
+  assert.equal(defaults.mergeThreshold, 6);
+  assert.equal(defaults.fallbackRecallTokens, 2_020);
+  assert.equal(defaults.maxCandidates, 16);
+  const flat = await latentDemandOf({ hierarchical: false });
+  assert.equal(flat.mergeThreshold, 6);
+  assert.equal(flat.fallbackRecallTokens, 2_020);
+  assert.equal((await latentDemandOf({ summaryTargetTokens: 1_000 })).fallbackRecallTokens, 1_020);
+});
+
+test("each leaf's presentation count since it last changed survives the receipt being written and read back", async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  const say = (n: number) => {
+    for (let i = 0; i < n; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ${'words '.repeat(40)}` }]);
+  };
+  const present = async (id: string) => {
+    await manager.compile(BUDGET, undefined, PREFIX);
+    selected.beginKvUnifiedSubmission({ submissionId: id, requestHash: `wire-${id}`, layoutHash: `layout-${id}` });
+    selected.reportKvUnifiedAccepted({ submissionId: id, acceptedAt: 1, wireReceipt: wireReceiptFor(`wire-${id}`, pendingOf(selected).markers) });
+  };
+  say(6);
+  await present('s1');
+  say(6);
+  await present('s2');
+  const handed = async (using: AutobiographicalStrategy, compiling: ContextManager) => {
+    await compiling.compile(BUDGET, undefined, PREFIX);
+    const { presentation } = (using as unknown as { _lastKvUnified: { options: { presentation: { currentSeq: number; leaves: ReadonlyMap<string, unknown> } } } })._lastKvUnified.options;
+    return { currentSeq: presentation.currentSeq, leaves: new Map(presentation.leaves) };
+  };
+  const before = await handed(selected, manager);
+  assert.equal(before.currentSeq, 2, 'two accepted presentations advance the sequence the solver is handed');
+  assert.ok(new Set([...before.leaves.values()].map((leaf) => (leaf as { lastChangedSeq: number }).lastChangedSeq)).size > 1,
+    'premise: leaves changed at different presentations');
+  manager.close();
+  const second = strategy();
+  const reopened = await ContextManager.open({ path: STORE, strategy: second });
+  assert.deepEqual(await handed(second, reopened), before);
+  reopened.close();
 });

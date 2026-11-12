@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { SummaryEntry } from '../src/types/index.js';
 
 const stores: string[] = [];
 
@@ -162,5 +163,61 @@ describe('ContextManager branch lifecycle regressions', () => {
     assert.deepEqual(stored(), [], 'premise: the sweep runs and persists when its branch is current');
 
     manager.close();
+  });
+});
+
+describe('AutobiographicalStrategy branch generations', () => {
+  const options = { compressionModel: 'mock', autoTickOnNewMessage: false } as const;
+
+  class SeededStrategy extends AutobiographicalStrategy {
+    seedL1(text: string, sourceIds: string[]): string {
+      const entry: SummaryEntry = {
+        id: `L1-${this.nextSummaryIdCounter()}`,
+        level: 1,
+        content: text,
+        tokens: Math.ceil(text.length / 4),
+        sourceLevel: 0,
+        sourceIds,
+        sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! },
+        created: Date.now(),
+      };
+      this.pushSummary(entry);
+      return entry.id;
+    }
+  }
+
+  it('a switch to the branch already current advances its generation, so a strategy another manager loaded before it refuses', async () => {
+    const first = await ContextManager.open({ path: storePath(), strategy: new AutobiographicalStrategy(options) });
+    const other = new AutobiographicalStrategy(options);
+    const second = await ContextManager.open({
+      store: first.getStore(),
+      namespace: 'second',
+      strategy: other,
+    });
+    try {
+      assert.strictEqual(other.getSummary('none'), null, 'premise: loaded for the current generation');
+      await first.switchBranch(first.currentBranch().name);
+      assert.throws(() => other.getSummary('none'), /requires reinitialization for the current branch generation/);
+    } finally {
+      second.close();
+      first.close();
+    }
+  });
+
+  it('refuses an entrypoint while the initializer for the current generation runs, and keeps what that initializer loaded', async () => {
+    const strategy = new SeededStrategy(options);
+    const manager = await ContextManager.open({ path: storePath(), strategy });
+    try {
+      const ids = ['a', 'b', 'c', 'd'].map((text, index) =>
+        manager.addMessage(index % 2 === 0 ? 'user' : 'assistant', content(text)),
+      );
+      const summary = strategy.seedL1('Four short turns.', ids);
+      const switching = manager.switchBranch(manager.currentBranch().name);
+      assert.throws(() => strategy.getSummary(summary), /requires reinitialization for the current branch generation/);
+      await switching;
+      assert.strictEqual(manager.getSummary(summary)?.id, summary);
+    } finally {
+      manager.close();
+    }
   });
 });
