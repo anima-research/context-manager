@@ -130,6 +130,12 @@ interface ContextManagerBaseConfig {
   strategy?: ContextStrategy;
   /** Membrane instance for compression strategies */
   membrane?: Membrane;
+  /**
+   * Membrane for memory-writing calls only (see
+   * StrategyContext.compressionMembrane), so they can use another provider or
+   * credential than `membrane`. Unset: they use `membrane`.
+   */
+  compressionMembrane?: Membrane;
   /** Token estimator function */
   tokenEstimator?: (text: string) => number;
   /**
@@ -242,6 +248,12 @@ export interface DeriveContextOptions {
   /** Membrane for the derived manager's own compression calls. Default: the parent's. */
   membrane?: Membrane;
   /**
+   * The derived manager's compressionMembrane. Default: the parent's, unless
+   * `membrane` is given, in which case none (the derived manager's calls all
+   * go through the `membrane` given, as before).
+   */
+  compressionMembrane?: Membrane;
+  /**
    * - `'reuse'` (default): keep the parent's rendering frontier — persisted
    *   fold state arrives through the store, and, at the head, the in-memory
    *   remainder is handed from the parent's strategy to the child's — so the
@@ -325,6 +337,7 @@ export interface ReopenDerivedOptions {
   derivation: ContextDerivation;
   strategy?: ContextStrategy;
   membrane?: Membrane;
+  compressionMembrane?: Membrane;
   tokenEstimator?: (text: string) => number;
   /**
    * The view the derived manager read through: the one given to `derive`,
@@ -602,6 +615,8 @@ export class ContextManager {
   private contextLog: ContextLog;
   private strategy: ContextStrategy;
   private membrane?: Membrane;
+  /** Memory-writing calls' membrane, when not `membrane` (see the config's). */
+  private compressionMembrane?: Membrane;
   private initializationAttempt = 0;
   private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
@@ -941,6 +956,7 @@ export class ContextManager {
       config.viewFilter,
       auxiliaryStores,
     );
+    if (config.compressionMembrane) manager.compressionMembrane = config.compressionMembrane;
     if (config.now) manager.now = config.now;
     manager.slots = {
       messageNamespace,
@@ -2989,6 +3005,9 @@ export class ContextManager {
         options.viewFilter ?? this.viewFilter,
         auxiliaryStores,
       );
+      const compressionMembrane = options.compressionMembrane
+        ?? (options.membrane ? undefined : this.compressionMembrane);
+      if (compressionMembrane) derived.compressionMembrane = compressionMembrane;
       // At the head the child's branch took the window's chain head as it was,
       // so the child starts from the parent's reading of it, as its message
       // store starts from the parent's listing. The reading is taken only
@@ -3077,6 +3096,7 @@ export class ContextManager {
         : {}),
       ...(options.strategy ? { strategy: options.strategy } : {}),
       ...(options.membrane ? { membrane: options.membrane } : {}),
+      ...(options.compressionMembrane ? { compressionMembrane: options.compressionMembrane } : {}),
       ...(options.tokenEstimator ? { tokenEstimator: options.tokenEstimator } : {}),
       ...(options.viewFilter ? { viewFilter: options.viewFilter } : {}),
       ...(options.debugLogContext !== undefined ? { debugLogContext: options.debugLogContext } : {}),
@@ -3816,6 +3836,14 @@ export class ContextManager {
     } catch (err) {
       failed(err);
     }
+  }
+
+  /**
+   * The membrane memory-writing calls go through when it isn't the
+   * manager's own (the config's `compressionMembrane`), else undefined.
+   */
+  getCompressionMembrane(): Membrane | undefined {
+    return this.compressionMembrane;
   }
 
   /**
@@ -4720,6 +4748,7 @@ export class ContextManager {
       window: this.windowIndexView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
+      ...(this.compressionMembrane ? { compressionMembrane: this.compressionMembrane } : {}),
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,

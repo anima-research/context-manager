@@ -196,6 +196,14 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
+  /**
+   * Membrane for the strategy's memory-writing calls (L1 compression, merges,
+   * their refusal and fallback retries, transition summaries) when they go to
+   * a different provider or credential from the agent's own turns. Unset:
+   * they use `membrane`. Its calls get the same signal handling as
+   * `membrane`'s.
+   */
+  compressionMembrane?: Membrane;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
