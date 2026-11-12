@@ -14,7 +14,7 @@ export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-cha
 // Storage
 export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
-export { concatBodyGroups } from './adaptive/render.js';
+export { concatBodyGroups, joinBodyParts } from './adaptive/render.js';
 export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
 export { windowIndexStateId, WindowWriteOutcomeUnknownError, type WindowMode, type WindowStatus } from './window-index.js';

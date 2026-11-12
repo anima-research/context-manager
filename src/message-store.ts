@@ -837,7 +837,8 @@ export class MessageStore {
    * It reads back from `index` over changes and messages holding results but
    * no call, to the nearest message that holds a call, reading each message
    * whole, every shard of its body, since ingress sharding puts a message's
-   * calls and results on its body's first shard. It checks that message's
+   * calls and results on its body's first shard and, from its first call on,
+   * its last. It checks that message's
    * calls, by id: those a result in a later message answers, as parallel
    * calls' results in messages of their own do, and those its own later
    * blocks answer, as in a bundled cycle (splitMixedToolMessages), are
@@ -856,7 +857,7 @@ export class MessageStore {
     const length = this.length();
     const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
     // A body is one step of either walk, read whole: ingress sharding puts a
-    // message's non-text blocks, its calls and results, on its first shard.
+    // message's calls and results on its first shard and its last.
     const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
       const from = bodyStart(at, i);
       const to = bodyEnd(length, at, i);

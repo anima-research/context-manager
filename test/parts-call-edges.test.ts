@@ -1,0 +1,505 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredMessage } from '../src/types/index.js';
+import * as contextManager from '../src/index.js';
+import { concatBodyGroups, OverBudgetError } from '../src/index.js';
+import { call, freshObjects, long, open, Probe, result, sum, text, thinking, type Layout } from './body-parts-harness.js';
+
+const types = (m: { content: ContentBlock[] }): string[] => m.content.map((b) => b.type);
+const recall = (): string => '';
+
+describe('ingress keeps a reply\'s blocks from its first call on with its last part', () => {
+  const picture = (): ContentBlock => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } }) as unknown as ContentBlock;
+  const SHAPES: Record<string, { content: ContentBlock[]; first: string[]; last: string[]; joined: string[] }> = {
+    'thinking, text and a call': {
+      content: [thinking('T'), text(long('A')), call('c1')],
+      first: ['text'], last: ['text', 'thinking', 'tool_use'], joined: ['thinking', 'tool_use', 'text'],
+    },
+    'a reply answering its own call': {
+      content: [thinking('T'), text(long('A')), call('c1'), result('c1', 'r'), text('after')],
+      first: ['text'], last: ['text', 'thinking', 'tool_use', 'tool_result'], joined: ['thinking', 'tool_use', 'tool_result', 'text'],
+    },
+    'two calls with text between': {
+      content: [thinking('T'), text(long('A')), call('c1'), text('and'), call('c2')],
+      first: ['text'], last: ['text', 'thinking', 'tool_use', 'tool_use'], joined: ['thinking', 'tool_use', 'tool_use', 'text'],
+    },
+    'thinking, an image, text and a call': {
+      content: [thinking('T'), picture(), text(long('A')), call('c1')],
+      first: ['text'], last: ['text', 'thinking', 'image', 'tool_use'], joined: ['thinking', 'image', 'tool_use', 'text'],
+    },
+    'an image, thinking, text and a call': {
+      content: [picture(), thinking('T'), text(long('A')), call('c1')],
+      first: ['text', 'image'], last: ['text', 'thinking', 'tool_use'], joined: ['image', 'thinking', 'tool_use', 'text'],
+    },
+    'thinking and text, no call': {
+      content: [thinking('T'), text(long('A'))],
+      first: ['text', 'thinking'], last: ['text'], joined: ['thinking', 'text'],
+    },
+    'results and text': {
+      content: [result('c0', 'r'), text(long('A'))],
+      first: ['text', 'tool_result'], last: ['text'], joined: ['tool_result', 'text'],
+    },
+  };
+  for (const [shape, c] of Object.entries(SHAPES)) {
+    it(`${shape}: where each block is stored, and the parts joined send every block in stored order, ahead of the text`, async () => {
+      const o = await open();
+      try {
+        const parts = o.add('a', c.content);
+        const stored = parts.map((i) => o.all()[i]!);
+        assert.ok(stored.length >= 6, `premise: stored in ${stored.length} parts`);
+        assert.deepEqual([types(stored[0]!), types(stored.at(-1)!)], [c.first, c.last]);
+        for (const middle of stored.slice(1, -1)) assert.deepEqual(types(middle), ['text']);
+        const joined = concatBodyGroups(stored, recall);
+        assert.equal(joined.length, 1);
+        assert.deepEqual(types(joined[0]!), c.joined, 'concatBodyGroups joins them');
+        const nonText = c.content.filter((b) => b.type !== 'text');
+        assert.deepEqual(joined[0]!.content.slice(0, -1), nonText, 'in the order they were stored');
+        const joinBodyParts = (contextManager as unknown as Record<string, unknown>).joinBodyParts as
+          ((parts: ContentBlock[][]) => ContentBlock[]) | undefined;
+        assert.equal(typeof joinBodyParts, 'function', 'the join is exported');
+        assert.deepEqual(joinBodyParts!(stored.map((m) => m.content)), joined[0]!.content, 'the export is that join');
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
+describe("the chunker closes a stored reply's parts before its last as it closes a long message's", () => {
+  it('the parts before the call\'s part close where they close without the call, and the call\'s part closes with its result', async () => {
+    const cut = async (withCall: boolean): Promise<{ chunks: string[][]; reply: string[]; res: string }> => {
+      const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 300 } });
+      try {
+        o.add('u', [text('intro')]);
+        const reply = o.add('a', withCall ? [thinking('T'), text(long('A')), call('c1')] : [thinking('T'), text(long('A'))]);
+        if (withCall) assert.ok(o.all()[reply.at(-1)!]!.content.some((b) => b.type === 'tool_use'), 'premise: the call is on the reply\'s last part');
+        const [res] = o.add('u', withCall ? [result('c1', 'what the tool said')] : [text('what the tool said')]);
+        for (let k = 0; k < 3; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 8_000))]);
+        const ids = o.all().map((m) => m.id);
+        return { chunks: o.strategy.chunkIds(o.view()), reply: reply.map((i) => ids[i]!), res: ids[res!]! };
+      } finally {
+        await o.close();
+      }
+    };
+    const [stored, reference] = [await cut(true), await cut(false)];
+    const chunkOf = (c: typeof stored, id: string) => c.chunks.findIndex((chunk) => chunk.includes(id));
+    const lastPart = stored.reply.at(-1)!;
+    const refLastPart = reference.reply.at(-1)!;
+    assert.ok(chunkOf(stored, lastPart) >= 0, "premise: the call's part is chunked");
+    assert.ok(reference.chunks.some((chunk) => chunk.at(-1) === refLastPart),
+      'premise: without the call, a chunk closes on the reply\'s last part');
+    assert.equal(chunkOf(stored, lastPart), chunkOf(stored, stored.res), 'the call\'s part closes with its result');
+    for (let k = 0; k < stored.reply.length - 1; k++) {
+      const mine = stored.chunks[chunkOf(stored, stored.reply[k]!)]!;
+      const theirs = reference.chunks[chunkOf(reference, reference.reply[k]!)]!;
+      assert.equal(mine.indexOf(stored.reply[k]!), theirs.indexOf(reference.reply[k]!), `part ${k} sits where it does without the call`);
+    }
+  });
+});
+
+describe('the edges around a reply stored in 19 parts, swept across every part', () => {
+  async function nineteen(layout: Layout, config: Record<string, unknown>, persist = true) {
+    const o = await open({ layout, persist, config });
+    o.add('u', [text('intro')]);
+    o.add('a', [text('hello')]);
+    o.add('u', [text('go')]);
+    const reply = o.add('a', [thinking('T'), text(long('A', 19 * 12_000 - 1_000)), call('c1')]);
+    const [res] = o.add('u', [result('c1', 'what the tool said')]);
+    for (let k = 0; k < 2; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 6_000))]);
+    assert.equal(reply.length, 19, `premise: the reply is stored in ${reply.length} parts`);
+    const holder = layout === 'new' ? reply.at(-1)! : reply[0]!;
+    assert.ok(o.all()[holder]!.content.some((b) => b.type === 'tool_use'), `premise: the ${layout === 'new' ? 'last' : 'first'} part holds the call`);
+    return { ...o, reply, res: res! };
+  }
+
+  for (const layout of ['new', 'old'] as const) {
+    const label = layout === 'new' ? 'stored as ingress stores it now' : 'stored with its call on its first part';
+    it(`${label}: the recent window's start`, async () => {
+      const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 10_000_000 });
+      try {
+        const prices = o.strategy.walkPrices(o.view());
+        for (const k of [...o.reply, o.res]) {
+          o.strategy.set({ recentWindowTokens: sum(prices, k) });
+          const start = o.strategy.recentStart(o.view());
+          if (layout === 'old') assert.equal(start, o.reply[0]!, `landing at ${k}: the window starts at the reply's first part`);
+          else assert.equal(start, k === o.res ? o.reply.at(-1)! : k, `landing at ${k}: as for a message stored whole`);
+        }
+      } finally {
+        await o.close();
+      }
+    });
+
+    it(`${label}: the head window's end`, async () => {
+      const o = await nineteen(layout, { headWindowTokens: 10_000_000, recentWindowTokens: 0 });
+      try {
+        const prices = o.estimates();
+        for (const k of [...o.reply, o.res]) {
+          o.strategy.set({ headWindowTokens: sum(prices, 0, k) });
+          const end = o.strategy.headEnd(o.view());
+          if (layout === 'old') assert.equal(end, o.reply[0]!, `landing at ${k}: the head ends before the reply's first part`);
+          else assert.equal(end, k === o.res ? o.reply.at(-1)! : k, `landing at ${k}: as for a message stored whole`);
+        }
+      } finally {
+        await o.close();
+      }
+    });
+
+    it(`${label}: a compression hold`, async () => {
+      const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 10_000_000 });
+      try {
+        const ids = o.all().map((m) => m.id);
+        for (const k of [...o.reply, o.res]) {
+          o.manager.holdCompression([ids[k]!]);
+          const start = o.strategy.holdStart(o.view());
+          if (layout === 'old') assert.equal(start, o.reply[0]!, `holding ${k}: the hold starts at the reply's first part`);
+          else assert.equal(start, k === o.res ? o.reply.at(-1)! : k, `holding ${k}: as for a message stored whole`);
+          o.manager.releaseCompression([ids[k]!]);
+        }
+      } finally {
+        await o.close();
+      }
+    });
+
+    it(`${label}: the chunks`, async () => {
+      const o = await nineteen(layout, { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false }, false);
+      try {
+        const ids = o.all().map((m) => m.id);
+        const prices = o.estimates();
+        for (const k of o.reply) {
+          o.strategy.set({ targetChunkTokens: sum(prices, 0, k) + Math.floor(prices[k]! / 2) });
+          const chunks = o.strategy.chunkIds(o.view());
+          const ends = chunks.map((c) => ids.indexOf(c.at(-1)!));
+          const holder = ids[layout === 'new' ? o.reply.at(-1)! : o.reply[0]!]!;
+          const callChunk = chunks.findIndex((c) => c.includes(holder));
+          if (layout === 'old' || k === o.reply.at(-1)!) {
+            assert.ok(callChunk >= 0, `premise, closing at ${k}: the call's part is chunked; chunks end at ${ends}`);
+          }
+          if (callChunk >= 0) assert.ok(chunks[callChunk]!.includes(ids[o.res]!), `closing at ${k}: the call's chunk holds its result; chunks end at ${ends}`);
+          if (layout === 'new' && k < o.reply.at(-1)!) {
+            assert.equal(ends[0], k, `closing at ${k}: the first chunk closes there, as for a long message's parts; chunks end at ${ends}`);
+          }
+        }
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
+describe("the newest turn a refusal names as the floor", () => {
+  it('a newest reply whose last part, holding a call with no result, is trimmed refuses the compile though its earlier parts are sent', async () => {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 1_000_000 } });
+    try {
+      o.add('u', [text('intro')]);
+      const reply = o.add('a', [text(long('R')), call('c9')]);
+      assert.ok(reply.length > 1, 'premise: the reply is stored in parts');
+      o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), reply.at(-1)!) });
+      const refused = await o.manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }).then(() => undefined, (e: unknown) => e);
+      assert.ok(refused instanceof OverBudgetError);
+      assert.match(refused.message, /did not retain the newest turn/);
+    } finally {
+      await o.close();
+    }
+  });
+  it('a result after a reply stored as ingress stores it now needs only the call\'s part kept raw with it', async () => {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
+    try {
+      o.add('u', [text('intro')]);
+      const reply = o.add('a', [thinking('T'), text(long('A')), call('c1')]);
+      o.add('u', [result('c1', 'what the tool said')]);
+      const prices = o.strategy.walkPrices(o.view());
+      const floor = sum(prices, reply.at(-1)!);
+      assert.ok(sum(prices, reply[0]!) > floor + 1, 'premise: the whole reply costs more than its last part');
+      const refused = await o.manager.compile({ maxTokens: floor + 1, reserveForResponse: 0 }).then(() => undefined, (e: unknown) => e);
+      assert.ok(refused instanceof OverBudgetError, 'premise: the whole recent window is over the budget');
+      assert.deepEqual(refused.clearedBy, ['smaller-recent-window'], 'a smaller recent window would clear it');
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe("a subclass's lastMessageContainsToolUse still decides where the chunker may not close", () => {
+  class Holds extends Probe {
+    protected lastMessageContainsToolUse(chunk: StoredMessage[]): boolean {
+      return chunk.at(-1)!.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('HOLD'));
+    }
+  }
+  for (const [name, Strategy, closesAt] of [['the base', Probe, 3], ['a subclass holding at its marker', Holds, 4]] as const) {
+    it(`${name}: the first chunk closes at message ${closesAt}`, async () => {
+      const o = await open({ Strategy, persist: false, config: { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false } });
+      try {
+        for (let k = 0; k < 8; k++) o.add(k % 2 ? 'a' : 'u', [text(`${k === 3 ? 'HOLD' : 'turn'} ${k} ${long('T', 4_000)}`)]);
+        o.strategy.set({ targetChunkTokens: sum(o.estimates(), 0, 3) + 1 });
+        const ids = o.all().map((m) => m.id);
+        const first = o.strategy.chunkIds(o.view())[0]!;
+        assert.equal(ids.indexOf(first.at(-1)!), closesAt);
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
+describe('an edge moved to the first part of a body stored before, where that part holds a result', () => {
+  async function bundled() {
+    const o = await open({ layout: 'old', config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
+    o.add('u', [text('intro')]);
+    const [c1] = o.add('a', [call('c1')]);
+    const body = o.add('u', [result('c1', 'the first answer'), text(long('BODY', 60_000)), call('c2')]);
+    o.add('u', [result('c2', 'the second answer')]);
+    o.add('a', [text('ok')]);
+    assert.ok(body.length > 2, 'premise: the body is stored in parts');
+    const first = o.all()[body[0]!]!.content;
+    assert.ok(first.some((b) => b.type === 'tool_result') && first.some((b) => b.type === 'tool_use'), 'premise: its first part holds the result and the call');
+    return { ...o, c1: c1!, body };
+  }
+  it("the recent window's start moves on to the call that part's result answers", async () => {
+    const o = await bundled();
+    try {
+      o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), o.body[2]!) });
+      assert.equal(o.strategy.recentStart(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+  it('a compression hold does too', async () => {
+    const o = await bundled();
+    try {
+      o.manager.holdCompression([o.all()[o.body[2]!]!.id]);
+      assert.equal(o.strategy.holdStart(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+  it("the head window's end pulls back past that call", async () => {
+    const o = await bundled();
+    try {
+      o.strategy.set({ headWindowTokens: sum(o.estimates(), 0, o.body[2]!) });
+      assert.equal(o.strategy.headEnd(o.view()), o.c1);
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe('a view whose listing gives fresh objects at each read', () => {
+  it('defers the chunker\'s close inside a body stored with its call on its first part, as the store\'s own view does', async () => {
+    const o = await open({ layout: 'old', persist: false, config: { headWindowTokens: 0, recentWindowTokens: 300, attachmentsIgnoreSize: false } });
+    try {
+      for (const [who, what] of [['u', 'intro'], ['a', 'hello'], ['u', 'go']] as const) o.add(who, [text(what)]);
+      const reply = o.add('a', [thinking('T'), text(long('A', 6 * 12_000)), call('c1')]);
+      const [res] = o.add('u', [result('c1', 'what the tool said')]);
+      for (let k = 0; k < 2; k++) o.add(k % 2 ? 'u' : 'a', [text(long(`after${k}`, 6_000))]);
+      assert.ok(reply.length > 3 && o.all()[reply[0]!]!.content.some((b) => b.type === 'tool_use'), 'premise: the call is on the first of the reply\'s parts');
+      const prices = o.estimates();
+      o.strategy.set({ targetChunkTokens: sum(prices, 0, reply[2]!) + Math.floor(prices[reply[2]!]! / 2) });
+      const ids = o.all().map((m) => m.id);
+      const holding = (chunks: string[][]) => chunks.find((c) => c.includes(ids[reply[0]!]!)) ?? [];
+      assert.ok(holding(o.strategy.chunkIds(o.view())).includes(ids[res!]!), "premise: with the store's own view, the call's chunk holds its result");
+      assert.ok(holding(o.strategy.chunkIds(freshObjects(o.view()))).includes(ids[res!]!));
+    } finally {
+      await o.close();
+    }
+  });
+});
+
+describe("the chunker's check of a long body", () => {
+  for (const every of [1, 2, 4]) {
+    it(`reads each of a body's 2,000 parts a bounded number of times, checked at every ${every === 1 ? '' : `${every === 2 ? 'second' : 'fourth'} `}part`, () => {
+      const p = new Probe({ adaptiveResolution: true, compressionModel: 'mock' } as never);
+      const N = 2_000;
+      const parts = Array.from({ length: N }, (_, k) =>
+        ({ id: `p${k}`, sequence: k, participant: 'u', content: [text(`part ${k}`)], timestamp: new Date(0), bodyGroupId: 'g', shardIndex: k }) as unknown as StoredMessage);
+      let reads = 0;
+      const listing = new Proxy(parts, {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      const position = new Map(parts.map((m, k) => [m.id, k] as const));
+      for (let k = every - 1; k < N; k += every) p.endsOnCall([parts[k]!], listing, position);
+      assert.ok(reads < 10 * N, `${reads} reads of the listing for ${N} parts`);
+    });
+  }
+});
+
+describe('a run of messages that each hold a call and a result', () => {
+  async function run(shape: 'own' | 'chained') {
+    const o = await open({ config: { headWindowTokens: 0, recentWindowTokens: 10_000_000 } });
+    o.add('u', [text('intro')]);
+    o.add('a', [text('hello')]);
+    const at: number[] = [];
+    if (shape === 'own') {
+      for (let k = 0; k < 8; k++) at.push(...o.add('a', [call(`s${k}`), result(`s${k}`, `answer ${k}`), text(`step ${k}`)]));
+    } else {
+      at.push(...o.add('a', [call('c0')]));
+      for (let k = 1; k < 8; k++) at.push(...o.add('a', [result(`c${k - 1}`, `answer ${k - 1}`), call(`c${k}`)]));
+    }
+    o.add('u', shape === 'own' ? [text('after')] : [result('c7', 'answer 7')]);
+    o.add('a', [text('done')]);
+    assert.equal(at.length, 8, 'premise: none of the run is split');
+    return { ...o, at };
+  }
+  const expected = (shape: 'own' | 'chained', at: number[], landed: number) => (shape === 'own' ? landed - 1 : at[0]!);
+  for (const shape of ['own', 'chained'] as const) {
+    const label = shape === 'own' ? 'each its own call\'s result' : 'each the result of the call before it';
+    it(`${label}: the recent window's start moves back ${shape === 'own' ? 'one message, as on main' : 'to the run\'s first message'}`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.strategy.set({ recentWindowTokens: sum(o.strategy.walkPrices(o.view()), landed) });
+        assert.equal(o.strategy.recentStart(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+    it(`${label}: a compression hold does too`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.manager.holdCompression([o.all()[landed]!.id]);
+        assert.equal(o.strategy.holdStart(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+    it(`${label}: the head window's end pulls back ${shape === 'own' ? 'one message, as on main' : 'to the run\'s first message'}`, async () => {
+      const o = await run(shape);
+      try {
+        const landed = o.at[5]!;
+        o.strategy.set({ headWindowTokens: sum(o.estimates(), 0, landed) });
+        assert.equal(o.strategy.headEnd(o.view()), expected(shape, o.at, landed));
+      } finally {
+        await o.close();
+      }
+    });
+  }
+});
+
+describe('the edges held at chunk coverage, where an older chunk divides a body stored before', () => {
+  class Seeded extends Probe {
+    holds = true;
+    leftOut = new Set<string>();
+    protected override windowsHoldAtCoverage(): boolean {
+      return this.holds;
+    }
+    protected override summariesAcross(...args: Parameters<Probe['summariesAcross']>): ReturnType<Probe['summariesAcross']> {
+      const across = super.summariesAcross(...args);
+      for (const id of across) this.leftOut.add(id);
+      return across;
+    }
+    seedL1(id: string, sourceIds: string[]): void {
+      this.summaries.push({
+        id, level: 1, content: `${id} recalls ${sourceIds.length} messages`, tokens: 8, sourceLevel: 0, sourceIds,
+        sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
+      } as never);
+      for (const m of sourceIds) this.resolutions.set(m as never, 1);
+    }
+  }
+  async function stored(kind: 'adaptive' | 'kv-unified') {
+    const o = await open({ layout: 'old', kind, persist: false, Strategy: Seeded, config: { headWindowTokens: 0, recentWindowTokens: 10_000_000, autoTickOnNewMessage: false } });
+    for (let k = 0; k < 4; k++) o.add(k % 2 ? 'a' : 'u', [text(`before ${k} ` + 'words '.repeat(40))]);
+    const body = o.add('a', [text(long('REPLY', 60_000)), call('c1')]);
+    const [answer] = o.add('u', [result('c1', 'what the tool said')]);
+    for (let k = 0; k < 3; k++) o.add(k % 2 ? 'u' : 'a', [text(`after ${k} ` + 'words '.repeat(40))]);
+    assert.ok(body.length > 3 && o.all()[body[0]!]!.content.some((b) => b.type === 'tool_use'), 'premise: the reply is stored in parts, with its call on the first');
+    return { ...o, s: o.strategy as Seeded, ids: o.all().map((m) => m.id), body, answer: answer! };
+  }
+  const sent = async (o: Awaited<ReturnType<typeof stored>>): Promise<{ called: boolean; answered: unknown }> => {
+    const messages = (await o.manager.compile({ maxTokens: 10_000_000, reserveForResponse: 0 })).messages as unknown as Array<{ content: ContentBlock[] }>;
+    const at = messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 'c1'));
+    const next = at < 0 ? undefined : messages[at + 1]?.content.find((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'c1');
+    return { called: at >= 0, answered: (next as { content?: unknown } | undefined)?.content };
+  };
+  const parts = (o: Awaited<ReturnType<typeof stored>>, edge: number): boolean => o.body[0]! < edge && o.answer >= edge;
+
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: the recent window, its count reaching the body's fourth part, isn't held after an older chunk that ends at its second; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), o.body[3]!) + 1 });
+        const start = o.s.recentStart(o.view());
+        assert.ok(!parts(o, start), `the recent window's start, ${start}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+    it(`${kind}: the head window, its count reaching the body's fourth part, doesn't end at an older chunk that starts at its third; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(o.body[2]!, o.ids.length - 2));
+        o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.body[3]!) + 1 });
+        const end = o.s.headEnd(o.view());
+        assert.ok(!parts(o, end), `the head's end, ${end}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+    it(`${kind}: the head window, its count past the whole body, isn't held at an older chunk that owns the body from its fourth part to the result; the request sends the call and its result`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-older', o.ids.slice(o.body[3]!, o.answer + 1));
+        o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.answer + 1) + 1 });
+        const end = o.s.headEnd(o.view());
+        assert.ok(!parts(o, end), `the head's end, ${end}, doesn't part the call (${o.body[0]}) from its result (${o.answer})`);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+      } finally { await o.close(); }
+    });
+  }
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: the recent window, its count reaching back before the body, gives way only as far as the body's first part where its hold after an older chunk over the body's first two parts would part the pair, and an earlier chunk's summary isn't left out`, async () => {
+      const o = await stored(kind);
+      try {
+        o.s.seedL1('L1-earlier', o.ids.slice(0, o.body[0]!));
+        o.s.seedL1('L1-older', o.ids.slice(o.body[0]!, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+        assert.equal(o.s.recentStart(o.view()), o.body[0]);
+        assert.deepEqual(await sent(o), { called: true, answered: 'what the tool said' });
+        assert.ok(o.s.leftOut.has('L1-older'), "premise: the older chunk's summary, over messages the window takes in, is left out");
+        assert.ok(!o.s.leftOut.has('L1-earlier'), "the earlier chunk's summary isn't left out");
+      } finally { await o.close(); }
+    });
+  }
+  it("where the recent window's hold gives way, its start is never before the start it has without the holds", async () => {
+    const shapes: Array<[string, (o: Awaited<ReturnType<typeof stored>>) => void]> = [
+      ['an older chunk over the body\'s first two parts, the count inside the body', (o) => {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), o.body[3]!) + 1 });
+      }],
+      ['the same chunk, the count before the body', (o) => {
+        o.s.seedL1('L1-older', o.ids.slice(0, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+      }],
+      ['an earlier chunk and an older one over the body\'s first two parts, the count before the body', (o) => {
+        o.s.seedL1('L1-earlier', o.ids.slice(0, o.body[0]!));
+        o.s.seedL1('L1-older', o.ids.slice(o.body[0]!, o.body[2]!));
+        o.s.set({ recentWindowTokens: sum(o.s.walkPrices(o.view()), 2) + 1 });
+      }],
+    ];
+    for (const [shape, seed] of shapes) {
+      const o = await stored('adaptive');
+      try {
+        seed(o);
+        o.s.holds = false;
+        const stock = o.s.recentStart(o.view());
+        o.s.holds = true;
+        const held = o.s.recentStart(o.view());
+        assert.ok(held >= stock, `${shape}: the start, ${held}, is at or after the start without the holds, ${stock}`);
+        assert.ok(!parts(o, held), `${shape}: the start, ${held}, doesn't part the call from its result`);
+      } finally { await o.close(); }
+    }
+  });
+  it(`a named limit, in the adaptive selection: the head window, its count reaching the body's fourth part, where the newest older chunk starts there and holds the result, ends before the body, and the request sends the call with a stub, the result inside that chunk's summary, which the middle folds`, async () => {
+    const o = await stored('adaptive');
+    try {
+      o.s.seedL1('L1-older', o.ids.slice(o.body[3]!, o.answer + 1));
+      o.s.set({ recentWindowTokens: 0, headWindowTokens: sum(o.estimates(), 0, o.body[3]!) + 1 });
+      assert.equal(o.s.headEnd(o.view()), o.body[0], "the head's end comes back before the body");
+      const { called, answered } = await sent(o);
+      assert.ok(called, 'the call is sent');
+      assert.match(String(answered), /isn't shown in this context/, 'a stub stands where its result belongs');
+    } finally { await o.close(); }
+  });
+});

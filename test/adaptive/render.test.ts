@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { chunkMessage } from '../../src/adaptive/chunker.js';
-import { concatBodyGroups, placeholderRecallText } from '../../src/adaptive/render.js';
+import { concatBodyGroups, joinBodyParts, placeholderRecallText } from '../../src/adaptive/render.js';
 import type { StoredMessage } from '../../src/types/message.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -139,16 +139,26 @@ test('render: chunker + render round-trips with realistic large doc', () => {
   assert.equal(text, body);
 });
 
-test('render: a non-text block in a raw shard is written as its placeholder, and the composite takes its id from the first shard and counts its shards', () => {
+test("render: a raw shard's non-text blocks go ahead of the joined text, in shard order, and the composite takes its id from the first shard and counts its shards", () => {
   const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } } as unknown as ContentBlock;
+  const call = { type: 'tool_use', id: 'call-1', name: 'look', input: {} } as unknown as ContentBlock;
   const messages = [
     makeShard('first part ', 'bg-x', 0),
     makeShard('', 'bg-x', 1, { content: [image] }),
-    makeShard(' last part', 'bg-x', 2),
+    makeShard(' last part', 'bg-x', 2, { content: [{ type: 'text', text: ' last part' } as ContentBlock, call] }),
   ];
   const out = concatBodyGroups(messages, placeholderRecallText);
   assert.equal(out.length, 1);
   assert.equal(out[0].id, 'bg-x-shard-0');
   assert.equal(out[0].metadata?.shardCount, 3);
-  assert.deepEqual(out[0].content, [{ type: 'text', text: 'first part [non-text content: image] last part' }]);
+  assert.deepEqual(out[0].content, [image, call, { type: 'text', text: 'first part  last part' }]);
+});
+
+test('render: parts with no text join into their other blocks alone, with no empty text block', () => {
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } } as unknown as ContentBlock;
+  const call = { type: 'tool_use', id: 'call-1', name: 'look', input: {} } as unknown as ContentBlock;
+  assert.deepEqual(joinBodyParts([[image], [call]]), [image, call]);
+  assert.deepEqual(joinBodyParts([[image], [{ type: 'text', text: '' } as ContentBlock]]), [image]);
+  assert.deepEqual(joinBodyParts([[{ type: 'text', text: 'a' } as ContentBlock, call], [{ type: 'text', text: 'b' } as ContentBlock]]),
+    [call, { type: 'text', text: 'ab' }]);
 });

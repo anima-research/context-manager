@@ -241,14 +241,21 @@ describe('tool pruning, priced as sent', () => {
   }
 
   it('counts a result whose call is on the first shard of a sharded message', async () => {
-    // Ingress chunking puts a message's non-text blocks on its first shard,
-    // so the call and its result aren't adjacent in the store: more shards
-    // come between them than pairing repair looks ahead over. The count
-    // follows calls, not adjacency, and the head and recent windows join a
-    // body's shards, so the result answers its call and takes a slot.
+    // A body stored with its call on its first shard, as ingress stored a
+    // split message before it put a reply's call on its last: more shards
+    // come between the call and its result than pairing repair looks ahead
+    // over. The count follows calls, not adjacency, and the head and recent
+    // windows join a body's shards, so the result answers its call and takes
+    // a slot.
     const { cm } = await open({ adaptiveResolution: true, targetChunkTokens: 100, toolResultMaxLastN: 1 });
     cm.addMessage('u', text('look these up'));
-    cm.addMessage('a', [{ type: 'text', text: `thinking aloud ${PROSE}` }, call('call-1')]);
+    const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): unknown } }).messageStore;
+    const shardCount = 9;
+    for (let k = 0; k < shardCount; k++) {
+      const part: ContentBlock[] = [{ type: 'text', text: `${k === 0 ? 'thinking aloud ' : ''}${PROSE.slice(k * 600, (k + 1) * 600)}` }];
+      if (k === 0) part.push(call('call-1'));
+      store.append('a', part, undefined, undefined, { bodyGroupId: 'g', shardIndex: k, shardCount });
+    }
     assert.ok(cm.getAllMessages().filter((m) => m.bodyGroupId).length > 7, 'more shards than pairing repair looks ahead over');
     cm.addMessage('u', [result('call-1', 'short one')]);
     cm.addMessage('a', [call('call-2')]);

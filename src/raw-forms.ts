@@ -86,6 +86,12 @@ export function isOpaqueCarrier(block: ContentBlock): boolean {
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
+/** Whether a block carries a provider item: the Responses formatter emits only an object `rawItem`. */
+export function carriesRawItem(block: ContentBlock): boolean {
+  const raw = (block as RawFormCarrier).rawItem;
+  return !!raw && typeof raw === 'object';
+}
+
 function itemKey(block: ContentBlock): string | undefined {
   const raw = (block as RawFormCarrier).rawItem;
   // The Responses formatter emits only an object, deduplicated per message by

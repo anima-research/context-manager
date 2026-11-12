@@ -385,8 +385,8 @@ export function rawBodiesOf(attribution: Pick<EntryProvenance, 'sources' | 'bodi
 
 /** Whether rendered content carries its source messages unaltered. */
 function carries(content: ContentBlock[], sourceMessages: readonly StoredMessage[]): boolean {
-  if (sourceMessages.length === 1) return coversStoredContent(content, sourceMessages[0]!.content);
-  return sourceMessages.length > 1 && compositeCovers(content, [...sourceMessages]);
+  if (sourceMessages.length === 1 && sourceMessages[0]!.bodyGroupId === undefined) return coversStoredContent(content, sourceMessages[0]!.content);
+  return sourceMessages.length > 0 && compositeCovers(content, [...sourceMessages]);
 }
 
 function carriesWithRelocated(
@@ -417,8 +417,8 @@ function carriesWithRelocated(
 }
 
 /**
- * A composite entry (the strategy merged several shards into one message)
- * carries its members unaltered only when it carries their text,
+ * A composite entry (the strategy joined one or more shards into one
+ * message) carries its members unaltered only when it carries their text,
  * concatenated in shard order, intact, and every non-text block of theirs,
  * unaltered and in their order, among its own non-text blocks. A composite
  * gathers the text into one block, so where a non-text block sits relative

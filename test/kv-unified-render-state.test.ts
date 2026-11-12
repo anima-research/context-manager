@@ -361,12 +361,28 @@ const TIES: Record<string, TieCase> = {
     premise: (w) => has(w, (b) => textOf(b).includes('[truncated')),
     what: 'a cut message',
   },
-  "a body's raw shards in the middle, the first holding an image the composite leaves out": {
-    config: { headWindowTokens: 0, recentWindowTokens: 300 },
+  "a body's raw shards in the middle, the first holding an image the composite sends": {
+    config: { headWindowTokens: 0, recentWindowTokens: 300, maxLiveImages: 2 },
     first: [['u', [text('intro')]], ['a', [text('hi')]], ['u', [image(), text(PROSE.slice(0, 80_000))]], ['a', [text(plain(1))]], ...CLOSE],
-    premise: (w) => w.some((m) => m.content.length === 1 && textOf(m.content[0]!).length >= 70_000) &&
-      !has(w, (b) => (b as { type: string }).type === 'image'),
-    what: 'a middle composite of text alone',
+    premise: (w) => w.some((m) => m.content[0]?.type === 'image' && textOf(m.content.at(-1)!).length >= 70_000),
+    what: 'a middle composite sending its image',
+  },
+  "a reply's raw shards in the middle, with thinking and a call, and its result after them": {
+    config: { headWindowTokens: 0, recentWindowTokens: 300 },
+    first: [['u', [text('intro')]], ['a', [text('hi')]],
+      ['a', [{ type: 'thinking', thinking: 'pondering', signature: 'sig' } as ContentBlock, text(PROSE.slice(0, 80_000)), call('call-1', 'q')]],
+      ['u', [result('call-1', plain(2))]], ['a', [text(plain(3))]], ...CLOSE],
+    premise: (w) => w.some((m, i) => m.content[0]?.type === 'thinking' && m.content[1]?.type === 'tool_use' &&
+      textOf(m.content.at(-1)!).length >= 70_000 && w[i + 1]?.content[0]?.type === 'tool_result'),
+    what: 'a middle composite sending its thinking and call, with the result after it',
+  },
+  "a body's raw shard in the middle whose long result the cap cuts": {
+    config: { headWindowTokens: 0, recentWindowTokens: 300, maxMessageTokens: 10_000 },
+    first: [['u', [text('intro')]], ['a', [call('call-1', 'q')]],
+      ['u', [result('call-1', PROSE.slice(0, 60_000)), text(PROSE.slice(0, 80_000))]], ['a', [text(plain(3))]], ...CLOSE],
+    premise: (w) => w.some((m, i) => m.content[0]?.type === 'tool_result' && textOf(m.content[0]!).length < 60_000 &&
+      textOf(w[i + 1]?.content.at(-1) ?? text('')).length >= 60_000),
+    what: 'a middle composite sending a cut result',
   },
   "a body's raw shards in the recent window, which the merge joins": {
     config: { headWindowTokens: 0, recentWindowTokens: 1_000_000 },
