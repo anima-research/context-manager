@@ -55,7 +55,7 @@ function replan(leaves: Leaf[], nodes: Node[], budget: Budget, count: number): s
   const plans: string[] = [];
   let previous: ReadonlyMap<string, number> = new Map();
   for (let k = 0; k < count; k++) {
-    const p = planControlledFrontier(inputs, tree, { ...budget, previous, rawZone: new Set() });
+    const p = planControlledFrontier(inputs, tree, { ...budget, previous, rawZone: new Set(), attendedChunks: 0 });
     plans.push(`${inputs.chunks.map((c) => p.resolutions.get(c.id) ?? 0).join('')} ${p.tokens}`);
     previous = p.resolutions;
   }
@@ -83,7 +83,7 @@ test('replanned on unchanged inputs under the expand threshold, a seeded plan th
   const tree = new SummaryTree(inputs);
   const params = {
     targetTokens: 100, foldAtTokens: 120, expandAtTokens: 100, windowTokens: 120, now: 12, mergeThreshold: 3,
-    rawZone: new Set<string>(),
+    rawZone: new Set<string>(), attendedChunks: 0,
   };
   const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
   const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
@@ -186,7 +186,7 @@ test('the inversion pass reads a group as its fold does: a pin on a leaf of anot
   const tree = new SummaryTree(inputs);
   const params = {
     previous, targetTokens: 55, foldAtTokens: 60, windowTokens: 1000, now: 100, mergeThreshold: 6,
-    rawZone: new Set<string>(), pinCaps: new Map([['m1', 1]]),
+    rawZone: new Set<string>(), attendedChunks: 0, pinCaps: new Map([['m1', 1]]),
   };
   const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
   const seeded = planControlledFrontier(inputs, tree, params);
@@ -225,7 +225,7 @@ test('a protected leaf of another lineage doesn\'t make a group a boundary-cut f
   const tree = new SummaryTree(inputs);
   const params = {
     previous, targetTokens: 220, foldAtTokens: 230, windowTokens: 1000, now: 100, mergeThreshold: 6,
-    rawZone: new Set(['m2']),
+    rawZone: new Set(['m2']), attendedChunks: 1,
   };
   const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
   const seeded = planControlledFrontier(inputs, tree, params);
