@@ -2136,6 +2136,21 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
+type SampleDecision = {
+  implied: number;
+  rejected: boolean;
+  next: {
+    calibration: number;
+    ema: number | null;
+    provisional: { fromEpoch: number | null } | null;
+    declared: boolean;
+    declaredCandidate: number | null;
+    outOfBandRun: { first: number; count: number } | null;
+  };
+  log?: string;
+  persist?: boolean;
+};
+
 type SelectPricing = {
   overhead: ContentBlock[];
   injections?: ReadonlyArray<ContentBlock[]>;
@@ -2825,6 +2840,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           deepestLevel: err.diagnostics.deepestLevel,
           ...(err.diagnostics.requestLimitTokens !== undefined ? { requestLimitTokens: err.diagnostics.requestLimitTokens } : {}),
           ...(err.diagnostics.requestAllowanceTokens !== undefined ? { requestAllowanceTokens: err.diagnostics.requestAllowanceTokens } : {}),
+          ...(err.diagnostics.requestLimitBound ? { requestLimitBound: true as const } : {}),
           // An early throw means no fold plan was computed at all; a late one
           // means we have it.
           resolutions: partial?.resolutions ?? {},
@@ -3354,6 +3370,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._lastSelectStats = null;
     this._lastCompileEstimate = 0;
     this._lastCompileInjected = 0;
+    this._lastSelect = null;
+    this._providerRate = null;
     this._storeView = null;
     // Prices memoized over the view just cleared: the next one may estimate otherwise.
     this._answerCostCache.clear();
@@ -9497,6 +9515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let entries: ContextEntry[];
       this.thinkingBound = opts?.thinkingBinding?.binds === true;
       this.selectPricing = pricing;
+      this._selectArmed = false;
       try {
         entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
@@ -9512,6 +9531,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // path strips its render last (applyImageStripping, `returned`), and a
       // strip with no limits records nothing, so the hits are this render's.
       this.reportCeilingHits();
+      if (this._selectArmed) {
+        this._lastSelect = { store, log, budget: { ...budget }, opts: opts && { ...opts }, keys: this.requestKeys(entries), stubs: pricing?.stubTokens ?? 0 };
+      }
       return entries;
     }
     // A dry run commits nothing, and that includes what a select leaves for
@@ -9573,32 +9595,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     budget: TokenBudget,
     target: number,
     bound: number,
-    adaptive: boolean,
   ): { maxTokens: number; rejectionBudget: number } {
     const pricing = this.selectPricing;
     const limit = pricing?.limitTokens;
     if (pricing === null || limit === undefined) return { maxTokens: target, rejectionBudget: bound };
-    const overhead = this.priceContent(pricing.overhead);
-    const injected = this.priceMessageInjections(pricing.injections);
-    const atCeiling = adaptive && this._calibrationProvisional !== null;
-    const scale = atCeiling ? this._calibration / CALIBRATION_CEILING : 1;
-    const allowance = Math.floor((limit - budget.reserveForResponse) * scale - overhead - injected);
+    const { allowance, overhead, injected, scale } = this.allowanceUnderRequestLimit(pricing, limit, budget.reserveForResponse);
     if (allowance <= 0) {
-      pricing.limitBound = true;
       throw noRoomUnderRequestLimit({
         limit,
         reserve: budget.reserveForResponse,
         overhead: Math.ceil(overhead / scale),
         injected: Math.ceil(injected / scale),
         allowance,
-        ...(atCeiling ? { ceiling: CALIBRATION_CEILING } : {}),
+        pricedAt: this.requestPricedAt(),
       });
     }
     pricing.allowance = allowance;
     const room = allowance - (pricing.stubReserve ?? 0);
-    if (room < target || room < bound) pricing.allowanceTokens = room;
-    if (room < bound) pricing.limitBound = true;
+    pricing.allowanceTokens = room < target || room < bound ? room : undefined;
+    pricing.limitBound = room < bound;
     return { maxTokens: Math.min(target, room), rejectionBudget: Math.min(bound, room) };
+  }
+
+  private allowanceUnderRequestLimit(
+    pricing: SelectPricing,
+    limit: number,
+    reserve: number,
+    multiplier = this._calibration,
+    rate = this.pricedRate(),
+  ): { allowance: number; overhead: number; injected: number; scale: number } {
+    const view = this._storeView;
+    const repriced = multiplier !== this._calibration;
+    if (repriced) view?.setTokenCalibration?.(multiplier);
+    try {
+      const overhead = this.priceContent(pricing.overhead);
+      const injected = this.priceMessageInjections(pricing.injections);
+      const scale = multiplier / Math.max(rate, multiplier);
+      return { allowance: Math.floor((limit - reserve) * scale - overhead - injected), overhead, injected, scale };
+    } finally {
+      if (repriced) view?.setTokenCalibration?.(this._calibration);
+    }
+  }
+
+  private roomUnderLastLimit(multiplier: number, rate: number | null): boolean {
+    const last = this._lastSelect;
+    const pricing = last ? this.selectPricingOf(last.opts) : null;
+    const limit = pricing?.limitTokens;
+    if (!last || !pricing || limit === undefined) return true;
+    const priced = rate !== null && rate > multiplier ? rate : multiplier;
+    return this.allowanceUnderRequestLimit(pricing, limit, last.budget.reserveForResponse, multiplier, priced).allowance > 0;
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -9614,8 +9659,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
-        // it (#179, the startup wedge). Any other refusal stands, and so does
-        // one the request limit made (dropProvisionalCalibration).
+        // it (#179, the startup wedge). Any other refusal stands
+        // (dropProvisionalCalibration).
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, dryRun)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
@@ -15111,8 +15156,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       diagnostics: Required<Pick<OverBudgetError['diagnostics'], 'middleCountUnit' | 'deepestLevelKind'>>;
     },
   ): OverBudgetError {
-    return new OverBudgetError({
+    const error = new OverBudgetError({
       ...opts,
+      ...(this.selectPricing?.limitTokens !== undefined ? { pricedAt: this.requestPricedAt() } : {}),
       diagnostics: {
         ...opts.diagnostics,
         ...this.summaryInventoryDiagnostics(),
@@ -15122,8 +15168,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         inputBudget: budget.maxTokens - budget.reserveForResponse,
         ...(this.selectPricing?.limitTokens !== undefined ? { requestLimitTokens: this.selectPricing.limitTokens } : {}),
         ...(this.selectPricing?.allowanceTokens !== undefined ? { requestAllowanceTokens: this.selectPricing.allowanceTokens } : {}),
+        ...(this.selectPricing?.limitBound ? { requestLimitBound: true as const } : {}),
       },
     });
+    return error;
   }
 
   /**
@@ -15210,7 +15258,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
     const room = budget.maxTokens - budget.reserveForResponse;
     const { maxTokens, rejectionBudget } = this.boundsUnderRequestLimit(
-      budget, room, Math.floor(room * (1 + overBudgetGraceRatio)), true);
+      budget, room, Math.floor(room * (1 + overBudgetGraceRatio)));
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -15813,6 +15861,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budgetTokens: rejectionBudget,
         fits: planFits,
         ...(planFits ? {} : { clearedBy: planClearedBy() }),
+        ...(planFits || !this.selectPricing?.limitBound ? {} : { requestLimitBound: true as const }),
         exhausted: result.exhausted,
         headTokens,
         tailTokens,
@@ -15834,9 +15883,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // under a provisional multiplier above 1, which a committing select
     // would drop and retry at (selectPath): the dry run throws the same
     // refusal so it takes the same fallback, and its preview says what the
-    // real compile will do. If the retry at 1 is still over, it reports.
+    // real compile will do. If the retry at 1 is still over, it reports. A
+    // refusal's retry (retryOfLastSelect) throws it too, since it asks what a
+    // committing select would do.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    if (!planFits && (!dryRun || dryFallback)) {
+    if (!planFits && (!dryRun || dryFallback || this._retryingRefused)) {
       // The plan's middle is what's over, priced as the plan priced it, so
       // the pins keeping raw tokens there are named. The refusals after the
       // plan count other things (an emitted prefix, a shard's text alone)
@@ -16229,12 +16280,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
       this._lastCompileInjected = this.priceMessageInjections(opts?.messageInjections);
       this._calibrationArmed = true; // exactly one sample per compile
+      this._selectArmed = true;
     }
     return merged;
   }
 
   private _lastCompileEstimate = 0;
   private _lastCompileInjected = 0;
+  private _lastSelect: { store: MessageStoreView; log: ContextLogView; budget: TokenBudget; opts: SelectOptions | undefined; keys: string[]; stubs: number } | null = null;
+  private _selectArmed = false;
   private _storeView: MessageStoreView | null = null;
 
   /** Thinking the context manager left out after this strategy's committing
@@ -16280,12 +16334,199 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   reportRealInputTokens(realTotal: number, overhead?: RequestOverhead): void {
     this.requireLoadedBranch('reportRealInputTokens');
-    if (!Number.isFinite(realTotal) || realTotal <= 0) {
-      this._calibrationArmed = false;
-      return;
+    const sample = this.takeSample(realTotal, overhead);
+    if (sample === null || this._providerRate === null || overhead == null) return;
+    if (sample.rejected && sample.implied <= this._calibration) return;
+    const rate = sample.implied > this._calibration ? sample.implied : null;
+    if (rate !== null && !this.roomUnderLastLimit(this._calibration, rate)) return;
+    this._providerRate = rate;
+  }
+
+  /**
+   * A length refusal of the request the last compile built: the provider
+   * said the request is too long, and `stated` is the input count its
+   * refusal gave, where it gave one (membrane's `MembraneError.promptTokens`);
+   * one that isn't a positive finite number is taken as none.
+   * `overhead` is what the request sent besides the window, as
+   * `reportRealInputTokens` takes it. It takes the compile's one sample, as
+   * that does, so it's for a refusal of the first request built from the
+   * compile: one reported after that sample was taken changes nothing, and
+   * so does one of a compile that armed no sample, as a hierarchical select's
+   * (`adaptiveResolution` off) doesn't. A host that passes
+   * `SelectOptions.requestLimitTokens` should report a provider's too-long
+   * refusals here: priced at its own multiplier, a request the provider
+   * counts higher is otherwise refused by the provider at every compile.
+   *
+   * A stated count is the compile's sample, under `reportRealInputTokens`'
+   * rules. Where the compile had a request limit and the count is more than
+   * the store priced the request at, the store also keeps the rate the count
+   * implies, where that is above its multiplier, and prices the limit's
+   * allowance at it. A refusal with no count, under a limit, keeps the
+   * calibration's ceiling as that rate, where the store priced the request
+   * below it. Where what a refusal teaches, the multiplier its count's
+   * sample would set or the rate it would keep, would leave the window no
+   * room under the refused compile's limit beside its overhead and
+   * injections, the store learns nothing from it. Each usage sample after
+   * that which declares its overhead replaces the rate with its own where
+   * its own is above the multiplier, and ends it where its own isn't and the
+   * calibration's band doesn't reject the sample; it keeps no rate that
+   * would leave the window no room. The rate is kept in memory.
+   *
+   * `changed` says a retry can now come out different: that a select now,
+   * with the refused compile's store, budget and options, returns a request
+   * other than the refused one. The store runs that select dry to tell,
+   * refusing where a committing select would. A message the store has taken
+   * in since the compile, and a retry would select, makes it differ too.
+   * Where that select refuses, a retry sends nothing, so `changed` is false.
+   * A refusal the store has no estimate for answers false: it learns
+   * nothing from it, and the request it refused may not be the one its last
+   * compile built (a later round's, or one already reported), so there is
+   * none it can compare a retry with.
+   * `why` says in one sentence what the store made of the refusal, followed,
+   * where a retry's select refuses, by that refusal, and is also logged.
+   */
+  reportRefusedAsTooLong(stated: number | undefined, overhead: RequestOverhead): { changed: boolean; why: string } {
+    this.requireLoadedBranch('reportRefusedAsTooLong');
+    const result = this.learnFromRefusal(stated, overhead);
+    this.diag.warn(`[estimator-calibration] a too-long refusal: ${result.why}`);
+    return result;
+  }
+
+  private learnFromRefusal(stated: number | undefined, overhead: RequestOverhead): { changed: boolean; why: string } {
+    if (!this._calibrationArmed) {
+      return { changed: false, why: 'The store has no estimate of the refused request to learn from: its last compile was already reported, there is none, a refused compile since discarded the multiplier it was priced at, or its select doesn\'t calibrate (adaptiveResolution off).' };
     }
+    const why = this.learnedFrom(stated, overhead);
+    const retry = this.retryOfLastSelect();
+    return retry.refusal === undefined
+      ? { changed: retry.differs, why }
+      : { changed: false, why: `${why} A retry's select now refuses: ${retry.refusal}` };
+  }
+
+  private learnedFrom(stated: number | undefined, overhead: RequestOverhead): string {
+    const counted = stated !== undefined && Number.isFinite(stated) && stated > 0;
+    const last = this._lastSelect;
+    const limit = last?.opts?.requestLimitTokens;
+    const limitRoom = last && limit !== undefined ? limit - last.budget.reserveForResponse : null;
+    if (!(this._lastCompileEstimate > 0)) {
+      this._calibrationArmed = false;
+      const empty = 'The refused request\'s window was empty, so it was all overhead and injections, which the store can\'t fold; ' +
+        'what the request sends beside the window, with the reply\'s reserve against max_tokens, is above what the provider takes';
+      return `${empty}${limitRoom !== null ? ', and either the store\'s price of it is below the provider\'s count, or the request limit is above what the provider takes too' : ''}.`;
+    }
+    const ceiling = CALIBRATION_CEILING.toFixed(2);
+    const before = this._calibration;
+    const besides = (this._lastCompileInjected + this.priceRequestOverhead(overhead)) / before;
+    const raw = this._lastCompileEstimate / before + besides;
+    const noRoom = 'what the request sends beside the window leaves it no room under the request limit';
+    const aboveLimit = 'so the request limit, or the reply\'s reserve against max_tokens, is above what the provider takes.';
+    const aboveBudget = 'so the compile\'s budget with its over-budget grace, and what the request sends beside the window, is above what the provider takes.';
+    if (!counted) {
+      this._calibrationArmed = false;
+      const noCount = 'The provider refused the request as too long without stating its count';
+      if (limitRoom === null) return `${noCount}, and without a request limit the store keeps no rate to raise for it.`;
+      const rate = this.pricedRate();
+      if (rate >= CALIBRATION_CEILING) {
+        return `${noCount}, and the store already prices it at a rate of ${rate.toFixed(2)}, at or above the calibration's ceiling of ${ceiling}, so it has nothing to raise.`;
+      }
+      if (!this.roomUnderLastLimit(before, CALIBRATION_CEILING)) return `${noCount}, and at the calibration's ceiling of ${ceiling} ${noRoom}, so the store doesn't keep the ceiling as a rate.`;
+      this._providerRate = CALIBRATION_CEILING;
+      if ((raw + (last?.stubs ?? 0) / before) * CALIBRATION_CEILING <= limitRoom) {
+        return `${noCount}, and at the calibration's ceiling of ${ceiling} the refused request still fits the request limit, so either the provider counts it at more than that, or the request limit, or the reply's reserve against max_tokens, is above what the provider takes.`;
+      }
+      return `${noCount}, so the next compile prices the request at the calibration's ceiling of ${ceiling}.`;
+    }
+    const pricedAt = limitRoom !== null ? this.pricedRate() : before;
+    const price = Math.round(raw * pricedAt);
+    const decision = this.decideSample(stated, overhead)!;
+    this._calibrationArmed = false;
+    const { implied } = decision;
+    const after = decision.next.calibration;
+    const counts = `The provider counted ${Math.round(stated)} input tokens`;
+    const compared = `${counts}, ${implied <= pricedAt ? 'no more' : 'more'} than the store's price of ${price}`;
+    if (limitRoom !== null) {
+      const rate = implied > pricedAt && implied > after ? implied : this._providerRate;
+      if (!this.roomUnderLastLimit(after, rate)) {
+        const at = rate !== null && rate > after ? rate : after;
+        return `${compared}, and at the rate of ${at.toFixed(2)} that it teaches, ${noRoom}, so the store learns nothing from it.`;
+      }
+    }
+    this.applySample(decision);
+    const moved = this._calibration === before ? '.' : `; the sample moves the multiplier to ${this._calibration.toFixed(2)}.`;
+    if (implied <= pricedAt) {
+      return `${compared}, ${(limitRoom !== null ? aboveLimit : aboveBudget).slice(0, -1)}${moved}`;
+    }
+    if (limitRoom === null) {
+      return this._calibration === before
+        ? `${compared}, but this sample doesn't move the multiplier, and without a request limit the store keeps no other rate, so the next compile prices the request as this one did.`
+        : `${compared}, so the next compile prices the request at a rate of ${this._calibration.toFixed(2)}.`;
+    }
+    const keeps = implied > this._calibration;
+    if (keeps) this._providerRate = implied;
+    if (stated <= limitRoom) {
+      const notes = [
+        ...(this._calibration === before ? [] : [`the sample moves the multiplier to ${this._calibration.toFixed(2)}`]),
+        ...(keeps ? [`the store keeps a rate of ${implied.toFixed(2)} for the request limit`] : []),
+      ];
+      return `${compared} but within the request limit less the reply's reserve, ${aboveLimit.slice(0, -1)}${notes.length > 0 ? `; ${notes.join(', and ')}` : ''}.`;
+    }
+    return `${compared}, so the next compile prices the request at a rate of ${this.pricedRate().toFixed(2)}.`;
+  }
+
+  private retryOfLastSelect(): { differs: boolean; refusal?: string } {
+    const last = this._lastSelect;
+    if (!last) return { differs: false };
+    let entries: ContextEntry[];
+    this._retryingRefused = true;
+    try {
+      entries = this.select(last.store, last.log, last.budget, { ...last.opts, dryRun: true });
+    } catch (err) {
+      return { differs: false, refusal: err instanceof Error ? err.message : String(err) };
+    } finally {
+      this._retryingRefused = false;
+    }
+    const keys = this.requestKeys(entries);
+    return { differs: keys.length !== last.keys.length || keys.some((key, i) => key !== last.keys[i]) };
+  }
+
+  private pricedRate(): number {
+    const rate = this._providerRate;
+    return rate !== null && rate > this._calibration ? rate : this._calibration;
+  }
+
+  private requestPricedAt(): string {
+    const rate = this.pricedRate();
+    if (rate > this._calibration) return `a rate of ${rate.toFixed(2)} the store keeps for the request limit`;
+    return this._calibrationProvisional
+      ? `the store's provisional multiplier of ${rate.toFixed(2)}, which no request has measured under the current pricing`
+      : `the store's multiplier of ${rate.toFixed(2)}`;
+  }
+
+  private _providerRate: number | null = null;
+  private _retryingRefused = false;
+
+  private requestKeys(entries: readonly ContextEntry[]): string[] {
+    const known = this._requestKeys.get(entries);
+    if (known) return known;
+    const keys = entries.map((e) => `${e.participant}\0${JSON.stringify(e.content)}`);
+    this._requestKeys.set(entries, keys);
+    return keys;
+  }
+
+  private readonly _requestKeys = new WeakMap<readonly ContextEntry[], string[]>();
+
+  private takeSample(realTotal: number, overhead: RequestOverhead | undefined): { implied: number; rejected: boolean } | null {
+    const decision = this.decideSample(realTotal, overhead);
+    this._calibrationArmed = false;
+    if (decision === null) return null;
+    this.applySample(decision);
+    return { implied: decision.implied, rejected: decision.rejected };
+  }
+
+  private decideSample(realTotal: number, overhead: RequestOverhead | undefined): SampleDecision | null {
+    if (!Number.isFinite(realTotal) || realTotal <= 0) return null;
     const window = this._lastCompileEstimate;
-    if (!window || window <= 0) return;
+    if (!window || window <= 0) return null;
 
     // ARM-ONCE-PER-COMPILE (2026-07-12 regression fix). A turn makes MANY API
     // calls — tool-use rounds and max_tokens continuations each append to the
@@ -16295,8 +16536,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real=504k) drove the multiplier 1.0 -> 2.37 in minutes, inflating every
     // estimate (the fold floor went 62k -> 108k on unchanged content) and
     // exhausting the picker on every wake. One sample per compile, always.
-    if (!this._calibrationArmed) return;
-    this._calibrationArmed = false;
+    if (!this._calibrationArmed) return null;
     const declared = overhead != null;
 
     // The overhead in the window's units (current calibrated), so the implied
@@ -16314,6 +16554,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ` real=${Math.round(realTotal / 1000)}k)`;
     const ratio = realTotal / est;
     const current = this._calibration;
+    const state: SampleDecision['next'] = {
+      calibration: current,
+      ema: this._calibrationEma,
+      provisional: this._calibrationProvisional,
+      declared: this._calibrationDeclared,
+      declaredCandidate: this._declaredCandidate,
+      outOfBandRun: this._outOfBandRun,
+    };
     const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
@@ -16341,27 +16589,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let fromRun = false;
     if (!ratioInBand && !observedInBand) {
       const run = this._outOfBandRun;
-      this._outOfBandRun = !declared ? null
+      state.outOfBandRun = !declared ? null
         : run && Math.abs(observed / run.first - 1) <= OUT_OF_BAND_RUN_AGREEMENT
           ? { first: run.first, count: run.count + 1 }
           : { first: observed, count: 1 };
-      const count = this._outOfBandRun?.count ?? 0;
+      const count = state.outOfBandRun?.count ?? 0;
       if (count < OUT_OF_BAND_RUN_LENGTH) {
-        this.diag.error(
-          `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ${counts} — ` +
+        return {
+          implied: observed,
+          rejected: true,
+          next: state,
+          log: `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ${counts} — ` +
             (declared
               ? `multiplier stays ${this._calibration.toFixed(2)} until ${OUT_OF_BAND_RUN_LENGTH} samples in a row ` +
                 `agree within ${OUT_OF_BAND_RUN_AGREEMENT * 100}% (${count} of ${OUT_OF_BAND_RUN_LENGTH})`
               : `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}; if every sample ` +
                 `reads about the same, the caller may be leaving out the system prompt and tools it sends ` +
                 `(reportRealInputTokens' second argument)`),
-        );
-        return;
+        };
       }
-      this._outOfBandRun = null;
+      state.outOfBandRun = null;
       fromRun = true;
     } else {
-      this._outOfBandRun = null;
+      state.outOfBandRun = null;
     }
 
     // A multiplier learned from samples that didn't declare their overhead
@@ -16371,19 +16621,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (declaredOnUnmarked && !this._calibrationProvisional && !fromRun) {
       const candidate = this._declaredCandidate;
       if (candidate === null) {
-        this._declaredCandidate = observed;
-        this.diag.error(
-          `[estimator-calibration] real/est=${ratio.toFixed(2)} implies ${observed.toFixed(2)}: the first sample ` +
+        state.declaredCandidate = observed;
+        return {
+          implied: observed,
+          rejected: false,
+          next: state,
+          log: `[estimator-calibration] real/est=${ratio.toFixed(2)} implies ${observed.toFixed(2)}: the first sample ` +
             `with its overhead declared, held for the next; if they agree within ` +
             `${DECLARED_PAIR_AGREEMENT * 100}% their mean replaces the multiplier, and if not it steps; ` +
             `multiplier stays ${current.toFixed(2)} ${counts}`,
-        );
-        return;
+        };
       }
-      this._declaredCandidate = null;
+      state.declaredCandidate = null;
       if (Math.abs(observed / candidate - 1) <= DECLARED_PAIR_AGREEMENT) replacement = (candidate + observed) / 2;
     } else if (declared) {
-      this._declaredCandidate = null;
+      state.declaredCandidate = null;
     }
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
@@ -16393,10 +16645,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the guess outright; the EMA steps from here on. A consistent run replaces
     // it outright too.
     const provisional = this._calibrationProvisional;
-    this._calibrationProvisional = null;
+    state.provisional = null;
     const next = replacement ?? (provisional || fromRun ? observed : ema + alpha * (observed - ema));
     const clamped = Math.min(CALIBRATION_CEILING, Math.max(0.6, next));
-    this._calibrationEma = clamped;
+    state.ema = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
     // than 2% from the applied value. Every applied change reprices every
     // message and summary, so each structure kept across compiles (kv-unified
@@ -16409,28 +16661,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A provisional multiplier confirmed within the band gets its stamp
       // now: the record it came from has none, or is the discard's.
       if (provisional) {
-        this.diag.error(
-          `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
+        if (declared) state.declared = true;
+        return {
+          implied: observed,
+          rejected: false,
+          next: state,
+          log: `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
             `${current.toFixed(2)} ${counts}; stamped`,
-        );
-        if (declared) this._calibrationDeclared = true;
-        this.persistCalibration();
-      } else if (declaredOnUnmarked) {
-        this._calibrationDeclared = true;
-        this.persistCalibration();
+          persist: true,
+        };
       }
-      return;
+      if (declaredOnUnmarked) {
+        state.declared = true;
+        return { implied: observed, rejected: false, next: state, persist: true };
+      }
+      return { implied: observed, rejected: false, next: state };
     }
-    this.diag.error(
-      `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
+    state.calibration = clamped;
+    state.declared = declared;
+    return {
+      implied: observed,
+      rejected: false,
+      next: state,
+      log: `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
         `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}` +
         `${fromRun ? ` (${OUT_OF_BAND_RUN_LENGTH} consistent out-of-band samples: learned at the clamp)` : provisional ? ' (provisional: replaced, not stepped)' : replacement !== null ? ' (two samples with their overhead declared agree: replaced by their mean, not stepped)' : ''} ` +
         counts,
-    );
-    this._calibration = clamped;
-    this._calibrationDeclared = declared;
-    this.applyCalibration();
-    this.persistCalibration();
+      persist: true,
+    };
+  }
+
+  private applySample(decision: SampleDecision): void {
+    const { next } = decision;
+    const moved = next.calibration !== this._calibration;
+    this._calibration = next.calibration;
+    this._calibrationEma = next.ema;
+    this._calibrationProvisional = next.provisional;
+    this._calibrationDeclared = next.declared;
+    this._declaredCandidate = next.declaredCandidate;
+    this._outOfBandRun = next.outOfBandRun;
+    if (decision.log !== undefined) this.diag.error(decision.log);
+    if (moved) this.applyCalibration();
+    if (decision.persist) this.persistCalibration();
   }
 
   /** The store's price of what a request sent besides the window: its system
@@ -16697,11 +16969,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the clamp allows, and says nothing about this release's); otherwise it
    * is kept, but not re-stamped. A provisional multiplier above 1 that puts
    * the first compile over budget is dropped to 1 and the select runs again
-   * (dropProvisionalCalibration), unless the request limit made the
-   * refusal: its bound, no room, or the stubs past what it left. The first
-   * sample the band accepts replaces
-   * a provisional multiplier outright, instead of stepping the EMA toward it,
-   * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
+   * (dropProvisionalCalibration). The first
+   * sample the band accepts replaces a provisional multiplier outright,
+   * instead of stepping the EMA toward it, and writes the stamp
+   * (reportRealInputTokens). The 1 a discard restarts
    * from is provisional too, so one sample sets it rather than about ten; it
    * is persisted as such (`provisional: true`), so a restart before that
    * sample doesn't turn the guess into a learned value, and a later epoch's
@@ -16954,8 +17225,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
                   `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
-                  `outright, and a compile it puts over budget drops it to 1.00 first, unless the request limit ` +
-                  `made the refusal. Stamped (epoch ` +
+                  `outright, and a compile it puts over budget, or over a request limit that no rate the store ` +
+                  `keeps for it prices, drops it to 1.00 first. Stamped (epoch ` +
                   `${current}) once a sample confirms it.`,
               );
             }
@@ -16987,21 +17258,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  can run again, and record the reset; a committing select logs and
    *  persists it, a dry one keeps it to itself (select() puts it back).
    *  Returns false when there is nothing to drop: no provisional multiplier,
-   *  or one at or below 1, where raising estimates can't help, so the refusal
-   *  stands. Also false when the request limit made the refusal: it set the
-   *  hard bound, left no room, or found the pairing repair's stubs past what
-   *  it left. Each such bound scales with the multiplier as the window's
-   *  price does, so a lower one can't make the window fit. The 1 stays provisional: the
-   *  first sample sets it. */
+   *  or one at or below 1, where raising estimates can't help, or a refusal
+   *  the request limit bounds while the store prices the limit at a rate it
+   *  keeps for the request limit, which no multiplier moves; so the refusal
+   *  stands. A drop leaves no sample armed: the estimate armed was priced at
+   *  the multiplier it discards. The 1 stays provisional: the first sample
+   *  sets it. */
   protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
     const provisional = this._calibrationProvisional;
-    if (!provisional || this._calibration <= 1 || this.selectPricing?.limitBound) return false;
+    if (!provisional || this._calibration <= 1) return false;
+    if (err.diagnostics.requestLimitBound && this.pricedRate() > this._calibration) return false;
     const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const discarded = this._calibration;
     const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
     this._calibration = 1;
     this._calibrationReset = reset;
     this._calibrationDeclared = false;
+    this._calibrationArmed = false;
     this.applyCalibration();
     if (dryRun) return true;
     this.diag.warn(
@@ -17195,9 +17468,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Measured stable prefix: first index where this compile's entry bytes
     // diverge from the previous compile's. Measured for every strategy, since
     // the fold diff reports it; kv-unified places its markers without it.
-    const keys = entries.map(
-      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
-    );
+    const keys = this.requestKeys(entries);
     let firstDiff = n;
     const prev = this._prevCacheKeys;
     if (prev) {
@@ -18541,8 +18812,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const { maxTokens, rejectionBudget: graceLimit } = this.boundsUnderRequestLimit(budget, room,
       this.config.enforceBudget === false
         ? Number.POSITIVE_INFINITY
-        : Math.floor(room * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0))),
-      false);
+        : Math.floor(room * (1 + Math.max(0, this.config.overBudgetGraceRatio ?? 0))));
 
     let totalTokens = 0;
 
@@ -21556,8 +21826,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     pricing.stubTokens = stubTokens;
     const window = this.rsTokens(this._rs);
     if (window + stubTokens <= pricing.allowance) return;
-    pricing.limitBound = true;
     pricing.allowanceTokens = pricing.allowance;
+    pricing.limitBound = true;
     const error = this.overBudgetError(budget, {
       stage: 'Request limit',
       budget: pricing.allowance,

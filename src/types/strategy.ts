@@ -903,14 +903,28 @@ export interface SelectOptions {
    * the select keeps that sum within it, in the window's units at the
    * compile's multiplier (for a strategy that doesn't calibrate, such as the
    * passthrough strategies, as the store's estimator prices it), the
-   * strategy's over-budget grace included; while an AutobiographicalStrategy's
-   * multiplier is provisional, it keeps the sum within it priced at the
-   * calibration's ceiling, by scaling its price at the provisional
-   * multiplier. The store rounds each block's price at that multiplier, by
-   * up to half a token, so at a true rate up to the ceiling the request can
-   * pass the limit by up to half a token a block, scaled by the ceiling over
-   * the multiplier. A select whose sum would still pass it, or whose
-   * limit leaves the window no room, refuses with an `OverBudgetError`.
+   * strategy's over-budget grace included. After a too-long refusal of a
+   * request under it (`AutobiographicalStrategy.reportRefusedAsTooLong`), an
+   * AutobiographicalStrategy can keep the sum within it priced at a rate
+   * above its multiplier, by scaling its price at the multiplier: the rate
+   * the refusal's stated count implies, where that is above both the
+   * multiplier and the rate it priced the refused request at, or, where the
+   * refusal stated no count, the calibration's ceiling, where it priced the
+   * request below that. Where that rate, or the multiplier the refusal's
+   * count would set, would leave the window no room beside what the request
+   * sends, the strategy learns nothing from the refusal. Each usage sample
+   * after that which declares its overhead replaces the rate with its own
+   * where that is above the multiplier and leaves the window room, and ends
+   * it where its own is no higher than the multiplier and the calibration's
+   * band doesn't reject it. The store rounds each block's price at the
+   * multiplier by up to half a token, so at a true rate up to the one it
+   * priced at, the request can pass the
+   * limit by up to half a token a block, scaled by that rate over the
+   * multiplier. A select whose sum would still pass it, or whose limit
+   * leaves the window no room, refuses with an `OverBudgetError`. An
+   * AutobiographicalStrategy's own such refusals name the rate it priced the
+   * request at, except the one for the pairing repair's stubs, which names
+   * the allowance and the limit instead.
    * It needs `requestOverhead`: one given without it, or one that isn't a
    * positive finite number, is refused with a `TypeError` before anything is
    * selected. */
@@ -947,6 +961,10 @@ export interface PreviewResult {
    *  bound reports the plan instead, without them. */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /** Present, and true, on a preview that doesn't fit, where the request
+   *  limit, not the budget, is the bound it measured against, as the live
+   *  compile's refusal says (`OverBudgetDiagnostics.requestLimitBound`). */
+  requestLimitBound?: true;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
   /** True when the picker could not fold any further, and when the request
