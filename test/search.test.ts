@@ -10,7 +10,7 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
 
@@ -157,6 +157,38 @@ describe('AutobiographicalStrategy — search (gap #7)', () => {
     assert.ok(got, 'should find the seeded summary');
     assert.equal(got?.content, 'lookup me');
     assert.equal(manager.getSummary('nonexistent'), null);
+    manager.close();
+  });
+});
+
+describe('ContextManager with a strategy that neither searches summaries nor gives render stats', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  async function open(): Promise<ContextManager> {
+    const strategy = new PassthroughStrategy();
+    for (const method of ['searchSummaries', 'getSummary', 'getRenderStats']) {
+      assert.ok(!(method in strategy), `premise: the strategy has no ${method}`);
+    }
+    return ContextManager.open({ path: TEST_STORE_PATH, strategy });
+  }
+
+  it('searchSummaries answers an empty array', async () => {
+    const manager = await open();
+    assert.deepStrictEqual(manager.searchSummaries({ text: 'anything' }), []);
+    manager.close();
+  });
+
+  it('getSummary answers null', async () => {
+    const manager = await open();
+    assert.strictEqual(manager.getSummary('any-id'), null);
+    manager.close();
+  });
+
+  it('getRenderStats answers null', async () => {
+    const manager = await open();
+    assert.strictEqual(manager.getRenderStats(), null);
     manager.close();
   });
 });

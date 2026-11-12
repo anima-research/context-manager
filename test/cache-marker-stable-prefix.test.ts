@@ -139,3 +139,29 @@ test('never more than 3 message-level markers', () => {
     assert.ok(marksOf(es).length <= 3, `round ${round}: ${marksOf(es)}`);
   }
 });
+
+test('with no deep band, a compile whose prefix changes inside the head marks no entry there but the first slot', () => {
+  const s = new Exposed({});
+  const a = fixture();
+  s.place(a.es, a.head, a.tail);
+  const b = fixture();
+  b.es[1] = entry('h1', 'sys-b, edited');
+  s.place(b.es, b.head, b.tail);
+  assert.deepEqual(marksOf(b.es), [1, 10]);
+
+  const longHead = (edited: boolean) => {
+    const es = [
+      entry('h0', 'sys-a'), entry('h1', 'sys-b'), entry('h2', edited ? 'sys-c, edited' : 'sys-c'), entry('h3', 'sys-d'),
+      entry('m0', 'fold-0'), entry('m1', 'fold-1'), entry('m2', 'fold-2'),
+      entry('m3', 'fold-3'), entry('m4', 'fold-4'), entry('m5', 'fold-5'),
+      entry('t0', 'raw-0'), entry('t1', 'raw-1'), entry('t2', 'raw-2'),
+    ];
+    return { es, head: new Set(['h0', 'h1', 'h2', 'h3']), tail: new Set(['t0', 't1', 't2']) };
+  };
+  const t = new Exposed({});
+  const c = longHead(false);
+  t.place(c.es, c.head, c.tail);
+  const d = longHead(true);
+  t.place(d.es, d.head, d.tail);
+  assert.deepEqual(marksOf(d.es), [3, 12], 'an edit inside a longer head, with entries before it unchanged, marks none of them');
+});

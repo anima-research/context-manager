@@ -48,6 +48,7 @@ export type {
 export type {
   MessageStoreView,
   ContextLogView,
+  WindowIndexView,
   StrategyContext,
   ReadinessState,
   ContextStrategy,
@@ -91,6 +92,7 @@ export type {
   RenderedSummaryInfo,
   ImageCeilings,
   ThinkingBinding,
+  ThinkingStanding,
   RequestIdentity,
 } from './strategy.js';
 

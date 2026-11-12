@@ -53,12 +53,25 @@ export interface ContextEntry {
   /**
    * The tool_use ids whose results a structural repair moved out of this
    * entry into the entry that answers their tool_use. The request still
-   * carries each result, in that other entry: attribution looks for it
-   * there by its tool_use id, so moving a result is not a loss, while a
-   * moved result that was later altered, or is missing from the request,
-   * still is.
+   * carries each result, in that other entry: attribution looks for it by
+   * its tool_use id among every result in the request, so moving a result
+   * is not a loss, while a moved result that was later altered, or is
+   * missing from the request, still is. Where `relocatedBlocks` is set,
+   * attribution looks for those blocks instead, and for a result with the
+   * id still in this entry.
    */
   relocatedResults?: string[];
+  /**
+   * The result blocks that repair placed for `relocatedResults`, as it
+   * placed them, one block of its own for each move. Where it's set,
+   * attribution credits a moved result only through one of these blocks
+   * still in the request, unaltered, or through a result with its id still
+   * in this entry that isn't among the blocks repair recorded as placed for
+   * any entry. A stub repair generated, or a copy that releasing a raw form
+   * made of a block it placed, isn't recorded, so either counts as a carrier
+   * wherever it covers the moved result.
+   */
+  relocatedBlocks?: ContentBlock[];
 }
 
 /**
@@ -110,12 +123,37 @@ export interface WaitingWork {
 /**
  * An injection into the compiled context.
  * Source-agnostic: may come from MCPL servers, local strategies, or application code.
+ *
+ * Injections are never stored: `compile()` places them afresh each time it
+ * runs. What each position costs is on `position`, where `beforeUser` is
+ * deprecated (anima-research/agent-framework#171); `system` and `afterUser`
+ * are supported.
  */
 export interface ContextInjection {
   /** Server-defined namespace (e.g., "memory", "compliance") */
   namespace: string;
 
-  /** Where to inject in the message array */
+  /**
+   * Where to inject:
+   * - `system`: comes back in `CompileResult.systemInjections`, for the
+   *   caller's system prompt, and isn't stored. A change to its text changes
+   *   the system prompt, so the request misses the prompt cache from the
+   *   system prompt on, and on a model that binds a reply's thinking to
+   *   everything before it, every earlier reply loses its thinking
+   *   (`thinkingBinding`), since the system prompt comes before them all.
+   * - `afterUser`: placed again after the last user message at every compile
+   *   (at the end when there is none), so it moves as newer user messages
+   *   arrive: the request misses the cache from its old place on, and on a
+   *   model that binds a reply's thinking to everything before it, every
+   *   reply after its old place loses its thinking (`thinkingBinding`). It's
+   *   for text that must stay near the end, such as instructions.
+   * - `beforeUser`: deprecated (anima-research/agent-framework#171). It's
+   *   placed again before the last user message at every compile, so it moves
+   *   as `afterUser` does, at the same costs, and since a tool's result is
+   *   carried in a user message, after a tool call it lands between the call
+   *   and its result. Store the content as an ordinary message
+   *   (`ContextManager.addMessage`) instead, where it stays.
+   */
   position: 'system' | 'beforeUser' | 'afterUser';
 
   /** Content blocks to inject (multimodal) */
@@ -153,9 +191,11 @@ export interface CompileResult {
   messages: NormalizedMessage[];
 
   /**
-   * System-position injections, grouped by namespace.
+   * The content blocks of the `system`-position injections, flattened in the
+   * order given; their namespaces aren't kept.
    * Caller should append these to the system prompt.
    * Separated because the system prompt is outside context-manager's scope.
+   * Empty when no `system`-position injection is passed.
    */
   systemInjections: ContentBlock[];
 
@@ -237,7 +277,9 @@ export interface CompileResult {
 
   /**
    * Set on a compile with `thinkingBinding.binds` that newly leaves out a
-   * stored reply's thinking: what, and why (see
+   * stored reply's thinking, other than one a host noted, after the compile
+   * that wrote the branch's record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`): what, and why (see
    * `SelectOptions.thinkingBinding`).
    */
   thinkingStrip?: ThinkingStrip;
@@ -265,7 +307,10 @@ export interface ThinkingStrip {
    * that compile sent them with their thinking, they were stored since, or
    * it didn't send them as stored replies at all. A record is written by a
    * committing compile with `binds`, so a compile without it is passed
-   * over.
+   * over. A reply a host noted, after the compile that wrote the branch's
+   * record, as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`) is never among them: the
+   * provider's report of that request already told the host.
    * So a reply can be reported again: one whose thinking went, that a later
    * compile didn't send, and that renders again. A host that tells each
    * loss once keeps its own set of what it has told.
@@ -382,21 +427,43 @@ export interface JournalMark {
 
 /**
  * A rendered layout: the form every message of the strategy's view took in
- * one compile. Membership and form are kept apart: `members` lists the
- * view's messages by sequence, ascending, and `units` partition them in
- * that order, each covering its `n` next members (a raw unit, one). A
- * message the view lacked (removed, filtered out) is in no unit, however
- * near a range it lies. Token estimates are base estimates (before the
- * store's calibration multiplier), so they compare across compiles.
+ * one compile. Membership and form are kept apart: `members` names the
+ * view's messages in view order, each by a number it keeps while it stays
+ * in the window, ascending, and `units` partition them in that order, each
+ * covering its `n` next members (a raw unit, one). A message the view
+ * lacked (removed, taken out of the window, filtered out) is in no unit,
+ * however near a range it lies, and every other member keeps its number.
+ * Token estimates are base estimates (before the store's calibration
+ * multiplier), so they compare across compiles.
+ *
+ * What the numbers are depends on the manager's window on the compile's
+ * branch (`keyedBy`, agent-framework #291). While the window is the record
+ * (legacy mode, see ContextManager.windowMode) they are the messages'
+ * store sequences, which ascend in the record's order. Once rows are
+ * presented the window can list them in another order, and they are the
+ * messages' window-index ordinals (ContextManager.ordinalOf), which ascend
+ * in the window's. Before this, a layout was `v: 2`, without `keyedBy` or
+ * `memberSequences`, and its members were store sequences: acceptRound
+ * reads a `v: 2` layout that way, so a provenance an earlier release's
+ * compile returned, carried across the upgrade, is still accepted. A
+ * layout of any other version without `keyedBy` says nothing of what its
+ * members count, and acceptRound refuses it, writing nothing.
  */
 export interface RenderedLayout {
-  readonly v: 2;
-  /** The view's message sequences, ascending: the layout's exact membership. */
+  readonly v: 3;
+  /** What `members` count: store sequences while the window is the record, window-index ordinals once rows are presented. */
+  readonly keyedBy: 'sequence' | 'ordinal';
+  /** The view's messages, by `keyedBy`, ascending: the layout's exact membership. */
   readonly members: readonly number[];
   /** The members' message ids, parallel to `members`. In memory only: an
-   *  accepted layout persists sequences, and receipts take ids from the
+   *  accepted layout persists members, and receipts take ids from the
    *  compile being accepted. */
   readonly memberIds: readonly MessageId[];
+  /** The members' store sequences, parallel to `members`: what a receipt
+   *  names a message by (`FoldSpanBound.sequence`), whatever `keyedBy` is.
+   *  Keyed by sequence, the same as `members`; keyed by ordinal, in window
+   *  order, which need not ascend. In memory only, as `memberIds`. */
+  readonly memberSequences: readonly number[];
   readonly units: readonly LayoutUnit[];
   /** Base-estimate tokens of everything this compile rendered. */
   readonly totalTokens: number;

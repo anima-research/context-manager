@@ -28,6 +28,7 @@ import {
   ContextManager,
   MessageStore,
   PassthroughStrategy,
+  WindowedPassthroughStrategy,
 } from '../src/index.js';
 
 type ViewStore = JsStore & { view(branch: string): JsStore };
@@ -140,9 +141,11 @@ describe('ContextManager.derive', () => {
       },
     );
     // The strategy names what the child inherits: its memory and how it is
-    // presented, not its work queue or its own refusal ledger.
+    // presented, not its work queue or its own refusal ledger. The manager
+    // lists its own states beside the manifest's, the window index among
+    // them (agent-framework #291), which no strategy's manifest names.
     assert.deepEqual(derivation.inherited.statePrefixes, []);
-    for (const id of ['messages', 'context', 'mint-preimage-envelopes', 'default/autobio:summaries', 'default/autobio:resolutions', 'default/autobio:merge-quarantine']) {
+    for (const id of ['messages', 'context', 'default/window', 'mint-preimage-envelopes', 'default/autobio:summaries', 'default/autobio:resolutions', 'default/autobio:merge-quarantine']) {
       assert.ok(derivation.inherited.stateIds.includes(id), `inherits ${id}`);
     }
     for (const id of ['default/autobio:mergeQueue', 'default/autobio:compression-refusal-quarantine-events']) {
@@ -307,6 +310,34 @@ describe('ContextManager.derive', () => {
       JSON.stringify(fromChild.messages.map((m) => m.content)),
       'a cold open renders the same content',
     );
+  });
+
+  it('a child of another strategy places its cache markers as a fresh solve does, not from its parent\'s last request', { skip }, async () => {
+    const parent = await ContextManager.open({
+      path: storePath(),
+      strategy: new WindowedPassthroughStrategy(),
+      membrane: mockMembrane() as never,
+    });
+    managers.push(parent);
+    for (let i = 0; i < 12; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    const fromParent = await parent.compile(BUDGET);
+    assert.ok(fromParent.messages.some((m) => (m as { cacheBreakpoint?: boolean }).cacheBreakpoint), 'premise: the parent placed cache markers');
+
+    const child = () => new AutobiographicalStrategy({ compressionModel: 'mock', adaptiveResolution: true, targetChunkTokens: 100, recentWindowTokens: 200 });
+    const reusing = await parent.derive({ branch: 'dendrite/reusing', strategy: child() });
+    const fresh = await parent.derive({ branch: 'dendrite/fresh', strategy: child(), solve: 'fresh' });
+    managers.push(reusing, fresh);
+    const marks = (r: { messages: unknown[] }) =>
+      r.messages.flatMap((m, i) => ((m as { cacheBreakpoint?: boolean }).cacheBreakpoint ? [i] : []));
+    const fromReusing = await reusing.compile(BUDGET);
+    const fromFresh = await fresh.compile(BUDGET);
+    assert.equal(
+      JSON.stringify(fromReusing.messages.map((m) => m.content)),
+      JSON.stringify(fromFresh.messages.map((m) => m.content)),
+      'premise: both children render the same content',
+    );
+    assert.ok(marks(fromFresh).length > 0, 'premise: a fresh child places cache markers');
+    assert.deepEqual(marks(fromReusing), marks(fromFresh));
   });
 
   it('hands a reusing child the markers the parent placed, with the cache keys they were placed for', { skip }, async () => {
@@ -475,6 +506,21 @@ describe('ContextManager.derive', () => {
     assert.equal(child.getAllMessages().length, HISTORY);
   });
 
+  it('keeps compression holds apart: the parent\'s holds at the derive stay its own, and a hold placed on either side after it is that side\'s alone', { skip }, async () => {
+    const { parent, ids } = await foldedParent();
+    parent.holdCompression([ids[HISTORY - 3]!]);
+    assert.deepEqual([...parent.getCompressionHolds()], [ids[HISTORY - 3]], 'premise: the parent holds a message when it derives');
+    const child = await parent.derive({ branch: 'dendrite/holds', strategy: folding() });
+    managers.push(child);
+    assert.deepEqual([...child.getCompressionHolds()], [], 'the child starts with none of the parent\'s holds');
+
+    parent.holdCompression([ids[HISTORY - 1]!]);
+    child.holdCompression([ids[HISTORY - 2]!]);
+
+    assert.deepEqual([...parent.getCompressionHolds()], [ids[HISTORY - 3], ids[HISTORY - 1]]);
+    assert.deepEqual([...child.getCompressionHolds()], [ids[HISTORY - 2]]);
+  });
+
   it('leaves the parent\'s merge queue and refusal ledger behind, by the strategy\'s manifest', { skip }, async () => {
     const { parent, strategy } = await foldedParent();
     const root = parent.getStore();
@@ -584,6 +630,21 @@ describe('ContextManager.derive', () => {
     other.close();
   });
 
+  it('starts a windowed child derived at the head from the parent\'s anchor, in the strategy\'s own slot or the one its caller names', { skip }, async () => {
+    for (const options of [{}, { anchorStateId: 'subconscious/anchor' }]) {
+      const parentStrategy = new WindowedPassthroughStrategy(options);
+      const parent = await ContextManager.open({ path: storePath(), namespace: 'agents/mira', strategy: parentStrategy });
+      managers.push(parent);
+      for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+      const anchor = parent.getAllMessages()[3]!.sequence;
+      parentStrategy.setAnchor(anchor);
+
+      const childStrategy = new WindowedPassthroughStrategy(options);
+      managers.push(await parent.derive({ branch: 'dendrite/windowed', strategy: childStrategy }));
+      assert.equal(childStrategy.getAnchor(), anchor, JSON.stringify(options));
+    }
+  });
+
   it('survives a restart: the branch is the child\'s durable state', { skip }, async () => {
     const path = storePath();
     const parent = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
@@ -613,6 +674,24 @@ describe('ContextManager.derive', () => {
     assert.equal(messages[HISTORY]!.id, childOnly);
     assert.equal(reopened.getAllMessages().some((m) => m.id === childOnly), false);
     await resumed.compile(BUDGET);
+  });
+
+  it('reopening a derived context creates no branch', { skip }, async () => {
+    const path = storePath();
+    const parent = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    for (let i = 0; i < 6; i++) parent.addMessage(i % 2 ? 'Claude' : 'User', turn(i));
+    const child = await parent.derive({ branch: 'dendrite/child', strategy: folding() });
+    const derivation = child.getDerivation()!;
+    parent.close();
+
+    const reopened = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() as never });
+    managers.push(reopened);
+    const store = reopened.getStore();
+    const branches = () => store.listBranches().map((b) => b.name).sort();
+    const before = branches();
+    const resumed = await ContextManager.reopenDerived({ store, derivation, strategy: folding(), membrane: mockMembrane() as never });
+    assert.equal(resumed.currentBranch().name, 'dendrite/child', 'premise: it reopened the child\'s branch');
+    assert.deepEqual(branches(), before);
   });
 
   it('a derived context can itself be derived from', { skip }, async () => {
@@ -859,6 +938,26 @@ describe('MessageStore coherence across handles on one branch', () => {
   });
 });
 
+describe('MessageStore.deriveOnto from a seed', () => {
+  it("a store its parent seeds starts at its parent's calibration multiplier", { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-derive-seeded-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const parent = new MessageStore(root);
+      parent.append('user', [{ type: 'text', text: 'before the fork' }]);
+      parent.setTokenCalibration(1.3);
+      root.createBranchAt('seeded-child', root.currentBranch().name, root.currentSequence());
+      const derived = parent.deriveOnto((root as ViewStore).view('seeded-child'));
+      assert.equal(derived.getAll()[0], parent.getAll()[0], 'premise: the parent seeded the child, which shares its message object');
+      assert.equal(derived.getTokenCalibration(), 1.3);
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('MessageStore message views', () => {
   it('an append converts only the new message; an edit replaces only the edited one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cm-views-'));
@@ -881,6 +980,28 @@ describe('MessageStore message views', () => {
       assert.equal(afterEdit[2], first[2]);
     } finally {
       manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('MessageStore.deriveOnto', () => {
+  it("a store its parent's messages can't seed loads cold, at its parent's calibration multiplier", { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-derive-cold-'));
+    const root = JsStore.create({ path: join(dir, 'store') });
+    try {
+      MessageStore.register(root);
+      const parent = new MessageStore(root);
+      parent.append('user', [{ type: 'text', text: 'before the fork' }]);
+      parent.setTokenCalibration(1.3);
+      root.createBranchAt('cold-child', root.currentBranch().name, root.currentSequence());
+      parent.append('user', [{ type: 'text', text: 'after the fork' }]);
+      const derived = parent.deriveOnto((root as ViewStore).view('cold-child'));
+      assert.deepEqual(derived.getAll().map((m) => (m.content[0] as { text: string }).text), ['before the fork'],
+        'premise: the child holds what its branch held at the fork');
+      assert.equal(derived.getTokenCalibration(), 1.3);
+    } finally {
+      root.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import { ExactKvUnifiedPolicySolver, type AcceptedPresentationReference } from '../../src/adaptive/kv-unified-policy.js';
-import { TerminalPolicyEvaluator, type FrontierTrace } from '../../src/adaptive/kv-unified-terminal.js';
+import { TerminalPolicyEvaluator, presentedLeavesByIndex, type FrontierTrace } from '../../src/adaptive/kv-unified-terminal.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
@@ -331,4 +331,98 @@ test('a kept layout translation with an unknown unit is rebuilt once the forest 
     assert.equal(actual.fidelityLoss, expected.fidelityLoss, `F at ${at}`);
     assert.equal(actual.continuityLoss, expected.continuityLoss, `K at ${at}`);
   }
+});
+
+test('a leaf shown at its accepted level under another representation costs continuity at distance one', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'a', rawTokens: 100 });
+  chronicle.addChunk({ id: 'b', rawTokens: 100 });
+  const l1 = chronicle.produceL1(['a', 'b']);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs);
+  const presentation: AcceptedPresentationReference = {
+    currentSeq: 5, leaves: new Map(['a', 'b'].map((id) => [id, { level: 1, repHash: 'summary:regenerated', lastChangedSeq: 1 }])),
+  };
+  assert.notEqual(forest.leaf('a')!.repHashes[1], 'summary:regenerated');
+  const options = { maxTokens: 10_000, presentation };
+  const enumeration = forest.enumerateExactCuts();
+  const cut = enumeration.candidates.find((candidate) => candidate.frontier.get('a') === 1);
+  assert.ok(cut, `fixture has no cut through ${l1.id}`);
+  const prepared = new TerminalPolicyEvaluator(inputs, forest, options).candidate(traceFor(cut.frontier), cut.renderedTokens);
+  const exact = new ExactKvUnifiedPolicySolver(inputs, forest).scoreCandidates([cut], options, enumeration.stats);
+  assert.ok(exact.feasible);
+  assert.ok(exact.selected.continuityLoss > 0);
+  assert.equal(prepared.continuityLoss, exact.selected.continuityLoss);
+});
+
+test("a gap-bearing summary's estimated cache churn orders it by its earliest leaf, as the exact layout does", () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 20 });
+  for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 40 + i * 10 });
+  chronicle.produceL1(['c0', 'c2']);
+  chronicle.produceL1(['c1', 'c3']);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs, { preserveGapBearingSummaries: true });
+  const cuts = forest.enumerateExactCuts().candidates;
+  const cut = cuts.find((candidate) => candidate.frontier.get('c0') === 1 && candidate.frontier.get('c1') === 0);
+  assert.ok(cut, 'fixture has no cut holding only the first L1');
+  const layout = renderLayout(inputs, new SummaryTree(inputs), cut.frontier);
+  const options = {
+    maxTokens: 10_000,
+    cache: { immutablePrefixHash: 'same', layout,
+      markers: layout.units.map((_, i) => ({ unitIndex: i + 1, offset: layout.units[i + 1]?.offset ?? layout.totalTokens })) },
+    currentImmutablePrefixHash: 'same',
+    policy: { cacheLambda: 100, cacheScale: 50 },
+  };
+  const evaluator = new TerminalPolicyEvaluator(inputs, forest, options);
+  assert.ok(evaluator.cacheRelevant);
+  const trace = traceFor(new Map(['c0', 'c1', 'c2', 'c3'].map((id) => [id, cut.frontier.get(id) ?? 0])));
+  const exact = evaluator.candidate(trace, cut.renderedTokens);
+  const estimate = evaluator.estimate(trace, cut.renderedTokens);
+  assert.equal(estimate.cacheChurn, exact.cacheChurn);
+});
+
+test('the presentation is read again for another map under the same scope', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 10 });
+  chronicle.addChunk({ id: 'x', rawTokens: 100 });
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs);
+  const scope = {};
+  const first = new Map([['x', { level: 0, repHash: 'raw:x', lastChangedSeq: 1 }]]);
+  const second = new Map([['x', { level: 1, repHash: 'summary:other', lastChangedSeq: 2 }]]);
+  assert.equal(presentedLeavesByIndex(first, forest, scope)[0], first.get('x'));
+  assert.equal(presentedLeavesByIndex(second, forest, scope)[0], second.get('x'));
+});
+
+test('the presentation is read again for a sibling forest whose appended leaf has another id', () => {
+  const base: PickerInputs = {
+    chunks: [{ id: 'z', sequence: 0, rawTokens: 100, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: undefined }],
+    summaries: new Map(), recallPairTokens: new Map(), headTokens: 0, tailTokens: 0,
+    headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base);
+  const grow = (id: string): PickerInputs => ({
+    ...base, chunks: [{ ...base.chunks[0] },
+      { id, sequence: 1, rawTokens: 50, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: undefined }],
+    summaries: new Map(), recallPairTokens: new Map(), headChunkIds: new Set(), tailChunkIds: new Set(),
+  });
+  const withY = CanonicalSummaryForest.derive(first, grow('y'));
+  const withW = CanonicalSummaryForest.derive(first, grow('w'));
+  assert.ok(withY && withW);
+  assert.equal(withY.ownership, withW.ownership);
+  const presentation = new Map([
+    ['y', { level: 0, repHash: 'raw:y', lastChangedSeq: 1 }],
+    ['w', { level: 0, repHash: 'raw:w', lastChangedSeq: 2 }],
+  ]);
+  const scope = {};
+  assert.equal(presentedLeavesByIndex(presentation, withY, scope)[1], presentation.get('y'));
+  assert.equal(presentedLeavesByIndex(presentation, withW, scope)[1], presentation.get('w'));
 });

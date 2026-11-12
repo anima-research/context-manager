@@ -9,6 +9,7 @@ import type {
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
+import type { WindowMode } from '../window-index.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -26,6 +27,16 @@ export interface MessageStoreView {
    * view asks each source's, and the source's `get` where it has none.
    */
   sequenceOf?(id: MessageId): number | undefined;
+  /**
+   * A message's position in `getAll()`, undefined when the listing doesn't
+   * hold it, without reading the message where the view can (optional).
+   * The window a ContextManager gives its strategy and its compile answers
+   * it: by sequence while the window is the record, which lists by
+   * sequence, and from the window's own positions once a host presents
+   * rows to the agent in another order (`ContextManager.presentRows`). A
+   * filtered view doesn't forward it, since its positions are its own.
+   */
+  positionOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */
@@ -72,11 +83,82 @@ export interface ContextLogView {
 }
 
 /**
+ * Read-only view of the agent's window index for strategies (see
+ * window-index.ts and ContextManager.presentRows): where each row entered
+ * the window, by index ordinal. An ordinal never moves, whatever leaves the
+ * window or the store, and it counts the window before the view filter, so
+ * a strategy can keep a place in the window that a host's filter, a removal
+ * or a retracted row doesn't shift. Every read asks the index on the branch
+ * the store is on, so a view held across a branch switch follows it.
+ *
+ * In legacy mode, until the window is written down on the branch (a host's
+ * first presentRows, presentRows([]) among them, or a retractRows that
+ * names a row), the window is the record and there are no ordinals: a
+ * strategy keeps its places by sequence there, as it always has.
+ */
+export interface WindowIndexView {
+  /** `'legacy'` while the window is the record, `'presented'` once it is written down on the branch (the first presentRows, or a retractRows that names a row), even while it holds no row. */
+  mode(): WindowMode;
+  /**
+   * The ordinal of every row in the window, from one reading of the index;
+   * null in legacy mode. Read it at once: a later presentation changes it.
+   * It can map the id of a row the record no longer has, removed through
+   * another manager, until a host retracts it (ContextManager.ordinalOf);
+   * the view never lists such a row.
+   */
+  ordinals(): ReadonlyMap<MessageId, number> | null;
+  /**
+   * The index's length: every ordinal below it has been issued on this
+   * branch, to rows, tombstones and the write-down's header. A
+   * presentation's rows take ordinals from it on, after any tombstones the
+   * same write puts first. 0 in legacy mode.
+   */
+  length(): number;
+  /**
+   * The ordinal of the first row in the window, in window order, stored at
+   * `sequence` or after; `length()` when no row in the window is. Undefined
+   * in legacy mode. While the window is in record order its rows from there
+   * on are the rows stored at `sequence` and after; once rows are presented
+   * out of record order, a row stored before `sequence` and presented after
+   * that first row is after it in the window too.
+   */
+  ordinalFrom(sequence: Sequence): number | undefined;
+  /** The sequence of the first row in the window at `ordinal` or after, before the view filter; undefined when none is, and in legacy mode. */
+  sequenceFrom(ordinal: number): Sequence | undefined;
+  /**
+   * The rows that left the window and haven't been presented again since,
+   * from one reading of the index: rows a host took out (retractRows), and
+   * rows removed from the record once they were taken out, by a removal
+   * through the manager or by their ids. Null in legacy mode. A row
+   * removed before the window was written down was never in the
+   * written-down window (in legacy mode the window is the record, so a
+   * strategy may have folded it; what folded it stays, as it always has
+   * there), and isn't one. A strategy that folds rows reads it at its open to let go of what
+   * covers a row that left while no strategy of its kind heard it go
+   * (onRetracted). Optional: a view a caller builds by hand may not have
+   * it, which a strategy reads as no row having left.
+   */
+  left?(): ReadonlySet<MessageId> | null;
+}
+
+/**
  * Context provided to strategy methods.
  */
 export interface StrategyContext {
-  /** Read-only view of message store */
+  /**
+   * Read-only view of the rows the strategy reads: the agent's window over
+   * the merged record (the manager's slot and its auxiliary slots), with
+   * the view filter applied. In legacy mode the window is the merged record
+   * itself; once a host presents rows, it is the rows presented, in the
+   * order they were presented (ContextManager.presentRows).
+   */
   messageStore: MessageStoreView;
+  /**
+   * The agent's window index (optional: a context a caller builds by hand
+   * has none, which a strategy reads as legacy mode). A ContextManager
+   * gives its own, live.
+   */
+  window?: WindowIndexView;
   /**
    * The agent's live tool definitions, as last supplied by the host (set on
    * every activation via ContextManager.setToolDefinitions). Summarizer /
@@ -159,6 +241,12 @@ export interface ReadinessState {
  * Strategies control how context is selected, compressed, and maintained.
  */
 export interface ContextStrategy {
+  /**
+   * Whether this strategy's select reads `SelectOptions.thinkingStanding`.
+   * The manager works it out from the branch's record only for one that
+   * says so; absent or false, a binding compile's select gets none.
+   */
+  readsThinkingStanding?(): boolean;
   /** Strategy name for identification */
   readonly name: string;
 
@@ -251,12 +339,208 @@ export interface ContextStrategy {
   tick?(ctx: StrategyContext): Promise<void>;
 
   /**
-   * React to new messages.
-   * Called after a message is added to the store, inside the write that
-   * stored it, so its synchronous part runs before addMessage returns; the
-   * manager doesn't wait for the promise. A rejection, or a throw before it
-   * returns, is logged through the manager's diagnostics, naming the message,
-   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * React to rows entering the agent's window, the rows its strategy reads
+   * (see ContextManager.presentRows). Called with the rows that entered, in
+   * window order, every shard of a body, and a context whose view holds
+   * them, unless the manager's view filter leaves them out: a row the filter
+   * leaves out is given here all the same, and the view doesn't list it or
+   * give it a position. A presentRows whose outcome was unknown
+   * (WindowWriteOutcomeUnknownError) is heard at a later write, with the
+   * rows as that call found them: a row removed meanwhile is given as it
+   * was stored, though the view no longer holds it, and onRetracted with
+   * `removed` follows. A presentRows call is one record, so one the store
+   * refuses presents nothing and calls nothing. In an index a pre-release
+   * build wrote one record per row (see ContextManager.presentRows), a
+   * presentRows cut short can have left a body's first shards in the
+   * window; the call that completes that body gives only the shards that
+   * enter then. A presentRows that puts a body back whole, its first
+   * shard having been out while later ones were in, calls onRetracted for
+   * those later shards first, then this with every shard of the body. A
+   * sharded addMessage stores its shards on one branch: where a hook moves
+   * the store's branch between two shards (a host's onMessage listener of
+   * a shard's add), the write stops before the next shard and throws
+   * WriteLandedError naming the shards stored, which stay on the branch it
+   * started on (WriteOutcomeUnknownError where a shard's append threw after
+   * the move); in legacy mode the strategy hears them once it is
+   * initialized again, where the window of the branch it initialized on
+   * holds them.
+   *
+   * While the manager is in legacy mode its window is the record, so a row
+   * enters it when this manager stores it: the call comes from inside the
+   * addMessage that stored it, after a holdCompression hold is placed, and
+   * its synchronous part runs before addMessage returns. A sharded add is
+   * told once, after every shard is stored, with every shard, as a
+   * presentRows gives a body; a strategy with only onNewMessage hears each
+   * shard in turn at that point. A sharded write that fails tells the
+   * strategy only of the shards it leaves stored (WriteLandedError), once it
+   * has tried to remove them, in one call.
+   * Once a host presents rows on the branch, or takes a row out of its
+   * window by name (retractRows ends legacy mode too), a stored row isn't
+   * heard until it is presented: the call comes from presentRows, once per call, after
+   * the rows are in the window and before presentRows returns (where the
+   * manager's own work around the call fails, such as the context it
+   * builds, that is logged and the call waits for the strategy's next
+   * notification). A row
+   * presented again after retractRows is heard again. A row from an
+   * auxiliary slot is heard only when a host presents it; in legacy mode it
+   * enters the window unheard, as it always has. The first presentRows on a
+   * branch, which writes the legacy window down, enters no new row and
+   * calls nothing. While the strategy isn't initialized (it is initializing,
+   * or its last initialization failed), the calls from presentRows wait until
+   * it is, and then one call carries the rows still in the window, in
+   * window order, each once. So, for a strategy with only onNewMessage, do
+   * the calls for an add's later shards in legacy mode, when its hook for an
+   * earlier shard started an initialization: the rows the record still
+   * holds are carried, if the branch the strategy initialized on is still
+   * in legacy mode, and the rows its
+   * window holds, if a host presented there meanwhile. The branch is the one
+   * the store is on when the call is made: the branch the strategy
+   * initialized on, unless a hook moved the store itself while the strategy
+   * stayed initialized, which leaves the host to initialize it again there
+   * (setStrategy(getStrategy())), and that initialize reads that branch's
+   * window, a row the call left out included. They wait for the manager's strategy, not for
+   * this instance: a strategy set with setStrategy() while rows wait hears
+   * them after its own initialize, though that initialize read a window
+   * that held them.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * rows, and doesn't reach the caller: the rows stay stored and in the
+   * window, and the strategy isn't offered them again. A hook that returns
+   * no promise isn't a failure, and nothing is logged.
+   *
+   * A strategy with this hook isn't called through onNewMessage.
+   */
+  onPresented?(rows: readonly StoredMessage[], ctx: StrategyContext): Promise<void>;
+
+  /**
+   * React to rows leaving the agent's window, so that nothing the strategy
+   * keeps of them shows the agent a row it no longer holds. Called with the
+   * rows that left, in the order the window held them, every shard of a
+   * body, and a context whose view no longer holds them, except where a
+   * presentRows moves a body whole (below): there the view holds the
+   * shards that moved at their new places. The window leaves the record
+   * alone: a row that left is still stored unless it was removed.
+   *
+   * `info.ids` is every row that left in the call, in the same order, and
+   * `rows` the ones among them the manager can give: a row the store holds,
+   * or one a removal through this manager read before it went. A row the
+   * store no longer holds, removed through another manager (which this one
+   * doesn't hear) and taken out of this window by its id, has no row to
+   * give: it is in `info.ids` alone, with `removed: true`, and `rows` can be
+   * empty. A strategy that keeps rows by id lets go of these as of the
+   * others, so that every reader of a removed row whose window the host
+   * repairs (ContextManager.retractRemoved, retractAbsentRows) unfolds it,
+   * not only the manager that removed it.
+   *
+   * It is called once per call, before the call returns (where the
+   * manager's own work around the call fails, such as the context it
+   * builds, that is logged and the call waits for the strategy's next
+   * notification), and a retractRows that names rows the store no longer
+   * holds calls it a second time, for those, by their ids alone:
+   *
+   * - from ContextManager.retractRows, after the rows are out of the
+   *   window, with `undone` as the call gave it and `removed: false`. Rows
+   *   the store no longer holds, which retractRows takes out by their ids,
+   *   are given in a second call of their own, by `info.ids` alone, with
+   *   `removed: true`. A retractRows in legacy mode writes the window down
+   *   and then takes the rows out, so it calls this as it would once a host
+   *   presents.
+   * - from ContextManager.retractRemoved and retractAbsentRows, which take
+   *   out rows removed through another manager, by `info.ids` alone, with
+   *   `removed: true` and `undone: false`.
+   * - once a host presents rows on the branch, from a removal through this
+   *   manager (removeMessage, removeMessages) of rows the window held, after
+   *   the row is out of the window, with the rows as they were before they
+   *   were removed, `removed: true` and `undone: false`. The removal stands
+   *   whether or not the window's tombstone could be written, so a row
+   *   whose tombstone failed is given all the same, and is given again,
+   *   by its id, when retractAbsentRows later takes it out: a strategy
+   *   that kept nothing of a row takes such a call as nothing to do.
+   *   Where the window index's ordinals can't be read at the removal, so
+   *   the manager can't tell which rows the window held, every row removed
+   *   is given, with the row as it was and its id, `removed: true`; with no
+   *   ordinal to tell it by, such a call waiting on an initialization is
+   *   made on a branch whose record no longer holds the row. The shards a
+   *   sharded addMessage that fails partway removes, as it removes what it
+   *   stored, are given the same way, with `removed: true`, when a host's
+   *   listener of a shard's add presented them. Except a removeMessages
+   *   whose range's rows can't be read before it goes (logged): the
+   *   window's rows of it keep their ordinals, untold, until
+   *   retractAbsentRows takes them out and tells the strategy by id. And
+   *   except where a strategy hook the removal runs moves the store's
+   *   branch (its onCompressionHoldsReleased, or a hook that hears what an
+   *   earlier window write did): then no strategy is told, and on the
+   *   removal's branch the rows keep their ordinals until retractAbsentRows
+   *   takes them out there.
+   * - from ContextManager.presentRows, for the later shards of a body whose
+   *   first shard the window lacked, which leave so that the body enters
+   *   whole, with `undone: false` and `removed: false`, before the body is
+   *   heard through onPresented. The move is one write, which takes the
+   *   shards out of their old places and puts them back after the first
+   *   shard, so this call's view still holds them, at their new places
+   *   (`ctx.messageStore.get(id)` finds them): the call says they left
+   *   their old places, and what covers them there goes, while
+   *   onPresented hears them where they stand now.
+   *
+   * While the manager is in legacy mode its window is the record, and a
+   * removal takes the row out of both at once: nothing calls this, and a
+   * strategy that folded the row keeps what it folded, as it always has. A
+   * tombstone write the store refuses takes nothing out and calls nothing;
+   * one that throws after the store kept part of it calls this with the
+   * rows it took out before the error is thrown or logged. A row
+   * presented again (a redo) is heard through onPresented, as a row new to
+   * the window, at its new place.
+   *
+   * A strategy that folds rows into summaries drops or folds again what
+   * covers these: a summary of a row that left shows the agent what it no
+   * longer holds, and once the row is presented again it would render
+   * twice, raw at its new place and folded at its old one.
+   *
+   * While the strategy isn't initialized, the calls wait until it is, and
+   * are then made in the order they came, before the rows presented
+   * meanwhile are heard. A row that has been presented again since is still
+   * given, since what the strategy kept of it is at its old place: the
+   * window holds it again, at a new ordinal, by the time this is called. A
+   * row the branch the strategy initialized on (the branch the store is on
+   * when the call is made, as for onPresented's) holds at the ordinal it
+   * left, in its window and its record (a branch made before it left), is
+   * left out, as is a row a branch made before it was presented presented
+   * on its own, whether or not it took it out again since (that branch's
+   * index never gave it the ordinal it left in the record that did, even
+   * where it gave it the same ordinal in a record of its own),
+   * and every row while that branch is in legacy mode, and a call left
+   * with no row isn't made. They wait for the manager's strategy,
+   * not for this instance, as onPresented's do.
+   *
+   * Fire and forget, as onPresented: a rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the rows,
+   * and doesn't reach the caller. The rows stay out of the window, and the
+   * strategy isn't offered them again.
+   */
+  onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean; ids: readonly MessageId[] }): Promise<void>;
+
+  /**
+   * React to a new row in the agent's window, one row at a time: the older
+   * form of onPresented, called only for a strategy without onPresented, at
+   * the points onPresented says. While the manager is in legacy mode, that
+   * is after a message is added to the store, inside the write that stored
+   * it, so its synchronous part runs before addMessage returns. Once a host
+   * presents rows on the branch, it is from presentRows, once per row
+   * presented, in window order, and no longer at the add: a row stored and
+   * not presented isn't in the window the context reads. Each row's call
+   * is made only if the manager is still open, with this strategy
+   * initialized: a call that closes the manager, sets a strategy, or starts
+   * an initialization (a setStrategy() or switchBranch() called before its
+   * first await) stops the calls for the rows after it, even one that
+   * finishes before the call returns (a strategy with no initialize). Those
+   * rows wait for the initialization, as onPresented's do, and so reach a
+   * replacement after its initialize, those the window of the branch it
+   * initialized on holds; after close() nothing hears them.
+   *
+   * The manager doesn't wait for the promise. A rejection, or a throw before
+   * it returns, is logged through the manager's diagnostics, naming the
+   * message, and doesn't reach the caller: the message stays stored, and the
    * strategy isn't offered it again. A hook that returns no promise, as one
    * written in JavaScript can, isn't a failure, and nothing is logged.
    */
@@ -380,12 +664,39 @@ export interface ThinkingBinding {
    *  without the option, and neither reads nor writes the branch's record. */
   binds?: boolean;
   /** The request carries the provider's drop control, so a stale block is
-   *  set aside rather than refused. Absent means false. */
+   *  set aside rather than refused. A host that notes the blocks set aside
+   *  (`ContextManager.noteThinkingDropped`) has them left out from the next
+   *  compile. Absent means false. */
   dropBlock?: boolean;
   /** The participant whose messages are the model's own replies, such as
    *  the agent's name. Required with `binds`: another participant's reply
    *  never keeps its thinking. */
   participant?: string;
+}
+
+/**
+ * Which stored replies' thinking a binding compile could still send, as the
+ * branch's record has it before the compile selects anything (see
+ * `SelectOptions.thinkingStanding`). It is what holds while the request
+ * stays as the record has it: the compile itself may leave out more, from
+ * the first message that differs.
+ */
+export interface ThinkingStanding {
+  /** No stored reply keeps its thinking, whatever is selected: a head
+   *  digest differs from the record's, the record vouches for nothing, or
+   *  the branch has no record and the request no drop control. */
+  none: boolean;
+  /** The stored bodies whose thinking is already left out: sent without it
+   *  by the record's compile, or noted since as set aside by the provider. */
+  without: ReadonlySet<MessageId>;
+  /** A reply stored at or below this sequence keeps no thinking; absent
+   *  under the drop control, which leaves those to the provider. */
+  recordedAfter?: Sequence;
+  /** A reply stored above this sequence keeps no thinking: it is past the
+   *  end of what the record vouches for (what its compile sent, and what a
+   *  host has noted since), where nothing is compared. Absent with no
+   *  record, where the drop control leaves every reply to the provider. */
+  recordedThrough?: Sequence;
 }
 
 /**
@@ -477,13 +788,19 @@ export interface SelectOptions {
    * after them
    * (`ContextManager.noteRequestSent`): what its stream's requests went on
    * to carry and, once the stream ended, its last reply. With them it keeps
-   * the stored bodies the compile sent without their thinking, the
-   * compile's `identity`, and the branch's sequence where the record began.
+   * the stored bodies the compile sent without their thinking or a host
+   * noted since as set aside by the provider
+   * (`ContextManager.noteThinkingDropped`), the compile's `identity`, and
+   * the branch's sequence where the record began.
    * A compile compares what it renders with the record in order. From the
    * first message that differs, or from the first message when an
    * `identity` digest changed, every message goes without its thinking, and
    * so does every message past the record's end: only the host knows which
-   * stored reply answered which request. A reply whose stored body went
+   * stored reply answered which request. A noted reply sent without its
+   * thinking doesn't count as differing where the record holds it as sent
+   * with its thinking, so the replies after it keep their thinking, for the
+   * provider to judge; a compiled message that also holds a body the note
+   * didn't name still differs. A reply whose stored body went
    * without its thinking goes without it again, since what came after it
    * was minted without it. A message whose participant isn't
    * `participant`, or that has no stored body (a summary's recall answer,
@@ -500,6 +817,13 @@ export interface SelectOptions {
    * thinking as it is. Either way it starts the record. Each committing
    * compile with `binds` writes the record; a dry compile reports what it
    * would leave out and writes no record. The record survives a restart.
+   *
+   * Under `dropBlock`, a reply whose thinking the provider set aside goes
+   * without it from the compile after the host notes so
+   * (`ContextManager.noteThinkingDropped`), and the replies after it keep
+   * theirs while it is otherwise as it was sent. A host that doesn't note it
+   * keeps sending the block, for the provider to set aside again, until
+   * something else leaves its thinking out.
    *
    * So once a branch has a record, a reply keeps its thinking at the compile
    * after it's stored only if the host has noted it: each later round of a
@@ -531,6 +855,16 @@ export interface SelectOptions {
    * `CompileResult.systemInjections`.
    */
   identity?: RequestIdentity;
+  /**
+   * Set by the context manager on the select of a compile with
+   * `thinkingBinding.binds`, and not read from a caller: what the branch's
+   * binding record says, before anything is selected, of the thinking its
+   * stored replies still carry. A strategy that weighs what a change of
+   * layout would drop reads it (the memory strategy's kv-unified
+   * `thinkingLambda`); it changes nothing about what the compile then
+   * leaves out, which the manager decides from what the select returns.
+   */
+  thinkingStanding?: ThinkingStanding;
   /** Exact normalized tools/system/context-prefix identity supplied by the
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
@@ -548,19 +882,39 @@ export interface SelectOptions {
    * request carries and the select's window doesn't. A strategy whose
    * calibration compares the provider's input total with the compile prices
    * it there (AutobiographicalStrategy.reportRealInputTokens).
-   * ContextManager.compile fills it from its injections; `system` ones go
-   * into the caller's system prompt instead. */
+   * ContextManager.compile fills it from its injections, and passes none
+   * when it has none, whatever its caller gave; `system` ones go into the
+   * caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
-  /** The overhead of the request the compile is for: the system prompt and
-   * tool definitions it sends besides the window and its message-position
-   * injections. Its system prompt is the one the request sends, with the
+  /** The overhead of the request the compile is for: the system prompt, the
+   * tool definitions and any other messages it sends besides the window and
+   * its message-position injections. Its system prompt is the one the request sends, with the
    * system-position injections passed to this compile appended: the compile
    * hands those back unchanged (`systemInjections`) and prices none of them.
    * AutobiographicalStrategy prices it, and the message injections, for
-   * `RenderStats.request`, and selects exactly as it would without it. An
-   * overhead whose tool definitions can't be serialised as JSON is refused
-   * before anything is selected. */
+   * `RenderStats.request`, and selects exactly as it would without it,
+   * unless `requestLimitTokens` is given. An overhead whose tool definitions
+   * can't be serialised as JSON is refused before anything is selected. */
   requestOverhead?: RequestOverhead;
+  /** The most the whole request may hold, in tokens, as the provider limits
+   * it: the selected window, the message injections, `requestOverhead` and
+   * the budget's `reserveForResponse` together, with any tool-result stubs
+   * an AutobiographicalStrategy's pairing repair adds to the window. Given,
+   * the select keeps that sum within it, in the window's units at the
+   * compile's multiplier (for a strategy that doesn't calibrate, such as the
+   * passthrough strategies, as the store's estimator prices it), the
+   * strategy's over-budget grace included; while an AutobiographicalStrategy's
+   * multiplier is provisional, it keeps the sum within it priced at the
+   * calibration's ceiling, by scaling its price at the provisional
+   * multiplier. The store rounds each block's price at that multiplier, by
+   * up to half a token, so at a true rate up to the ceiling the request can
+   * pass the limit by up to half a token a block, scaled by the ceiling over
+   * the multiplier. A select whose sum would still pass it, or whose
+   * limit leaves the window no room, refuses with an `OverBudgetError`.
+   * It needs `requestOverhead`: one given without it, or one that isn't a
+   * positive finite number, is refused with a `TypeError` before anything is
+   * selected. */
+  requestLimitTokens?: number;
 }
 
 /**
@@ -580,13 +934,23 @@ export class NoFoldPlanToPreviewError extends Error {
  * the rendered entries. Mirrors the diagnostics `OverBudgetError` would carry.
  */
 export interface PreviewResult {
-  /** Rendered token total the layout would occupy. */
+  /** Rendered token total the layout would occupy. A preview a request
+   *  limit refused before planning, for want of room, gives what the request
+   *  holds besides the window instead. */
   finalTokens: number;
-  /** Hard budget the preview ran against. */
+  /** Hard budget the preview ran against; for that refusal, the limit. */
   budgetTokens: number;
+  /** The limit and what it left the window, where the refusal the preview
+   *  reports carries them in its diagnostics (`requestLimitTokens`,
+   *  `requestAllowanceTokens`), as the strategy's over-budget refusals under
+   *  `SelectOptions.requestLimitTokens` do. A preview of a plan over its
+   *  bound reports the plan instead, without them. */
+  requestLimitTokens?: number;
+  requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
-  /** True when the picker could not fold any further. */
+  /** True when the picker could not fold any further, and when the request
+   *  limit leaves the window no room at any fold. */
   exhausted: boolean;
   /**
    * When the layout doesn't fit: what clears that refusal besides a larger
@@ -888,9 +1252,14 @@ export interface TimeRangeSummaryEntry {
   level: number;
   content: string;
   tokens: number;
-  /** `sourceRange.first` message's `timestamp`, in epoch ms. */
+  /**
+   * The `timestamp`, in epoch ms, of the first message the summary covers
+   * in the record (by sequence): `sourceRange.first`'s, until a host
+   * presents rows out of record order, after which a chunk is in the
+   * window's order and its first row needn't be its earliest.
+   */
   startMs: number;
-  /** `sourceRange.last` message's `timestamp`, in epoch ms. */
+  /** Likewise the last message's: `sourceRange.last`'s until then. */
   endMs: number;
   /**
    * Exact identity/order boundaries of the covered span, ALONGSIDE the
@@ -900,8 +1269,9 @@ export interface TimeRangeSummaryEntry {
    * not `startMs`/`endMs` alone: two distinct messages can share a
    * timestamp (wall-clock ms resolution, rapid-fire appends), but
    * `sequence` (chronicle's per-record sequence number) is strictly
-   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
-   * resolved `StoredMessage.id`/`.sequence`.
+   * monotonic and never ties. The `StoredMessage.id`/`.sequence` of the
+   * messages `startMs` and `endMs` are read from: `sourceRange.first`/
+   * `.last`'s until a host presents rows out of record order.
    */
   firstMessageId: string;
   lastMessageId: string;
@@ -972,6 +1342,11 @@ export interface RequestOverhead {
   system?: string;
   /** The tool definitions the request sends. */
   tools?: ReadonlyArray<ToolDefinition>;
+  /** The content of each message the request sends besides the compiled
+   * window and the message injections, such as tool results a caller adds to
+   * the request after the compile. Each is priced as the window prices the
+   * same blocks sent whole. */
+  messages?: ReadonlyArray<ContentBlock[]>;
 }
 
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
@@ -1068,14 +1443,23 @@ export interface RenderStats {
    * (`SelectOptions.messageInjections`), 0 when it has none. Present only when
    * the select was given an overhead, so a compile without one has no price
    * here rather than a price of 0. The overhead's price is the store's
-   * estimate of the system prompt and of the tool definitions as JSON
-   * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * estimate of the system prompt, of the tool definitions as JSON
+   * (`JSON.stringify`) and of its messages' blocks as the window prices them
+   * sent whole, not the provider's count of what its formatter sends.
    * System-position injections are priced only as part of that system
    * prompt: the compile hands the ones it was passed back unchanged
    * (`systemInjections`) for the caller to append, so the overhead's system
-   * prompt is the one sent, with them appended.
+   * prompt is the one sent, with them appended. With
+   * `SelectOptions.requestLimitTokens`, `limitTokens` is that limit, and
+   * `allowanceTokens`, present only when the limit lowered the select's
+   * target or its hard bound, is what it left the window: the limit less
+   * `reserveForResponse`, the injections and the overhead, at the price the
+   * select kept it at, and less the price of the first select's stubs where
+   * a second select reserved room for them. `stubTokens`, present only under
+   * a limit where the pairing repair added tool-result stubs, is their price,
+   * which `total` doesn't count; the limit counts them.
    */
-  request?: { overheadTokens: number; injectedTokens: number };
+  request?: { overheadTokens: number; injectedTokens: number; limitTokens?: number; allowanceTokens?: number; stubTokens?: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
@@ -1128,6 +1512,11 @@ export interface RenderStats {
      *  N individual what-if solves it stopped or, remembered from a compile
      *  on the same inputs, skipped, joined by `+` (`ceiling=`). */
     ceiling?: string;
+    /** Under `foldingStrategy: 'kv-unified'` with `thinkingLambda`, on a
+     *  compile for a model that binds thinking: what a change of layout was
+     *  priced at for the thinking it would drop, in the solver's points,
+     *  rounded (`changePenalty=`). Absent where it is 0. */
+    changePenalty?: number;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
      *  live compile. A caller reads a dry pass's stats from its compile's
@@ -1140,6 +1529,37 @@ export interface RenderStats {
      *  returned, past which no cached prefix reaches. Present only when a
      *  compile that changed at least one saved level committed. */
     foldDiff?: FoldDiff;
+    /** The floor (#415): the cheapest plan the summaries held allow for this
+     *  compile's inputs, head and tail included, in the plan's units, whatever
+     *  the folding strategy picked. A compile refuses once its plan passes
+     *  `hardBudget`, and every plan does once the floor does, so
+     *  `hardBudget - floorTokens` is how far the store is from the point
+     *  where every compile refuses: it usually shrinks as history arrives and
+     *  grows as L1s and merges land. Under kv-unified it takes that solver's
+     *  own constraints, locks included; under the other folding strategies,
+     *  which give pins precedence over locks, it counts no lock, and is a
+     *  lower bound. Absent where the forest couldn't be built or its computation
+     *  fails (`floor=` on the plan line). */
+    floorTokens?: number;
+    /** The plan size above which this compile refuses: the input budget with
+     *  `overBudgetGraceRatio` added (`hardBudget=`). Set with `floorTokens`. */
+    hardBudget?: number;
+    /** An estimate of what the work queued at the end of this compile would
+     *  take off the floor once it lands: each queued chunk's messages as this
+     *  compile would send them (as the floor prices them, a message a raw pin
+     *  keeps raw at nothing) less the recall pair its L1 is expected to render
+     *  as, and each queued merge's sources' pairs less its parent's. Work that
+     *  wouldn't shrink the floor counts as zero, as does work the gates tick
+     *  reads keep from a summary: everything without a compression model or a
+     *  membrane; every chunk while the speculative cap holds; a chunk the
+     *  compression quarantine holds or deferred for the host's tools; every
+     *  chunk from the first a compression hold reaches; a merge holding a
+     *  source a hold or a merge-quarantine record keeps out, or already
+     *  merged, and every merge from the first a hold blocks. It doesn't replay
+     *  the rest of tick (adoption, the overlap guard, pins and locks over a
+     *  merge's sources), and merges not yet queued aren't counted
+     *  (`queuedRelief=`). Set with `floorTokens`. */
+    queuedReliefTokens?: number;
   };
 }
 
@@ -1332,6 +1752,36 @@ export interface KvUnifiedConfig {
      * after a move and then read at whole doublings of the turns since.
      */
     ageBandSteps?: number;
+    /**
+     * Linear price of a rewrite, in points per `cacheScale` of cache churn
+     * (the tokens a layout makes the provider compute again that the last
+     * accepted one wouldn't, times `cacheWritePrice - cacheReadPrice`).
+     * Above 0 it takes the place of the `cacheLambda` term. That term is
+     * quadratic and measured from the pool's cheapest layout, so two
+     * layouts that differ by a few hundred thousand tokens of rewrite
+     * score within a few dozen points, and a change that also re-levels
+     * old history, or folds a stray old message, costs about what one that
+     * only folds new history does. Priced linearly:
+     *
+     * - the layout last accepted, which rewrites nothing, is cheaper than
+     *   any change by that change's whole rewrite, so a small gain no
+     *   longer moves it;
+     * - a change that leaves the earlier cache breakpoints standing is
+     *   cheaper by what stands before them, so old history is re-leveled
+     *   (in either direction: it still returns to a shallower level) only
+     *   where that is worth the extra rewrite.
+     *
+     * The rewrite is measured from the last breakpoint a layout keeps, as
+     * the provider's cache is: changes between two breakpoints cost alike.
+     * With this set, `adoptEpsilon` is the tolerance on top of the
+     * rewrite's own price and can be small. Latent demand (which merges
+     * are worth producing) is decided as if this were 0, so summaries are
+     * produced as they are without it. Absent or 0: the `cacheLambda`
+     * term. As a starting value, 500 prices a 300k-token rewrite at a
+     * 1-hour cache's prices at about 2,900 points, which is what
+     * `adoptEpsilon: 3000` alone asks of a change today.
+     */
+    rewriteLambda?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;
@@ -1377,6 +1827,46 @@ export interface KvUnifiedConfig {
    * merge it would otherwise demand.
    */
   latentDemandMode?: 'individual' | 'joint';
+  /**
+   * What the thinking a change would drop is worth, in points per token,
+   * on a compile for a model that binds thinking
+   * (`SelectOptions.thinkingBinding.binds`); on any other compile it is
+   * not read. Such a model drops every thinking block after the first
+   * message that differs from the request the block was minted in, and
+   * the thinking still in play sits in the newest raw messages, after
+   * everything a fold or an unfold touches. So any change to the layout
+   * drops all of it, wherever the change begins, and the cost is the same
+   * for every change: the layout last accepted is kept while the best
+   * change beats it by no more than `adoptEpsilon` plus this cost
+   * (`KvUnifiedOptions.changePenalty`). It decides whether to change,
+   * never which change.
+   *
+   * The cost is this times the tokens of the thinking a change would
+   * drop: each of the agent's own stored replies still rendered raw whose
+   * thinking the branch's binding record still has as sent, counted at
+   * the store's price and weighted by 2^(-d / `thinkingHalfLifeTokens`),
+   * where d is the raw tokens between the reply and the newest message.
+   * Thinking the record no longer vouches for costs nothing, so after a
+   * change of tools or system text, or a change the provider already set
+   * the thinking aside for, a layout change that was waiting comes at
+   * once. With the layout seriously sticky while recent thinking is in
+   * play, the change comes when a turn starts with little of it, or when
+   * the budget's wall forces it.
+   *
+   * Absent or 0: thinking costs nothing, as for a model that doesn't bind
+   * it. As a starting value, 1 makes a few thousand tokens of recent
+   * thinking outweigh any budget pressure below the wall (the over-budget
+   * penalty reaches `budgetOverLambda` there). A value that isn't a finite
+   * number of 0 or more is refused at the compile that would read it.
+   */
+  thinkingLambda?: number;
+  /**
+   * The half-life, in raw tokens back from the newest message, of the
+   * weight `thinkingLambda` gives a reply's thinking. 50,000 unless set.
+   * Read only while `thinkingLambda` is above 0, where a value that isn't a
+   * finite number above 0 is refused at the compile.
+   */
+  thinkingHalfLifeTokens?: number;
 }
 
 export interface AutobiographicalConfig {
@@ -1389,18 +1879,29 @@ export interface AutobiographicalConfig {
   quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */
   targetChunkTokens: number;
-  /** Recent tokens to keep uncompressed (~30000) */
+  /** Recent tokens to keep uncompressed (~30000). Counted at the live
+   *  calibration multiplier. Once chunks exist, the window starts no earlier
+   *  than after the last message a chunk owns while that leaves it at least
+   *  half this size: a recalibration doesn't take chunked messages back into
+   *  the window, and a raised value fills from new messages. A value raised
+   *  to more than twice what the chunks left takes effect at once. */
   recentWindowTokens: number;
   /** Tokens at the head of the conversation to preserve verbatim (default: 0).
    *  Messages within this window are never chunked or compressed — they survive
-   *  as raw copies so initial instructions retain full granularity. */
+   *  as raw copies so initial instructions retain full granularity. Counted at
+   *  the live calibration multiplier. Once chunks exist, the head ends at the
+   *  first message a chunk owns while that keeps it between half and twice
+   *  this size, so a recalibration doesn't move it; past either bound the
+   *  token count decides. */
   headWindowTokens: number;
   /** Always break at message boundaries */
   chunkOnMessageBoundary: boolean;
   /** Don't count attachment tokens toward chunk size */
   attachmentsIgnoreSize: boolean;
-  /** When true, onNewMessage() fires tick() as a background promise so compression
-   *  runs automatically without the framework calling tick() explicitly. */
+  /** When true, rows entering the window (onPresented: each add in legacy
+   *  mode, each presentRows once a host presents rows) fire tick() as a
+   *  background promise so compression runs automatically without the
+   *  framework calling tick() explicitly. The name is the hook's older one. */
   autoTickOnNewMessage: boolean;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
@@ -1661,7 +2162,10 @@ export interface AutobiographicalConfig {
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. Kept within
-   *  `imageCeiling`, so 0 means up to that ceiling. A window kept at the
+   *  `imageCeiling`, so 0, the default, means up to that ceiling: stripping
+   *  an image that was already sent edits the prompt mid-history, which
+   *  rewrites the cache from there and invalidates the thinking after it, so
+   *  no limit strips unless a host sets one. A window kept at the
    *  ceiling leaves no room under it for images a caller appends to the
    *  compiled request, so a caller that keeps its requests within the
    *  ceilings recompiles at each image it adds; at about 1,600 tokens an
@@ -1679,7 +2183,8 @@ export interface AutobiographicalConfig {
    *  text placeholder, even though the surrounding text stays verbatim. Measured
    *  as cumulative tokens walked from the tail over the stored messages, before
    *  tool pruning and image strips, which the recent window's walk counts after.
-   *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
+   *  Typically much shallower than recentWindowTokens. 0, the default, = never
+   *  strip by depth. */
   imageStripDepthTokens?: number;
 
   /**
@@ -1687,8 +2192,9 @@ export interface AutobiographicalConfig {
    * (2026-07-12 contiguity fix) used to break a merge run when the positional
    * gap between consecutive unmerged candidates exceeded this many messages,
    * bridging smaller holes. Every grouping decision now requires exact
-   * adjacency in store order, with no listed message between two sources,
-   * whatever this is set to. Configurations that set it still type-check.
+   * adjacency in store order (the strategy's view: the window's order once a
+   * host presents), with no listed message between two sources, whatever
+   * this is set to. Configurations that set it still type-check.
    *
    * @deprecated Not read: grouping requires exact adjacency.
    */
@@ -1699,7 +2205,7 @@ export interface AutobiographicalConfig {
    * only while their cumulative inline size (a base64 source, a `data:` URL's
    * payload, a generated image's `data`; 0 for a remote URL) stays under
    * this budget — on top of `maxLiveImages` / `imageStripDepthTokens`.
-   * Default 20 MiB of base64. The window keeps at most `imageByteCeiling`
+   * Default 0: no byte wall of its own. The window keeps at most `imageByteCeiling`
    * whatever this says, and 0 here means up to that ceiling. It counts the
    * images the window counts (see `maxLiveImages`), not the request's other
    * bytes, so on its own it can't keep a request under membrane's byte cap:
@@ -1899,13 +2405,30 @@ export interface AutobiographicalConfig {
   /**
    * Store-topology policy. On every load the summary archive is audited for
    * crossed ownership: a summary whose leaves are not contiguous among the
-   * chunk-owned messages in store order (an interleaved live representation
-   * sits inside its span — issue #122's cross-era merges, restore/branch
-   * interleavings, hand surgery). `'reject'` (default) throws
-   * `StoreTopologyError` from `initialize`, so `ContextManager.open` fails
-   * and the operator repairs the store before the resident runs on it.
+   * chunk-owned messages in view order, which is record order in legacy
+   * mode and window order once a host presents (an interleaved live
+   * representation sits inside its span — issue #122's cross-era merges,
+   * restore/branch interleavings, hand surgery, or, once a host presents, a
+   * row that left the window and was presented again before the strategy
+   * heard it go). `'reject'` (default) throws `StoreTopologyError` from
+   * `initialize` for what the audit names, so `ContextManager.open` fails
+   * and the operator repairs the store before the resident runs on it. Once
+   * a host presents, an open that isn't `auditOnly` first demotes every
+   * summary the audit names, whatever made it non-contiguous, and throws
+   * only if the audit still names a summary after that: each is dropped
+   * with every summary above it, an L1's chunk record is compressed again
+   * over its longest run of rows the window holds together, and its other
+   * rows are chunked again where the window holds them (an uncompressed
+   * record whose rows the window holds apart is trimmed the same way). So
+   * a store whose crossed ownership predates presentation is demoted, not
+   * refused, at its first open after a host presents; to keep it for a
+   * repair, open a copy with `topologyPolicy: 'report'` and `auditOnly:
+   * true` (a `'report'` open alone still lets go of what covers a row out
+   * of the window). In legacy mode, and in an
+   * audit-only open, nothing is demoted.
    * `'report'` logs the violations at error level and reports them through
-   * `getCompressionDebt().topologyViolations` (state `critical`).
+   * `getCompressionDebt().topologyViolations` (state `critical`), and
+   * leaves them as it finds them.
    * A kv-unified config that explicitly opts into gap handling
    * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
    * defaults to `'report'`: those stores are known to carry gaps.
@@ -2193,10 +2716,11 @@ export interface AutobiographicalConfig {
    * The count runs over the whole conversation, not only what a compile
    * renders raw: a result is replaced once the conversation holds N newer
    * answered calls of its tool, folded ones included, so folding never
-   * brings a replaced result back. A result answers the earliest call with
-   * its id before it, in its own message or an earlier one, that no result
-   * has answered yet; a further result for an answered call goes with that
-   * call. Calls are ordered by the message that made them, and calls made in
+   * brings a replaced result back. A result answers the nearest call with
+   * its id before it, in its own message or an earlier one, so a later call
+   * that reuses an id takes the results after it; a further result for an
+   * answered call goes with that call. Calls are ordered by the message that
+   * made them, and calls made in
    * one message by where their results are stored, as the render sends them
    * unless pairing repair moves some. A result is replaced before
    * `maxMessageTokens` cuts its message, and the plan and the render stats
@@ -2241,8 +2765,8 @@ export interface AutobiographicalConfig {
    * toward the cap without holding production. Under `hierarchical: false`
    * tick runs no merge, so the cap holds nothing.
    *
-   * Default: undefined (no cap; compression fires eagerly on every
-   * new message when `autoTickOnNewMessage` is true).
+   * Default: undefined (no cap; compression fires eagerly whenever rows
+   * enter the window when `autoTickOnNewMessage` is true).
    */
   maxSpeculativeL1s?: number;
 
@@ -2694,8 +3218,11 @@ Write naturally, as recollection of what you experienced.`,
   carrierPolicy: 'full',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
-  maxLiveImages: 6,
-  imageStripDepthTokens: 30000,
+  // No image is stripped by default: replacing an already-sent image edits
+  // the prompt mid-history, which rewrites the cache from there and
+  // invalidates later thinking. Only the ceilings below still bind.
+  maxLiveImages: 0,
+  imageStripDepthTokens: 0,
   imageCeiling: DEFAULT_IMAGE_CEILING,
   imageByteCeiling: DEFAULT_IMAGE_BYTE_CEILING,
   positionedRecallPairs: true,

@@ -313,6 +313,29 @@ describe('imageStripHysteresisRatio', () => {
     await m.close();
   });
 
+  it('an edit replays a different history too, under a tool pruning override that keeps one decision: shrinking text between images can strip an image newer than it, as a removal does', async () => {
+    class OneDecision extends ImageRatioStrategy {
+      private readonly decision = { replaced: new Map(), inputCap: 0 };
+      protected override toolPruning() { return this.decision; }
+    }
+    const m = await ContextManager.open({
+      path: STORE,
+      strategy: new OneDecision({ headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true,
+        imageStripDepthTokens: 6000, imageStripHysteresisRatio: 0.5 } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+    });
+    const ids: Record<string, string> = {};
+    ids.t0 = m.addMessage('user', prose('t0', 1000));
+    const gaps = [400, 1600, 400, 1400, 300];
+    for (let i = 1; i <= 6; i++) {
+      m.addMessage('user', img(`img-${i}`));
+      if (i < 6) ids[`t${i}`] = m.addMessage('user', prose(`t${i}`, gaps[i - 1]!));
+    }
+    assert.equal(await stripped(m, 6), '....II');
+    m.editMessage(ids.t4! as never, prose('t4', 10));
+    assert.equal(await stripped(m, 6), '.....I');
+    await m.close();
+  });
+
   it('depth is counted at the store\'s calibrated estimates, so a calibration change can move the set, as the doc says', () => {
     // Three image messages of 1,600 tokens under a depth of 5,000: at
     // calibration 1 the oldest is at 4,800, within it; at 1.1 it is at 5,280,
@@ -571,36 +594,38 @@ describe('imageStripHysteresisRatio', () => {
     });
   });
 
-  it("with no byte cap set, the rule trims to ratio × the default byte cap, which its verdicts would otherwise drop", async () => {
-    // Three images of 8 MiB, past the default 20 MiB and under the default
-    // count. The rule's verdicts replace the limits, so the default byte cap
-    // binds only through the rule.
+  it("the rule trims to ratio × the byte cap, which its verdicts would otherwise drop", async () => {
+    // Three images of 8 MiB, past a 20 MiB byte cap and under the count
+    // ceiling. The rule's verdicts replace the limits, so the byte cap binds
+    // only through the rule. (No limit strips by default, so the cap is set.)
     const big = 8 * 1024 * 1024;
-    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy({}) });
+    const cap = { maxLiveImageBytes: 20 * 1024 * 1024 };
+    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy(cap) });
     for (let i = 1; i <= 3; i++) off.addMessage('user', img(`img-${i}`, big));
-    assert.equal(await stripped(off, 3), '.II', 'without the ratio, the default keeps the newest two');
+    assert.equal(await stripped(off, 3), '.II', 'without the ratio, the cap keeps the newest two');
     await off.close();
-    const m = await ContextManager.open({ path: STORE, strategy: strategy({ imageStripHysteresisRatio: 0.5 }) });
+    const m = await ContextManager.open({ path: STORE, strategy: strategy({ ...cap, imageStripHysteresisRatio: 0.5 }) });
     for (let i = 1; i <= 3; i++) m.addMessage('user', img(`img-${i}`, big));
-    assert.equal(await stripped(m, 3), '..I', 'with it, the trim goes to ratio × the default, 10 MiB');
+    assert.equal(await stripped(m, 3), '..I', 'with it, the trim goes to ratio × the cap, 10 MiB');
     await m.close();
   });
 
   it('within one message, the rule keeps its last images, where the limits alone keep the first that fit', async () => {
-    // One message of three 8 MiB images, told apart by their data, under the
-    // default byte cap.
+    // One message of three 8 MiB images, told apart by their data, under a
+    // 20 MiB byte cap.
     const big = 8 * 1024 * 1024;
+    const cap = { maxLiveImageBytes: 20 * 1024 * 1024 };
     const content = ['A', 'B', 'C'].map((c) => ({ type: 'image', source: { type: 'base64', data: c.repeat(big), mediaType: 'image/png' } }) as ContentBlock);
     const live = async (m: ContextManager): Promise<string> => {
       const entry = (await m.compile(BUDGET)).messages.find((e) => e.content.some((b) => b.type === 'text' && b.text === 'zz-label'));
       const kept = new Set((entry?.content ?? []).flatMap((b) => b.type === 'image' ? [(b as { source: { data: string } }).source.data[0]] : []));
       return ['A', 'B', 'C'].map((c) => kept.has(c) ? 'I' : '.').join('');
     };
-    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy({}) });
+    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy(cap) });
     off.addMessage('user', [...content, { type: 'text', text: 'zz-label' }]);
     assert.equal(await live(off), 'II.', 'without the ratio, its first two stay');
     await off.close();
-    const m = await ContextManager.open({ path: STORE, strategy: strategy({ imageStripHysteresisRatio: 0.5 }) });
+    const m = await ContextManager.open({ path: STORE, strategy: strategy({ ...cap, imageStripHysteresisRatio: 0.5 }) });
     m.addMessage('user', [...content, { type: 'text', text: 'zz-label' }]);
     assert.equal(await live(m), '..I', 'with it, its last stays: a message\'s stripped images are its first ones');
     await m.close();
