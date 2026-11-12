@@ -2681,9 +2681,11 @@ export interface AutobiographicalConfig {
 
   /**
    * When true (default), each selected summary emits as its own positioned
-   * Q/A recall pair, sorted chronologically by source range. When false,
-   * all selected summaries are concatenated into one Q/A pair between head
-   * and tail (legacy behavior pre-2026-05-10).
+   * Q/A recall pair, sorted chronologically by source range, or, on the
+   * hierarchical select without adaptive resolution, as its messages in the
+   * pair's place where they cost less and stand alone (see the README).
+   * When false, all selected summaries are concatenated into one Q/A pair
+   * between head and tail (legacy behavior pre-2026-05-10).
    *
    * Per-region positioning is the spec-faithful behavior: it lets the agent
    * see each memory in its temporal place rather than as a wall of unrelated

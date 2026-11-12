@@ -18805,10 +18805,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Emit summaries + pinned messages between head and recent windows.
     //
-    // Default (positionedRecallPairs=true): one Q/A pair per summary,
-    // interleaved with raw pinned messages, all sorted chronologically by
-    // source-range / message position. Each memory appears in its temporal
-    // place rather than as a wall of unrelated recollections.
+    // Default (positionedRecallPairs=true): one Q/A pair per summary, or
+    // its messages where they cost less and stand alone, interleaved with
+    // raw pinned messages, all sorted chronologically by source-range /
+    // message position. Each memory appears in its temporal place rather
+    // than as a wall of unrelated recollections.
     //
     // Legacy (positionedRecallPairs=false): summaries concatenated into one
     // Q/A pair between head and tail; pinned messages still emit raw, in
@@ -18881,27 +18882,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      fallback above walks this.chunks so it cannot see these. Render
     //      them raw until compression catches up — same freshness contract as
     //      the fallback: summaries may lag, but no message ever disappears.
+    const sumById = new Map(listed.map(s => [s.id, s]));
+    const leafCache = new Map<string, string[]>();
+    const leavesOf = (s: SummaryEntry): string[] => {
+      const cached = leafCache.get(s.id);
+      if (cached) return cached;
+      const out: string[] = [];
+      const stack: string[] = [s.id];
+      const seen = new Set<string>();
+      while (stack.length > 0) {
+        const id = stack.pop();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const sum = sumById.get(id);
+        if (!sum) continue;
+        if (sum.sourceLevel === 0) out.push(...sum.sourceIds);
+        else stack.push(...sum.sourceIds);
+      }
+      leafCache.set(s.id, out);
+      return out;
+    };
+    const rawPlanned = new Set<string>();
     {
-      const sumById = new Map(listed.map(s => [s.id, s]));
-      const leafCache = new Map<string, string[]>();
-      const leavesOf = (s: SummaryEntry): string[] => {
-        const cached = leafCache.get(s.id);
-        if (cached) return cached;
-        const out: string[] = [];
-        const stack: string[] = [s.id];
-        const seen = new Set<string>();
-        while (stack.length > 0) {
-          const id = stack.pop();
-          if (!id || seen.has(id)) continue;
-          seen.add(id);
-          const sum = sumById.get(id);
-          if (!sum) continue;
-          if (sum.sourceLevel === 0) out.push(...sum.sourceIds);
-          else stack.push(...sum.sourceIds);
-        }
-        leafCache.set(s.id, out);
-        return out;
-      };
       // Highest-level live claimer per leaf (coarsest representation is the
       // cheapest way to restore coverage). Empty summaries represent nothing.
       const claimedBy = new Map<string, SummaryEntry>();
@@ -18915,7 +18917,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const covered = new Set<string>();
       for (const s of selectedSummaries) for (const leaf of leavesOf(s)) covered.add(leaf);
-      const rawPlanned = new Set<string>();
       for (const i of head) rawPlanned.add(messages[i].id);
       for (let i = effectiveRecentStart; i < messages.length; i++) rawPlanned.add(messages[i].id);
       for (const p of middleRaw) rawPlanned.add(p.msg.id);
@@ -18939,6 +18940,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    const pairsSentRaw: Array<{ question: ContextEntry; answer: ContextEntry; entries: ContextEntry[] }> = [];
     if (selectedSummaries.length > 0 || middleRaw.length > 0) {
       const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
@@ -18963,6 +18965,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           summaries: items.slice(0, k + 1).flatMap((it) => (it.kind === 'summary' && it.summary.content?.trim() ? [it.summary] : [])),
           raw: items.slice(0, k + 1).flatMap((it) => (it.kind === 'pin' ? [it.msg] : [])),
         });
+        let leafClaims: Map<string, number> | undefined;
+        const claimsOf = (): Map<string, number> => {
+          const claims = new Map<string, number>();
+          for (const s of selectedSummaries) for (const leaf of new Set(leavesOf(s))) claims.set(leaf, (claims.get(leaf) ?? 0) + 1);
+          return claims;
+        };
+        const aloneAt = (s: SummaryEntry, at: number): number[] | undefined => {
+          const leaves = new Set(leavesOf(s));
+          if (leaves.size === 0) return undefined;
+          const positions: number[] = [];
+          for (const id of leaves) {
+            const p = positionOf.get(id);
+            if (p === undefined || rawPlanned.has(id) || (leafClaims ??= claimsOf()).get(id) !== 1) return undefined;
+            positions.push(p);
+          }
+          positions.sort((a, b) => a - b);
+          return positions[0] === at && positions.every((p, i) => p === at + i) ? positions : undefined;
+        };
+        let unanswered: ReadonlySet<string> | undefined;
+        const callsNothingAnswers = (): ReadonlySet<string> => (unanswered ??= this.callsNothingAnswers(messages));
 
         for (const [k, item] of items.entries()) {
           if (item.kind === 'summary') {
@@ -18988,23 +19010,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               summaries: rendered.refs,
             };
             const pairTokens = this.recallPairCost(summary, headerText);
+            const pairSent = rendered.refs.some((ref) => ref.partial)
+              ? Math.min(pairTokens, this.estimateTokens(questionEntry.content) + this.estimateTokens(rendered.content))
+              : pairTokens;
+            const positions = aloneAt(summary, item.position);
+            const swap = positions && this.rawInPlaceOfPair(store, messages, positions, pairSent, msgCap, callsNothingAnswers);
+            const tokens = swap ? swap.tokens : pairTokens;
             // Never silently drop a selected representation: everything in
             // this list either covers history (summaries) or IS uncovered
             // history (pins / uncompressed / frontier raw). Emit within
             // grace; refuse the turn beyond it.
-            if (totalTokens + pairTokens > graceLimit) {
+            if (totalTokens + tokens > graceLimit) {
               throw middleRefusal({
-                actual: totalTokens + pairTokens,
+                actual: totalTokens + tokens,
                 unit: 'selection-items',
                 count: items.length,
-                deepestLevel: summary.level,
+                deepestLevel: swap ? 0 : summary.level,
                 ...prefixOf(k),
               });
             }
             entries.push(questionEntry);
             entries.push(answerEntry);
-            totalTokens += pairTokens;
-            this.rsSummary(summary.level, pairTokens, summary.id);
+            totalTokens += tokens;
+            if (swap) {
+              this.rsRaw('middleRaw', swap.messageTokens, swap.messages.length);
+              this._emittedSummaryIds.add(summary.id);
+              pairsSentRaw.push({ question: questionEntry, answer: answerEntry, entries: swap.entries });
+            } else {
+              this.rsSummary(summary.level, pairTokens, summary.id);
+            }
           } else {
             const msg = item.msg;
             const { content, extra } = this.cappedForSend(store, msg, msgCap);
@@ -19148,6 +19182,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
+    this.spliceRawInPlaceOfPairs(entries, pairsSentRaw);
     this.keepStubsUnderRequestLimit(entries, budget, 'selection-items');
     // Strip stale images (this path places no cache markers). Its emission
     // priced every message at the store's full estimate of the form it sends,
@@ -21541,6 +21576,90 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private postProcessToolEntries(entries: ContextEntry[]): void {
     this.trimOrphanedToolUse(entries);
     this.enforceToolPairing(entries);
+  }
+
+  private callsNothingAnswers(messages: readonly StoredMessage[]): Set<string> {
+    const blocks: ContentBlock[] = [];
+    const at: string[] = [];
+    messages.forEach((message, position) => message.content.forEach((block, k) => {
+      blocks.push(block);
+      at.push(`${position}:${k}`);
+    }));
+    const answered = new Set<number>();
+    for (const call of answeredCallIndexes(blocks)) if (call !== undefined) answered.add(call);
+    const out = new Set<string>();
+    blocks.forEach((block, i) => {
+      if (block.type === 'tool_use' && !answered.has(i)) out.add(at[i]!);
+    });
+    return out;
+  }
+
+  private rawInPlaceOfPair(
+    store: MessageStoreView,
+    messages: readonly StoredMessage[],
+    positions: readonly number[],
+    pairTokens: number,
+    msgCap: number,
+    callsNothingAnswers: () => ReadonlySet<string>,
+  ): { entries: ContextEntry[]; messages: StoredMessage[]; messageTokens: number; tokens: number } | undefined {
+    const sent: StoredMessage[] = [];
+    const built: ContextEntry[] = [];
+    let messageTokens = 0;
+    for (const position of positions) {
+      const msg = messages[position]!;
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      messageTokens += store.estimateTokens(this.prunedForSend(store, msg)) + extra;
+      if (messageTokens >= pairTokens) return undefined;
+      sent.push(msg);
+      built.push({ index: built.length, sourceMessageId: msg.id, sourceRelation: 'copy', participant: msg.participant, content });
+    }
+    const copies = built.map((entry) => ({ ...entry, content: [...entry.content] }));
+    const repaired = [...copies];
+    this.enforceToolPairing(repaired);
+    const stubs: ContentBlock[] = [];
+    let next = 0;
+    for (const entry of repaired) {
+      if (entry.relocatedResults?.length || entry.relocatedBlocks?.length) return undefined;
+      const kept = entry.content.filter((block) => !this.generatedToolResultStubs.has(block));
+      const added = entry.content.filter((block) => this.generatedToolResultStubs.has(block));
+      if (entry === copies[next]) {
+        const original = built[next++]!.content;
+        if (kept.length !== original.length || kept.some((block, k) => block !== original[k])) return undefined;
+      } else if (kept.length > 0 || added.length === 0 || copies.includes(entry)) {
+        return undefined;
+      }
+      stubs.push(...added);
+    }
+    if (next !== copies.length) return undefined;
+    if (stubs.length > 0) {
+      const nothingAnswers = callsNothingAnswers();
+      const free = new Set<string>();
+      const answered = new Set<string>();
+      for (const position of positions) {
+        messages[position]!.content.forEach((block, k) => {
+          if (block.type === 'tool_use') (nothingAnswers.has(`${position}:${k}`) ? free : answered).add((block as { id: string }).id);
+        });
+      }
+      for (const stub of stubs) {
+        const id = (stub as { toolUseId: string }).toolUseId;
+        if (!free.has(id) || answered.has(id)) return undefined;
+      }
+    }
+    const tokens = messageTokens + (stubs.length > 0 ? store.estimateTokens({ content: stubs } as unknown as StoredMessage) : 0);
+    if (tokens >= pairTokens) return undefined;
+    return { entries: repaired, messages: sent, messageTokens, tokens };
+  }
+
+  private spliceRawInPlaceOfPairs(entries: ContextEntry[], pairs: ReadonlyArray<{ question: ContextEntry; answer: ContextEntry; entries: ContextEntry[] }>): void {
+    if (pairs.length === 0) return;
+    for (const pair of pairs) {
+      const at = entries.indexOf(pair.question);
+      if (at < 0 || entries[at + 1] !== pair.answer) {
+        throw new Error('[autobiographical] a recall pair the hierarchical select sends as its messages is no longer where emission put it, after tool-pairing repair');
+      }
+      entries.splice(at, 2, ...pair.entries);
+    }
+    for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
   }
 
   private keepStubsUnderRequestLimit(

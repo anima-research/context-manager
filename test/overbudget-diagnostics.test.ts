@@ -585,7 +585,7 @@ describe('OverBudgetError diagnostics', () => {
       });
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
-          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
         const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.equal(error.diagnostics.middleChunkCount, 1);
@@ -2260,12 +2260,13 @@ describe('OverBudgetError.clearedBy', () => {
       });
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
-          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
         strategy.seedL1('L1-a', [ids[0]!]);
         strategy.seedL1('L1-b', [ids[1]!]);
         strategy.queueMergeOf(['L1-a', 'L1-b']);
         if (held) manager.holdCompression([ids[1]!], { timeoutMs: 60_000 });
         const error = await refusal(manager);
+        assert.match(error.message, /attempted representation level=L1/, 'the premise: a recall pair refuses');
         assert.deepEqual(error.clearedBy, !held && modelled ? ['compression'] : []);
         if (held) manager.releaseCompression([ids[1]!]);
       });
@@ -2403,7 +2404,7 @@ describe('OverBudgetError.clearedBy', () => {
         });
         await withManager(strategy, async (manager) => {
           const ids = Array.from({ length: 2 }, (_, i) =>
-            manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+            manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]));
           strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
           if (work === 'running') strategy.startCompressing();
           // A merge whose source in memory covers a message the compile can fold.
@@ -3142,6 +3143,8 @@ describe('OverBudgetError in the hierarchical middle', () => {
   });
   const say = (manager: ContextManager, i: number): string =>
     manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+  const sayCovered = (manager: ContextManager, i: number): string =>
+    manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
   /** The input budget whose grace window (0.25) holds `tokens` and nothing more than a token or so past it. */
   const holding = (tokens: number) => ({ maxTokens: Math.ceil(tokens / 1.25) + 20, reserveForResponse: 20 });
   const unit = (error: OverBudgetError) => Reflect.get(error.diagnostics, 'middleCountUnit');
@@ -3155,10 +3158,11 @@ describe('OverBudgetError in the hierarchical middle', () => {
       for (const positionedRecallPairs of [true, false]) {
         const strategy = middleStrategy({ positionedRecallPairs, ...sameQuestion, ...(after === 'the recent window' ? { recentWindowTokens: 50 } : {}) });
         await withManager(strategy, async (manager) => {
-          const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+          const covered = after === 'nothing' ? 3 : after === 'a raw message' ? 1 : 2;
+          const ids = Array.from({ length: 3 }, (_, i) => (i < covered ? sayCovered : say)(manager, i));
           // One message raw after the pair, or in the recent window, or none. The L1's 200 tokens are past the
           // 80-token input budget, so selection passes it over, and coverage completion includes it.
-          strategy.seedPyramid(after === 'nothing' ? ids : after === 'a raw message' ? ids.slice(0, 1) : ids.slice(0, 2), 1);
+          strategy.seedPyramid(ids.slice(0, covered), 1);
           refusals.push(await refusal(manager));
         });
       }
@@ -3180,7 +3184,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
       let error!: OverBudgetError;
       let head!: OverBudgetError;
       await withManager(strategy, async (manager) => {
-        const ids = Array.from({ length: 3 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 3 }, (_, i) => (i === 1 ? sayCovered : say)(manager, i));
         strategy.seedPyramid([ids[1]!], 1);
         head = await refusal(manager, undefined, { maxTokens: 30, reserveForResponse: 20 });
         error = await refusal(manager, undefined, budget);
@@ -3243,7 +3247,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
   it('names nothing at a positioned pair for a merge of summaries after it', async () => {
     const strategy = middleStrategy({ positionedRecallPairs: true });
     await withManager(strategy, async (manager) => {
-      const ids = Array.from({ length: 4 }, (_, i) => say(manager, i));
+      const ids = Array.from({ length: 4 }, (_, i) => (i === 1 ? say : sayCovered)(manager, i));
       // The pair over m0 comes first and refuses; m1 is raw; two L1s after it are queued to merge.
       strategy.seedUndercountedL1('L1-first', [ids[0]!]);
       strategy.seedUndercountedL1('L1-later', [ids[2]!]);
@@ -3279,7 +3283,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
       const strategy = middleStrategy({ positionedRecallPairs, carrierPolicy, ...sameQuestion });
       let result: { refused?: OverBudgetError } = {};
       await withManager(strategy, async (manager) => {
-        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 2 }, (_, i) => sayCovered(manager, i));
         strategy.seedCarrierL1('L1-carrier', ids, 400);
         try {
           await manager.compile({ maxTokens: 220, reserveForResponse: 20 });
@@ -3410,12 +3414,14 @@ describe('OverBudgetError in the hierarchical middle', () => {
       const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
       const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
       try {
-        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 2 }, (_, i) => sayCovered(manager, i));
         strategy.seedPyramid(ids, 1);
-        await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        const compiled = await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+        assert.ok(compiled.provenance!.messages.some((m) => m.kind === 'summary'), 'the premise: the recall pair goes out');
         outcomes.push(undefined);
       } catch (error) {
         assert.ok(error instanceof OverBudgetError, String(error));
+        assert.match(error.message, /attempted representation level=L1/, 'the premise: the recall pair refuses');
         outcomes.push(error.actual);
       } finally {
         await manager.close();
@@ -3433,12 +3439,13 @@ describe('OverBudgetError in the hierarchical middle', () => {
       const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
       const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...(tokenEstimator ? { tokenEstimator } : {}) });
       try {
-        const ids = Array.from({ length: 2 }, (_, i) => say(manager, i));
+        const ids = Array.from({ length: 2 }, (_, i) => sayCovered(manager, i));
         strategy.seedPyramid(ids, 1);
         await manager.compile({ maxTokens: 260, reserveForResponse: 20 }, undefined, { dryRun: true }).catch(() => undefined);
         assert.equal(Reflect.get(strategy, '_storeView'), null, 'a dry compile leaves no view bound');
         try {
-          await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+          const compiled = await manager.compile({ maxTokens: 260, reserveForResponse: 20 });
+          assert.ok(compiled.provenance!.messages.some((m) => m.kind === 'summary'), 'the premise: the recall pair goes out');
         } finally {
           assert.equal(Reflect.get(strategy, '_storeView'), null, 'nor does a committing one, so a mint request prices as before');
         }
@@ -3456,6 +3463,7 @@ describe('OverBudgetError in the hierarchical middle', () => {
       assert.equal(await outcome(positionedRecallPairs), undefined, 'the premise: at the default rate the pair fits');
       const refused = await outcome(positionedRecallPairs, twice);
       assert.ok(refused, `${positionedRecallPairs ? 'positioned' : 'combined'}: refused at the store's rate`);
+      assert.match(refused.message, /attempted representation level=L1/, "the L1's pair is what refuses");
       assert.ok(refused.actual > 300, String(refused.actual));
     }
   });
