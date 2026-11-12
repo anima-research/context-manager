@@ -95,6 +95,37 @@ export function answeredCallIndexes(blocks: readonly ContentBlock[]): Array<numb
 }
 
 /**
+ * Where a window over these messages may start: `starts[i]` is true when no
+ * `tool_result` in message `i` or after it answers (answeredCallIndexes) a
+ * `tool_use` in a message before `i`. So a window from such an index holds
+ * the call of every result it holds that the messages answer. Index 0 and
+ * `messages.length` are always true.
+ */
+export function cleanStarts(messages: ReadonlyArray<{ content: readonly ContentBlock[] }>): boolean[] {
+  const owner: number[] = [];
+  const blocks: ContentBlock[] = [];
+  messages.forEach((msg, m) => {
+    for (const block of msg.content) {
+      blocks.push(block);
+      owner.push(m);
+    }
+  });
+  const opened = new Array<number>(messages.length + 2).fill(0);
+  answeredCallIndexes(blocks).forEach((call, at) => {
+    if (call === undefined) return;
+    opened[owner[call]! + 1]!++;
+    opened[owner[at]! + 1]!--;
+  });
+  const starts: boolean[] = [];
+  let open = 0;
+  for (let i = 0; i <= messages.length; i++) {
+    open += opened[i]!;
+    starts.push(open === 0);
+  }
+  return starts;
+}
+
+/**
  * Strip each `tool_use` that no `tool_result` in the message list answers,
  * and each `tool_result` that answers no `tool_use` there. A result answers
  * the nearest call before it with its id (answeredCallIndexes), so a call is
@@ -122,10 +153,27 @@ export function answeredCallIndexes(blocks: readonly ContentBlock[]): Array<numb
  * case AND the very-last-message case AND any future not-yet-anticipated
  * source of unpaired blocks. Anything more specific would mislead the
  * debugger reading the compressed conversation later.
+ *
+ * With `{ keepCalls: true }`, every `tool_use` stays, and only each
+ * `tool_result` that answers no call before it goes, its raw form given up
+ * and an emptied message given the same placeholder. Each message the strip
+ * leaves whole comes back as itself, and one it changes as a plain object
+ * with its own fields and the new content. Where it changes none, it
+ * returns `messages` itself. A message stored with no blocks is left whole.
  */
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
-): Array<{ participant: string; content: ContentBlock[] }> {
+  options: { keepCalls: true },
+): readonly T[];
+// Last, since Parameters<> and ReturnType<> read the last overload: the one-argument form stays what they give.
+export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
+  messages: readonly T[],
+): Array<{ participant: string; content: ContentBlock[] }>;
+export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
+  messages: readonly T[],
+  options?: { keepCalls?: boolean },
+): ReadonlyArray<T | { participant: string; content: ContentBlock[] }> {
+  const keepCalls = options?.keepCalls === true;
   const starts: number[] = [];
   const blocks: ContentBlock[] = [];
   for (const msg of messages) {
@@ -138,19 +186,20 @@ export function stripUnpairedToolBlocks<T extends { participant: string; content
     paired.add(call);
     paired.add(at);
   });
-  return messages.map((msg, m) => {
-    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(starts[m]! + b) : true));
+  let changed = false;
+  const out = messages.map((msg, m) => {
+    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_result' || (block.type === 'tool_use' && !keepCalls) ? paired.has(starts[m]! + b) : true));
     if (trimmed.length === msg.content.length) {
-      return { participant: msg.participant, content: msg.content };
+      return keepCalls ? msg : { participant: msg.participant, content: msg.content };
     }
-    return {
-      participant: msg.participant,
-      // A dropped block may share its raw replay form with a block that stays
-      // (one <function_calls> holds several invokes); the survivors give it up
-      // so the dropped block doesn't ship with them (see raw-forms.ts).
-      content: trimmed.length > 0
-        ? releaseEditedRawForms(msg.content, trimmed)
-        : [{ type: 'text', text: '[tool call omitted]' }],
-    };
+    changed = true;
+    // A dropped block may share its raw replay form with a block that stays
+    // (one <function_calls> holds several invokes); the survivors give it up
+    // so the dropped block doesn't ship with them (see raw-forms.ts).
+    const content: ContentBlock[] = trimmed.length > 0
+      ? releaseEditedRawForms(msg.content, trimmed)
+      : [{ type: 'text', text: '[tool call omitted]' }];
+    return keepCalls ? { ...msg, content } : { participant: msg.participant, content };
   });
+  return keepCalls && !changed ? messages : out;
 }

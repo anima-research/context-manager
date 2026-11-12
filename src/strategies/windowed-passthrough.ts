@@ -34,6 +34,7 @@ import {
   type ResolvedImageLimits,
 } from '../live-image-limits.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
+import { cleanStarts, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
 import { roomUnderRequestLimit } from '../request-limit.js';
 
 /**
@@ -169,6 +170,19 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 0;
  * and presented again, as an undo and its redo do), so it is made at the
  * branch's first read in presented mode and kept.
  *
+ * **Tool pairs.** A tool_result goes out only with the tool_use it answers
+ * (answeredCallIndexes). One that answers no call before it in the view
+ * (its call removed, retracted, filtered out or never stored) is left out,
+ * before anything is priced, and a message that held nothing else sends
+ * `[tool call omitted]`. The window starts at the anchor, or earlier, at
+ * the latest message from which every result it holds has its call in it
+ * (cleanStarts): a host's anchor on a result, a slot an earlier release
+ * wrote there, or a result stored after the anchor for a call before it
+ * brings the call and the rows between in. The anchor itself isn't moved,
+ * so getAnchor() and getAnchorOrdinal() still name it. A re-anchor starts
+ * only where every result's call is in the window, so a call and its result
+ * across its cut go in or out together.
+ *
  * **Branch scoping.** The anchor persists in a chronicle snapshot slot, so
  * it survives restarts and follows branches like every other piece of
  * durable state. The in-memory copy is re-derived from the slot whenever
@@ -220,9 +234,10 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 0;
  *
  * **Hard budget.** After per-message shaping (truncation, image policy) the
  * window is priced against `maxTokens - reserveForResponse`. Overflow
- * re-anchors; if the single newest message alone still exceeds the usable
- * budget, or with system changes, the changes and the newest conversation
- * message, or the changes alone, the strategy refuses with
+ * re-anchors; if the newest message, with every message back to the latest
+ * start that keeps every tool result with its call, still exceeds the
+ * usable budget, or with system changes, the changes and that newest
+ * conversation message, or the changes alone, the strategy refuses with
  * {@link OverBudgetError} (the framework's over-budget breaker handles it)
  * rather than emitting a request the provider will reject. Previews report
  * the oversized window instead.
@@ -364,7 +379,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /**
    * The current window start (inclusive), as a chronicle sequence. While
    * the window is the record, the window is every row stored at it or
-   * after. Once rows are presented the window starts at an ordinal
+   * after, and the rows back to the calls its tool results answer (see Tool
+   * pairs in the class doc). Once rows are presented the window starts at an ordinal
    * (getAnchorOrdinal), and this is the sequence it was set from: the one
    * setAnchor was given, or that of the row a re-anchor started the window
    * at.
@@ -377,7 +393,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /**
    * The current window start (inclusive), as an index ordinal, on a branch
    * where the manager presents rows: the window is the row at it and every
-   * row presented after it. Undefined in legacy mode, and under a context
+   * row presented after it, and the rows back to the calls its tool results
+   * answer (see Tool pairs in the class doc). Undefined in legacy mode, and under a context
    * without a window index. A sequence anchor not converted yet is
    * converted here, as a compile converts it, and written to the slot (see
    * the class doc).
@@ -559,6 +576,27 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     return (message) => (ordinals.get(message.id) ?? Infinity) >= from;
   }
 
+  /**
+   * Where the window starts in `messages`, the stripped view, for select
+   * and renderAsNewest alike: at the first row at or after the anchor
+   * (atOrAfterAnchor), then back to the latest clean start (cleanStarts), so
+   * a tool_result it holds goes with its tool_use. The view lists rows in
+   * record order while the window is the record, and in window order, the
+   * order of their ordinals, once rows are presented, so the rows before the
+   * anchor come first in both.
+   */
+  private windowStart(
+    messages: readonly StoredMessage[],
+    clean: readonly boolean[],
+    presented: { ordinals: ReadonlyMap<MessageId, number>; from: number } | null,
+  ): number {
+    const shown = this.atOrAfterAnchor(presented);
+    let start = 0;
+    while (start < messages.length && !shown(messages[start]!)) start++;
+    while (!clean[start]) start--;
+    return start;
+  }
+
   // --------------------------------------------------------------------------
   // Branch-scoped state
   // --------------------------------------------------------------------------
@@ -683,18 +721,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   ): ContextEntry[] {
     this.syncToBranch();
     const maxTokens = roomUnderRequestLimit(store, budget.reserveForResponse, budget.maxTokens - budget.reserveForResponse, opts);
-    const messages = store.getAll();
+    const messages = stripUnpairedToolBlocks(store.getAll(), { keepCalls: true });
+    const clean = cleanStarts(messages);
     const presented = this.presentedAnchor(opts?.dryRun === true);
-    const shown = this.atOrAfterAnchor(presented);
-
-    // The window: everything at or after the anchor. The view lists rows in
-    // record order while the window is the record, and in window order, the
-    // order of their ordinals, once rows are presented, so the rows before
-    // the anchor come first in both.
-    let start = 0;
-    while (start < messages.length && !shown(messages[start]!)) {
-      start++;
-    }
+    let start = this.windowStart(messages, clean, presented);
 
     // Per-message shaping BEFORE pricing, so the window is sized on what
     // will actually be sent: the live-image policy's verdicts, decided once
@@ -756,15 +786,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const tokens = priced(i);
         if (acc + tokens > target) break;
         acc += tokens;
-        newStart = i;
+        if (clean[i]) newStart = i;
       }
       // Always make progress: if even the newest message exceeds the
       // target, emit just that message rather than nothing — subject to the
       // hard-budget check below. A system change is no conversation message,
-      // so that's the newest message that isn't one, if the window holds one.
+      // so that's the newest message that isn't one, if the window holds one,
+      // with every message back to the latest clean start before it, so
+      // every tool result goes with its call.
       if (newStart === messages.length && messages.length > 0) {
         newStart = messages.length - 1;
-        while (newStart > start && holdsSystemChange(messages[newStart]!.content)) newStart--;
+        const floor = start < messages.length ? start : 0;
+        while (newStart > floor && (holdsSystemChange(messages[newStart]!.content) || !clean[newStart])) newStart--;
       }
       start = newStart;
       total = 0;
@@ -790,16 +823,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // leaves it where the last sent window started, so the turns that fit
     // once the caller consolidates its changes are still in the window.
     if (total > maxTokens && !opts?.dryRun) {
+      const unit = messages.slice(start).filter((m) => !holdsSystemChange(m.content)).length > 1 ? ', back to the latest start that keeps every tool result with its call' : '';
       throw new OverBudgetError({
         budget: maxTokens,
         actual: total,
         stage: changeTokens === 0
-          ? 'Windowed passthrough: the newest message alone'
+          ? (unit ? `Windowed passthrough: the newest message${unit}` : 'Windowed passthrough: the newest message alone')
           : total > changeTokens
-            ? 'Windowed passthrough: its system changes and the newest conversation message'
+            ? `Windowed passthrough: its system changes and the newest conversation message${unit}`
             : 'Windowed passthrough: its system changes alone',
         // No compression here: the window moves past this message once a
-        // newer one that fits arrives (the progress clause above). System
+        // newer one that fits arrives (the progress clause above), unless a
+        // tool result in it answers a call in what was refused. System
         // changes go out wherever the window starts, so once they leave no
         // room for a message only the caller, consolidating them, clears it.
         clearedBy: changeTokens < maxTokens ? ['newer-message'] : [],
@@ -852,12 +887,15 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /**
    * See `ContextStrategy.renderAsNewest`. The steps select takes for the
    * messages it sends, over the view's suffix from the batch's oldest
-   * message to its newest: each cut as select cuts it (cappedContent), then
-   * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
-   * each decided from its message and newer ones, with depth from the view's
-   * newest message, so they're select's. A message before the anchor (by
-   * its ordinal once rows are presented, by its sequence before) comes back
-   * as null, since select leaves it out, but for a system change, which
+   * message to its newest: each tool_result that answers no call before it
+   * in the view left out (see Tool pairs in the class doc), each cut as
+   * select cuts it (cappedContent), then the live-image policy's verdicts
+   * applied (liveImagePolicy, stripImages), each decided from its message
+   * and newer ones, with depth from the view's newest message, so they're
+   * select's. A message before the window's start (the anchor, by its
+   * ordinal once rows are presented, by its sequence before, or the latest
+   * clean start before it) comes back as null, since select leaves it out,
+   * but for a system change, which
    * comes back as select sends it ahead of the window, cut as any message
    * is: a compile moves the anchor only to a message it sent, but a
    * caller's setAnchor can move it past one just stored. Like select, it
@@ -869,10 +907,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.syncToBranch();
-    const messages = store.getAll();
+    const messages = stripUnpairedToolBlocks(store.getAll(), { keepCalls: true });
+    const clean = cleanStarts(messages);
     const at = new Map(messages.map((m, i) => [m.id, i] as const));
-    const atOrAfter = this.atOrAfterAnchor(this.presentedAnchor());
-    const shown = (i: number): boolean => atOrAfter(messages[i]!);
+    const first = this.windowStart(messages, clean, this.presentedAnchor());
+    const shown = (i: number): boolean => i >= first;
     let from = messages.length;
     for (const id of ids) {
       const i = at.get(id);
@@ -935,7 +974,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * window would again be priced with images the strip takes out.
    */
   private liveImagePolicy(
-    messages: StoredMessage[],
+    messages: readonly StoredMessage[],
     store: MessageStoreView,
     from: number,
   ): ImagePolicy {
