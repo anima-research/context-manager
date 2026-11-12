@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../../src/adaptive/chunker.js';
 
@@ -137,4 +138,33 @@ test('chunker: large doc (synthetic 500K-token-equivalent) produces sensible sha
   }
   // Byte-faithful
   assert.equal(result.shards.map((s) => s.content).join(''), body);
+});
+
+test('chunker: a body whose estimate equals chunkThreshold is not sharded', () => {
+  const body = 'a'.repeat(TINY.chunkThreshold * TINY.charsPerToken);
+  const result = chunkMessage(body, TINY);
+  assert.equal(result.wasSharded, false);
+  assert.equal(result.shards.length, 1);
+  assert.equal(result.shards[0].content, body);
+});
+
+test("chunker: each shard's sourceHash is the SHA-256 of its own content's UTF-8 bytes, sharded or not", () => {
+  const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
+  const lines: string[] = [];
+  for (let i = 0; i < 12; i++) lines.push(`Ligne ${i.toString().padStart(2, '0')} — café über`);
+  const sharded = chunkMessage(lines.join('\n'), TINY);
+  assert.ok(sharded.shards.length >= 2, 'premise: the body is sharded');
+  for (const shard of sharded.shards) assert.equal(shard.sourceHash, sha256(shard.content));
+  const whole = chunkMessage('Un café — short.', TINY);
+  assert.equal(whole.wasSharded, false, 'premise: the body is under the threshold');
+  assert.equal(whole.shards[0].sourceHash, sha256('Un café — short.'));
+});
+
+test('chunker: no shard of a sharded body is longer than 1.25 times its target, even where the nearest seam lies past that', () => {
+  const body = ('x'.repeat(55) + ' ').repeat(5);
+  const result = chunkMessage(body, TINY);
+  assert.equal(result.wasSharded, true, 'premise: the body is sharded');
+  const limit = TINY.chunkSize * TINY.charsPerToken * 1.25;
+  assert.equal(result.shards.map((s) => s.content).join(''), body);
+  for (const shard of result.shards) assert.ok(shard.content.length <= limit, `${shard.content.length} > ${limit}`);
 });

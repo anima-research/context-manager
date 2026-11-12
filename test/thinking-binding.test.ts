@@ -269,6 +269,35 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
+  it('presented mode: a write between a stream\u2019s rounds, presented after them, leaves every reply its thinking', async () => {
+    // The sibling of the test above once a host presents rows (agent-framework
+    // #291): the other writer's row is stored between the rounds, as there,
+    // but enters the window at the next boundary, after the rounds the
+    // stream sent, so the reply after it keeps its thinking. The sibling of
+    // the auxiliary-slot test below is in window-index.test.ts.
+    cleanup();
+    const manager = await open();
+    manager.presentRows([]);
+    const u1 = manager.addMessage('User', [text('U1')]);
+    manager.presentRows([u1]);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const a1 = manager.addMessage('Claude', [thought(1), text('A1'), toolUse('t1')]);
+    manager.presentRows([a1]);
+    const other = manager.addMessage('Other', [text('zz-interleaved')]);
+    const r1 = manager.addMessage('User', [toolResult('t1', 'zz-result')]);
+    manager.presentRows([r1]);
+    note(manager, [a1, r1], identity());
+    const a2 = manager.addMessage('Claude', [thought(2), text('A2')]);
+    manager.presentRows([a2]);
+    note(manager, [a1, r1, a2], identity());
+    manager.presentRows([other]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, A1: true, tool_result: false, A2: true, 'zz-interleaved': false });
+    assert.deepEqual(next.messages.map((m) => (m.content.find((b) => b.type === 'text') as { text?: string } | undefined)?.text ?? 'tool_result'), ['U1', 'A1', 'tool_result', 'A2', 'zz-interleaved']);
+    assert.equal(next.thinkingStrip, undefined);
+    await manager.close();
+  });
+
   it('a write in an auxiliary slot between a stream\u2019s rounds leaves out the reply after it', async () => {
     cleanup();
     const main = await open();
@@ -1216,6 +1245,221 @@ describe('thinking binding: compile', () => {
     assert.equal(JSON.stringify(recordOf(a, 'zz-a')), recorded, 'zz-b\u2019s write left zz-a\u2019s record');
     await b.close();
     await a.close();
+  });
+});
+
+describe('thinking binding: noteThinkingDropped', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  const dropped = (manager: ContextManager, ids: readonly MessageId[], compileId = recordCompileId(manager)): boolean =>
+    manager.noteThinkingDropped(ids, compileId);
+
+  it('a reply the provider set aside, once noted, goes without its thinking from the next compile on, and the replies after it keep theirs', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const first = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(first), { U1: false, A1: true, U2: false, A2: true }, 'setup: the drop control sends both');
+    assert.equal(manager.noteThinkingDropped([a1, a1], first.provenance!.compileId), true);
+    assert.deepEqual((recordOf(manager) as BindingRecord).dropped, [a1], 'each once');
+    const store = manager.getStore() as unknown as { setStateJson: (...args: unknown[]) => unknown };
+    const setStateJson = store.setStateJson;
+    let writes = 0;
+    store.setStateJson = (...args) => {
+      writes += 1;
+      return setStateJson.apply(store, args);
+    };
+    assert.equal(manager.noteThinkingDropped([a1], first.provenance!.compileId), true, 'a repeat matches the record');
+    assert.equal(writes, 0, 'and writes nothing');
+    store.setStateJson = setStateJson;
+    for (const label of ['the next compile', 'and the one after']) {
+      const next = await manager.compile(BIG, undefined, BIND_DROP);
+      assert.deepEqual(thinkingByText(next), { U1: false, A1: false, U2: false, A2: true }, label);
+      assert.equal(next.thinkingStrip, undefined, `${label}: a noted reply isn\u2019t reported as a strip`);
+    }
+    assert.ok((recordOf(manager) as BindingRecord).without.includes(a1), 'the compile keeps it in the record');
+    assert.equal((recordOf(manager) as BindingRecord).dropped, undefined, 'and clears the note');
+    assert.ok(!(recordOf(manager) as BindingRecord).without.includes(a2), 'control');
+    await manager.close();
+  });
+
+  it('a noted reply still lets a changed message after it take the replies that follow', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const u2 = manager.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'U2'))!.id;
+    await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(dropped(manager, [a1]), true);
+    manager.editMessage(u2, [text('U2 zz-edited')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(next).A1, false);
+    assert.equal(thinkingByText(next).A2, false, 'the edit before A2 takes its thinking');
+    assert.deepEqual(next.thinkingStrip, { newly: [a2], cause: 'messages' });
+    await manager.close();
+  });
+
+  it('the match by a reply\u2019s whole form is a noted reply\u2019s alone: one left out as stored before the record still takes the replies after it', async () => {
+    cleanup();
+    const manager = await open();
+    seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
+    assert.equal(note(manager, [a3], identity()), true, 'setup: the record holds A3');
+    const next = await manager.compile(BIG, undefined, BIND);
+    assert.deepEqual(thinkingByText(next), { U1: false, A1: false, U2: false, A2: false, A3: false });
+    await manager.close();
+  });
+
+  async function splitCycle(manager: ContextManager): Promise<{ b1: MessageId; split: CompileResult }> {
+    manager.addMessage('User', [text('U1')]);
+    const c0 = await manager.compile(BIG, undefined, BIND_DROP);
+    const cycle = (result: string): ContentBlock[] => [thought(1), toolUse('t1'), toolResult('t1', result), thought(3), text('B1')];
+    const b1 = manager.addMessage('Claude', cycle('zz-result'));
+    assert.equal(manager.noteRequestSent([b1], identity(), c0.provenance!.compileId), true);
+    manager.addMessage('User', [text('U2')]);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    manager.editMessage(b1, cycle('zz-result-changed'));
+    const split = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(split.messages.flatMap((m) => m.content.filter(isThinking)), [thought(1)], 'setup: the first part keeps its thinking, the last goes without');
+    return { b1, split };
+  }
+
+  it('with nothing noted, a body the record\u2019s compile sent partly with its thinking still takes the replies after it', async () => {
+    cleanup();
+    const manager = await open();
+    const { split } = await splitCycle(manager);
+    const c1 = manager.addMessage('Claude', [thought(5), text('C1')]);
+    assert.equal(manager.noteRequestSent([c1], identity(), split.provenance!.compileId), true);
+    manager.addMessage('User', [text('U3')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(next.messages.flatMap((m) => m.content.filter(isThinking)).length, 0, 'the first part goes without, and so does C1');
+    assert.deepEqual(next.thinkingStrip, { newly: [c1], cause: 'messages' });
+    await manager.close();
+  });
+
+  it('a note on a body the record\u2019s compile sent partly with its thinking counts as a note: the replies after it keep theirs', async () => {
+    cleanup();
+    const manager = await open();
+    const { b1, split } = await splitCycle(manager);
+    assert.equal(dropped(manager, [b1]), true);
+    assert.deepEqual((recordOf(manager) as BindingRecord).dropped, [b1]);
+    const c1 = manager.addMessage('Claude', [thought(5), text('C1')]);
+    assert.equal(manager.noteRequestSent([c1], identity(), split.provenance!.compileId), true);
+    manager.addMessage('User', [text('U3')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(next.messages.flatMap((m) => m.content.filter(isThinking)), [thought(5)], 'only C1 keeps its thinking');
+    assert.equal(next.thinkingStrip, undefined);
+    await manager.close();
+  });
+
+  it('a note naming one body of a compiled message that holds two leaves the message differing: it and the replies after it go without, and the body it didn\u2019t name is reported', async () => {
+    cleanup();
+    let pair: [MessageId, MessageId] | undefined;
+    class Merging extends PassthroughStrategy {
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
+        const entries = super.select(store, log, budget, opts);
+        const at = entries.findIndex((e) => e.sourceMessageId === pair?.[0]);
+        if (!pair || at < 0 || entries[at + 1]?.sourceMessageId !== pair[1]) return entries;
+        const [first, second] = [entries[at]!, entries[at + 1]!];
+        entries.splice(at, 2, { ...first, sourceMessageId: undefined, sourceMessageIds: [...pair], content: [...first.content, ...second.content] });
+        return entries;
+      }
+    }
+    const manager = await open(STORE, new Merging());
+    manager.addMessage('User', [text('U1')]);
+    const a1 = manager.addMessage('Claude', [thought(1), text('A1')]);
+    const a1b = manager.addMessage('Claude', [thought(2), text('A1b')]);
+    manager.addMessage('User', [text('U2')]);
+    const c1 = manager.addMessage('Claude', [thought(3), text('C1')]);
+    pair = [a1, a1b];
+    const first = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.ok(first.provenance!.messages.some((m) => m.kind === 'raw' && m.bodies.length === 2), 'setup: A1 and A1b compile as one message');
+    assert.deepEqual(thinkingByText(first), { U1: false, 'A1|A1b': true, U2: false, C1: true }, 'setup');
+    assert.equal(dropped(manager, [a1]), true);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, 'A1|A1b': false, U2: false, C1: false });
+    assert.deepEqual(next.thinkingStrip, { newly: [a1b, c1], cause: 'messages' });
+    await manager.close();
+  });
+
+  it('a noted reply edited since it was sent differs from the record: the replies after it go without their thinking', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1, a2 } = seed(manager);
+    const first = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(first), { U1: false, A1: true, U2: false, A2: true }, 'setup');
+    assert.equal(dropped(manager, [a1]), true);
+    manager.editMessage(a1, [thought(1), text('A1 edited')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, 'A1 edited': false, U2: false, A2: false });
+    assert.deepEqual(next.thinkingStrip, { newly: [a2], cause: 'messages' });
+    await manager.close();
+  });
+
+  it('a noted reply that a committing compile in between didn\u2019t send is reported again when it renders', async () => {
+    cleanup();
+    let hidden: MessageId | undefined;
+    class Hiding extends PassthroughStrategy {
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
+        return super.select(store, log, budget, opts).filter((e) => e.sourceMessageId === undefined || e.sourceMessageId !== hidden);
+      }
+    }
+    const manager = await open(STORE, new Hiding());
+    const { a1 } = seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(dropped(manager, [a1]), true);
+    hidden = a1;
+    const between = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal('A1' in thinkingByText(between), false, 'setup: the compile in between doesn\u2019t send A1');
+    hidden = undefined;
+    const again = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(again).A1, false);
+    assert.ok(again.thinkingStrip?.newly.includes(a1), `A1 is reported: ${JSON.stringify(again.thinkingStrip)}`);
+    await manager.close();
+  });
+
+  it('writes nothing on a branch with no record, or for a compile other than the record\u2019s, and refuses what it can\u2019t record before writing', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1 } = seed(manager);
+    assert.equal(manager.noteThinkingDropped([a1], 'zz-no-compile'), false, 'no record yet');
+    assert.equal(recordOf(manager), null);
+    const c1 = await manager.compile(BIG, undefined, BIND_DROP);
+    const c2 = await manager.compile(BIG, undefined, BIND_DROP);
+    const recorded = JSON.stringify(recordOf(manager));
+    assert.equal(manager.noteThinkingDropped([a1], c1.provenance!.compileId), false, 'a stale compile');
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'nothing written');
+    const refused: Array<[string, () => unknown, RegExp]> = [
+      ['ids not a list', () => manager.noteThinkingDropped('zz' as unknown as MessageId[], c2.provenance!.compileId), /`messageIds` must be an array/],
+      ['an id not a string', () => manager.noteThinkingDropped([a1, 3 as unknown as MessageId], c2.provenance!.compileId), /id 1 must be a message id/],
+      ['a compileId not a string', () => manager.noteThinkingDropped([a1], undefined as unknown as string), /`compileId` must be a string, the provenance.compileId of the compile the stream was built from; got undefined/],
+      ['a hole among the ids', () => manager.noteThinkingDropped(new Array<MessageId>(1), c2.provenance!.compileId), /id 0 must be a message id/],
+    ];
+    for (const [label, call, message] of refused) {
+      assert.throws(call, (error: unknown) => error instanceof Error && message.test(error.message), label);
+    }
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'the record is as it was');
+    await manager.compile(BIG, undefined, bind({ dropBlock: true, dryRun: true }));
+    await manager.compile(BIG);
+    assert.equal(manager.noteThinkingDropped([a1], c2.provenance!.compileId), true);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.equal(thinkingByText(next).A1, false);
+    await manager.close();
+  });
+
+  it('writes the record of the branch it\u2019s on, and leaves another branch\u2019s', async () => {
+    cleanup();
+    const manager = await open();
+    const { a1 } = seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const mainRecord = JSON.stringify(recordOf(manager));
+    await manager.fork('zz-fork');
+    assert.equal(dropped(manager, [a1]), true, 'the fork holds main\u2019s record and its compile');
+    assert.deepEqual((recordOf(manager) as BindingRecord).dropped, [a1]);
+    await manager.switchBranch('main');
+    assert.equal(JSON.stringify(recordOf(manager)), mainRecord, 'main\u2019s record is as it was');
+    await manager.close();
   });
 });
 

@@ -432,6 +432,67 @@ There is no single linear change exchange rate: the discrete tree-cut
 frontier is non-convex, and linear scalarization reaches only supported
 points.
 
+**A linear rewrite price (`policy.rewriteLambda`, off unless set; added
+2026-11).** The quadratic `f_K` is only as steep as its scale makes it. At
+the scale deployments ran (`cacheScale` 100,000 with `cacheLambda` 1) two
+cuts that differ by a few hundred thousand tokens of rewrite score within
+a few dozen points, against fidelity and occupancy differences in the
+thousands, so `K` rarely decided anything: on a copy of one resident's
+store a forced transition folded six raw messages at the very start of
+history beside the new fold, which moved the first changed token from
+about 250k to 3k and doubled the rewrite, and other transitions re-leveled
+old summaries, some of them back and forth on successive transitions
+(context-manager #412 reports the same flip). On that copy, `cacheScale`
+10,000 or 20,000 was enough to keep the first change at the new fold, so
+the quadratic's scale is one remedy. `rewriteLambda` is the other: with it
+the cache term is `rewriteLambda · K(x) / cacheScale`, linear in the churn
+itself, in place of `f_K(K_excess)`. It is the provider's own cost model
+(a rewritten token is billed the same wherever it is), it needs no floor
+(a floor is one constant per pool in a linear term, so it decides nothing
+and scores from two pools compare without a shared frame), and what it
+charges for reaching further back is in proportion to what that rewrites,
+where the quadratic charges four times as much for twice the rewrite: old
+history still returns to a shallower level where its fidelity is worth
+that rewrite. The remark above stands: a linear term selects only
+supported points of the (welfare, churn) frontier. Marker quantization is
+unchanged: `K` is measured from the last marker a cut keeps, so cuts that
+first change between the same two markers cost alike.
+
+**A change penalty (`KvUnifiedOptions.changePenalty`; the memory
+strategy's `thinkingLambda`).** Some of what a change costs is the same
+for every cut outside the carried family. On a model that binds signed
+thinking to the request that minted it, a block is dropped once anything
+before it differs, and the thinking still in play sits in the newest raw
+messages, after everything a fold or an unfold touches: any change of
+layout drops all of it, wherever the change begins. Such a cost can't
+choose between changes, only between changing and holding, so it is added
+to `adoptEpsilon` for the live solve. The memory strategy prices it per
+compile from what the branch's binding record still vouches for
+(`SelectOptions.thinkingStanding`): each of the agent's own replies still
+rendered raw, its thinking at the store's price, weighted by
+`2^(−d / thinkingHalfLifeTokens)` for the raw tokens `d` between it and
+the newest message, times `thinkingLambda`. It is zero on a compile for a
+model that doesn't bind thinking, and zero again once the record no longer
+vouches for the thinking (another system text or tool list, or a change
+the provider already set it aside for), which is when a transition that
+was waiting comes. A reply stored past the record's end
+(`ThinkingStanding.recordedThrough`) isn't counted: nothing vouches for it
+until a host notes it as a row its stream sent, and the next compile
+sends it without its thinking whatever it selects. The cost is an upper
+bound: a change that begins after some raw replies leaves their thinking
+standing, and they are priced all the same, since one number can't depend
+on where a change begins (the rewrite's price does). Hard-wall priority is
+unchanged: nothing here retains `R > W`.
+
+**Neither enters latent demand (§8).** A merge is worth producing when the
+layout the policy would move to is better with it, and that is asked
+before a transition is due. Priced at what a change costs now, the best
+cut of both pools is the carried one for as long as holding is cheaper, no
+merge would be demanded until a transition is forced, and that transition
+would find none of the summaries it needs. The demand solves, and the base
+they are measured against, therefore run with `rewriteLambda` 0 and no
+change penalty: the same labels, scored as before.
+
 **Explicit continuity relaxation.** `ρ(reason) ∈ [0,1]` is supplied by a
 reason-coded, time-bounded transition policy, not inferred from a large diff.
 Normal operation and tool/system changes use `ρ = 1`: a cold cache does not
@@ -680,7 +741,9 @@ model, or cached.
   cacheCreationTokens?})` — name is
   implementation-owned, but request identity must prevent a receipt for one
   compile being applied to another. The next solve reads the **newest valid
-  cache receipt**, not the newest compiled frontier. Cache fields may be
+  cache receipt**, not the newest compiled frontier. Under kv-unified the
+  receipt that sets the cache reference is a compile's first accepted call's;
+  a later call of the same compile leaves it (§5A.3). Cache fields may be
   absent while the accepted-presentation fields are still committed.
 - **Current immutable-prefix fingerprint is a required solve input.** Before
   cut selection, the host passes the hash of tools + system + context prefix
@@ -797,6 +860,25 @@ itself the main hazard; do not design from those numbers. After rev 6:
   system and tools blocks by construction. Caveat recorded: with the system
   slot moved, an idle expiry kills the tools entry together with the window;
   irrelevant with keepalives on, remember if they are ever off.
+- **That's a compile's own request.** On the native tool loop's later calls in
+  the same turn, membrane may float markers of its own under `cm-owned`;
+  membrane's `floatingCacheMarker` doc, as antra-tess/membrane#239 extends it
+  to `cm-owned`, says when, where, and that within one tool loop membrane
+  changes no message content before the turn's opening (context-manager#168).
+  Once one of the compile's calls is accepted, a later call's receipt leaves
+  the cache reference and the recorded wire receipt as they stood once that
+  call was accepted (§5). A compile's calls are those begun after it and
+  before the next compile; one still in flight when the next compile runs
+  stays its own compile's. Calls begun after the next compile are that
+  compile's: the first of them accepted before the compile's own request
+  begins is its first accepted call, so it takes the count check, its wire
+  receipt is the one recorded, and the compile's own request then leaves
+  both. A call whose
+  count differs, such as a floated one, then leaves that compile no
+  reference. One still in flight when the compile's own request begins is
+  superseded, so that request, once accepted, is the first accepted call.
+  agent-framework starts a stream only from `idle` (`src/agent.ts:2192` at
+  v0.32.0), so its tool loop's calls end before its next stream compiles.
 - Placement is by **cumulative rendered (priced) tokens**, never by unit
   count (one summary unit and one raw unit differ by an order of magnitude),
   snapped to legal render-unit boundaries.
@@ -904,7 +986,10 @@ prefix; **stale imported block-level markers are rejected at a named
 normalization boundary before request construction** (CM cannot optimize a
 slot budget containing hidden markers; the loud data-defect behavior stays
 in `membrane-system` mode); the raw request carries at most the provider
-limit; membrane returns the exact wire receipt.
+limit; membrane returns the exact wire receipt. These rules, and formatter
+parity's and the wire receipt's below, hold for a compile's own request: on
+the native tool loop's later calls, a membrane that floats under `cm-owned`
+places markers of its own (§5A.3).
 
 **Formatter parity** — the same normalized policy applies to native
 Anthropic, Anthropic XML/prefill, Bedrock (incl. its ttl rewrite), context-
@@ -948,6 +1033,8 @@ Bedrock return equivalent receipts for equivalent normalized requests.
 | `kvUnifiedLambdaF` | 0 (v1) | recipe | future-churn price |
 | `kvUnifiedBeta` | 0.9/event | recipe | churn discount |
 | `kvUnifiedAdoptEpsilon` | 0.005·W | recipe | anti-cycle margin |
+| `kvUnified.policy.rewriteLambda` | 0 (off) | recipe | linear price of cache churn, per `cacheScale`, in place of the quadratic cache policy (§3.2) |
+| `kvUnified.thinkingLambda` / `kvUnified.thinkingHalfLifeTokens` | 0 (off) / 50,000 | recipe | points per token of thinking a change would drop on a model that binds it, and the half-life of its weight (§3.2) |
 | `cacheMarkers` | `membrane-system` | recipe | `cm-owned` hands all four slots to CM (§5A.3) |
 | W (`contextBudgetTokens`) | existing | existing | the wall |
 

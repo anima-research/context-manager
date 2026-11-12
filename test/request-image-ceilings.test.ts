@@ -298,22 +298,23 @@ describe('the image limits warning', () => {
           // At or above the memory strategy's 12 MiB compression budget, so
           // that budget isn't above the ceiling either.
           [{ maxLiveImageBytes: 16 * MiB, imageByteCeiling: 16 * MiB }, null],
-          // A default above a lowered ceiling is named too, marked as the
-          // default, and so is a default ceiling under a limit the host set.
-          [{ imageByteCeiling: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above imageByteCeiling 2 MiB, so the live window keeps at most 2 MiB']],
+          // The window's own limits default to none, so a lowered ceiling is
+          // above no default of theirs; the memory strategy's compression
+          // budget still has one, named and marked as the default. A default
+          // ceiling under a limit the host set is named too.
+          [{ imageByteCeiling: 2 * MiB }, name === 'autobiographical' ? ['maxCompressionImageBytes 12 MiB (default) is above imageByteCeiling 2 MiB'] : null],
           [{ maxLiveImages: 600 }, ['maxLiveImages 600 is above imageCeiling 500 (default), so the live window keeps at most 500']],
-          // The default window of 6 comes from the strategy's default config,
-          // not from the host, so it's marked too.
-          [{ imageCeiling: 4 }, ['maxLiveImages 6 (default) is above imageCeiling 4, so the live window keeps at most 4']],
+          // The default window has no count limit, so nothing is above the ceiling.
+          [{ imageCeiling: 4 }, null],
           // An infinite limit is none, like 0, so nothing is said.
           [{ maxLiveImages: Infinity }, null],
           // A malformed ceiling takes its default, which the later clause marks.
           [{ maxLiveImages: 600, imageCeiling: Number.NaN },
             ["imageCeiling NaN isn't 0 or a finite number above it, so the default 500 applies",
               'maxLiveImages 600 is above imageCeiling 500 (default)']],
-          // A byte budget given as null takes its default, and is marked so.
-          [{ maxLiveImageBytes: null, imageByteCeiling: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above imageByteCeiling 2 MiB']],
-          [{ maxLiveImageBytes: undefined, imageByteCeiling: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above imageByteCeiling 2 MiB']],
+          // A byte budget given as null takes its default, which is none.
+          [{ maxLiveImageBytes: null, imageByteCeiling: 2 * MiB }, name === 'autobiographical' ? ['maxCompressionImageBytes 12 MiB (default) is above imageByteCeiling 2 MiB'] : null],
+          [{ maxLiveImageBytes: undefined, imageByteCeiling: 2 * MiB }, name === 'autobiographical' ? ['maxCompressionImageBytes 12 MiB (default) is above imageByteCeiling 2 MiB'] : null],
           [{ maxLiveImageBytes: 30 * MiB, imageByteCeiling: -1 },
             ["imageByteCeiling -1 isn't 0 or a finite number above it, so the default 24 MiB applies",
               'maxLiveImageBytes 30 MiB is above imageByteCeiling 24 MiB (default)']],
@@ -442,7 +443,7 @@ describe('the line when an image ceiling first strips', () => {
       const cases = [
         [{ maxLiveImages: 0, imageCeiling: 2 }, 'imageCeiling 2 holds maxLiveImages 0 (no limit) to it'],
         [{ maxLiveImages: 5, imageCeiling: 2 }, 'imageCeiling 2 holds maxLiveImages 5 to it'],
-        [{ imageCeiling: 2 }, 'imageCeiling 2 holds maxLiveImages 6 (default) to it'],
+        [{ imageCeiling: 2 }, 'imageCeiling 2 holds maxLiveImages 0 (no limit) (default) to it'],
         [{ maxLiveImages: 0, maxLiveImageBytes: 0, imageByteCeiling: 8 },
           'imageByteCeiling 8 bytes holds maxLiveImageBytes 0 (no limit) to it'],
       ] as const;
@@ -1127,13 +1128,13 @@ describe('the line when an image ceiling first strips', () => {
     });
   }
 
-  it('marks only defaults in force: an explicit undefined maxLiveImages is no limit in the memory strategy, and 6 in windowed passthrough', async () => {
+  it('marks only defaults in force: an explicit undefined maxLiveImages is no limit in the memory strategy, and the default, also none, in windowed passthrough', async () => {
     const auto = await ceilingLines(memory({ maxLiveImages: undefined, imageCeiling: 2 }), [3]);
     assert.equal(auto.lines.length, 1, JSON.stringify(auto.lines));
     assert.ok(auto.lines[0]!.includes('imageCeiling 2 holds maxLiveImages 0 (no limit) to it,'), auto.lines[0]);
     const win = await ceilingLines(windowed({ maxLiveImages: undefined, imageCeiling: 2 }), [3]);
     assert.equal(win.lines.length, 1, JSON.stringify(win.lines));
-    assert.ok(win.lines[0]!.includes('imageCeiling 2 holds maxLiveImages 6 (default) to it,'), win.lines[0]);
+    assert.ok(win.lines[0]!.includes('imageCeiling 2 holds maxLiveImages 0 (no limit) (default) to it,'), win.lines[0]);
   });
 
   it("doesn't mark a value a subclass's enforced layer gives as a default", async () => {

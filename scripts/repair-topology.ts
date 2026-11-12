@@ -50,13 +50,26 @@
  * planned; the summary-id counter is raised past every stored id first, as
  * the loader raises it.
  * --rebuild-since <messageId|ISO date> rebuilds only crossed summaries whose
- * span starts at or after that message and compacts the older ones; strays
+ * span starts at or after that message, in the plan's order (window order
+ * once a host presents: a date names the first row in that order dated at
+ * or after it, so a row presented again after it counts as after it), and
+ * compacts the older ones; strays
  * and released messages before it get no partner, and no tower that starts
  * before it is dissolved to partner one (a crossed summary rebuilt after it
  * still takes its ancestors with it). The L1 split still releases a crossed
  * L1's other runs there, as the compact treatment does; such a run is
  * listed as `STILL STRANDED …`.
  * None of the modes makes model calls itself.
+ *
+ * Once a host presents rows to the namespace (agent-framework #291), the
+ * plan is made over its window, the rows presented in the order they were,
+ * as the strategy reads them; until then over the record. That is the
+ * `--messages-state` slot only: rows a manager merges from auxiliary slots
+ * aren't in the plan, as before. The verification after --apply is a
+ * default open of the namespace (no `isolate`), so it reads the shared
+ * `messages` slot whatever --messages-state names: after a repair of an
+ * isolated manager's slot (`agents/A/messages`, say) it doesn't audit that
+ * slot, as before.
  *
  * After --apply the store is reopened with topologyPolicy 'reject'; the run
  * fails if the audit still finds a crossed summary.
@@ -72,6 +85,8 @@ import { loadedAsWritten, planTopologyRepair, type RepairInputs, type RepairReco
 import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
 import { releasedRecordsLine, summaryIdCounterPast } from '../src/strategies/settle-summaries.js';
 import { flagValue, positionalArg, runsFromArgs, runsLine, RUN_VALUE_FLAGS, RUNS_USAGE } from './run-flags.js';
+import { WindowIndex } from '../src/window-index.js';
+import type { StoredMessage } from '../src/types/index.js';
 
 const args = process.argv.slice(2);
 const positional = positionalArg(args, ['--namespace', '--release-head-limit', '--mode', '--rebuild-since', '--messages-state', ...RUN_VALUE_FLAGS]);
@@ -115,7 +130,15 @@ const summaries = stateArray<RepairSummary>(sumsState);
 const records = stateArray<RepairRecord>(chunksState);
 const storedResolutions = store.getStateJson(resolutionsState);
 const resolutions = (storedResolutions != null && typeof storedResolutions === 'object' && !Array.isArray(storedResolutions) ? storedResolutions : {}) as Record<string, number>;
-const messages = stateArray<{ id: string }>(messagesState);
+// Once a host presents rows (agent-framework #291) the strategy reads, and
+// the verification's audit checks, the namespace's window: the rows
+// presented, in the order they were, which can differ from the record's.
+// The plan is made over it; in legacy mode it is the record. Only the
+// --messages-state slot's rows, so a manager that merges an auxiliary slot
+// isn't read as it reads it. The verification's open below is a default
+// one, which reads the shared `messages` slot whatever --messages-state
+// names, so it audits the slot planned here only where that is `messages`.
+const messages = new WindowIndex(store, namespace, console).listing(stateArray<StoredMessage>(messagesState)) as Array<{ id: string }>;
 const mergeQueue = stateArray<{ level: number; sourceIds: string[] }>(`${namespace}/autobio:mergeQueue`);
 const mergeQuarantine = stateArray<NonNullable<RepairInputs['mergeQuarantine']>[number]>(`${namespace}/autobio:merge-quarantine`);
 const quarantine = compressionQuarantineHolds(
@@ -171,7 +194,7 @@ else {
   for (const r of plan.rehomed) console.log(`  re-home ${r.id} (${r.leaves} leaves) from ${r.from} into ${r.into}`);
   for (const s of plan.splitL1) console.log(`  split L1 ${s.id}: keep ${s.kept}, release ${s.released.join(',')}`);
   for (const d of plan.dissolved) console.log(`  dissolve L${d.level} ${d.id} (single source ${d.child})`);
-  if (plan.rebuildSince) console.log(`  rebuild-since: message ${plan.rebuildSince.id} (store position ${plan.rebuildSince.position}) — ${plan.rebuildSince.rebuilt} crossed rebuilt, ${plan.rebuildSince.compacted} older ones compacted`);
+  if (plan.rebuildSince) console.log(`  rebuild-since: message ${plan.rebuildSince.id} (position ${plan.rebuildSince.position}) — ${plan.rebuildSince.rebuilt} crossed rebuilt, ${plan.rebuildSince.compacted} older ones compacted`);
   if (plan.dissolvedForRebuild.length) {
     const byLevel: Record<string, number> = {};
     for (const d of plan.dissolvedForRebuild) byLevel[`L${d.level}`] = (byLevel[`L${d.level}`] ?? 0) + 1;

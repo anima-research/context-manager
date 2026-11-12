@@ -105,6 +105,16 @@ test('kv-stable strategy: converges to null and leaves a small budget untouched'
   }
 });
 
+test('kv-stable strategy: a goal total below the budget is where it folds, so a store between the two folds under the goal', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 8, tokensPerChunk: 500, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const goal = { goalTotalTokens: 2_000, goalTargetTokens: 1_800 };
+  const result = new Picker(new KvStableStrategy(goal)).run(inputs, BUDGET(8_000));
+  assert.ok(result.finalTokens <= goal.goalTotalTokens, `folds under the goal: ${result.finalTokens} ≤ ${goal.goalTotalTokens}`);
+  const targetOnly = new Picker(new KvStableStrategy({ goalTargetTokens: goal.goalTargetTokens })).run(inputs, BUDGET(8_000));
+  assert.ok([...targetOnly.finalResolutions.values()].every((level) => level === 0), 'nothing folds under the budget without a goal total');
+});
+
 test('kv-stable strategy: pinned chunks stay raw, locked chunks keep their resolution', () => {
   const ch = buildChronicleWithChain({ chunkCount: 48, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
   ch.chunks[2].pinned = true;                                   // old → would otherwise fold

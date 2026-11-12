@@ -2138,7 +2138,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       });
       manager.addMessage('User', [{ type: 'text', text: 'one body' }]);
       assert.strictEqual(added.length, 3, 'each shard was stored, and the listener heard it');
-      assert.deepStrictEqual(strategy.heard, ['shard 0'], 'the strategy heard only the shard stored before the close()');
+      assert.deepStrictEqual(strategy.heard, [], 'the strategy hears a sharded body once every shard is stored, and by then the close() let it go');
       assert.strictEqual(storeOpenAtClose, true, 'the owned store stayed open while the add ran');
       assert.ok(manager.getStore().isClosed(), 'and closed when the add returned');
       const reopened = await ContextManager.open({ path, strategy: new PassthroughStrategy() });

@@ -1,0 +1,577 @@
+/**
+ * A half-written unfold is repaired by the next open (CM #350 bot review,
+ * finding 2), where that open demotes: under `topologyPolicy` 'reject', the
+ * default, in an open that isn't audit-only. 'report', and an audit-only
+ * open under 'reject', each leave the record's rows as they find them (the
+ * open still releases the record to raw, releaseUnsummarizedRecords, as
+ * every open does), as the last case shows (wave 4, finding 45; wave 5,
+ * finding 5; wave 6, finding 44).
+ *
+ * The autobiographical strategy writes what it lets go of (unfold) as three
+ * states, one after another: the summaries, then the chunk records, then
+ * the merge queue. A process that stops after the summaries' write leaves a
+ * chunk record that still names the L1 it dropped. The open makes such a
+ * record compressible again (releaseUnsummarizedRecords), over every row it
+ * held. When the unfold was the open's demote of a summary whose leaves the
+ * window holds apart, the record's rows stand apart in the window too, and
+ * before this repair nothing stopped the record from being compressed
+ * across them, into an L1 that the next open demoted again.
+ */
+
+import { describe, it, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { rmSync, existsSync } from 'node:fs';
+import type { ContentBlock } from '@animalabs/membrane';
+import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '../src/index.js';
+import type { CompileResult, MessageId, SummaryEntry } from '../src/index.js';
+
+const BASE = './test-unfold-half-write';
+let storeSeq = 0;
+function freshPath(): string {
+  const path = `${BASE}-${storeSeq++}`;
+  if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+  return path;
+}
+after(() => {
+  for (let i = 0; i < storeSeq + 1; i++) {
+    const p = `${BASE}-${i}`;
+    if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+  }
+});
+
+const text = (t: string): ContentBlock => ({ type: 'text', text: t });
+const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
+
+/** console.error's and console.warn's calls while `fn` runs. */
+async function linesDuring(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const realError = console.error;
+  const realWarn = console.warn;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = realError;
+    console.warn = realWarn;
+  }
+  return lines;
+}
+
+/** Summarizer mock: each answer names the tags its request carried. */
+function mockMembrane() {
+  let calls = 0;
+  return {
+    complete: async (request: { messages: Array<{ content: ContentBlock[] }> }) => {
+      calls++;
+      const input = request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n');
+      const tags = [...new Set(input.match(/TAG\d+/g) ?? [])].join(',');
+      return {
+        stopReason: 'end_turn',
+        content: [{ type: 'text', text: `[summary ${calls} of ${tags}] ` + 'mem '.repeat(20) }],
+        usage: { input_tokens: 10, output_tokens: 10 },
+      };
+    },
+  } as never;
+}
+
+const FOLDING = {
+  compressionModel: 'mock',
+  targetChunkTokens: 200,
+  recentWindowTokens: 300,
+  headWindowTokens: 0,
+  mergeThreshold: 4,
+} as const;
+
+interface Internals {
+  summaries: SummaryEntry[];
+  chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+  chunks: Array<{ messages: Array<{ id: MessageId }> }>;
+  summariesStateId: string;
+  chunksStateId: string;
+  mergeQueueStateId: string;
+  mergeQueue: Array<{ level: number; sourceIds: string[] }>;
+}
+const internals = (strategy: AutobiographicalStrategy) => strategy as unknown as Internals;
+
+type Unfold = (seeds: ReadonlySet<string>, sourcesOf: (record: unknown) => MessageId[] | undefined) => unknown;
+type StateWrite = (id: string, ...rest: unknown[]) => unknown;
+
+/**
+ * An autobiographical strategy whose process "stops" just after an unfold
+ * writes its summaries: from then on, no write to the strategy's summaries,
+ * chunk records or merge queue reaches the store.
+ */
+function stoppingAfterSummaries(): { strategy: AutobiographicalStrategy; stopped: () => boolean } {
+  const strategy = new AutobiographicalStrategy(FOLDING);
+  const self = strategy as unknown as {
+    store: Record<string, StateWrite>;
+    summariesStateId: string;
+    chunksStateId: string;
+    mergeQueueStateId: string;
+    unfold: Unfold;
+  };
+  const unfold = self.unfold;
+  let stopped = false;
+  let unfolding = false;
+  let patched = false;
+  self.unfold = function (this: typeof self, seeds, sourcesOf) {
+    if (!patched) {
+      patched = true;
+      const store = this.store;
+      const states = new Set([this.summariesStateId, this.chunksStateId, this.mergeQueueStateId]);
+      for (const name of ['setStateJson', 'appendToStateJson', 'editStateItem']) {
+        const write = store[name]!;
+        Object.defineProperty(store, name, {
+          configurable: true,
+          writable: true,
+          value: function (id: string, ...rest: unknown[]) {
+            if (stopped && states.has(id)) return undefined;
+            const result = write.call(store, id, ...rest);
+            if (unfolding && name === 'setStateJson' && id === self.summariesStateId) stopped = true;
+            return result;
+          },
+        });
+      }
+    }
+    unfolding = true;
+    try {
+      return unfold.call(this, seeds, sourcesOf);
+    } finally {
+      unfolding = false;
+    }
+  };
+  return { strategy, stopped: () => stopped };
+}
+
+/** The message ids a summary covers. */
+function leavesOf(cm: ContextManager, id: string): MessageId[] {
+  const summary = cm.getSummary(id);
+  if (!summary) return [];
+  return summary.level === 1 ? summary.sourceIds : summary.sourceIds.flatMap((source) => leavesOf(cm, source));
+}
+
+/** Each message id a compile renders, raw or inside a summary, as often as it renders it. */
+function renderedRows(cm: ContextManager, result: CompileResult): MessageId[] {
+  const rendered: MessageId[] = [];
+  let previous = new Set<string>();
+  for (const part of result.provenance?.messages ?? []) {
+    const named = new Set<string>(part.kind === 'summary' ? part.summaries.map((s) => s.id) : []);
+    if (part.kind === 'raw') rendered.push(...part.bodies.map((b) => b.messageId));
+    for (const id of named) if (!previous.has(id)) rendered.push(...leavesOf(cm, id));
+    previous = named;
+  }
+  return rendered;
+}
+
+async function drain(cm: ContextManager): Promise<void> {
+  for (let i = 0; i < 500 && !cm.isReady(); i++) await cm.tick();
+  assert.ok(cm.isReady(), 'the drain finished');
+}
+
+/** The chunk records whose rows the window doesn't hold as one run. */
+function splitRecords(cm: ContextManager, strategy: AutobiographicalStrategy): string[] {
+  const position = new Map(cm.getPresentedMessages().map((m, i) => [m.id, i] as const));
+  return internals(strategy).chunkRecords.filter((record) => {
+    const at = record.sourceIds.map((id) => position.get(id)).filter((p): p is number => p !== undefined).sort((a, b) => a - b);
+    return at.some((p, i) => i > 0 && p !== at[i - 1]! + 1);
+  }).map((record) => `${record.id}[${record.sourceIds.join(',')}]`);
+}
+
+describe('a half-written unfold', () => {
+  it("the open's demote stopped after its summaries' write: the next open trims the record the window holds apart, and nothing is compressed across it", async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    assert.ok(internals(strategy).summaries.some((s) => s.level === 1 && s.sourceIds.includes(row)), 'premise: the row is folded');
+    cm.close();
+
+    // Taken out and presented again through a strategy without the hook: the
+    // next folding open finds the L1 over the row's old place non-contiguous.
+    const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+    plain.retractRows([row], { undone: true });
+    plain.presentRows([row]);
+    plain.close();
+
+    // That open demotes the L1 and stops just after writing the summaries.
+    const stopping = stoppingAfterSummaries();
+    await linesDuring(async () => {
+      const open = await ContextManager.open({ path, namespace: 'agent', strategy: stopping.strategy, membrane: mockMembrane() });
+      open.close();
+    });
+    assert.ok(stopping.stopped(), 'premise: the demote wrote its summaries and nothing after');
+
+    const next = new AutobiographicalStrategy(FOLDING);
+    let reopened!: ContextManager;
+    const lines = await linesDuring(async () => {
+      reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane() });
+    });
+    assert.ok(
+      lines.some((line) => line.includes('uncompressed chunk record') && line.includes(`releasing [${row}]`)),
+      lines.join('\n'),
+    );
+    assert.deepEqual(splitRecords(reopened, next), [], 'every chunk record holds rows the window holds together');
+    assert.ok(
+      internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row) || r.sourceIds.length === 1 || !r.compressed),
+      'no record holds the row beside its old neighbours',
+    );
+
+    // Compression runs on, past the row's new place.
+    await drain(reopened);
+    for (let i = 24; i < 40; i++) {
+      reopened.presentRows([reopened.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))])]);
+    }
+    await drain(reopened);
+    assert.deepEqual(next.auditStoreTopology(reopened.getPresentedMessages()).map((v) => v.id), [], 'no summary was compressed across the window');
+    assert.deepEqual(splitRecords(reopened, next), []);
+    const rendered = renderedRows(reopened, await reopened.compile(BIG));
+    assert.equal(new Set(rendered).size, rendered.length, 'no row renders twice');
+    reopened.close();
+
+    // The repair was written: the next open finds nothing to demote or trim.
+    const again = await linesDuring(async () => {
+      const open = await ContextManager.open({ path, namespace: 'agent', strategy: new AutobiographicalStrategy(FOLDING), membrane: mockMembrane() });
+      open.close();
+    });
+    assert.ok(!again.some((line) => line.includes('the window holds the')), again.join('\n'));
+  });
+
+  // CM #350 bot review, wave 3, finding 14: unfold set each mirror before
+  // its write, so a write that threw in a live process left the strategy's
+  // memory apart from the store (the L1 gone from memory and kept in the
+  // store, or the records changed in memory and not in the store), and
+  // windowLost stopped before its rebuild, so the chunks still held the row.
+  it('a retraction whose state write throws leaves memory as the store holds it, and the chunks rebuilt over the window', async () => {
+    for (const [label, failing] of [['the summaries', 0], ['the chunk records', 1]] as const) {
+      const path = freshPath();
+      const strategy = new AutobiographicalStrategy(FOLDING);
+      const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+      cm.presentRows([]);
+      const ids: MessageId[] = [];
+      for (let i = 0; i < 24; i++) {
+        const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+        cm.presentRows([id]);
+        ids.push(id);
+      }
+      await drain(cm);
+      const row = ids[3]!;
+      const state = internals(strategy);
+      assert.ok(state.summaries.some((s) => s.level === 1 && s.sourceIds.includes(row)), `${label}: premise: the row is folded`);
+
+      const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+      const real = store.setStateJson;
+      const states = [state.summariesStateId, state.chunksStateId];
+      let writes = 0;
+      store.setStateJson = function (this: unknown, id: string, ...rest: unknown[]) {
+        if (states.includes(id) && writes++ === failing) throw new Error(`zz the store refused the write of ${id}`);
+        return real.call(this, id, ...rest);
+      };
+      let lines: string[];
+      try {
+        lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+      } finally {
+        delete (store as { setStateJson?: unknown }).setStateJson;
+      }
+      assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `${label}: premise: ${lines.join('\n')}`);
+      const ofStore = (id: string) => ((store.getStateJson(id) as Array<{ id: string }> | null) ?? []);
+      assert.deepEqual(state.summaries.map((s) => s.id), ofStore(state.summariesStateId).map((s) => s.id), `${label}: the summaries in memory are the store's`);
+      assert.deepEqual(state.chunkRecords, ofStore(state.chunksStateId), `${label}: the chunk records in memory are the store's`);
+      assert.ok(state.chunks.every((chunk) => !chunk.messages.some((m) => m.id === row)), `${label}: the chunks were rebuilt over the window, which lacks the row`);
+      cm.close();
+
+      // The next open lets go of what still covers the row out of the window.
+      const next = new AutobiographicalStrategy(FOLDING);
+      let reopened!: ContextManager;
+      await linesDuring(async () => {
+        reopened = await ContextManager.open({ path, namespace: 'agent', strategy: next, membrane: mockMembrane() });
+      });
+      assert.ok(internals(next).summaries.every((s) => !s.sourceIds.includes(row)), `${label}: no summary covers the row after the next open`);
+      assert.ok(internals(next).chunkRecords.every((r) => !r.sourceIds.includes(row)), `${label}: no record holds it`);
+      reopened.close();
+    }
+  });
+
+  // Wave 3 (finding 14, the verifier's pin): the merge queue, unfold's third
+  // write, is set in memory only once that write returns too.
+  it("a retraction whose merge queue write throws leaves the queue in memory as the store holds it", async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const other = state.summaries.find((s) => s.level === 1 && !s.sourceIds.includes(row));
+    assert.ok(covering && other, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    // A merge queued over the L1 the retraction drops, in memory and stored.
+    const queued = [{ level: 2, sourceIds: [covering.id, other.id] }];
+    state.mergeQueue = queued;
+    store.setStateJson(state.mergeQueueStateId, queued);
+
+    const real = store.setStateJson;
+    store.setStateJson = function (this: unknown, id: string, ...rest: unknown[]) {
+      if (id === state.mergeQueueStateId) throw new Error(`zz the store refused the write of ${id}`);
+      return real.call(this, id, ...rest);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+    }
+    assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `premise: ${lines.join('\n')}`);
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), "premise: the summaries' write landed, dropping the L1");
+    assert.deepEqual(state.mergeQueue, store.getStateJson(state.mergeQueueStateId), 'the queue in memory is the store\'s');
+    assert.deepEqual(state.mergeQueue, queued, 'which still holds the merge the failed write would have dropped');
+    cm.close();
+  });
+
+  // Wave 4, finding 7: a state write can land in the store and then throw.
+  // unfold set each mirror only once its write returned, so memory kept
+  // what the store no longer held, and the next unfold wrote it back: the
+  // L1 the retraction dropped, or the record holding the row, over a row
+  // out of the window. The strategy now reads the state back after a throw.
+  for (const [label, failing, unreadable] of [
+    ['the summaries', 'summaries', false],
+    ['the chunk records', 'chunks', false],
+    ['the merge queue', 'queue', false],
+    ['the summaries, where the read back throws too', 'summaries', true],
+  ] as const) {
+    it(`a retraction whose state write lands and then throws (${label}) leaves memory as the store holds it, and the next one writes nothing back`, async () => {
+      const path = freshPath();
+      const strategy = new AutobiographicalStrategy(FOLDING);
+      const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+      cm.presentRows([]);
+      const ids: MessageId[] = [];
+      for (let i = 0; i < 24; i++) {
+        const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+        cm.presentRows([id]);
+        ids.push(id);
+      }
+      await drain(cm);
+      const row = ids[3]!;
+      const state = internals(strategy);
+      const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+      const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+      assert.ok(covering && second, `${label}: premise: an L1 over the row and one beside it`);
+      const later = second.sourceIds[0]!;
+      const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+      // A merge queued over the L1 the retraction drops, so the queue is written too.
+      const queued = [{ level: 2, sourceIds: [covering.id, second.id] }];
+      state.mergeQueue = queued;
+      store.setStateJson(state.mergeQueueStateId, queued);
+
+      const id = { summaries: state.summariesStateId, chunks: state.chunksStateId, queue: state.mergeQueueStateId }[failing];
+      const realWrite = store.setStateJson;
+      const realRead = store.getStateJson;
+      let threw = false;
+      let readFails = false;
+      store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+        const result = realWrite.call(this, stateId, ...rest);
+        if (stateId === id && !threw) {
+          threw = true;
+          readFails = unreadable;
+          throw new Error(`zz the write of ${stateId} landed, then threw`);
+        }
+        return result;
+      };
+      store.getStateJson = function (this: unknown, stateId: string) {
+        if (readFails && stateId === id) {
+          readFails = false;
+          throw new Error(`zz the read of ${stateId} threw`);
+        }
+        return realRead.call(this, stateId);
+      };
+      let lines: string[];
+      try {
+        lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+      } finally {
+        delete (store as { setStateJson?: unknown }).setStateJson;
+        delete (store as { getStateJson?: unknown }).getStateJson;
+      }
+      assert.ok(threw && lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('landed, then threw')), `${label}: premise: ${lines.join('\n')}`);
+      const ofStore = (stateId: string) => ((store.getStateJson(stateId) as Array<{ id?: string }> | null) ?? []);
+      assert.deepEqual(state.summaries.map((s) => s.id), ofStore(state.summariesStateId).map((s) => s.id), `${label}: the summaries in memory are the store's`);
+      assert.deepEqual(state.chunkRecords, ofStore(state.chunksStateId), `${label}: the chunk records in memory are the store's`);
+      assert.deepEqual(state.mergeQueue, ofStore(state.mergeQueueStateId), `${label}: the queue in memory is the store's`);
+      assert.ok(state.chunks.every((chunk) => !chunk.messages.some((m) => m.id === row)), `${label}: the chunks were rebuilt over the window`);
+
+      // The next retraction writes from memory: nothing the first dropped comes back.
+      await linesDuring(async () => { cm.retractRows([later], { undone: true }); });
+      const summaries = ofStore(state.summariesStateId) as SummaryEntry[];
+      assert.ok(summaries.every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `${label}: no summary covers the row again: ${summaries.map((s) => s.id).join(', ')}`);
+      if (failing !== 'summaries') {
+        const records = ofStore(state.chunksStateId) as Array<{ id: string; sourceIds: string[] }>;
+        assert.ok(records.every((r) => !r.sourceIds.includes(row)), `${label}: no record holds the row again: ${JSON.stringify(records)}`);
+      }
+      cm.close();
+    });
+  }
+
+  // Wave 5, finding 53: the read back compared the store's summaries with
+  // what the write was given, but the store keeps a lone UTF-16 surrogate
+  // half in a string as U+FFFD (storedJson). So where a summary the
+  // retraction keeps held one (model text, which memory keeps as written),
+  // a write that landed and then threw read as one that didn't land, and
+  // memory kept the L1 the store had dropped.
+  it('a retraction whose summaries write lands and then throws, where a summary it keeps holds a lone surrogate half, leaves memory as the store holds it', async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+    assert.ok(covering && second, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    // The kept L1's text holds a lone high half, in memory as the model
+    // wrote it; the store holds U+FFFD there.
+    state.summaries = state.summaries.map((s) => (s === second ? { ...s, content: `memory a\uD800b` } : s));
+    store.setStateJson(state.summariesStateId, state.summaries);
+    const ofStore = () => ((store.getStateJson(state.summariesStateId) as SummaryEntry[] | null) ?? []);
+    assert.equal(ofStore().find((s) => s.id === second.id)?.content, 'memory a\uFFFDb', 'premise: the store keeps U+FFFD for the half');
+
+    const realWrite = store.setStateJson;
+    let threw = false;
+    store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+      const result = realWrite.call(this, stateId, ...rest);
+      if (stateId === state.summariesStateId && !threw) {
+        threw = true;
+        throw new Error(`zz the write of ${stateId} landed, then threw`);
+      }
+      return result;
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+    }
+    assert.ok(threw && lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('landed, then threw')), `premise: ${lines.join('\n')}`);
+    assert.ok(ofStore().every((s) => s.id !== covering.id), "premise: the store's summaries dropped the L1");
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), 'memory dropped it too');
+
+    // The next retraction writes from memory: the L1 doesn't come back.
+    await linesDuring(async () => { cm.retractRows([second.sourceIds[0]!], { undone: true }); });
+    assert.ok(ofStore().every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `no summary covers the row again: ${ofStore().map((s) => s.id).join(', ')}`);
+    cm.close();
+  });
+
+  it("a retraction whose summaries write throws without landing, and whose read back throws too, takes the let-go's side: the next retraction's write of the summaries drops the L1 from the store", async () => {
+    const path = freshPath();
+    const strategy = new AutobiographicalStrategy(FOLDING);
+    const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+    cm.presentRows([]);
+    const ids: MessageId[] = [];
+    for (let i = 0; i < 24; i++) {
+      const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+      cm.presentRows([id]);
+      ids.push(id);
+    }
+    await drain(cm);
+    const row = ids[3]!;
+    const state = internals(strategy);
+    const covering = state.summaries.find((s) => s.level === 1 && s.sourceIds.includes(row));
+    const second = state.summaries.find((s) => s.level === 1 && s !== covering && !s.sourceIds.includes(row));
+    assert.ok(covering && second, 'premise: an L1 over the row and one beside it');
+    const store = cm.getStore() as unknown as { setStateJson: StateWrite; getStateJson: (id: string) => unknown };
+    const realWrite = store.setStateJson;
+    const realRead = store.getStateJson;
+    let readFails = false;
+    store.setStateJson = function (this: unknown, stateId: string, ...rest: unknown[]) {
+      if (stateId === state.summariesStateId) {
+        readFails = true;
+        throw new Error(`zz the store refused the write of ${stateId}`);
+      }
+      return realWrite.call(this, stateId, ...rest);
+    };
+    store.getStateJson = function (this: unknown, stateId: string) {
+      if (readFails && stateId === state.summariesStateId) {
+        readFails = false;
+        throw new Error(`zz the read of ${stateId} threw`);
+      }
+      return realRead.call(this, stateId);
+    };
+    let lines: string[];
+    try {
+      lines = await linesDuring(async () => { cm.retractRows([row], { undone: true }); });
+    } finally {
+      delete (store as { setStateJson?: unknown }).setStateJson;
+      delete (store as { getStateJson?: unknown }).getStateJson;
+    }
+    assert.ok(lines.some((line) => line.includes('Strategy onRetracted failed') && line.includes('zz the store refused')), `premise: ${lines.join('\n')}`);
+    const ofStore = () => ((store.getStateJson(state.summariesStateId) as SummaryEntry[] | null) ?? []);
+    assert.ok(ofStore().some((s) => s.id === covering.id), "premise: the store's summaries still hold the L1");
+    assert.ok(state.summaries.every((s) => s.id !== covering.id), 'memory holds what the write meant to put');
+    await linesDuring(async () => { cm.retractRows([second.sourceIds[0]!], { undone: true }); });
+    assert.ok(ofStore().every((s) => s.id !== covering.id && !s.sourceIds.includes(row)), `the next retraction's write drops it from the store: ${ofStore().map((s) => s.id).join(', ')}`);
+    cm.close();
+  });
+
+  // Each config turns off the demote by one term of its gate alone (wave 5,
+  // finding 5): 'report' in an open that isn't audit-only, and an
+  // audit-only open under the default 'reject'. With both set, as this case
+  // was, the auditOnly term went untested.
+  it("under 'report' and in an audit-only open, the record's rows are left as they were found (the open still releases the record to raw)", async () => {
+    for (const config of [{ topologyPolicy: 'report' as const }, { auditOnly: true }]) {
+      const path = freshPath();
+      const strategy = new AutobiographicalStrategy(FOLDING);
+      const cm = await ContextManager.open({ path, namespace: 'agent', strategy, membrane: mockMembrane() });
+      cm.presentRows([]);
+      const ids: MessageId[] = [];
+      for (let i = 0; i < 24; i++) {
+        const id = cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`TAG${i} ` + 'word '.repeat(60))]);
+        cm.presentRows([id]);
+        ids.push(id);
+      }
+      await drain(cm);
+      cm.close();
+      const plain = await ContextManager.open({ path, namespace: 'agent', strategy: new PassthroughStrategy() });
+      plain.retractRows([ids[3]!], { undone: true });
+      plain.presentRows([ids[3]!]);
+      plain.close();
+      const stopping = stoppingAfterSummaries();
+      await linesDuring(async () => {
+        const open = await ContextManager.open({ path, namespace: 'agent', strategy: stopping.strategy, membrane: mockMembrane() });
+        open.close();
+      });
+      assert.ok(stopping.stopped(), 'premise: the demote wrote its summaries and nothing after');
+
+      const inspected = new AutobiographicalStrategy({ ...FOLDING, ...config });
+      let open!: ContextManager;
+      const lines = await linesDuring(async () => {
+        open = await ContextManager.open({ path, namespace: 'agent', strategy: inspected, membrane: mockMembrane() });
+      });
+      assert.ok(!lines.some((line) => line.includes('uncompressed chunk record')), `${JSON.stringify(config)}: ${lines.join('\n')}`);
+      assert.equal(splitRecords(open, inspected).length, 1, `${JSON.stringify(config)}: the record's rows are left as they were found`);
+      const split = internals(inspected).chunkRecords.find((record) => splitRecords(open, inspected)[0]!.startsWith(`${record.id}[`))!;
+      assert.ok(!split.compressed && split.summaryId === undefined, `${JSON.stringify(config)}: the open released the record to raw, as every open does: ${JSON.stringify(split)}`);
+      open.close();
+    }
+  });
+});

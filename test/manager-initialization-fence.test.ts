@@ -56,6 +56,7 @@ async function assertFenced(manager: ContextManager, id: string) {
   assert.throws(() => manager.unpin('unknown-pin'), fenced);
   assert.throws(() => manager.updateHotContextSettings({}), fenced);
   await assert.rejects(manager.resetHeadWindow('transition'), fenced);
+  await assert.rejects(manager.generateTransitionSummary(), fenced);
   assert.throws(() => manager.isReady(), fenced);
   assert.throws(() => manager.getPendingWork(), fenced);
   assert.throws(() => manager.getWaitingWork(), fenced);
@@ -173,6 +174,35 @@ describe('ContextManager initialization fence', () => {
   });
 
   for (const mode of ['manager', 'direct-store'] as const) {
+    it(`a summary written while the branch moved (${mode}) is refused, as the transition it is for would be`, async () => {
+      const summaryGate = gate();
+      // CM #350 bot review (wave 2), finding 48: the strategy's summary is in
+      // flight across the move, not refused before it is asked for.
+      let entered = false;
+      class TransitionStrategy extends PassthroughStrategy {
+        async generateTransitionSummary(): Promise<string> {
+          entered = true;
+          await summaryGate.promise;
+          return 'summary of the old branch';
+        }
+        resetHeadWindow(): void {}
+      }
+      await fixture(new TransitionStrategy(), async (manager, store) => {
+        manager.addMessage('user', text('original'));
+        store.createBranch('target');
+        const summary = manager.generateTransitionSummary();
+        assert.equal(entered, true, "setup: the strategy's summary was asked for before the move");
+        if (mode === 'manager') await manager.switchBranch('target');
+        else store.switchBranch('target');
+        const sequence = store.currentSequence();
+        const states = store.listStates().length;
+        summaryGate.resolve();
+        await assert.rejects(summary, { message: 'Branch or strategy changed during ContextManager.generateTransitionSummary; retry on the intended branch.' });
+        assert.equal(store.currentSequence(), sequence, 'the refusal stores nothing');
+        assert.equal(store.listStates().length, states, 'nor registers a state (CM #350 bot review, wave 3, finding 17)');
+      });
+    });
+
     it(`a delayed head transition cannot append after a ${mode} branch switch`, async () => {
       const summaryGate = gate();
       // No initialize hook: the manager-owned write still pins its own branch.

@@ -138,3 +138,17 @@ test('render: chunker + render round-trips with realistic large doc', () => {
   const text = (concatenated[0].content[0] as { type: 'text'; text: string }).text;
   assert.equal(text, body);
 });
+
+test('render: a non-text block in a raw shard is written as its placeholder, and the composite takes its id from the first shard and counts its shards', () => {
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } } as unknown as ContentBlock;
+  const messages = [
+    makeShard('first part ', 'bg-x', 0),
+    makeShard('', 'bg-x', 1, { content: [image] }),
+    makeShard(' last part', 'bg-x', 2),
+  ];
+  const out = concatBodyGroups(messages, placeholderRecallText);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].id, 'bg-x-shard-0');
+  assert.equal(out[0].metadata?.shardCount, 3);
+  assert.deepEqual(out[0].content, [{ type: 'text', text: 'first part [non-text content: image] last part' }]);
+});
