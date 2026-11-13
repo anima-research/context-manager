@@ -1,7 +1,7 @@
 /**
- * The compression-quarantine alarm's all-clear says "quarantine empty, debt
- * paid", and a host routes it to its operators, so it isn't said while the
- * quarantine the alarm last sounded on may still hold debt: not when the
+ * The compression-quarantine episode-end line is neutral about paid debt,
+ * and a host routes it to its operators, so it isn't said while the
+ * quarantine the alarm last sounded on may still hold records: not when the
  * status read fails, and not while the strategy reads another branch or
  * namespace. A ledger entry with no usable record or generation holds no
  * chunk back, so the projection leaves it out and names it, and a compression
@@ -102,8 +102,8 @@ async function sounding(strategy: ProbeStrategy): Promise<void> {
 }
 
 const counts = (handled: CompressionQuarantineStatus[]) => handled.map((status) => status.count);
-const allClear = (line: string) => line.includes('ALL CLEAR');
-const ALL_CLEAR = '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down ns=default';
+const allClear = (line: string) => line.includes('alarm stands down');
+const ALL_CLEAR = '[compression-quarantine] quarantine empty; coverage and debt payment not established; alarm stands down ns=default';
 const outcome = { outcome: 'refusal' };
 
 describe('the compression-quarantine all-clear is said only when the quarantine the alarm last sounded on is empty', () => {
@@ -184,7 +184,8 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
       `[compression-quarantine] on branch '${fx.manager.currentBranch().name}', left out ledger entries it can't use ` +
         '(keys=checkpoint-n,checkpoint-o,checkpoint-e,claim-no-rec,no-record-no,exhausted-no,numeric-key,mismatched-k,no-generatio,object-gener,empty-genera): ' +
         'they no longer hold their chunks back, no clear reaches them, and they stay in the ledger ' +
-        'until a checkpoint rewrites the ledger, which needs 256 events in it ns=default',
+        "until a checkpoint rewrites the gate's tolerant projection on the next native hygiene pass with at least 256 events; " +
+        "failed or stale hygiene is logged once per load ns=default",
     ], `each key left out named once, however often the ledger is read, and no key still in the quarantine:\n${repeat.lines.join('\n')}`);
     assert.deepEqual(counts(repeat.handled), [5], 'the alarm repeats on what stands');
     assert.ok(!repeat.lines.some(allClear), repeat.lines.join('\n'));
@@ -242,7 +243,7 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     fx.manager.close();
   });
 
-  it('a clear reaches no entry it left out, which stays in the ledger until a checkpoint at 256 events rewrites it', async () => {
+  it('R1-1 a clear reaches no entry it left out, but native checkpoint hygiene removes ignored damage', async () => {
     const fx = await refused('storage');
     fx.append(
       { kind: 'claim', key: 'claim-no-record', eventId: 'claim-no-record-generation', created: 1 },
@@ -261,8 +262,10 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     fx.append(...Array.from({ length: 256 - fx.ledger().length }, (_, i) => ({ kind: 'clear', key: `padding-${i}`, targetClaimId: 'none', created: 1 })));
     assert.equal(fx.ledger().length, 256);
     await heard(fx.strategy, () => fx.strategy.clearCompressionRefusalQuarantine());
-    assert.equal(held(), 0, 'the checkpoint left it out');
-    assert.ok(fx.ledger().some((event) => event?.kind === 'checkpoint'), 'the ledger now starts from a checkpoint');
+    assert.equal(held(), 0, 'checkpoint removes damage already ignored by the gate');
+    assert.equal(fx.ledger().length, 1, 'native hygiene redacts the old ledger');
+    assert.equal(fx.ledger()[0]!.kind, 'checkpoint');
+    assert.deepEqual(fx.ledger()[0]!.active, [], 'the empty gate projection stays empty');
     fx.manager.close();
   });
 
@@ -508,7 +511,7 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     fx.manager.close();
   });
 
-  it('still says the all-clear once, through the handler, when the debt is paid on its branch', async () => {
+  it('reports empty once through the handler without claiming a legacy clear paid debt', async () => {
     const fx = await refused('paid');
     await sounding(fx.strategy);
     await fx.strategy.clearCompressionRefusalQuarantine();
@@ -519,6 +522,8 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     });
     assert.deepEqual(paid.lines, [ALL_CLEAR]);
     assert.deepEqual(counts(paid.handled), [0]);
+    assert.equal(paid.handled[0]!.clearReason, 'quarantine-empty');
+    assert.equal(fx.strategy.getStats().l1, 0);
     fx.manager.close();
   });
 });
