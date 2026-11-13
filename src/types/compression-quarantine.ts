@@ -36,6 +36,10 @@ export interface CompressionQuarantineRecordView {
   outcomes: { outcome: string; stopReason: string | null; requestHash: string | null }[];
   outcomesComplete: boolean;
   sameSourceRecords: number;
+  /** Current accounting/fallback config matches this recorded request regime; not eligibility. */
+  countsTowardShapeCap: boolean;
+  /** Same-source records in that regime, including this one; zero when it does not count. */
+  sameRegimeRecords: number;
   siblingKeys: string[];
   siblingKeysComplete: boolean;
 }
@@ -50,7 +54,8 @@ export type CompressionQuarantineInspection = {
   totalRecords: number;
   /** Completeness of this selection (an exact-key query is not a full list). */
   complete: boolean;
-} | { status: 'branchUnavailable' | 'unreadable' | 'invalidSelection' };
+} | { status: 'unreadable'; reason?: 'ledger-entry' | 'store-read' }
+  | { status: 'branchUnavailable' | 'invalidSelection' };
 
 export interface CompressionQuarantineReleaseSelection {
   key: string;
@@ -64,7 +69,8 @@ export type CompressionQuarantineReleaseResult = {
   generation: string;
   /** Records, not chunks, queue ownership, coverage, or debt. */
   remainingRecords: number;
-} | { status: 'stale' | 'not-held' | 'unsupported' | 'unreadable' | 'branchUnavailable' | 'invalidSelection' };
+} | { status: 'unreadable'; reason?: 'ledger-entry' | 'store-read' }
+  | { status: 'stale' | 'not-held' | 'unsupported' | 'branchUnavailable' | 'invalidSelection' };
 
 /** Optional capability on the already loaded strategy. Never fall back to legacy clear-all. */
 export interface KeyedCompressionQuarantineStrategy extends ContextStrategy {

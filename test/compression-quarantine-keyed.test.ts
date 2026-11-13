@@ -24,6 +24,10 @@ const config = {
 };
 class Probe extends AutobiographicalStrategy {
   closedChunks(): Chunk[] { return this.chunks; }
+  setRegime(sourceOnly: boolean, toolProse?: { intoTool: string; fromTools: string[] }): void {
+    this.config.compressionSourceOnlyFallback = sourceOnly;
+    this.config.compressionToolProseFallback = toolProse;
+  }
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   get ledgerId(): string { return this.compressionRefusalQuarantineLedgerStateId; }
   get legacyId(): string { return this.compressionRefusalQuarantineStateId; }
@@ -239,8 +243,8 @@ describe('metadata-only keyed L1 quarantine capability', () => {
       [{ ...fx.event, record: { ...fx.event.record, sourceIds: ['wrong-hash'] } }], [{ kind: 'future-event' }]]) {
       fx.store.setStateJson(fx.strategy.ledgerId, ledger);
       const before = bytes(fx.path);
-      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable' });
-      assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable' });
+      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
+      assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'ledger-entry' });
       assert.deepEqual(bytes(fx.path), before);
     }
     const get = fx.store.getStateJson.bind(fx.store);
@@ -248,8 +252,8 @@ describe('metadata-only keyed L1 quarantine capability', () => {
       if (id === fx.strategy.ledgerId) throw new Error('DO-NOT-EXPOSE-SECRET-error-payload');
       return get(id);
     });
-    assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable' });
-    assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable' });
+    assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'store-read' });
+    assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'store-read' });
     read.mock.restore();
     fx.strategy.detach();
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
@@ -511,7 +515,7 @@ describe('R1 native review regressions', () => {
       assert.equal(record.selectable, false);
       assert.equal(record.familyKey, null);
       await noWrites(fx, async () => {
-        assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable' });
+        assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'ledger-entry' });
       });
       assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
     }
@@ -579,11 +583,11 @@ describe('R1 native review regressions', () => {
       damaged.record[field] = 'FAKE-NONDIGEST';
       if (field === 'key') damaged.key = damaged.record.key;
       fx.store.setStateJson(fx.strategy.ledgerId, [damaged]);
-      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable' });
+      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
     }
     const sibling = { ...fx.event, key: 'FAKE-SIBLING-KEY', record: { ...fx.event.record, key: 'FAKE-SIBLING-KEY' } };
     fx.store.setStateJson(fx.strategy.ledgerId, [fx.event, sibling]);
-    assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine({ key: fx.event.key }), { status: 'unreadable' });
+    assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine({ key: fx.event.key }), { status: 'unreadable', reason: 'ledger-entry' });
   });
 
   it('F1/F6 generic legacy and other-instance clears are neutral, not payment receipts', async (t) => {
@@ -658,7 +662,25 @@ describe('R1 native review regressions', () => {
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(old)).status, 'released');
   });
 
-  it('F11 oversized and damaged state skips destructive hygiene rather than evicting siblings', async (t) => {
+  it('R1-1/F11 repeated native writes compact damaged history from the gate projection', async (t) => {
+    const fx = await fixture(t, 'r1-damaged-hygiene');
+    const sibling = fx.sibling('damage-sibling');
+    const original = selection(fx.strategy, sibling.key);
+    const orphanKey = hash('orphan-exhaustion');
+    fx.append({ kind: 'exhausted', key: orphanKey, eventId: 'orphan-generation', outcomes: [] });
+    assert.equal(fx.strategy.inspectCompressionRefusalQuarantine().status, 'unreadable');
+    for (let round = 0; round < 3; round++) {
+      pad(fx);
+      await fx.strategy.clearCompressionRefusalQuarantine(hash('absent'));
+      assert.ok(fx.ledger().length < 256, 'damage must not disable future native compaction');
+      assert.equal(fx.ledger()[0]!.kind, 'checkpoint');
+      assert.equal(inspect(fx.strategy).totalRecords, 2);
+      assert.equal(selection(fx.strategy, sibling.key).expectedGeneration, original.expectedGeneration);
+      assert.ok(fx.strategy.gate(fx.event.record), 'the same enforced hold survives');
+    }
+  });
+
+  it('R1-1/F11 repeated native writes checkpoint more than 1024 holds losslessly', async (t) => {
     const fx = await fixture(t, 'r1-preservation');
     const siblings = Array.from({ length: 1025 }, (_, index) => {
       const key = hash(`oversized-${index}`);
@@ -666,17 +688,103 @@ describe('R1 native review regressions', () => {
     });
     fx.store.setStateJson(fx.strategy.ledgerId, [fx.event, ...siblings]);
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy, fx.event.key))).status, 'released');
-    assert.equal(inspect(fx.strategy).totalRecords, 1025);
-    assert.equal(fx.ledger().some((event) => event.kind === 'checkpoint'), false);
-    assert.deepEqual(fx.ledger().filter((event) => event.kind === 'exhausted').slice(1).map((event) => [event.key, event.eventId]),
-      siblings.map((event) => [event.key, event.eventId]));
-    for (const sibling of [siblings[0]!, siblings.at(-1)!]) {
-      assert.equal(selection(fx.strategy, sibling.key).expectedGeneration, sibling.eventId);
+    for (let round = 0; round < 3; round++) {
+      assert.ok(fx.ledger().length < 256, 'large hold sets must not disable native compaction');
+      assert.equal(inspect(fx.strategy).totalRecords, 1025);
+      assert.equal(fx.ledger()[0]!.kind, 'checkpoint');
+      assert.deepEqual(fx.ledger()[0]!.active.map((item: Event) => [item.record.key, item.generationId]).sort(),
+        siblings.map((event) => [event.key, event.eventId]).sort());
+      pad(fx);
+      await fx.strategy.clearCompressionRefusalQuarantine(hash('absent'));
     }
-    fx.store.setStateJson(fx.strategy.ledgerId, [null, ...fx.ledger()]);
-    const before = bytes(fx.path);
-    native(fx.strategy).checkpointCompressionQuarantineIfNeeded(native(fx.strategy).captureCompressionBranch());
-    assert.deepEqual(bytes(fx.path), before);
+    assert.ok(fx.ledger().length < 256);
+  });
+
+  it('R1-1 skipped hygiene logs once per load and still propagates uncertainty', async (t) => {
+    const fx = await fixture(t, 'r1-skipped-hygiene');
+    const lines: string[] = [];
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
+    const fail = () => {
+      const broken = mock.method(fx.store, 'getStateLen', () => { throw new Error('private-store-details'); });
+      try {
+        for (let i = 0; i < 2; i++) assert.throws(() => native(fx.strategy).checkpointCompressionQuarantineIfNeeded(
+          native(fx.strategy).captureCompressionBranch()), /private-store-details/);
+      } finally { broken.mock.restore(); }
+    };
+    try {
+      fail();
+      assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 1);
+      await fx.strategy.initialize(fx.ctx);
+      fail();
+      assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 2);
+      assert.ok(!lines.some((line) => line.includes('private-store-details')));
+    } finally { warn.mock.restore(); }
+  });
+
+  it('R1-2 unexpected projection errors propagate instead of masquerading as unreadable data', async (t) => {
+    const fx = await fixture(t, 'r1-programmer-error');
+    const selected = selection(fx.strategy);
+    const projection = fx.strategy as unknown as { readCompressionQuarantineProjection(): unknown };
+    const bug = new TypeError('fake projection bug');
+    const broken = mock.method(projection, 'readCompressionQuarantineProjection', () => { throw bug; });
+    try {
+      await noWrites(fx, async () => {
+        assert.throws(() => fx.strategy.inspectCompressionRefusalQuarantine(), (error) => error === bug);
+        await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), (error) => error === bug);
+      });
+    } finally { broken.mock.restore(); }
+  });
+
+  it('R1-3 reports the gate shape-cap regime counts under current configuration', async (t) => {
+    const fx = await fixture(t, 'r1-shape-counts');
+    const base = fx.event.record.normalizedConfig;
+    const events: Event[] = [];
+    const add = (label: string, count: number, normalizedConfig: Event) => {
+      for (let i = 0; i < count; i++) {
+        const key = hash(`${label}-${i}`);
+        events.push({ ...fx.event, key, eventId: `${label}-${i}`, record: { ...fx.event.record, key,
+          familyKey: hash(`${label}-family-${i}`), normalizedConfig } });
+      }
+    };
+    add('current', 3, base);
+    add('old-accounting', 3, { ...base, accountingVersion: -1 });
+    add('source-a', 2, { ...base, sourceOnlyFallbackEnabled: true, sourceOnlyFallbackRequestHash: hash('request-a') });
+    add('source-b', 3, { ...base, sourceOnlyFallbackEnabled: true, sourceOnlyFallbackRequestHash: hash('request-b') });
+    const toolProse = { intoTool: 'private_reasoning', fromTools: ['original_tool'] };
+    // Use the gate's normalized defaults, with deliberately reordered keys.
+    const options = fx.strategy as unknown as { toolProseHoistOptions(): Event | undefined };
+    fx.strategy.setRegime(false, toolProse);
+    const normalizedTool = Object.fromEntries(Object.entries(options.toolProseHoistOptions()!).reverse());
+    add('tool', 3, { ...base, toolProseFallback: normalizedTool });
+    fx.store.setStateJson(fx.strategy.ledgerId, events);
+    for (const [sourceOnly, tool, matching] of [[false, undefined, ['current']], [true, undefined, ['source-a', 'source-b']],
+      [false, toolProse, ['tool']]] as const) {
+      fx.strategy.setRegime(sourceOnly, tool);
+      const view = inspect(fx.strategy);
+      for (const event of events) {
+        const record = view.records.find((item) => item.key === event.key)!;
+        const label = event.eventId.replace(/-\d+$/, '');
+        const counts = (matching as readonly string[]).includes(label);
+        assert.equal(record.countsTowardShapeCap, counts, event.eventId);
+        const expectedCount = !counts ? 0 : label === 'source-a' ? 2 : 3;
+        assert.equal(record.sameRegimeRecords, expectedCount, event.eventId);
+        assert.equal(record.sameSourceRecords, events.length);
+        if (counts) {
+          const candidate = { ...event.record, key: hash('new-shape'), familyKey: hash('new-family') };
+          assert.equal(Boolean(fx.strategy.gate(candidate)), expectedCount >= 3, 'same predicate as the native gate');
+        }
+      }
+    }
+    // Releasing an out-of-regime record does not reduce the current cap.
+    fx.strategy.setRegime(false);
+    const current = events.find((event) => event.eventId === 'current-0')!;
+    const old = events.find((event) => event.eventId === 'old-accounting-0')!;
+    await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy, old.key));
+    const currentView = inspect(fx.strategy, { key: current.key }).records[0]!;
+    assert.equal(currentView.sameRegimeRecords, 3);
+    await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy, current.key));
+    const candidate = { ...current.record, key: hash('new-shape'), familyKey: hash('new-family') };
+    assert.equal(fx.strategy.gate(candidate), undefined);
   });
 
   it('F11 a transient checkpoint read failure throws even if a later postread would succeed', async (t) => {

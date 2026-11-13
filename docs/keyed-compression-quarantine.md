@@ -48,8 +48,13 @@ metadata-only. It uses the existing native projection without a maintenance
 tick, paid-off sweep, repair, provider request, or journal write. Calling it
 before initialization, after detach, or after an uninitialized branch change
 returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
-not an empty list. It conservatively refuses damaged historical events even
-if a later checkpoint could supersede them; it never rewrites them.
+not an empty list, with coarse `reason: 'store-read'` (the store threw) or
+`'ledger-entry'` (stored data failed validation). Store error text is never
+returned; unexpected projection/programmer errors propagate. Inspection
+conservatively refuses damaged historical events and never rewrites them.
+A later native hygiene pass can checkpoint the tolerant projection that the
+gate enforces, removing ignored damage; damage in a retained hold may still
+fail strict inspection afterwards.
 
 - The default list limit is 50, valid range 1–100. Records sort by full key.
   `complete: false` means the selection was truncated; `totalRecords` is the
@@ -99,6 +104,15 @@ if a later checkpoint could supersede them; it never rewrites them.
   Outcomes/source ids/sibling keys are capped at 32/100/100 respectively,
   with independent completeness flags. `sameSourceRecords` includes this
   record and all currently observed same-hash siblings, regardless of limit.
+- `countsTowardShapeCap` uses the native gate's shared predicate: current
+  accounting version and current source-only/tool-prose fallback configuration,
+  within this record's source-only request-hash regime. `sameRegimeRecords`
+  counts all same-source records in that regime, including this one, regardless
+  of output limit; it is zero when this record does not count. Different stored
+  source-only request hashes are separate regimes, just as at the gate. No
+  request is reconstructed to predict a future request hash. These fields help
+  distinguish a cap-affecting waiver from an out-of-regime waiver, but neither
+  establishes future eligibility (exact-key/family holds can also apply).
 
 `configuredModel` is this strategy's current configured compression model;
 `recordedModel` belongs to the historical record. Neither establishes an
@@ -118,7 +132,7 @@ pretending configuration is actual use or correlating an unrelated call.
 | `stale` | Branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
 | `not-held` | No active record for this full key under the matched binding. No mutation. This is **not** acknowledgement of an earlier uncertain operation. |
 | `unsupported` | Selected lineage has no trustworthy native generation. No mutation, no fallback writer or legacy clear. Capability absent is also unsupported at the host boundary. |
-| `unreadable` | Authoritative projection could not be read/validated before writes. No mutation. Surface failure, not an empty quarantine. |
+| `unreadable` | Authoritative projection could not be read/validated before writes. Coarse `reason` distinguishes `store-read` from `ledger-entry`, without store error text. No mutation. Surface failure, not an empty quarantine. |
 | `branchUnavailable` | Strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle rather than retrying against another instance. |
 | `invalidSelection` | Missing/empty/partial/wildcard/all key, absent generation/binding, or invalid inspect bounds. No clear-all interpretation. |
 | Rejected promise / exception | Mutation-path failure, potentially after a landed write. Preserve intent as **uncertain**. Do not fabricate `released` from a missing key or automatically resend. |
@@ -138,10 +152,16 @@ syncs and strictly rereads before acknowledging. Old event
 readers ignore the extra reason and use the unchanged target identity. There
 is no registration/strategy/schema or dependency change. Normal future native
 checkpoints can discard tombstones: this is not a permanent operation ledger.
-Checkpoint hygiene skips destructive compaction for damaged projections or
-more than 1,024 active holds, preserving every sibling rather than truncating
-them; bounded output is **not** a bounded-replay guarantee. Native generations
-survive checkpoints, including interruption between redaction and compaction.
+Shared native checkpoint hygiene runs at 256 ledger events for existing
+exhaustion, legacy clear and sweep callers as well as selected waivers. On
+strict validation failure it checkpoints the tolerant projection enforced by
+the gate; ignored entries are discarded, not archived as forensic evidence.
+Dropped keys are named once per load by the tolerant reader. Checkpoints
+preserve every enforced hold, including more than 1,024 records, without
+slicing or a new byte bound. Store/mutation failures still throw; failed or
+stale hygiene is logged once per load. Inspection output bounds do not bound
+ledger I/O or checkpoint bytes. Native generations survive checkpoints,
+including interruption between redaction and compaction.
 A failure during progress, append, checkpoint, sync or postread throws. A progress-only
 partial write can leave the hold standing but remove its old ladder answers.
 
