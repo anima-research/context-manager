@@ -4180,6 +4180,408 @@ describe('tool-prose hoist admission', () => {
     );
     fx.manager.close();
   });
+  describe('admission log decomposition', () => {
+    type Admission = {
+      baseCurveLabel: string; accountingSource: string; baseProviderInputTokens: number | null;
+      expansionDeltaTokens: number; boundedInputTokens: number; outputReserveTokens: number;
+      admittedTokens: number; budgetTokens: number; disposition: string;
+    };
+    type Log = { event?: string; metadata?: Record<string, unknown> & { admission?: Admission } };
+    const kinds = ['expansion', 'canonical-hoist', 'source-hoist'] as const;
+    type Kind = typeof kinds[number];
+    const label = (kind: Kind) => kind === 'expansion' ? 'expand:L2-201'
+      : kind === 'canonical-hoist' ? 'tool-prose-hoist' : 'source-only-tool-prose-hoist';
+    const baseLabel = (kind: Kind) => kind === 'source-hoist' ? 'source-only-final' : 'canonical';
+    const options = (kind: Kind, budget: number) => ({
+      compressionContextBudgetTokens: budget,
+      compressionRefusalCurveFallbacks: kind === 'expansion' ? 1 : 0,
+      compressionSourceOnlyFallback: kind === 'source-hoist',
+      ...(kind === 'expansion' ? {} : PROSE),
+    });
+
+    async function capture(fx: Fixture, work = () => fx.strategy.run(fx.target, managerContext(fx.manager))): Promise<Log[]> {
+      const path = `${freshPath()}-admission.jsonl`;
+      paths.push(path);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = path;
+      try {
+        await work();
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+      return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Log);
+    }
+
+    async function run(kind: Kind, usage: AttemptHandler, budget: number, carriers = false) {
+      // A truncated canonical skips its hoist, making source-only-final the
+      // source hoist's base. Its count deliberately differs from that base's.
+      const handlers: AttemptHandler[] = kind === 'source-hoist'
+        ? [{ stop: 'max_tokens', inputTokens: 777 }, usage, { stop: 'refusal' }]
+        : [usage, { stop: 'refusal' }];
+      const mock = flexibleMembrane(handlers);
+      const fx = await fixture(mock.membrane, options(kind, budget));
+      if (kind !== 'expansion') hoistableChunk(fx);
+      if (carriers) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+        handlers.unshift({ error: Object.assign(new Error('thinking blocks cannot be modified'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) });
+      }
+      try {
+        const logs = await capture(fx);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label(kind))?.metadata;
+        assert.ok(trace?.admission, `the ${kind} attempt has a decomposition`);
+        const curve = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === label(kind))?.metadata;
+        assert.deepEqual(curve?.admission, trace.admission, 'early and final snapshots agree');
+        for (const log of logs.filter(log => log.event === 'compression:attempt')) {
+          if (['canonical', 'source-only-final'].includes(String(log.metadata?.curveLabel))) {
+            assert.equal(Object.hasOwn(log.metadata!, 'admission'), false, 'ungated is not a measured zero');
+          }
+        }
+        // None of these log-only fields enters outcomes, progress, plans or keys.
+        const durable = JSON.stringify([
+          quarantineEvents(fx.manager),
+          fx.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+        ]);
+        assert.ok(!/"admission"|"baseCurveLabel"|"baseProviderInputTokens"/.test(durable));
+        const attempts = JSON.stringify(logs.filter(log => log.event === 'compression:attempt'));
+        assert.ok(!/a private note|private-L|sig-L|enc-L|"inputSchema"|"messages"|"content"/.test(attempts), 'no payload in attempt diagnostics');
+        for (const call of mock.calls) {
+          assert.ok(!JSON.stringify(call.request).includes('baseProviderInputTokens'), 'diagnostics never enter a request');
+        }
+        return { fx, mock, logs, trace, admission: trace.admission };
+      } catch (error) {
+        fx.manager.close();
+        throw error;
+      }
+    }
+
+    for (const kind of kinds) {
+      for (const observed of [true, false]) {
+        it(`${kind}: ${observed ? 'provider count including cache' : 'complete bound'}, admitted, equality and rejected`, async () => {
+          const usage: AttemptHandler = observed
+            ? { stop: 'refusal', inputTokens: 0, cacheCreationTokens: 100, cacheReadTokens: 900, topLevelInputTokens: 999_999 }
+            : { stop: 'refusal', omitUsage: true };
+          const roomy = await run(kind, usage, 1_000_000);
+          const baseIndex = kind === 'source-hoist' ? 1 : 0;
+          const base = roomy.mock.calls[baseIndex]!.request;
+          const rewrite = roomy.mock.calls[baseIndex + 1]!.request;
+          const delta = Math.max(1, roomy.fx.strategy.inputBound(rewrite) - roomy.fx.strategy.inputBound(base));
+          const bounded = observed ? 1_000 + delta : roomy.fx.strategy.inputBound(rewrite);
+          const reserve = Math.max(0, Math.ceil(rewrite.config.maxTokens));
+          const expected: Admission = {
+            baseCurveLabel: baseLabel(kind),
+            accountingSource: observed
+              ? kind === 'source-hoist' ? 'source_only_provider_usage_plus_expansion' : 'canonical_provider_usage_plus_expansion'
+              : 'complete_normalized_request_bound',
+            baseProviderInputTokens: observed ? 1_000 : null,
+            expansionDeltaTokens: delta, boundedInputTokens: bounded, outputReserveTokens: reserve,
+            admittedTokens: bounded + reserve, budgetTokens: 1_000_000, disposition: 'provider_attempt',
+          };
+          assert.deepEqual(roomy.admission, expected, 'only bounded numeric/enum fields are added');
+          assert.equal(roomy.trace.requestHash, createHash('sha256').update(JSON.stringify(rewrite)).digest('hex'));
+          assert.notEqual(roomy.trace.estimatedTokens, bounded, 'chars/4 is not the admission bound');
+          const calls = kind === 'source-hoist' ? 3 : 2;
+          assert.equal(roomy.mock.calls.length, calls, 'no diagnostic provider count call');
+          roomy.fx.manager.close();
+
+          const equal = await run(kind, usage, expected.admittedTokens);
+          assert.deepEqual(equal.admission, { ...expected, budgetTokens: expected.admittedTokens });
+          assert.equal(equal.mock.calls.length, calls, 'equality still admits');
+          equal.fx.manager.close();
+
+          const rejected = await run(kind, usage, expected.admittedTokens - 1);
+          assert.deepEqual(rejected.admission, {
+            ...expected, budgetTokens: expected.admittedTokens - 1, disposition: 'admission_rejected',
+          });
+          assert.equal(rejected.mock.calls.length, calls - 1, 'rejected rewrite never sent');
+          assert.equal(rejected.trace.latencyMs, 0);
+          assert.equal(rejected.trace.persisted, false);
+          assert.equal(rejected.trace.admittedTokens, expected.admittedTokens, 'existing total retained');
+          rejected.fx.manager.close();
+        });
+      }
+    }
+
+    it('zero, invalid and missing input usage is unknown, not measured zero', async () => {
+      for (const usage of [
+        { inputTokens: 0 }, { inputTokens: -1 }, { inputTokens: NaN }, { cacheReadTokens: 500 },
+      ]) {
+        const result = await run('canonical-hoist', { raw: { stopReason: 'refusal', content: [], usage } }, 1_000_000);
+        assert.equal(result.admission.baseProviderInputTokens, null);
+        assert.equal(result.admission.accountingSource, 'complete_normalized_request_bound');
+        assert.equal(result.admission.boundedInputTokens, result.fx.strategy.inputBound(result.mock.calls[1]!.request));
+        result.fx.manager.close();
+      }
+    });
+
+    it('a carrier-stripped canonical count is unusable for expansion and hoist admission', async () => {
+      for (const kind of ['expansion', 'canonical-hoist'] as const) {
+        // The rewrite is rejected, so only the canonical's stripped retry is
+        // answered; its positive count must not masquerade as a full-base count.
+        const result = await run(kind, { stop: 'refusal', inputTokens: 100 }, 1, true);
+        assert.equal(result.mock.calls.length, 2);
+        assert.equal(result.admission.baseProviderInputTokens, null);
+        assert.equal(result.admission.accountingSource, 'complete_normalized_request_bound');
+        assert.equal(result.admission.disposition, 'admission_rejected');
+        result.fx.manager.close();
+      }
+    });
+
+    it('logging leaves exact requests, call counts, family keys, plans and outcomes unchanged', async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      try {
+        for (const kind of kinds) {
+          const handlers: AttemptHandler[] = [{ stop: 'refusal' }];
+          const off = flexibleMembrane(handlers);
+          const a = await fixture(off.membrane, options(kind, 1_000_000));
+          const on = flexibleMembrane(handlers);
+          const b = await fixture(on.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
+          try {
+            delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+            await a.strategy.run(a.target, managerContext(a.manager));
+            await capture(b);
+            assert.deepEqual(on.calls.map(c => c.request), off.calls.map(c => c.request));
+            const records = (fx: Fixture) => quarantineEvents(fx.manager)
+              .filter(e => e.kind === 'exhausted')
+              .map(e => {
+                const record = e.record as Record<string, unknown>;
+                return { key: record.key, familyKey: record.familyKey, plan: record.plan, outcomes: e.outcomes };
+              });
+            assert.ok(records(a).length > 0);
+            assert.equal(typeof records(a)[0]!.key, 'string');
+            assert.equal(typeof records(a)[0]!.familyKey, 'string');
+            assert.deepEqual(records(b), records(a));
+          } finally { a.manager.close(); b.manager.close(); }
+        }
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
+    for (const mode of ['disabled', 'diagnostic', 'write'] as const) {
+      it(mode === 'diagnostic' ? 'throwing admission diagnostics leave compression identical'
+        : mode === 'write' ? 'log write failures leave compression identical'
+          : 'disabled logging does zero admission diagnostic work', async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        try {
+          for (const kind of kinds) {
+            for (const scenario of ['refusal', 'end_turn', 'provider-rejected', 'admission-rejected'] as const) {
+              const budget = scenario === 'admission-rejected' ? 1 : 1_000_000;
+              const finish: AttemptHandler = scenario === 'provider-rejected'
+                ? { error: Object.assign(new Error('bad request'), {
+                  type: 'invalid_request', httpStatus: 400, retryable: false,
+                }) }
+                : { stop: scenario === 'end_turn' ? 'end_turn' : 'refusal', text: scenario === 'end_turn' ? 'a memory' : '' };
+              const handlers: AttemptHandler[] = kind === 'source-hoist'
+                ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, finish]
+                : [{ stop: 'refusal' }, finish];
+              const control = flexibleMembrane(handlers);
+              const probe = flexibleMembrane(handlers);
+              const a = await fixture(control.membrane, options(kind, budget));
+              const b = await fixture(probe.membrane, options(kind, budget));
+              if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
+              let diagnostics = 0;
+              const warnings: string[] = [];
+              const warn = console.warn;
+              console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+              const seam = b.strategy as unknown as { compressionAdmissionTrace: (...args: unknown[]) => unknown };
+              assert.equal(Object.hasOwn(seam, 'compressionAdmissionTrace'), false, 'the seam is a prototype method');
+              const original = seam.compressionAdmissionTrace;
+              seam.compressionAdmissionTrace = function (...args) {
+                diagnostics++;
+                if (mode === 'diagnostic') throw new Error('diagnostic failed');
+                return original.apply(this, args);
+              };
+              try {
+                delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+                const [baseline] = await Promise.allSettled([a.strategy.run(a.target, managerContext(a.manager))]);
+                const [observed] = await Promise.allSettled([(async () => {
+                  if (mode === 'write') {
+                    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.';
+                    await b.strategy.run(b.target, managerContext(b.manager));
+                  } else if (mode === 'diagnostic') await capture(b);
+                  else await b.strategy.run(b.target, managerContext(b.manager));
+                })()]);
+                assert.equal(observed!.status, baseline!.status);
+                assert.equal(a.target.compressed, scenario === 'end_turn', 'the control reaches the intended outcome');
+                assert.equal(control.calls.length, (kind === 'source-hoist' ? 3 : 2)
+                  - (scenario === 'admission-rejected' ? 1 : 0));
+                if (scenario === 'provider-rejected' || scenario === 'admission-rejected') {
+                  const outcome = exhaustedOutcomes(a).find(o => o.curveLabel === label(kind));
+                  assert.equal(outcome?.outcome, scenario === 'provider-rejected' ? 'provider_error' : 'admission_rejected',
+                    `${kind}: the control exercises ${scenario}`);
+                }
+                assert.equal(b.target.compressed, a.target.compressed);
+                assert.deepEqual(probe.calls, control.calls);
+                const records = (fx: Fixture) => quarantineEvents(fx.manager)
+                  .filter(e => e.kind === 'exhausted')
+                  .map(e => {
+                    const r = e.record as Record<string, unknown>;
+                    return { key: r.key, familyKey: r.familyKey, plan: r.plan, outcomes: e.outcomes };
+                  });
+                assert.deepEqual(records(b), records(a));
+                assert.deepEqual(
+                  b.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                  a.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                );
+                if (mode === 'diagnostic') {
+                  assert.ok(diagnostics > 0, 'the throwing diagnostic was exercised');
+                  assert.ok(warnings.some(w => w.includes('compression admission diagnostic failed:')));
+                  assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
+                }
+                else if (mode === 'write') {
+                  assert.ok(diagnostics > 0);
+                  assert.ok(warnings.some(w => w.includes('compression log write failed:')));
+                  assert.equal(warnings.some(w => w.includes('compression admission diagnostic failed:')), false);
+                } else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
+              } finally { console.warn = warn; a.manager.close(); b.manager.close(); }
+            }
+          }
+        } finally {
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        }
+      });
+    }
+
+    it('a successful recall expansion carries admission through curve-succeeded', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 1234 }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      try {
+        const logs = await capture(fx);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded')?.metadata;
+        const attempt = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('expansion'))?.metadata;
+        assert.ok(succeeded?.admission);
+        assert.deepEqual(succeeded, attempt && (({ chunk_message_ids, chunk_hash, model, ...trace }) => trace)(attempt));
+        assert.equal(succeeded.persisted, true);
+        assert.equal(succeeded.admission.baseProviderInputTokens, 1234);
+        assert.equal(succeeded.admission.boundedInputTokens, 1234 + succeeded.admission.expansionDeltaTokens);
+        assert.equal(succeeded.admittedTokens, succeeded.admission.admittedTokens);
+        assert.equal(fx.target.compressed, true);
+      } finally { fx.manager.close(); }
+    });
+
+    it('the logged delta prices sent forms, not released raw replay copies', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 50_000 }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      fx.target.messages = fx.target.messages.map(m => ({
+        ...m, content: m.content.map(b => ({ ...b, rawXml: '<raw>' + 'replay '.repeat(1000) + '</raw>' }) as ContentBlock),
+      }));
+      try {
+        const logs = await capture(fx);
+        const [base, rewrite] = mock.calls.map(c => c.request);
+        assert.ok(fx.strategy.inputBound(rewrite!) < fx.strategy.inputBound(base!), 'complete bound falls when raw copies are released');
+        const sent = (r: NormalizedRequest): NormalizedRequest => ({ ...r, messages: r.messages.map(m => ({
+          ...m, content: m.content.map(b => {
+            const { rawXml: _raw, ...fields } = b as ContentBlock & { rawXml?: string };
+            return fields as ContentBlock;
+          }),
+        })) });
+        const delta = fx.strategy.inputBound(sent(rewrite!)) - fx.strategy.inputBound(sent(base!));
+        assert.ok(delta > 1);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'tool-prose-hoist')?.metadata;
+        assert.equal(trace?.admission?.expansionDeltaTokens, delta);
+        assert.equal(trace?.admission?.boundedInputTokens, 50_000 + delta);
+      } finally { fx.manager.close(); }
+    });
+
+    it('an unwritable opt-in log remains nonfatal for an admitted hoist', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      let warnings = 0;
+      console.warn = (...args) => { if (args.some(arg => String(arg).includes('compression log write failed'))) warnings++; };
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.'; // a directory, not a writable JSONL file
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        assert.equal(mock.calls.length, 2);
+        assert.equal(fx.target.compressed, true);
+        assert.ok(warnings > 0, 'the actual write failures were reported');
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+
+    it('a resumed source-only hoist logs the count retained from source-only-final', async () => {
+      const outage = Object.assign(new Error('temporary outage'), { type: 'server_error' });
+      const mock = flexibleMembrane([
+        { stop: 'max_tokens', inputTokens: 777 }, { stop: 'refusal', inputTokens: 1234 },
+        { error: outage }, { stop: 'end_turn', text: 'memory after the outage' },
+      ]);
+      const fx = await fixture(mock.membrane, options('source-hoist', 1_000_000));
+      hoistableChunk(fx);
+      try {
+        const interrupted = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage));
+        assert.equal(interrupted.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
+          && log.metadata?.curveLabel === label('source-hoist')), false, 'interrupted rungs have no attempt trace');
+        assert.equal(interrupted.some(log => log.metadata?.admission), false, 'no admission diagnostic for an interrupted rung');
+        assert.equal(mock.calls.length, 3);
+        const progress = fx.manager.getStore().getStateJson('default/autobio:compression-family-progress');
+        assert.ok(!JSON.stringify(progress).includes('baseProviderInputTokens'));
+        const logs = await capture(fx);
+        assert.equal(mock.calls.length, 4, 'only the interrupted hoist is sent again');
+        assert.deepEqual(mock.calls[3]!.request, mock.calls[2]!.request);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('source-hoist'))?.metadata;
+        assert.equal(trace?.admission?.baseCurveLabel, 'source-only-final');
+        assert.equal(trace?.admission?.baseProviderInputTokens, 1234);
+        assert.equal(trace?.admission?.accountingSource, 'source_only_provider_usage_plus_expansion');
+        const admission = trace!.admission!;
+        assert.equal(admission.boundedInputTokens, 1234 + admission.expansionDeltaTokens);
+        assert.equal(admission.admittedTokens, admission.boundedInputTokens + admission.outputReserveTokens);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded');
+        // Hoists do not expand a parent, so only recall expansions emit curve-succeeded.
+        assert.equal(succeeded, undefined);
+      } finally { fx.manager.close(); }
+    });
+
+    it('an admitted hoist whose provider rejects still logs the computed admission', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { error: Object.assign(new Error('bad request'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      try {
+        const logs = await capture(fx);
+        const trace = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === 'tool-prose-hoist')?.metadata;
+        assert.equal(trace?.outcome, 'provider_error');
+        assert.ok(trace);
+        assert.deepEqual(Object.keys(trace).sort(), [
+          'curveLabel', 'recallIds', 'recallLevels', 'leafCoverageHash', 'requestHash',
+          'messageCount', 'estimatedTokens', 'latencyMs', 'persisted', 'outcome',
+          'errorType', 'admittedTokens', 'budgetTokens', 'admission',
+        ].sort());
+        assert.equal(trace.errorType, 'invalid_request');
+        assert.equal(trace.latencyMs, 0);
+        assert.equal(trace.persisted, false);
+        assert.equal(trace.messageCount, mock.calls[1]!.request.messages.length);
+        assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1]!.request)).digest('hex'));
+        assert.equal(trace.admittedTokens, trace.admission?.admittedTokens);
+        assert.equal(trace.budgetTokens, trace.admission?.budgetTokens);
+        const attempts = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'tool-prose-hoist');
+        assert.equal(attempts.length, 1);
+        const { chunk_message_ids, chunk_hash, model, ...attempt } = attempts[0]!.metadata!;
+        assert.deepEqual(attempt, trace);
+        assert.deepEqual(chunk_message_ids, fx.target.messages.map(m => m.id));
+        assert.equal(typeof chunk_hash, 'string');
+        assert.equal(typeof model, 'string');
+        assert.equal(trace?.admission?.disposition, 'provider_attempt');
+        assert.equal(trace?.admission?.baseProviderInputTokens, 100);
+        assert.equal(mock.calls.length, 2);
+        assert.ok(!JSON.stringify(quarantineEvents(fx.manager)).includes('baseProviderInputTokens'));
+      } finally { fx.manager.close(); }
+    });
+  });
 });
 
 describe('prepared tool-prose mode rewrite', () => {

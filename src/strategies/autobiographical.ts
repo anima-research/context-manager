@@ -135,16 +135,22 @@ function isCalibrationReset(v: unknown): v is CalibrationReset {
  * Every entry names the namespace whose compression it describes, since one
  * process's strategies share the log (#239).
  */
-function logCompressionCall(entry: Record<string, unknown>, namespace: string): void {
+function withCompressionLog(work: (logPath: string) => void, namespace: string, failure = 'compression log write failed:'): void {
   const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
   if (!logPath) return;
   try {
+    work(logPath);
+  } catch (err) {
+    namespaceDiagnostics(() => namespace).warn(failure, err);
+  }
+}
+
+function logCompressionCall(entry: Record<string, unknown>, namespace: string): void {
+  withCompressionLog((logPath) => {
     mkdirSync(dirname(logPath), { recursive: true });
     const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
-  } catch (err) {
-    namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
-  }
+  }, namespace);
 }
 
 /**
@@ -1323,6 +1329,42 @@ interface CompressionAdmission {
   disposition: 'provider_attempt' | 'admission_rejected';
 }
 
+/** Log-only decomposition of an already computed admission; never part of a
+ *  refusal plan, family identity, outcome or persisted progress record. */
+interface CompressionAdmissionTrace extends CompressionAdmission {
+  baseCurveLabel: 'canonical' | 'source-only-final';
+  accountingSource:
+    | 'complete_normalized_request_bound'
+    | 'canonical_provider_usage_plus_expansion'
+    | 'source_only_provider_usage_plus_expansion';
+  /** Null means no usable observation of the planned base, not measured zero.
+   *  A count of its carrier-stripped copy is not an observation of that base. */
+  baseProviderInputTokens: number | null;
+}
+
+
+function compressionAdmissionTrace(
+  admission: CompressionAdmission,
+  baseCurveLabel: CompressionAdmissionTrace['baseCurveLabel'],
+  baseProviderInputTokens: number | undefined,
+): CompressionAdmissionTrace {
+  return {
+    baseCurveLabel,
+    accountingSource: baseProviderInputTokens === undefined
+      ? 'complete_normalized_request_bound'
+      : baseCurveLabel === 'canonical'
+        ? 'canonical_provider_usage_plus_expansion'
+        : 'source_only_provider_usage_plus_expansion',
+    baseProviderInputTokens: baseProviderInputTokens ?? null,
+    expansionDeltaTokens: admission.expansionDeltaTokens,
+    boundedInputTokens: admission.boundedInputTokens,
+    outputReserveTokens: admission.outputReserveTokens,
+    admittedTokens: admission.admittedTokens,
+    budgetTokens: admission.budgetTokens,
+    disposition: admission.disposition,
+  };
+}
+
 interface CompressionRefusalPlanRecord extends CompressionRefusalVariantRecord {
   curveLabel: string;
   accountingSource:
@@ -1615,6 +1657,8 @@ interface RecallCurveVariant {
 }
 
 interface CompressionAttemptTrace {
+  /** Opt-in, log-only; never copied into durable outcomes or progress. */
+  admission?: CompressionAdmissionTrace;
   curveLabel: string;
   recallIds: string[];
   recallLevels: number[];
@@ -4955,6 +4999,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private normalizedCompressionContextBudget(): number {
     const configured = this.config.compressionContextBudgetTokens ?? 200_000;
     return Number.isFinite(configured) && configured > 0 ? configured : 200_000;
+  }
+
+  private compressionAdmissionTrace(
+    admission: CompressionAdmission,
+    baseCurveLabel: CompressionAdmissionTrace['baseCurveLabel'],
+    baseProviderInputTokens: number | undefined,
+  ): CompressionAdmissionTrace {
+    return compressionAdmissionTrace(admission, baseCurveLabel, baseProviderInputTokens);
   }
 
   /**
@@ -11903,6 +11955,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logError: string | undefined;
     let logWithdrawn = false;
     let logSummaryId: string | undefined;
+    // Log-only traces: durable outcomes/progress copy named fields, never admission.
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
     let splitMeta: Record<string, unknown> | undefined;
@@ -12505,7 +12558,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // variant's is, and nothing is sent.
         const runToolProseRung = async (
           hoistedRequest: NormalizedRequest,
-          base: { request: NormalizedRequest; providerInputTokens: number | undefined },
+          base: {
+            request: NormalizedRequest;
+            curveLabel: CompressionAdmissionTrace['baseCurveLabel'];
+            providerInputTokens: number | undefined;
+          },
           curveLabel: string,
           recallIds: string[],
           recallLevels: number[],
@@ -12536,6 +12593,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               budgetTokens: admission.budgetTokens,
             };
             attemptTraces.push(trace);
+            if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+              trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+            }, this.ns, 'compression admission diagnostic failed:');
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12551,8 +12611,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
             hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
           ));
-          if (result.kind === 'decided') return;
+          if (result.kind === 'decided') {
+            if (!result.reused) {
+              const trace: CompressionAttemptTrace = {
+                curveLabel, recallIds, recallLevels, leafCoverageHash: coverageHash,
+                requestHash, messageCount: hoistedRequest.messages.length,
+                estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
+                latencyMs: 0, persisted: false, outcome: 'provider_error',
+                ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
+                admittedTokens: admission.admittedTokens, budgetTokens: admission.budgetTokens,
+              };
+              attemptTraces.push(trace);
+              if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+                trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+              }, this.ns, 'compression admission diagnostic failed:');
+              logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+            }
+            return;
+          }
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+          }, this.ns, 'compression admission diagnostic failed:');
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
             trace.outcome = 'success';
@@ -12584,7 +12664,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedCanonical) {
             await runToolProseRung(
               hoistedCanonical,
-              { request, providerInputTokens: canonicalProviderInputTokens },
+              { request, curveLabel: 'canonical', providerInputTokens: canonicalProviderInputTokens },
               'tool-prose-hoist',
               canonicalRecallIds,
               canonicalRecallLevels,
@@ -12631,6 +12711,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               budgetTokens: contextBudget,
             };
             attemptTraces.push(trace);
+            if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+              trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+            }, this.ns, 'compression admission diagnostic failed:');
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12674,6 +12757,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 budgetTokens: contextBudget,
               };
               attemptTraces.push(trace);
+              if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+                trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+              }, this.ns, 'compression admission diagnostic failed:');
               logCompressionCall({
                 event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
               }, this.ns);
@@ -12682,6 +12768,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const variantResponse = result.response;
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+          }, this.ns, 'compression admission diagnostic failed:');
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
           logCompressionCall({
@@ -12776,7 +12865,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedSourceOnly) {
             await runToolProseRung(
               hoistedSourceOnly,
-              { request: sourceOnlyFallbackRequest, providerInputTokens: progressSourceOnlyInputTokens },
+              { request: sourceOnlyFallbackRequest, curveLabel: 'source-only-final', providerInputTokens: progressSourceOnlyInputTokens },
               'source-only-tool-prose-hoist',
               [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
