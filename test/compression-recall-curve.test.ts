@@ -4363,39 +4363,59 @@ describe('tool-prose hoist admission', () => {
       }
     });
 
-    for (const enabled of [false, true]) {
-      it(enabled ? 'throwing admission diagnostics leave compression identical' : 'disabled logging does zero admission diagnostic work', async () => {
+    for (const mode of ['disabled', 'diagnostic', 'write'] as const) {
+      it(mode === 'diagnostic' ? 'throwing admission diagnostics leave compression identical'
+        : mode === 'write' ? 'log write failures leave compression identical'
+          : 'disabled logging does zero admission diagnostic work', async () => {
         const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
         try {
           for (const kind of kinds) {
-            for (const stop of ['refusal', 'end_turn'] as const) {
-              const finish: AttemptHandler = { stop, text: stop === 'end_turn' ? 'a memory' : '' };
+            for (const scenario of ['refusal', 'end_turn', 'provider-rejected', 'admission-rejected'] as const) {
+              const budget = scenario === 'admission-rejected' ? 1 : 1_000_000;
+              const finish: AttemptHandler = scenario === 'provider-rejected'
+                ? { error: Object.assign(new Error('bad request'), {
+                  type: 'invalid_request', httpStatus: 400, retryable: false,
+                }) }
+                : { stop: scenario === 'end_turn' ? 'end_turn' : 'refusal', text: scenario === 'end_turn' ? 'a memory' : '' };
               const handlers: AttemptHandler[] = kind === 'source-hoist'
                 ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, finish]
                 : [{ stop: 'refusal' }, finish];
               const control = flexibleMembrane(handlers);
               const probe = flexibleMembrane(handlers);
-              const a = await fixture(control.membrane, options(kind, 1_000_000));
-              const b = await fixture(probe.membrane, options(kind, 1_000_000));
+              const a = await fixture(control.membrane, options(kind, budget));
+              const b = await fixture(probe.membrane, options(kind, budget));
               if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
               let diagnostics = 0;
+              const warnings: string[] = [];
+              const warn = console.warn;
+              console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
               const seam = b.strategy as unknown as { compressionAdmissionTrace: (...args: unknown[]) => unknown };
+              assert.equal(Object.hasOwn(seam, 'compressionAdmissionTrace'), false, 'the seam is a prototype method');
               const original = seam.compressionAdmissionTrace;
               seam.compressionAdmissionTrace = function (...args) {
                 diagnostics++;
-                if (enabled) throw new Error('diagnostic failed');
+                if (mode === 'diagnostic') throw new Error('diagnostic failed');
                 return original.apply(this, args);
               };
               try {
                 delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
                 const [baseline] = await Promise.allSettled([a.strategy.run(a.target, managerContext(a.manager))]);
                 const [observed] = await Promise.allSettled([(async () => {
-                  if (enabled) await capture(b);
+                  if (mode === 'write') {
+                    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.';
+                    await b.strategy.run(b.target, managerContext(b.manager));
+                  } else if (mode === 'diagnostic') await capture(b);
                   else await b.strategy.run(b.target, managerContext(b.manager));
                 })()]);
                 assert.equal(observed!.status, baseline!.status);
-                assert.equal(a.target.compressed, stop === 'end_turn', 'the control reaches the intended outcome');
-                assert.equal(control.calls.length, kind === 'source-hoist' ? 3 : 2);
+                assert.equal(a.target.compressed, scenario === 'end_turn', 'the control reaches the intended outcome');
+                assert.equal(control.calls.length, (kind === 'source-hoist' ? 3 : 2)
+                  - (scenario === 'admission-rejected' ? 1 : 0));
+                if (scenario === 'provider-rejected' || scenario === 'admission-rejected') {
+                  const outcome = exhaustedOutcomes(a).find(o => o.curveLabel === label(kind));
+                  assert.equal(outcome?.outcome, scenario === 'provider-rejected' ? 'provider_error' : 'admission_rejected',
+                    `${kind}: the control exercises ${scenario}`);
+                }
                 assert.equal(b.target.compressed, a.target.compressed);
                 assert.deepEqual(probe.calls, control.calls);
                 const records = (fx: Fixture) => quarantineEvents(fx.manager)
@@ -4405,9 +4425,21 @@ describe('tool-prose hoist admission', () => {
                     return { key: r.key, familyKey: r.familyKey, plan: r.plan, outcomes: e.outcomes };
                   });
                 assert.deepEqual(records(b), records(a));
-                if (enabled) assert.ok(diagnostics > 0, 'the throwing diagnostic was exercised');
-                else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
-              } finally { a.manager.close(); b.manager.close(); }
+                assert.deepEqual(
+                  b.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                  a.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                );
+                if (mode === 'diagnostic') {
+                  assert.ok(diagnostics > 0, 'the throwing diagnostic was exercised');
+                  assert.ok(warnings.some(w => w.includes('compression admission diagnostic failed:')));
+                  assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
+                }
+                else if (mode === 'write') {
+                  assert.ok(diagnostics > 0);
+                  assert.ok(warnings.some(w => w.includes('compression log write failed:')));
+                  assert.equal(warnings.some(w => w.includes('compression admission diagnostic failed:')), false);
+                } else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
+              } finally { console.warn = warn; a.manager.close(); b.manager.close(); }
             }
           }
         } finally {
@@ -4416,6 +4448,23 @@ describe('tool-prose hoist admission', () => {
         }
       });
     }
+
+    it('a successful recall expansion carries admission through curve-succeeded', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 1234 }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      try {
+        const logs = await capture(fx);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded')?.metadata;
+        const attempt = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('expansion'))?.metadata;
+        assert.ok(succeeded?.admission);
+        assert.deepEqual(succeeded, attempt && (({ chunk_message_ids, chunk_hash, model, ...trace }) => trace)(attempt));
+        assert.equal(succeeded.persisted, true);
+        assert.equal(succeeded.admission.baseProviderInputTokens, 1234);
+        assert.equal(succeeded.admission.boundedInputTokens, 1234 + succeeded.admission.expansionDeltaTokens);
+        assert.equal(succeeded.admittedTokens, succeeded.admission.admittedTokens);
+        assert.equal(fx.target.compressed, true);
+      } finally { fx.manager.close(); }
+    });
 
     it('the logged delta prices sent forms, not released raw replay copies', async () => {
       const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 50_000 }]);
@@ -4473,7 +4522,10 @@ describe('tool-prose hoist admission', () => {
       const fx = await fixture(mock.membrane, options('source-hoist', 1_000_000));
       hoistableChunk(fx);
       try {
-        await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage));
+        const interrupted = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage));
+        assert.equal(interrupted.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
+          && log.metadata?.curveLabel === label('source-hoist')), false, 'interrupted rungs have no attempt trace');
+        assert.equal(interrupted.some(log => log.metadata?.admission), false, 'no admission diagnostic for an interrupted rung');
         assert.equal(mock.calls.length, 3);
         const progress = fx.manager.getStore().getStateJson('default/autobio:compression-family-progress');
         assert.ok(!JSON.stringify(progress).includes('baseProviderInputTokens'));
@@ -4484,6 +4536,12 @@ describe('tool-prose hoist admission', () => {
         assert.equal(trace?.admission?.baseCurveLabel, 'source-only-final');
         assert.equal(trace?.admission?.baseProviderInputTokens, 1234);
         assert.equal(trace?.admission?.accountingSource, 'source_only_provider_usage_plus_expansion');
+        const admission = trace!.admission!;
+        assert.equal(admission.boundedInputTokens, 1234 + admission.expansionDeltaTokens);
+        assert.equal(admission.admittedTokens, admission.boundedInputTokens + admission.outputReserveTokens);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded');
+        // Hoists do not expand a parent, so only recall expansions emit curve-succeeded.
+        assert.equal(succeeded, undefined);
       } finally { fx.manager.close(); }
     });
 
@@ -4497,6 +4555,26 @@ describe('tool-prose hoist admission', () => {
         const logs = await capture(fx);
         const trace = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === 'tool-prose-hoist')?.metadata;
         assert.equal(trace?.outcome, 'provider_error');
+        assert.ok(trace);
+        assert.deepEqual(Object.keys(trace).sort(), [
+          'curveLabel', 'recallIds', 'recallLevels', 'leafCoverageHash', 'requestHash',
+          'messageCount', 'estimatedTokens', 'latencyMs', 'persisted', 'outcome',
+          'errorType', 'admittedTokens', 'budgetTokens', 'admission',
+        ].sort());
+        assert.equal(trace.errorType, 'invalid_request');
+        assert.equal(trace.latencyMs, 0);
+        assert.equal(trace.persisted, false);
+        assert.equal(trace.messageCount, mock.calls[1]!.request.messages.length);
+        assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1]!.request)).digest('hex'));
+        assert.equal(trace.admittedTokens, trace.admission?.admittedTokens);
+        assert.equal(trace.budgetTokens, trace.admission?.budgetTokens);
+        const attempts = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'tool-prose-hoist');
+        assert.equal(attempts.length, 1);
+        const { chunk_message_ids, chunk_hash, model, ...attempt } = attempts[0]!.metadata!;
+        assert.deepEqual(attempt, trace);
+        assert.deepEqual(chunk_message_ids, fx.target.messages.map(m => m.id));
+        assert.equal(typeof chunk_hash, 'string');
+        assert.equal(typeof model, 'string');
         assert.equal(trace?.admission?.disposition, 'provider_attempt');
         assert.equal(trace?.admission?.baseProviderInputTokens, 100);
         assert.equal(mock.calls.length, 2);

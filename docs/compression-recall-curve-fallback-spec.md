@@ -273,7 +273,8 @@ For canonical and each fallback attempt, record metadata only by default:
 - message count and estimated/rendered tokens;
 - stop reason and provider refusal category when available;
 - latency;
-- whether result was persisted.
+- whether result was persisted;
+- opt-in `admission` decomposition on attempted or admission-rejected gated rungs (log-only, never persisted).
 
 Do not log new plaintext copies of summary bodies beyond existing configured compression logging.
 
