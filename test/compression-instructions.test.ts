@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateCompressionInstructions } from '../src/index.js';
@@ -299,7 +302,7 @@ it('non-refusal tool-use reading merge retries retain reading template and no-to
   const calls = await run('readingFallback', 'own', custom, {}, Probe, 2, 'tool_use');
   assert.equal(instruction(calls[0]!), 'CUSTOM RMERGE 0 2 2560 2000');
   assert.ok(instruction(calls[1]!).startsWith(instruction(calls[0]!) + '\n\n'));
-  assert.match(instruction(calls[1]!), /tool/i);
+  assert.ok(instruction(calls[1]!).includes('Write the memory as plain text directly in your response — do not call any tools for this.'));
 });
 
 it('empty chunk retries retain custom text and request plain prose', async () => {
@@ -310,9 +313,9 @@ it('empty chunk retries retain custom text and request plain prose', async () =>
 });
 
 it('rejects own symbols and non-enumerable settings rather than dropping them at clone time', () => {
-  for (const key of ['chunk', Symbol('private')]) {
-    const templates = Object.defineProperty({ opening: 'valid' }, key, { value: 'hidden' });
-    for (const value of [{ templates }, Object.defineProperty({}, key, { value: 'hidden' })]) {
+  for (const [key, enumerable] of [['chunk', false], [Symbol('private'), false], [Symbol('private'), true]] as const) {
+    const templates = Object.defineProperty({ opening: 'valid' }, key, { value: 'hidden', enumerable });
+    for (const value of [{ templates }, Object.defineProperty({}, key, { value: 'hidden', enumerable })]) {
       assert.throws(() => validateCompressionInstructions(value), /expected enumerable string keys/);
       assert.throws(() => new Probe({ compressionInstructions: value }), /expected enumerable string keys/);
     }
@@ -406,5 +409,75 @@ it('legacy optional boolean modes remain type-compatible and delegate with the o
     for (const config of [undefined, {}, { preset: 'default' }, custom] as (CompressionInstructions | undefined)[]) {
       assert.deepEqual(await run(mode, 'own', config, {}, Legacy), await run(mode, 'own', config));
     }
+  }
+});
+
+it('inherited instruction fields cannot select wording or supply the explicit participant', () => {
+  const fields = { templates: { chunk: 'UNEXPECTED', witnessedChunk: 'UNEXPECTED' }, participant: 'INHERITED', preset: 'unknown' };
+  const saved = Object.getOwnPropertyDescriptors(Object.prototype);
+  try {
+    for (const [key, value] of Object.entries(fields)) Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true });
+    validateCompressionInstructions({});
+    assert.equal(compressionInstruction({}, 'chunk', { targetTokens: 100 }), undefined);
+    new Probe({ witnessedInstruction: 'existing', compressionInstructions: {} });
+    assert.throws(() => validateCompressionInstructions({ templates: { chunk: '{participant}' } }), /participant required/);
+    assert.throws(() => new Probe({ compressionInstructions: { templates: { chunk: '{participant}' } } }), /participant required/);
+  } finally {
+    for (const key of Object.keys(fields)) {
+      if (Object.hasOwn(saved, key)) Object.defineProperty(Object.prototype, key, saved[key]);
+      else Reflect.deleteProperty(Object.prototype, key);
+    }
+  }
+});
+
+it('throwing getters and proxies produce value-free TypeErrors in validator and constructor', () => {
+  const fail = () => { throw new Error('PRIVATE TEMPLATE DATA'); };
+  for (const value of [
+    { get preset() { return fail(); } },
+    { templates: { get chunk() { return fail(); } } },
+    new Proxy({}, { getPrototypeOf: fail }),
+    new Proxy({}, { ownKeys: fail }),
+  ]) {
+    for (const check of [() => validateCompressionInstructions(value), () => new Probe({ compressionInstructions: value })]) {
+      assert.throws(check, { name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings' });
+    }
+  }
+});
+
+it('ordinary and reading merge hooks retain fallback levels for empty and legacy sources', () => {
+  class Expose extends Probe {
+    check() {
+      for (const [sources, shown] of [[[], 0], [[{ level: 3 }], 2], [[{ level: 3, witnessed: true }], 2]] as [SummaryEntry[], number][]) {
+        assert.equal(this.getMergeInstruction(4, sources, 100), `CUSTOM ${sources[0]?.witnessed ? 'W' : ''}MERGE ${shown} 4 100`);
+        assert.equal(this.getReadingMergeInstruction(4, sources, 500, 100), `CUSTOM RMERGE ${shown} 4 500 100`);
+      }
+    }
+  }
+  new Expose({ compressionInstructions: custom }).check();
+});
+
+it('skipped-level L4 telemetry retains the legacy shown level across defaults and retries', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cm-level-'));
+  const log = join(dir, 'calls.jsonl');
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+  try {
+    const expected: number[] = [];
+    for (const config of [undefined, {}, { preset: 'default' }, custom] as (CompressionInstructions | undefined)[]) {
+      for (const childLevel of [0, 1] as const) {
+        for (const mode of ['merge', 'readingMerge', 'fallback', 'readingFallback'] as const) {
+          const calls = await run(mode, 'own', config, {}, Probe, 4, undefined, childLevel);
+          expected.push(...calls.map(() => childLevel === 0 ? 0 : 2));
+          if (config === custom) assert.match(instruction(calls[0]!), new RegExp(`^CUSTOM R?MERGE ${childLevel} 4 `));
+        }
+      }
+    }
+    const records = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      .filter(record => record.operation === 'merge_l4' && !record.event);
+    assert.deepEqual(records.map(record => record.metadata.source_level_shown), expected);
+  } finally {
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

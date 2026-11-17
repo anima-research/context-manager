@@ -2609,7 +2609,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     validateCompressionInstructions(this.config.compressionInstructions);
-    if (this.config.witnessedInstruction !== undefined && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
+    if (this.config.witnessedInstruction !== undefined && compressionInstruction(this.config.compressionInstructions, 'witnessedChunk', { targetTokens: 0 }) !== undefined) {
       throw new TypeError('Conflicting witnessedInstruction and compressionInstructions.templates.witnessedChunk; remove one setting');
     }
     this.configProvenance = resolved.provenance;
@@ -14232,9 +14232,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ---- 3. INSTRUCTION ----
-    // sourceLevelShown is the level of content the model actually sees
-    // Use the declared child level, including legacy sources that skip a level.
-    const sourceLevelShown = sources[0].sourceLevel;
+    // Preserve historical telemetry, including skipped-level sources and retries.
+    // Custom instruction hooks independently infer the declared child level.
+    const sourceLevelShown = sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
 
     // Reading-mode detection: when ALL the merge's leaf messages are
     // shards of the same bodyGroup, we know the agent was reading a

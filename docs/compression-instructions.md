@@ -50,6 +50,8 @@ which is also the hard output cap (`maxTokens`), not a promise of complete outpu
 `totalTokens` is the token count of the larger sharded body.
 `sourceLevelShown` is the numeric level of the material actually shown: **0 means
 raw messages**, not “L0 memories”; positive values mean summaries at that level.
+For heterogeneous sources this scalar describes only the first source's expanded
+level, not every item in the payload.
 `targetLevel` is the level of the summary being produced (for example, 2 or 3).
 
 `context` is the existing transition payload (capped head text and recent
@@ -104,9 +106,11 @@ Precedence:
 The source-level refusal merge retry did not call ordinary `getMergeInstruction` or
 `getReadingMergeInstruction` overrides. It still does not; a new protected
 `getSourceMergeInstruction` hook covers that distinct payload. Ordinary merge
-hooks receive an optional final shown-level argument for selected wording.
-Delegating overrides should forward this argument; older overrides that omit it
-infer the custom template's shown level from the sources' declared child level.
+hooks retain their original signatures: `getMergeInstruction(targetLevel, sources,
+targetTokens)` and `getReadingMergeInstruction(targetLevel, sources, totalTokens,
+targetTokens)`. Delegating overrides should call `super` with those same arguments;
+the base hooks infer custom templates' shown level from the first source's declared
+`sourceLevel` (falling back to its level minus one, or 0 for empty sources).
 The source-retry hook takes only `(targetLevel, sources, targetTokens)`; it
 ignores reading mode and has no reading-body `totalTokens` argument.
 Before any refusal, `tool_use` retries retain the ordinary/reading merge hook

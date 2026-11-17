@@ -44,7 +44,9 @@ if (git('status', '--porcelain', '--untracked-files=no') || untrackedSource() ||
 }
 const producerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');
-// Never execute pre-existing dist output. Build with the compiler we record.
+// Rebuild source product/harness output with the compiler we record.
+// The producer scenario module imported above comes from producer dist; build
+// the producer first. Its loaded file hash is recorded separately.
 mkdirSync(`${root}/dist`, { recursive: true });
 const build = mkdtempSync(`${root}/dist/golden-build-`);
 try {

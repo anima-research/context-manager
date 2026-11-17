@@ -61,7 +61,7 @@ export class KnowledgeProbe extends KnowledgeStrategy {
 }
 export type Mode = 'chunk' | 'reading' | 'split' | 'readingSplit' | 'merge' | 'readingMerge' | 'fallback' | 'readingFallback' | 'transition';
 export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: CompressionInstructions,
-  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 | 4 = 2, firstResponse?: 'tool_use' | 'empty') {
+  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 | 4 = 2, firstResponse?: 'tool_use' | 'empty', childLevel: 0 | 1 = 1) {
   const path = mkdtempSync(join(tmpdir(), 'test-instructions-'));
   const calls: NormalizedRequest[] = [];
   let manager: ContextManager | undefined;
@@ -113,7 +113,7 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       for (const s of sources) strategy.seed(s);
       if (targetLevel >= 3) {
         sources = sources.map((s, i) => ({ ...s, id: `L${targetLevel - 1}-${200 + i}`, level: (targetLevel - 1) as 2 | 3,
-          sourceLevel: 1, sourceIds: [s.id] }));
+          sourceLevel: childLevel, sourceIds: childLevel === 0 ? s.sourceIds : [s.id] }));
         for (const s of sources) strategy.seed(s);
       }
       assert.equal(await strategy.merge(sources.map(s => s.id), ctx, mode.toLowerCase().includes('fallback'), targetLevel), true);

@@ -1907,9 +1907,9 @@ export interface AutobiographicalConfig {
   /** Base instruction-hook customization; see docs/compression-instructions.md. */
   compressionInstructions?: CompressionInstructions;
 
-  /** System prompt for summarization */
+  /** Legacy config field; current compression request builders do not read it. */
   summarySystemPrompt?: string;
-  /** User prompt template for summarization. Use {content} for the transcript. */
+  /** Legacy config field; not an active compression template. Use compressionInstructions. */
   summaryUserPrompt?: string;
   /**
    * As-of perspective pin for inherited history (e.g. a resident continued

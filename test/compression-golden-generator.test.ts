@@ -179,6 +179,23 @@ it('generator hashes raw bytes, symlink text and NUL-delimited filenames', () =>
       '-c', 'commit.gpgsign=false', 'commit', '-qm', 'paths and filter');
     const clean = capture(root);
     assert.equal(clean.status, 0, clean.stderr);
+    for (const flag of ['assume-unchanged', 'skip-worktree']) {
+      for (const path of [odd, 'src/link.txt']) {
+        git('update-index', '--' + flag, path);
+        if (path === odd) writeFileSync(join(root, path), 'changed odd filename\n');
+        else {
+          rmSync(join(root, path));
+          symlinkSync('elsewhere.ts', join(root, path));
+        }
+        assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+        if (path === odd) writeFileSync(join(root, path), 'original\n');
+        else {
+          rmSync(join(root, path));
+          symlinkSync('product.ts', join(root, path));
+        }
+        git('update-index', '--no-' + flag, path);
+      }
+    }
     git('config', 'filter.restore.clean', "printf 'export const value = 1;\\n'");
     git('update-index', '--assume-unchanged', 'src/product.ts');
     writeFileSync(join(root, 'src/product.ts'), 'export const value = 2;\n');

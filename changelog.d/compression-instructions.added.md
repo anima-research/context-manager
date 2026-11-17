@@ -5,7 +5,9 @@
 - Export `validateCompressionInstructions`, `CompressionInstructions`,
   `CompressionInstructionTemplates`, and `CompressionInstructionValues`.
   Add protected `getCompressionOpening` and `getSourceMergeInstruction` hooks;
-  existing ordinary and reading merge hook signatures remain unchanged.
+  existing ordinary and reading merge hook signatures and call arities remain
+  unchanged, preserving subclass optional argument defaults. Custom merge
+  templates infer the shown source level from the source entries.
 - Keep source-level refusal retries on custom `merge`/`witnessedMerge` wording,
   including reading-mode merges; forward drain recipe instructions and report
   validation failures using value-free paths and reasons.
@@ -16,3 +18,6 @@
   (including an empty string) with `templates.witnessedChunk` is rejected.
   Reading slots take precedence over witnessed slots except on split pieces
   and source-level refusal retries.
+- Instruction settings ignore inherited fields and normalize inspection errors
+  to value-free validation diagnostics. Existing skipped-level merge telemetry
+  is preserved independently of custom template values.
