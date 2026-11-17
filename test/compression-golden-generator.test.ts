@@ -21,7 +21,7 @@ function fixture(check: (root: string, git: (...args: string[]) => string) => vo
     mkdirSync(join(root, 'test'));
     mkdirSync(join(root, 'dist/test'), { recursive: true });
     symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
-    writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\n');
+    writeFileSync(join(root, '.gitignore'), 'node_modules\ndist/\n');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     writeFileSync(join(root, 'package-lock.json'), '{}');
     writeFileSync(join(root, 'src/product.ts'), 'export const value = 1;\n');
@@ -36,12 +36,14 @@ function fixture(check: (root: string, git: (...args: string[]) => string) => vo
     git('add', '.');
     git('-c', 'user.name=Synthetic Fixture', '-c', 'user.email=fixture@example.invalid',
       '-c', 'commit.gpgsign=false', 'commit', '-qm', 'synthetic source');
+    assert.equal(git('ls-files', '--', 'node_modules'), '');
+    assert.equal(git('check-ignore', 'node_modules'), 'node_modules');
     check(root, git);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 function capture(root: string, env = process.env) {
   return spawnSync(process.execPath, [generator, root, join(root, 'dist/capture.json')],
-    { encoding: 'utf8', timeout: 30000, env });
+    { encoding: 'utf8', timeout: 360000, env });
 }
 
 it('generator records actual source HEAD/tree, ignores Git overrides and preserves own undefined', () => {
@@ -139,7 +141,7 @@ it('generator rejects ignored additions and tracked bytes hidden by index flags'
   fixture((root, git) => {
     writeFileSync(join(root, '.git/info/exclude'), 'src/ignored.ts\n'.replace('\\n', '\n'));
     writeFileSync(join(root, 'src/ignored.ts'), 'export const extra = 1;');
-    assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+    assert.match(capture(root).stderr, /src\/ignored\.ts/);
     rmSync(join(root, 'src/ignored.ts'));
     for (const flag of ['assume-unchanged', 'skip-worktree']) {
       git('update-index', '--' + flag, 'src/product.ts');
@@ -160,9 +162,9 @@ it('generator rejects untracked helpers and hidden root-level changes', () => {
     rmSync(join(root, 'test/helper.ts'));
     for (const flag of ['assume-unchanged', 'skip-worktree']) {
       git('update-index', '--' + flag, '.gitignore');
-      writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\nextra\n');
+      writeFileSync(join(root, '.gitignore'), 'node_modules\ndist/\nextra\n');
       assert.match(capture(root).stderr, /Refusing dirty source worktree/);
-      writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\n');
+      writeFileSync(join(root, '.gitignore'), 'node_modules\ndist/\n');
       git('update-index', '--no-' + flag, '.gitignore');
     }
   });
@@ -200,5 +202,41 @@ it('generator hashes raw bytes, symlink text and NUL-delimited filenames', () =>
     git('update-index', '--assume-unchanged', 'src/product.ts');
     writeFileSync(join(root, 'src/product.ts'), 'export const value = 2;\n');
     assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+  });
+});
+
+it('generator reports compiler diagnostics and source inspection errors distinctly', () => {
+  fixture((root, git) => {
+    writeFileSync(join(root, 'src/product.ts'), 'export const value: number = "invalid";');
+    git('add', 'src/product.ts');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'invalid compile');
+    const result = capture(root);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /src\/product\.ts.*error TS2322/);
+    git('update-index', '--assume-unchanged', 'src/product.ts');
+    rmSync(join(root, 'src/product.ts'));
+    assert.match(capture(root).stderr, /Unable to inspect source path.*src\/product\.ts/);
+  });
+});
+
+it('generator rebuilds producer scenarios rather than importing stale producer dist', () => {
+  fixture((root, git) => {
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'scripts/generate-compression-main-golden.mjs'), readFileSync(generator));
+    writeFileSync(join(root, 'test/compression-main-scenarios.ts'), readFileSync('test/compression-main-scenarios.ts'));
+    const harness = join(root, 'test/compression-instructions-harness.ts');
+    writeFileSync(harness, 'export type Mode = string;\n' + readFileSync(harness, 'utf8'));
+    git('add', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'synthetic producer');
+    writeFileSync(join(root, 'dist/test/compression-main-scenarios.js'), 'throw new Error("STALE SCENARIOS");');
+    const result = spawnSync(process.execPath, [join(root, 'scripts/generate-compression-main-golden.mjs'),
+      root, join(root, 'dist/capture.json')], { encoding: 'utf8', timeout: 360000 });
+    assert.equal(result.status, 0, result.stderr);
+    const golden = JSON.parse(readFileSync(join(root, 'dist/capture.json'), 'utf8'));
+    assert.equal(Object.keys(golden.requests).length, 93);
+    assert.notEqual(golden.scenarioModuleSha256, createHash('sha256')
+      .update(readFileSync(join(root, 'dist/test/compression-main-scenarios.js'))).digest('hex'));
   });
 });

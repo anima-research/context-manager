@@ -311,11 +311,12 @@ describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
     for (const mode of ['none', 'xml', 'bare'] as const) {
       const rendered = await renderAdaptiveFixture({ recallEnvelope: mode });
       const ladders = rendered.compressionRequests.filter((messages) =>
-        messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))),
+        messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))) &&
+        messages.some(m => textOf(m).includes('System: You will soon form a new memory')),
       );
       assert.ok(ladders.length > 0, `${mode}: fixture must mint at least one request carrying a recall ladder`);
       const request = ladders[ladders.length - 1];
-      const surgery = transformZeroRecallCompression(request as never);
+      const surgery = transformZeroRecallCompression(request as never, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening());
       results.push({
         mode,
         removed: surgery.removedRecallIds,

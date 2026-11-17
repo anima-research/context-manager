@@ -5,7 +5,6 @@ import { resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mainScenarios, scenarioKey, goldenReminders } from '../dist/test/compression-main-scenarios.js';
 
 const [sourceRoot, output] = process.argv.slice(2);
 if (!sourceRoot || !output) throw new Error('usage: node scripts/generate-compression-main-golden.mjs <source-worktree-root> <output.json>');
@@ -23,37 +22,47 @@ const sourceTree = git('rev-parse', 'HEAD^{tree}');
 // Compare bytes to HEAD independently of index stat/assume-unchanged flags.
 function sourceFilesChanged() {
   const paths = git('ls-tree', '-rz', '--name-only', 'HEAD').split('\0').filter(Boolean);
-  return paths.some(path => {
+  return paths.filter(path => {
     try {
       const full = resolve(root, path);
       const bytes = lstatSync(full).isSymbolicLink() ? readlinkSync(full, { encoding: 'buffer' }) : readFileSync(full);
       const hash = execFileSync('git', ['hash-object', '--stdin', '--no-filters'],
         { input: bytes, encoding: 'utf8', env: gitEnv, timeout: 10000 }).trim();
       return hash !== git('rev-parse', 'HEAD:' + path);
-    } catch { return true; }
+    } catch { throw new Error(`Unable to inspect source path ${JSON.stringify(path)}`); }
   });
 }
 function untrackedSource() {
   const paths = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean);
   paths.push(...git('ls-files', '-z', '--others', '--', 'src', 'test', 'scripts').split('\0').filter(Boolean));
-  return paths.some(path => path !== 'test/compression-instructions-harness.ts');
+  return [...new Set(paths)].filter(path => path !== 'test/compression-instructions-harness.ts');
 }
 // Permit only the legacy harness port among non-ignored untracked files.
-if (git('status', '--porcelain', '--untracked-files=no') || untrackedSource() || sourceFilesChanged()) {
-  throw new Error('Refusing dirty source worktree; commit intentional changes before capture');
+const changedPaths = [...sourceFilesChanged(), ...untrackedSource()];
+if (git('status', '--porcelain', '--untracked-files=no') || changedPaths.length) {
+  throw new Error(`Refusing dirty source worktree; restore/remove unintended files, clear index flags, or commit intentional changes. Paths: ${JSON.stringify(changedPaths.slice(0, 10)).slice(0, 2000)}`);
 }
 const producerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 // Rebuild source product/harness output with the compiler we record.
-// The producer scenario module imported above comes from producer dist; build
-// the producer first. Its loaded file hash is recorded separately.
+// Rebuild the producer scenarios too: incremental producer dist is not evidence.
 mkdirSync(`${root}/dist`, { recursive: true });
 const build = mkdtempSync(`${root}/dist/golden-build-`);
+mkdirSync(`${producerRoot}/dist`, { recursive: true });
+const scenarioBuild = root === producerRoot ? build : mkdtempSync(`${producerRoot}/dist/golden-scenarios-`);
 try {
   const compiler = realpathSync(`${root}/node_modules/typescript/bin/tsc`);
   execFileSync(process.execPath, [compiler, '--project', `${root}/tsconfig.json`,
     '--outDir', build, '--incremental', 'false', '--composite', 'false'],
-    { cwd: root, timeout: 120000, stdio: 'pipe' });
+    { cwd: root, timeout: 120000, stdio: ['ignore', 'inherit', 'inherit'] });
+  if (scenarioBuild !== build) {
+    execFileSync(process.execPath, [realpathSync(`${producerRoot}/node_modules/typescript/bin/tsc`),
+      '--project', `${producerRoot}/tsconfig.json`, '--outDir', scenarioBuild,
+      '--incremental', 'false', '--composite', 'false'],
+      { cwd: producerRoot, timeout: 120000, stdio: ['ignore', 'inherit', 'inherit'] });
+  }
+  const scenarioModule = `${scenarioBuild}/test/compression-main-scenarios.js`;
+  const { mainScenarios, scenarioKey, goldenReminders } = await import(pathToFileURL(scenarioModule).href);
   const { run, Probe, KnowledgeProbe } = await import(pathToFileURL(`${build}/test/compression-instructions-harness.js`).href);
   const requests = {};
   for (const s of mainScenarios) {
@@ -62,7 +71,7 @@ try {
   }
   // Do not publish a clean-source label if source changed during the capture.
   if (git('rev-parse', 'HEAD') !== source || git('status', '--porcelain', '--untracked-files=no') ||
-      untrackedSource() || sourceFilesChanged()) {
+      untrackedSource().length || sourceFilesChanged().length) {
     throw new Error('Source worktree changed during capture');
   }
   writeFileSync(output, JSON.stringify({
@@ -72,11 +81,14 @@ try {
     compiler: JSON.parse(readFileSync(`${root}/node_modules/typescript/package.json`, 'utf8')).version,
     sourceDependencyLockSha256: sha256(`${root}/package-lock.json`),
     installedDependencyLockSha256: sha256(`${root}/node_modules/.package-lock.json`),
-    scenarioModuleSha256: sha256(`${producerRoot}/dist/test/compression-main-scenarios.js`),
+    scenarioModuleSha256: sha256(scenarioModule),
     compiledHarnessSha256: sha256(`${build}/test/compression-instructions-harness.js`),
     mainHarnessSha256: sha256(`${root}/test/compression-instructions-harness.ts`),
     requests,
   }, (_key, value) => value === undefined ? { $cmGoldenUndefined: true } : value, 2) + '\n');
   console.log(`Wrote ${Object.keys(requests).length} request sets from ${source} (tree ${sourceTree}) to ${output}`);
 
-} finally { rmSync(build, { recursive: true, force: true }); }
+} finally {
+  rmSync(build, { recursive: true, force: true });
+  if (scenarioBuild !== build) rmSync(scenarioBuild, { recursive: true, force: true });
+}

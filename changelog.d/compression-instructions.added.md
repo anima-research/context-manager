@@ -22,3 +22,5 @@
 - Instruction settings read own fields on plain objects and normalize internal inspection errors
   to value-free validation diagnostics. Existing skipped-level merge telemetry
   is preserved independently of custom template values.
+- Keep recall-shaped custom compression openings from inserting a synthetic
+  conversation-resumes turn between consecutive source turns.

@@ -10,30 +10,42 @@ export interface ZeroRecallTransformResult {
   transformedSha256: string;
 }
 
-function textOf(message: NormalizedMessage): string {
-  return message.content
-    .filter((block): block is Extract<(typeof message.content)[number], { type: 'text' }> => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n');
+/** Reject source histories that cannot be distinguished from synthetic recalls. */
+export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMessage, 'participant' | 'content'>[]): void {
+  if (messages.some(message => message.participant === 'Context Manager'
+    && message.content.some(block => block.type === 'text' && /^\[CM\] Recall memory /.test(block.text)))) {
+    throw new Error('Raw recall-shaped Context Manager history; refusing zero-recall surgery');
+  }
 }
 
 /**
  * Explicit surgical transform for ONE compression request.
  *
- * Removes complete `[CM] Recall memory …` marker/answer pairs only.
+ * Removes complete `[CM] Recall memory …` marker/answer pairs before the
+ * configured opening only. Ambiguous or missing openings fail closed. The
+ * caller must establish that the prefix contains no raw recall-shaped history.
  * It does not annotate the request, generated summary, or prior turns; all
  * operation provenance belongs in the caller's external receipt.
  * It never edits Chronicle or any source message. Callers must bind its use to
  * an exact stopped store, branch, chunk, request hash and one-shot receipt.
  */
-export function transformZeroRecallCompression(messages: readonly NormalizedMessage[]): ZeroRecallTransformResult {
+export function transformZeroRecallCompression(messages: readonly NormalizedMessage[], opening: string): ZeroRecallTransformResult {
+  const boundaries = messages.flatMap((message, i) => message.participant === 'Context Manager'
+    ? message.content.filter(block => block.type === 'text' && block.text === opening).map(() => i)
+    : []);
+  if (!opening.trim() || boundaries.length !== 1) {
+    throw new Error('Missing or ambiguous compression opening; refusing zero-recall surgery');
+  }
+  const recallEnd = boundaries[0]!;
   const kept: NormalizedMessage[] = [];
   const removedRecallIds: string[] = [];
 
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    const marker = message.participant === 'Context Manager'
-      ? textOf(message).match(/^\[CM\] Recall memory ([^.]+)\./)
+    const block = message.content[0];
+    const marker = i < recallEnd && message.participant === 'Context Manager'
+      && message.content.length === 1 && block?.type === 'text'
+      ? block.text.match(/^\[CM\] Recall memory ([^.]+)\.$/)
       : null;
     if (!marker) {
       kept.push(message);
@@ -41,7 +53,7 @@ export function transformZeroRecallCompression(messages: readonly NormalizedMess
     }
 
     const answer = messages[i + 1];
-    if (!answer || answer.participant === 'Context Manager') {
+    if (i + 1 >= recallEnd || !answer || answer.participant === 'Context Manager') {
       throw new Error(`Malformed recall pair for ${marker[1]}: missing assistant answer`);
     }
     removedRecallIds.push(marker[1]);

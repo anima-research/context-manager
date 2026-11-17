@@ -1,8 +1,9 @@
 /**
- * Reconstruct the exact LLM prompt that would have been sent for a given
+ * Approximate the default LLM prompt for a given
  * L1 summary's production. Uses the chronicle's stored state (messages,
  * summaries, source IDs) and the strategy's current prompt-building logic
- * to rebuild the prompt deterministically.
+ * to rebuild a default-worded prompt. Custom compression instructions and
+ * subclass wording are not reconstructed.
  *
  * Usage:
  *   node dist/scripts/dump-compression-prompt.js <store-path> <L1-id> [output.md]
@@ -101,6 +102,7 @@ async function main() {
     process.exit(1);
   }
 
+  console.error('Approximate default-worded reconstruction only; custom templates and subclass wording are not reconstructed.');
   const strategy = new AutobiographicalStrategy({
     adaptiveResolution: true,
     targetChunkTokens: 3000,
@@ -262,7 +264,7 @@ async function main() {
 
   // Output
   const out: string[] = [];
-  out.push(`# Reconstructed compression prompt for ${target.id}\n`);
+  out.push(`# Approximate default compression prompt for ${target.id}\n`);
   out.push(`Source range: ${target.sourceRange.first} … ${target.sourceRange.last}\n`);
   out.push(`Source messages: ${target.sourceIds.length}\n`);
   out.push(`Prior L1s: ${priorL1s.length} (L1-0..L1-${targetIdx - 1})\n`);

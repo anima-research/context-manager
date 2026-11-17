@@ -75,7 +75,8 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       calls.push(structuredClone(request));
       // Canonical/source-only split requests have four raw records. Pieces have one.
       if (firstResponse && calls.length === 1) return {
-        content: [], stopReason: firstResponse === 'empty' ? 'end_turn' : 'tool_use',
+        content: firstResponse === 'empty' ? [] : [text('A nonempty tool-use preamble.'),
+          { type: 'tool_use', id: 'mock-call', name: 'mock', input: {} }], stopReason: firstResponse === 'empty' ? 'end_turn' : 'tool_use',
         usage: { inputTokens: 100, outputTokens: 0 },
       };
       const rawCount = texts(request).filter(s => s.startsWith('raw-')).length;

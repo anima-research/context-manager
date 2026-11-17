@@ -41,7 +41,7 @@ it('drain executable rejects conflicting forwarded settings before tools/store a
     const result = spawnSync(process.execPath, [resolve('dist/scripts/drain-autobiographical.js'),
       store, 'test', '--apply', '--model=mock-only', '--participant=Test',
       `--recipe=${recipe}`, `--tools-log=${join(dir, 'missing-tools')}`], {
-      encoding: 'utf8', timeout: 10000,
+      encoding: 'utf8', timeout: 60000,
       env: { ...process.env, ANTHROPIC_AUTH_TOKEN: '', ANTHROPIC_API_KEY: 'synthetic-not-a-key' },
     });
     assert.notEqual(result.status, 0);

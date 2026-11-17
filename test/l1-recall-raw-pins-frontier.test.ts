@@ -540,7 +540,7 @@ describe('a recall answer stays apart from the agent\'s own turn after it', () =
     const { cm, ids, textOf, requests } = await agentFirstChunk('agent-first-surgery');
     const request = await nextL1(cm, requests);
     assert.ok(request, 'the L1 request was sent');
-    const { messages, removedRecallIds } = transformZeroRecallCompression(request.messages);
+    const { messages, removedRecallIds } = transformZeroRecallCompression(request.messages, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening());
     assert.ok(removedRecallIds.length > 0, 'setup: the request recalls memories');
     assert.ok(!messages.some((m) => headerId(m) !== undefined), 'every recall pair is taken out');
     const raw = messages.findIndex((m) => m.content.some((b: any) => b.text === textOf.get(ids[212])));

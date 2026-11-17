@@ -84,6 +84,8 @@ strategy source is patched. The producer loads the built harness/product from
 `SOURCE_ROOT`, and scenario enumeration from this checkout. It records the source lockfile and the installed node_modules/.package-lock.json
 separately (including when node_modules is linked), compiler version, source and
 freshly compiled harness hashes, and the actual loaded scenario-module hash.
+Both source/harness and producer scenarios are built into fresh temporary output;
+preexisting producer `dist` scenarios are not imported.
 The installed lock is npm installation metadata, not a cryptographic inventory
 of every dependency file; use an unmodified npm ci installation. Do not mutate
 the compiler, dependencies, or harness during capture. Compare the candidate's requests

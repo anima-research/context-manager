@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { validateCompressionInstructions } from '../src/index.js';
 import { compressionInstruction } from '../src/compression-instructions.js';
 import type { CompressionInstructions, SummaryLevel, SummaryEntry } from '../src/index.js';
-import { Probe, run, custom, instruction, texts } from './compression-instructions-harness.js';
+import { Probe, KnowledgeProbe, run, custom, instruction, texts } from './compression-instructions-harness.js';
 
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
   for (const pin of ['own', 'mixed', 'inherited'] as const) {
@@ -68,7 +68,8 @@ it('every custom slot substitutes typed values; transition data and participant 
   }
   const transition = instruction((await run('transition', 'own', config))[0]!);
   assert.match(transition, /^TRANSITION 1500\nDATA /);
-  assert.match(transition, /raw-0 \{participant\} \{targetTokens\} \$&/);
+  const context = Array.from({ length: 4 }, (_, i) => `${i % 2 ? 'Participant' : 'Other'}: raw-${i} {participant} {targetTokens} $& ` + 'substantive '.repeat(15)).join('\n\n');
+  assert.equal(transition, `TRANSITION 1500\nDATA ${context}\nEND`);
   assert.ok(transition.endsWith('\nEND'));
 });
 
@@ -256,7 +257,7 @@ it('source-retry subclasses receive only level, sources and target tokens, inclu
     assert.equal(received.at(-1)!.length, 3);
     assert.equal(received.at(-1)![0], 2);
     assert.equal((received.at(-1)![1] as unknown[]).length, 2);
-    assert.equal(typeof received.at(-1)![2], 'number');
+    assert.equal(received.at(-1)![2], 2000);
     assert.ok(calls.length === 2);
   }
 });
@@ -274,7 +275,7 @@ it('inherited options are ignored and enforced invalid settings have value-free 
   let reads = 0;
   const changing = { templates: { get opening() { return ++reads < 3 ? 'valid' : () => 'PRIVATE'; } } };
   assert.throws(() => new Probe({ compressionInstructions: changing as never }), {
-    name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: expected object',
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: settings must be cloneable',
   });
   assert.throws(() => new Probe({ witnessedInstruction: '', compressionInstructions: {
     templates: { witnessedChunk: 'custom' },
@@ -284,7 +285,7 @@ it('inherited options are ignored and enforced invalid settings have value-free 
 it('source-only custom merges retain the attribution discipline suffix', async () => {
   for (const pin of ['own', 'inherited'] as const) {
     const calls = await run('merge', pin, custom, { compressionMergeSourceOnly: true });
-    assert.match(instruction(calls[0]!), /^CUSTOM (?:W)?MERGE 0 2 2000\n\nAttribution discipline: preserve who made each claim\./);
+    assert.equal(instruction(calls[0]!), `CUSTOM ${pin === 'inherited' ? 'WMERGE' : 'MERGE'} 0 2 2000\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.`);
   }
 });
 
@@ -301,7 +302,7 @@ it('witnessedInstruction is retained by witnessed split pieces', async () => {
 it('non-refusal tool-use reading merge retries retain reading template and no-tools addition', async () => {
   const calls = await run('readingFallback', 'own', custom, {}, Probe, 2, 'tool_use');
   assert.equal(instruction(calls[0]!), 'CUSTOM RMERGE 0 2 2560 2000');
-  assert.ok(instruction(calls[1]!).startsWith(instruction(calls[0]!) + '\n\n'));
+  assert.equal(instruction(calls[1]!), instruction(calls[0]!) + '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.');
   assert.ok(instruction(calls[1]!).includes('Write the memory as plain text directly in your response — do not call any tools for this.'));
 });
 
@@ -501,5 +502,58 @@ it('a recall-shaped custom opening does not split consecutive source turns', asy
       restored.messages.find(m => m.participant === 'Context Manager')!.content = originalOpening;
       assert.deepEqual(restored, baseline[i], 'only the opening changes; source turns still collapse identically');
     }
+  }
+});
+
+it('default L1 keeps recall-shaped raw source turns together without a resume separator', async () => {
+  class RawRecall extends Probe {
+    override compress(chunk: Parameters<Probe['compress']>[0], ctx: Parameters<Probe['compress']>[1]) {
+      return super.compress({ ...chunk, messages: chunk.messages.map((m, i) => ({ ...m,
+        participant: i === 0 ? 'Context Manager' : 'Participant',
+        content: i === 0 ? [{ type: 'text', text: '[CM] Recall memory raw.' }] : m.content,
+      })) }, ctx);
+    }
+  }
+  const [request] = await run('chunk', 'own', undefined, {}, RawRecall);
+  assert.ok(texts(request!).includes('[CM] Recall memory raw.'));
+  assert.ok(!texts(request!).includes('[CM] The conversation resumes.'));
+  const source = request!.messages.find(m => m.participant === 'Participant')!;
+  assert.equal(source.content.filter(b => b.type === 'text' && b.text.startsWith('raw-')).length, 3);
+});
+
+it('outer instruction accessors are read once and failures are value-free', () => {
+  assert.throws(() => new Probe({ get compressionInstructions(): CompressionInstructions { throw new Error('PRIVATE'); } }), {
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings',
+  });
+  let reads = 0;
+  new Probe({ get compressionInstructions() {
+    if (++reads > 1) throw new Error('PRIVATE LATER');
+    return { templates: { opening: 'OPEN' } };
+  } });
+  assert.equal(reads, 1);
+});
+
+it('clone failures identify cloneability and hidden-only template keys identify key shape', () => {
+  const proxy = new Proxy({}, {});
+  validateCompressionInstructions(proxy); // Structural validation does not promise cloneability.
+  assert.throws(() => new Probe({ compressionInstructions: proxy }), /settings must be cloneable/);
+  for (const key of ['chunk', Symbol('hidden')]) {
+    assert.throws(() => validateCompressionInstructions({ templates: Object.defineProperty({}, key, { value: 'hidden' }) }), /expected enumerable string keys/);
+  }
+});
+
+it('KnowledgeStrategy phase-specific overrides retain their wording with custom templates', async () => {
+  for (const phaseType of ['research', 'synthesis', 'lesson', 'subagent'] as const) {
+    class PhaseKnowledge extends KnowledgeProbe {
+      override compress(chunk: Parameters<Probe['compress']>[0], ctx: Parameters<Probe['compress']>[1]) {
+        return super.compress({ ...chunk, phaseType }, ctx);
+      }
+    }
+    const [baseline] = await run('chunk', 'own', undefined, {}, PhaseKnowledge);
+    const [configured] = await run('chunk', 'own', custom, {}, PhaseKnowledge);
+    assert.equal(instruction(configured!), instruction(baseline!));
+    assert.ok(instruction(configured!).includes('[LEAD]'));
+    assert.ok(!instruction(configured!).includes('CUSTOM CHUNK'));
+    assert.ok(texts(configured!).includes('CUSTOM OPEN'));
   }
 });

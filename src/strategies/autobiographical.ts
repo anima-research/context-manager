@@ -2565,7 +2565,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   constructor(config: AutobiographicalOptions = {}) {
     // Retain TypeError for malformed caller settings before structuredClone runs.
     if (Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions')) {
-      validateCompressionInstructions(config.compressionInstructions);
+      let settings: unknown;
+      try { settings = config.compressionInstructions; }
+      catch { throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings'); }
+      validateCompressionInstructions(settings);
+      // Read this newly supported outer accessor once, before the schema-agnostic
+      // resolver enumerates caller options (twice for provenance/defaults).
+      config = Object.defineProperties({}, {
+        ...Object.getOwnPropertyDescriptors(config),
+        compressionInstructions: { value: settings, enumerable: true, writable: true, configurable: true },
+      });
     }
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
@@ -2605,7 +2614,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
       } catch {
-        throw new TypeError('Invalid compressionInstructions configuration: configuration: expected object');
+        throw new TypeError('Invalid compressionInstructions configuration: configuration: settings must be cloneable');
       }
     }
     validateCompressionInstructions(this.config.compressionInstructions);
@@ -11481,7 +11490,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
       // First each recall answer is kept apart from the agent's own raw turn
       // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
-      // Only the prefix can contain recall headers. A custom opening (or
+      // Only the prefix is scanned for recall headers. A custom opening (or
       // source text) may itself look like one, but is not a recall pair.
       const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages, sourceOnlyStartIndex));
 
@@ -22158,7 +22167,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prompt, an opened chunk or the raw middle that starts with the agent's
    * turn; in a merge prompt, an L2 target or the raw middle that does. A
    * recall answer is the message after a `[CM] Recall memory <id>.` header
-   * (recallHeaderId), and it is the agent's, so a next message of the
+   * (recallHeaderId) before recallHeadersEnd (default: the entire array).
+   * The L1 caller excludes its opening and source, not raw prefix history.
+   * The answer is the agent's, so a next message of the
    * answer's participant is what the collapse below joins to it, and the
    * formatter at the wire. The turn goes in when the message right after the
    * answer is of that participant, or the first one after it that has any

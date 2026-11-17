@@ -101,8 +101,9 @@ function validateSettings(value: unknown): asserts value is CompressionInstructi
   if (participant !== undefined && (typeof participant !== 'string' || !participant.trim())) invalid('participant', 'expected nonblank string');
   let needsParticipant = false;
   if (templates !== undefined) {
-    if (!record(templates) || Object.keys(templates).length === 0) invalid('templates', 'expected nonempty object');
+    if (!record(templates)) invalid('templates', 'expected nonempty object');
     checkKeys(templates, 'templates');
+    if (Object.keys(templates).length === 0) invalid('templates', 'expected nonempty object');
     for (const [slot, template] of Object.entries(templates)) {
       if (!Object.hasOwn(placeholders, slot)) invalid('templates', 'unknown key');
       const path: Path = `templates.${slot as Slot}`;

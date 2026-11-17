@@ -22,7 +22,12 @@ Omitting the entire option, using `{}`, or selecting `preset: 'default'`
 keeps today's instruction text byte-for-byte. `default` is the only accepted
 preset; all other names are rejected. A partial `templates` object
 replaces only its named slots; every unspecified slot inherits the current
-built-in text. No migration of existing summaries is performed.
+built-in text. No migration of existing summaries is performed. This instruction-text guarantee
+is not a guarantee of identical full requests: L1 now ignores recall-shaped raw
+Context Manager headers at or after the opening when separating recall answers.
+Consecutive source turns can therefore collapse without the former synthetic
+resume turn, even with default settings. Header-shaped raw history before the
+opening is still detected heuristically.
 
 ## Slots and placeholders
 
@@ -86,7 +91,8 @@ mutating the caller's object afterward does not update a strategy. They are
 not hot-tunable. Inherited outer strategy options are ignored. Settings and
 `templates` must be plain objects (Object.prototype or null prototype); custom
 prototypes are rejected, not stripped of inherited fields. Non-cloneable settings
-are rejected with value-free errors. The validator is scoped to this object, not a schema for all
+are rejected at construction with value-free errors. The exported validator
+checks structure; it does not itself test structured-clone compatibility. The validator is scoped to this object, not a schema for all
 existing strategy or host recipe options.
 
 Precedence:
