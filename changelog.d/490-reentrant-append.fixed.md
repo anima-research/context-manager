@@ -1,0 +1,1 @@
+- Compression quarantine appends and family-progress writes retain the caller's branch authorization across reentrant store reads, preventing stale work from mutating a newly initializing branch. Progress sync stays on the store that received the write.

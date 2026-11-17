@@ -1433,6 +1433,18 @@ class CompressionQuarantineStoreReadError extends Error {
   constructor(cause: unknown) { super('Compression quarantine store read failed', { cause }); }
 }
 
+/** Fixed categories only: store error messages, names and arbitrary codes may contain payloads. */
+function quarantineFailureCategory(error: unknown): string {
+  try {
+    const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+    switch (code) {
+      case 'EACCES': case 'EPERM': case 'EIO': case 'ENOSPC': case 'EROFS': case 'EMFILE': case 'ENOENT':
+        return code;
+    }
+  } catch { /* A foreign error can have throwing accessors. */ }
+  return 'unclassified';
+}
+
 /** Shared by the native shape cap and metadata inspection; never counts old accounting. */
 function compressionQuarantineCountsTowardShapeCap(
   record: CompressionRefusalQuarantineRecord,
@@ -2806,6 +2818,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       () => {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
       const current = this.readCompressionQuarantineProjection();
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
       const cleared = targets.flatMap((target) => {
         const active = current.get(target.key);
         return active?.generationId === target.generationId ? [{ ...target, familyKey: active.record.familyKey }] : [];
@@ -2815,7 +2828,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // family whose recorded answers would exhaust it again at once.
       if (cleared.length > 0) {
         const families = new Set(cleared.map((target) => target.familyKey));
-        this.forgetCompressionFamilyProgress((entry) => families.has(entry.familyKey));
+        this.forgetCompressionFamilyProgress((entry) => families.has(entry.familyKey), undefined, sourceBranch);
       }
       for (const target of cleared) {
         this.appendCompressionQuarantineEvent({
@@ -2823,7 +2836,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           key: target.key,
           targetClaimId: target.generationId,
           created: Date.now(),
-        });
+        }, sourceBranch);
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
@@ -2968,9 +2981,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // As in the legacy native clear: progress first, then the targeted tombstone.
       // From here on exceptions propagate; a landed write followed by a failure is uncertain.
-      this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey, requireReleaseBinding);
+      this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey, requireReleaseBinding, sourceBranch);
       requireReleaseBinding();
-      this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() });
+      this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() }, sourceBranch);
       requireReleaseBinding();
       // Hygiene can return normally after losing branch currency. Neither it
       // nor sync/postread may turn another branch's absence into an acknowledgement.
@@ -5471,9 +5484,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private appendCompressionQuarantineEvent(
     event: NewCompressionQuarantineEvent,
+    source: CompressionOperationBranch,
   ): CompressionQuarantineEvent {
     if (!this.store) throw new Error('Compression quarantine store is not initialized');
-    this.requireBranchMutation('appendCompressionQuarantineEvent');
+    // Authorize only the branch/load the caller checked, never a reentrant initializer.
+    if (!this.isCompressionBranchCurrent(source)) {
+      throw new Error('Compression quarantine append refused stale branch-scoped mutation: authorized binding changed during operation');
+    }
     const stored = this.store.appendToStateJsonWithIdentity(
       this.compressionRefusalQuarantineLedgerStateId,
       event,
@@ -5500,11 +5517,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!identity || !this.store || this.compressionBranchGeneration !== identity.strategyGeneration) return false;
     const store = this.store;
     const observed = observeStoreBranch(store);
-    const branchName = store.currentBranch().name;
     return this.compressionBranchGeneration === identity.strategyGeneration &&
       this.store === store && store === identity.store &&
       this.ns === identity.namespace &&
-      branchName === identity.name &&
       observed.name === identity.name &&
       observed.generation === identity.generation;
   }
@@ -5546,9 +5561,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store || this.compressionBranchGeneration !== source.strategyGeneration) return false;
     const store = this.store;
     const observed = observeStoreBranch(store);
-    const branchName = store.currentBranch().name;
     return this.compressionBranchGeneration === source.strategyGeneration &&
-      this.store === store && branchName === source.name &&
+      this.store === store &&
       observed.name === source.name &&
       observed.generation === source.generation;
   }
@@ -5624,7 +5638,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         key: '__checkpoint__',
         active: serialized,
         created: Date.now(),
-      });
+      }, source);
       if (!this.isCompressionBranchCurrent(source)) {
         this.reportSkippedQuarantineHygiene();
         return;
@@ -5663,8 +5677,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The status, and the error when the quarantine couldn't be read, which the
-   * alarm logs. Health reads must never throw, so a read that fails comes
+   * The status, and the error when the quarantine couldn't be read. The
+   * alarm logs a payload-free failure notice, not the error. Health reads
+   * must never throw, so a read that fails comes
    * back with `unreadable` set, which tells it from an empty quarantine.
    */
   private readCompressionQuarantineStatus(now: number): { status: CompressionQuarantineStatus; error?: unknown } {
@@ -5929,7 +5944,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A strategy detached, or loaded again on another branch, during the
     // sweep sounds no alarm for the branch it swept.
     if (this.loadedBranchIdentity !== sweptIdentity || !this.isLoadedBranchCurrent()) return;
-    const { status } = this.readCompressionQuarantineStatus(now);
+    const { status, error } = this.readCompressionQuarantineStatus(now);
     if (status.unreadable) {
       // A read that failed says nothing about the debt, so the episode, its
       // repeat clock and the handler stay as they were. Said once an
@@ -5937,7 +5952,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (now - this.quarantineUnreadableSaidAt < interval) return;
       this.quarantineUnreadableSaidAt = now;
       this.diag.error(
-        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed)`,
+        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed: ${quarantineFailureCategory(error)})`,
       );
       return;
     }
@@ -6068,8 +6083,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!cleared) continue;
         this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
-    } catch {
-      this.diag.warn('[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect status to confirm holds (maintenance failed)');
+    } catch (error) {
+      this.diag.warn(`[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect status to confirm holds (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
   }
 
@@ -6103,6 +6118,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private sweepPaidOffCompressionProgress(ctx: StrategyContext): void {
     if (!this.store) return;
+    const source = this.captureCompressionBranch();
     try {
       const progress = this.readCompressionFamilyProgress();
       if (progress.size === 0) return;
@@ -6114,7 +6130,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunkRecords.length === 0) {
         // Nothing to judge spans by (no records yet, or chunk persistence
         // off): only age decides.
-        this.forgetCompressionFamilyProgress(aged);
+        this.forgetCompressionFamilyProgress(aged, undefined, source);
         return;
       }
       const byHash = new Map<string, ChunkRecord>();
@@ -6143,7 +6159,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const match = byHash.get(entry.chunkSourceHash);
         if (match) return match.compressed === true;
         return Array.isArray(entry.sourceIds) ? paidOff(entry.sourceIds) : true;
-      });
+      }, undefined, source);
     } catch (error) {
       this.diag.warn(`[autobiographical] compression progress sweep failed (progress remains): ${describeCompressionFailure(error)}`);
     }
@@ -6161,16 +6177,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
     if (!this.store) return;
     const identity = this.loadedBranchIdentity;
+    const source = this.captureCompressionBranch();
     // The span is covered: no family of it needs ladder progress any more.
     const chunkHash = sha256Json(chunk.messages.map((message) => message.id));
     try {
-      this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash);
+      this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash, undefined, source);
     } catch (error) {
       this.diag.warn(`[autobiographical] could not drop compression progress for a compressed chunk: ${describeCompressionFailure(error)}`);
     }
+    if (this.loadedBranchIdentity !== identity || !this.isCompressionBranchCurrent(source)) return;
     try {
       const hash = chunkHash;
       const projection = this.readCompressionQuarantineProjection();
+      if (this.loadedBranchIdentity !== identity || !this.isCompressionBranchCurrent(source)) return;
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
         const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId);
@@ -6184,8 +6203,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `successfully under a newer request shape`,
         );
       }
-    } catch {
-      this.diag.warn('[compression-quarantine] success-clear incomplete; clear may have landed, inspect status to confirm holds (maintenance failed)');
+    } catch (error) {
+      this.diag.warn(`[compression-quarantine] success-clear incomplete; clear may have landed, inspect status to confirm holds (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
   }
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
@@ -6248,7 +6267,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           alertKey: pending.alertKey,
           pendingEventId: pending.eventId,
           created: Date.now(),
-        });
+        }, source);
       }
       if (!this.isCompressionBranchCurrent(source)) return;
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
@@ -6308,7 +6327,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const exhausted = this.appendCompressionQuarantineEvent({
         kind: 'exhausted', key: record.key, record, outcomes, created: Date.now(),
-      });
+      }, source);
       exhaustion = 'written';
       if (!this.isCompressionBranchCurrent(source)) return;
       this.appendCompressionQuarantineEvent({
@@ -6317,7 +6336,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         targetClaimId: exhausted.eventId!,
         alertKey: record.key,
         created: Date.now(),
-      });
+      }, source);
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(source);
     });
@@ -6632,13 +6651,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(sourceOnlyTokens !== undefined ? { sourceOnlyProviderInputTokens: sourceOnlyTokens } : {}),
       updated: Date.now(),
     });
-    this.writeCompressionFamilyProgress(progress);
+    this.writeCompressionFamilyProgress(progress, source);
   }
 
-  private writeCompressionFamilyProgress(progress: Map<string, CompressionFamilyProgress>): void {
-    if (!this.store) return;
-    this.store.setStateJson(this.compressionFamilyProgressStateId, [...progress.values()]);
-    this.store.sync();
+  private writeCompressionFamilyProgress(progress: Map<string, CompressionFamilyProgress>, source: CompressionOperationBranch): void {
+    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
+    const store = this.store;
+    store.setStateJson(this.compressionFamilyProgressStateId, [...progress.values()]);
+    store.sync();
   }
 
   /**
@@ -6646,8 +6666,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * clear, an age or paid-off sweep): read afresh, remove only the matching
    * families, keep every other writer's.
    */
-  private forgetCompressionFamilyProgress(matches: (entry: CompressionFamilyProgress) => boolean, requireBinding?: () => void): void {
-    if (!this.store) return;
+  private forgetCompressionFamilyProgress(
+    matches: (entry: CompressionFamilyProgress) => boolean,
+    requireBinding: (() => void) | undefined,
+    source: CompressionOperationBranch,
+  ): void {
+    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
     requireBinding?.();
     const progress = this.readCompressionFamilyProgress();
     // A synchronous store read can reenter and change the loaded branch.
@@ -6659,7 +6683,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       progress.delete(key);
       changed = true;
     }
-    if (changed) this.writeCompressionFamilyProgress(progress);
+    if (changed) this.writeCompressionFamilyProgress(progress, source);
   }
 
   /**
@@ -12500,7 +12524,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.logCompressionFamilyDropped(chunk, quarantineRecord);
           return;
         }
-        this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
+        this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey, undefined, sourceBranch);
         if (exhaustion === 'written') logExhausted();
         onRequestStopped?.();
       };

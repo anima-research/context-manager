@@ -253,8 +253,9 @@ asks Chronicle to compact the state. The append-first order makes both crash
 gaps replay-equivalent and avoids an unsafe read/replace whole-array snapshot.
 A checkpoint retains every active exhausted family and its generation; it does
 not expire older families or cap active state at 1,024 families. Checkpointing
-bounds accumulated event history, not the number of active holds or checkpoint
-bytes. A hold remains until an exact-generation operator clear, an automatic
+bounds accumulated event history when redaction and compaction succeed, not the
+number of active holds or checkpoint bytes. Persistent hygiene failure can append
+repeated full checkpoints and grow replay history; the warning is once per load. A hold remains until an exact-generation operator clear, an automatic
 paid-off/orphan sweep or successful-compression clear, or its ledger entry is
 found unusable. Changing request keys does not remove old holds; they can still
 count toward the same-source/regime shape cap.
@@ -303,7 +304,9 @@ Suggested trace events:
 10. No thinking/private/tool payload is removed or altered by fallback construction.
 11. All-refused writes durable quarantine and stores no summary.
 12. Same unchanged request after restart makes no provider call.
-13. Changed frontier/chunk/model invalidates quarantine and permits retry.
+13. Changed frontier/model changes the request key but retains same-source/regime
+    holds: retry is permitted only below the shape cap. Changed chunk membership
+    changes the source identity; it does not delete old holds.
 14. Duplicate/concurrent producers still store only one L1 summary.
 
 ### Integration

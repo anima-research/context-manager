@@ -10,6 +10,7 @@ import {
   AutobiographicalStrategy, ContextManager, PassthroughStrategy, isKeyedCompressionQuarantineStrategy,
   type CompressionQuarantineReleaseSelection,
 } from '../src/index.js';
+import { markStoreBranchSwitch } from '../src/branch-generation.js';
 import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, CompressionQuarantineStatus } from '../src/types/index.js';
@@ -477,7 +478,7 @@ describe('one-key native compare-and-release', () => {
 // existing fake-provider fixture rather than a new controller or writer.
 function native(strategy: Probe) {
   return strategy as unknown as {
-    appendCompressionQuarantineEvent(event: Event): unknown;
+    appendCompressionQuarantineEvent(event: Event, source: unknown): unknown;
     captureCompressionBranch(): unknown;
     checkpointCompressionQuarantineIfNeeded(branch: unknown): void;
   };
@@ -485,7 +486,7 @@ function native(strategy: Probe) {
 function pad(fx: Awaited<ReturnType<typeof fixture>>) {
   while ((fx.store.getStateLen(fx.strategy.ledgerId) ?? 0) < 256) {
     native(fx.strategy).appendCompressionQuarantineEvent({ kind: 'alert_pending', key: fx.event.key,
-      targetClaimId: fx.event.eventId, alertKey: 'fake-padding', created: Date.now() });
+      targetClaimId: fx.event.eventId, alertKey: 'fake-padding', created: Date.now() }, native(fx.strategy).captureCompressionBranch());
   }
 }
 async function noWrites(fx: Awaited<ReturnType<typeof fixture>>, operation: () => Promise<unknown>) {
@@ -1105,12 +1106,13 @@ describe('Anima Review regressions', () => {
     if (sweep) fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
     const lines: string[] = [];
     const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
-    const compact = mock.method(fx.store, 'compactState', () => { throw new Error('/private/store SECRET-payload'); });
+    const compact = mock.method(fx.store, 'compactState', () => { throw Object.assign(new Error('/private/store SECRET-payload'), { code: 'EACCES' }); });
     try {
       if (sweep) await impl.sweepPaidOffQuarantineRecords();
       else await impl.clearQuarantineForCompressedChunk(fx.chunk);
       assert.equal(inspect(fx.strategy).totalRecords, 0, 'clear landed before maintenance threw');
       assert.ok(lines.some((line) => line.includes('clear may have landed')));
+      assert.ok(lines.some((line) => line.includes('maintenance failed: EACCES')));
       assert.ok(!lines.some((line) => /store operation failed|status will be reread/.test(line)));
       assert.ok(!lines.some((line) => /SECRET|private|records remain|klaxon persists/.test(line)));
     } finally { compact.mock.restore(); warn.mock.restore(); }
@@ -1123,12 +1125,13 @@ describe('Anima Review regressions', () => {
     const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
     const error = mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.join(' ')); });
     const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
-      if (id === fx.strategy.ledgerId) throw new Error('/private/store SECRET-payload');
+      if (id === fx.strategy.ledgerId) throw Object.assign(new Error('/private/store SECRET-payload'), { code: 'EACCES' });
       return get(id);
     });
     try {
       await fx.strategy.alarm();
       assert.ok(lines.some((line) => line.includes('quarantine status unreadable')));
+      assert.ok(lines.some((line) => line.includes('status check failed: EACCES')));
       assert.ok(!lines.some((line) => /SECRET|private/.test(line)));
     } finally { hook.mock.restore(); warn.mock.restore(); error.mock.restore(); }
   });
@@ -1319,8 +1322,8 @@ describe('round 8 binding and diagnostic regressions', () => {
     const sync = mock.method(fx.store, 'sync', () => { cleared = true; });
     const branch = mock.method(fx.store, 'currentBranch', () => {
       const result = current();
-      // observeStoreBranch reads first; the second lookup is the final one.
-      if (armed && ++lookups === 2) {
+      // The sole observation reads the generation after this reentrant lookup.
+      if (armed && ++lookups === 1) {
         armed = false;
         initialization = fx.strategy.initialize(fx.ctx);
       }
@@ -1341,18 +1344,158 @@ describe('round 8 binding and diagnostic regressions', () => {
     const read = impl.readCompressionQuarantineProjection.bind(impl);
     let competing: ReturnType<Probe['releaseCompressionRefusalQuarantine']> | undefined;
     let entered = 0;
+    let readsBeforeUnlock: Promise<number> | undefined;
     const hook = mock.method(impl, 'readCompressionQuarantineProjection', (...args: any[]) => {
       entered++;
       if (entered === 1) {
         competing = fx.strategy.releaseCompressionRefusalQuarantine(selected);
-        assert.equal(entered, 1, 'competing callback must not enter while the first is open');
+        // Let an incorrectly unqueued competitor's microtask run, while the
+        // first callback's await-work continuation has not released its gate.
+        readsBeforeUnlock = Promise.resolve().then(() => entered);
       }
       return read(...args);
     });
     try {
       assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
       assert.ok(competing);
+      assert.equal(await readsBeforeUnlock, 2, 'only the first release initial/final reads run before unlock');
       assert.equal((await competing).status, 'not-held');
     } finally { hook.mock.restore(); }
+  });
+});
+
+
+describe('round 9 append authorization', () => {
+  for (const operation of ['clear', 'checkpoint']) it(`rejects ${operation} when its append lookup starts a new initializer`, async (t) => {
+    const fx = await fixture(t, `r9-append-${operation}`);
+    const selected = selection(fx.strategy);
+    const source = native(fx.strategy).captureCompressionBranch();
+    const a = fx.store.currentBranch().name;
+    fx.store.createBranch('r9-b');
+    fx.store.switchBranch('r9-b');
+    fx.store.setStateJson(fx.strategy.ledgerId, []);
+    fx.store.switchBranch(a);
+    if (operation === 'checkpoint') pad(fx);
+    const impl = fx.strategy as any;
+    const appendEvent = impl.appendCompressionQuarantineEvent.bind(impl);
+    const current = fx.store.currentBranch.bind(fx.store);
+    let armed = false;
+    let initialization: Promise<void> | undefined;
+    const boundary = mock.method(impl, 'appendCompressionQuarantineEvent', (...args: any[]) => {
+      // The caller has already checked its binding; move only in the
+      // append helper's own branch lookup, not the earlier projection read.
+      armed = true;
+      return appendEvent(...args);
+    });
+    const branch = mock.method(fx.store, 'currentBranch', () => {
+      if (armed) {
+        armed = false;
+        fx.store.switchBranch('r9-b');
+        initialization = fx.strategy.initialize(fx.ctx);
+      }
+      return current();
+    });
+    const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
+    try {
+      if (operation === 'clear') await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /binding changed|stale branch/);
+      else assert.throws(() => native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source), /binding changed|stale branch/);
+      assert.ok(initialization, 'reentered initialization during the append guard');
+      await initialization;
+      assert.equal(append.mock.callCount(), 0, 'no old event may reach the new branch');
+      assert.deepEqual(fx.ledger(), []);
+    } finally { branch.mock.restore(); boundary.mock.restore(); append.mock.restore(); }
+  });
+});
+
+
+describe('round 9 progress authorization', () => {
+  for (const operation of ['public-clear', 'success-clear', 'sweep', 'record', 'exhaust']) {
+    it(`keeps B untouched when an A ${operation} read initializes B`, async (t) => {
+      const fx = await fixture(t, `r9-progress-${operation}`);
+      const impl = fx.strategy as any;
+      const source = impl.captureCompressionBranch();
+      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
+        outcomes: fx.event.outcomes, sourceIds: fx.event.record.sourceIds, updated: 0 }];
+      fx.store.setStateJson(fx.strategy.progressId, progress);
+      const a = fx.store.currentBranch().name;
+      fx.store.createBranch('r9-progress-b');
+      fx.store.switchBranch('r9-progress-b');
+      const bProgress = [{ ...progress[0], familyKey: hash('b-progress') }];
+      fx.store.setStateJson(fx.strategy.progressId, bProgress);
+      const bLedger = fx.ledger(); // A fork retaining the exact hold generation.
+      fx.store.switchBranch(a);
+      if (operation === 'sweep') fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
+      const get = fx.store.getStateJson.bind(fx.store);
+      let initialization: Promise<void> | undefined;
+      let moved = false;
+      // Exhaustion reenters through its projection; the other operations
+      // reenter through their progress read after capturing A authorization.
+      const trigger = operation === 'exhaust' ? fx.strategy.ledgerId : fx.strategy.progressId;
+      if (operation === 'exhaust') fx.store.setStateJson(fx.strategy.ledgerId, []);
+      const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+        const result = get(id);
+        if (id === trigger && !moved) {
+          moved = true;
+          fx.store.switchBranch('r9-progress-b');
+          initialization = fx.strategy.initialize(fx.ctx);
+        }
+        return result;
+      });
+      const set = mock.method(fx.store, 'setStateJson');
+      const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
+      try {
+        if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /stale branch/);
+        if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk);
+        if (operation === 'sweep') impl.sweepPaidOffCompressionProgress(fx.ctx);
+        if (operation === 'record') impl.recordCompressionFamilyProgress(source, fx.event.record, fx.event.outcomes, undefined, undefined, []);
+        if (operation === 'exhaust') await assert.rejects(impl.exhaustCompressionRequestFamily(source, fx.event.record, [], () => true, () => true), /stale branch/);
+        assert.ok(moved);
+        await initialization;
+        assert.equal(set.mock.calls.filter((call) => call.arguments[0] === fx.strategy.progressId).length, 0);
+        assert.equal(append.mock.callCount(), 0);
+        assert.deepEqual(get(fx.strategy.progressId), bProgress);
+        assert.deepEqual(fx.ledger(), bLedger);
+      } finally { hook.mock.restore(); set.mock.restore(); append.mock.restore(); }
+    });
+  }
+
+  it('observes a same-name manager switch during its sole branch lookup', async (t) => {
+    const fx = await fixture(t, 'r9-same-name-generation');
+    const impl = fx.strategy as any;
+    const source = impl.captureCompressionBranch();
+    const identity = impl.loadedBranchIdentity;
+    const current = fx.store.currentBranch.bind(fx.store);
+    let lookups = 0;
+    const hook = mock.method(fx.store, 'currentBranch', () => {
+      const result = current();
+      if (++lookups === 1) markStoreBranchSwitch(fx.store);
+      return result;
+    });
+    try {
+      assert.equal(impl.isCompressionBranchCurrent(source), false);
+      assert.equal(impl.isBranchIdentityCurrent(identity), false);
+    } finally { hook.mock.restore(); }
+  });
+
+  it('syncs the store that received progress even if setStateJson rebinds the strategy', async (t) => {
+    const fx = await fixture(t, 'r9-progress-sync');
+    const other = await fixture(t, 'r9-progress-sync-other');
+    const impl = fx.strategy as any;
+    const source = impl.captureCompressionBranch();
+    const set = fx.store.setStateJson.bind(fx.store);
+    const syncA = mock.method(fx.store, 'sync');
+    const syncB = mock.method(other.store, 'sync');
+    let initialization: Promise<void> | undefined;
+    const hook = mock.method(fx.store, 'setStateJson', (...args: Parameters<typeof set>) => {
+      set(...args);
+      if (args[0] === fx.strategy.progressId) initialization = fx.strategy.initialize(other.ctx);
+    });
+    try {
+      impl.writeCompressionFamilyProgress(new Map(), source);
+      assert.ok(initialization);
+      assert.equal(syncA.mock.callCount(), 1);
+      assert.equal(syncB.mock.callCount(), 0);
+      await initialization;
+    } finally { hook.mock.restore(); syncA.mock.restore(); syncB.mock.restore(); }
   });
 });

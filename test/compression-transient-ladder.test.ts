@@ -2023,12 +2023,12 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     // The progress goes before the clear event: a crash between
     // them leaves the quarantine standing, never a cleared family with its
     // old answers.
-    const self = fx.strategy as unknown as { appendCompressionQuarantineEvent(event: { kind: string }): unknown };
+    const self = fx.strategy as unknown as { appendCompressionQuarantineEvent(event: { kind: string }, source: unknown): unknown };
     const append = self.appendCompressionQuarantineEvent.bind(fx.strategy);
     const progressAtClear: number[] = [];
-    self.appendCompressionQuarantineEvent = (event: { kind: string }) => {
+    self.appendCompressionQuarantineEvent = (event: { kind: string }, source: unknown) => {
       if (event.kind === 'clear') progressAtClear.push(progressSlot(fx.manager).length);
-      return append(event);
+      return append(event, source);
     };
     await fx.strategy.clearCompressionRefusalQuarantine();
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
@@ -2809,7 +2809,11 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
       membrane: {
         complete: async (request: NormalizedRequest) => {
           if (inner.calls.length === dropAt) {
-            (strategy() as unknown as { forgetCompressionFamilyProgress(matches: () => boolean): void }).forgetCompressionFamilyProgress(() => true);
+            const native = strategy() as unknown as {
+              captureCompressionBranch(): unknown;
+              forgetCompressionFamilyProgress(matches: () => boolean, guard: undefined, source: unknown): void;
+            };
+            native.forgetCompressionFamilyProgress(() => true, undefined, native.captureCompressionBranch());
           }
           return complete(request);
         },
@@ -2963,7 +2967,11 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
             store.appendToStateJsonWithIdentity(
               LEDGER, { kind: 'alert_sent', key, targetClaimId: exhausted.id, alertKey: key, pendingEventId: pending.id, created: Date.now() }, 'eventId', 'sequence');
             if (dropped) {
-              (fx.strategy as unknown as { forgetCompressionFamilyProgress(matches: () => boolean): void }).forgetCompressionFamilyProgress(() => true);
+              const native = fx.strategy as unknown as {
+                captureCompressionBranch(): unknown;
+                forgetCompressionFamilyProgress(matches: () => boolean, guard: undefined, source: unknown): void;
+              };
+              native.forgetCompressionFamilyProgress(() => true, undefined, native.captureCompressionBranch());
             }
           }
           return complete(request);

@@ -287,7 +287,7 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     });
     assert.deepEqual(status, { count: 0, keys: [], spans: [], unreadable: true });
     assert.deepEqual(failing.lines, [
-      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed) ns=default',
+      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed: unclassified) ns=default',
     ], 'one line, and no warning from the paid-off sweep');
     assert.deepEqual(failing.handled, [], 'no handler call, all-clear or alarm');
 
