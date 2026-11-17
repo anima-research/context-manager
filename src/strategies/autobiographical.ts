@@ -65,7 +65,11 @@ import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type {
+  CompressionQuarantineBinding, CompressionQuarantineInspection, CompressionQuarantineRecordView,
+  CompressionQuarantineReleaseSelection, CompressionQuarantineReleaseResult,
+} from '../types/compression-quarantine.js';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { noRoomUnderRequestLimit, requestOverheadContent } from '../request-limit.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
@@ -1291,6 +1295,16 @@ export class StoreTopologyError extends Error {
   }
 }
 
+function isCanonicalQuarantineKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+function metadataString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+function metadataNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 interface CompressionRefusalOutcomeRecord {
   curveLabel: string;
   requestHash: string;
@@ -1356,6 +1370,8 @@ type CompressionQuarantineEvent =
   | (CompressionQuarantineEventBase & {
       kind: 'clear';
       targetClaimId: string;
+      /** Additive metadata: old readers ignore it; projection/clear identity is unchanged. */
+      reason?: 'operator-waiver';
     })
   | (CompressionQuarantineEventBase & {
       kind: 'exhausted';
@@ -1406,6 +1422,14 @@ function isUsableQuarantineRecord(record: unknown): record is CompressionRefusal
     typeof (record as { chunkSourceHash?: unknown }).chunkSourceHash === 'string';
 }
 
+/** Optional recorded membership must agree with the record's source hash. No repair on this surface. */
+function requireReadableQuarantineMembership(record: CompressionRefusalQuarantineRecord): void {
+  if (record.sourceIds !== undefined &&
+      (!isIdList(record.sourceIds) || sha256Json(record.sourceIds) !== record.chunkSourceHash)) {
+    throw new Error('Unreadable quarantine source membership');
+  }
+}
+
 /**
  * The active quarantine, replayed from the ledger (and the legacy snapshot
  * before it). An entry is made only from a usable record
@@ -1430,11 +1454,16 @@ function projectCompressionQuarantineEvents(
   legacyRecords: CompressionRefusalQuarantineRecord[] = [],
   dropped?: Set<string>,
   unlisted?: Set<string>,
+  strict = false,
 ): Map<string, ActiveCompressionQuarantine> {
   const active = new Map<string, ActiveCompressionQuarantine>();
   const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
   for (const record of legacyRecords) {
-    if (!isUsableQuarantineRecord(record)) continue;
+    if (!isUsableQuarantineRecord(record)) {
+      if (strict) throw new Error('Unreadable legacy quarantine record');
+      continue;
+    }
+    if (strict) requireReadableQuarantineMembership(record);
     active.set(record.key, {
       generationId: `legacy:${record.key}`,
       record,
@@ -1445,34 +1474,50 @@ function projectCompressionQuarantineEvents(
     });
   }
   for (const [index, event] of events.entries()) {
-    if (!event) continue;
+    if (!event) {
+      if (strict) throw new Error('Unreadable quarantine event');
+      continue;
+    }
+    if (strict && !['checkpoint', 'claim', 'clear', 'exhausted', 'alert_pending', 'alert_sent'].includes(event.kind)) {
+      throw new Error('Unknown quarantine event');
+    }
     // A checkpoint is known by its kind; its key isn't read.
     if (event.kind === 'checkpoint') {
       active.clear();
       if (!Array.isArray(event.active)) {
+        if (strict) throw new Error('Unreadable quarantine checkpoint');
         unlisted?.add(`the ledger's checkpoint at index ${index}`);
         continue;
       }
       for (const item of event.active) {
         if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
+          if (strict) throw new Error('Unreadable checkpoint generation/record');
           const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
           if (typeof key === 'string') dropped?.add(key);
           continue;
         }
+        if (strict) requireReadableQuarantineMembership(item.record);
         active.set(item.record.key, {
           generationId: item.generationId,
           record: item.record,
-          outcomes: outcomeList(item.outcomes),
+          outcomes: outcomeList(item.outcomes, strict),
           ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
           sentAlertKeys: new Set(Array.isArray(item.sentAlertKeys) ? item.sentAlertKeys : []),
         });
       }
       continue;
     }
-    if (typeof event.key !== 'string') continue;
+    if (typeof event.key !== 'string') {
+      if (strict) throw new Error('Unreadable quarantine key');
+      continue;
+    }
     if (event.kind === 'claim') {
       const generationId = event.eventId;
+      if (strict && (!isUsableGenerationId(generationId) || !isUsableQuarantineRecord(event.record))) {
+        throw new Error('Unreadable quarantine claim');
+      }
       if (!generationId) continue;
+      if (strict) requireReadableQuarantineMembership(event.record);
       legacyClaims.set(generationId, {
         generationId,
         record: event.record,
@@ -1490,17 +1535,20 @@ function projectCompressionQuarantineEvents(
         : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
       const generationId = own ? event.eventId : event.targetClaimId;
       if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
+        if (strict) throw new Error('Unreadable exhaustion generation/record');
         dropped?.add(event.key);
         continue;
       }
+      if (strict) requireReadableQuarantineMembership(record);
       active.set(event.key, {
         generationId,
         record,
-        outcomes: outcomeList(event.outcomes),
+        outcomes: outcomeList(event.outcomes, strict),
         sentAlertKeys: new Set<string>(),
       });
       continue;
     }
+    if (strict && !isUsableGenerationId(event.targetClaimId)) throw new Error('Unreadable quarantine target');
     const current = active.get(event.key);
     if (!current || current.generationId !== event.targetClaimId) continue;
     if (event.kind === 'clear') {
@@ -1540,7 +1588,11 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
 }
 
 /** A quarantine entry's outcomes as read back from the ledger: the objects in a list that carry a string `outcome`, and nothing else. */
-function outcomeList(value: unknown): CompressionRefusalOutcomeRecord[] {
+function outcomeList(value: unknown, strict = false): CompressionRefusalOutcomeRecord[] {
+  if (strict && (!Array.isArray(value) || value.some((entry) =>
+    typeof entry !== 'object' || entry === null || typeof entry.outcome !== 'string'))) {
+    throw new Error('Unreadable quarantine outcomes');
+  }
   return Array.isArray(value)
     ? value.filter((entry): entry is CompressionRefusalOutcomeRecord =>
       typeof entry === 'object' && entry !== null && typeof (entry as { outcome?: unknown }).outcome === 'string')
@@ -2714,6 +2766,112 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
+    });
+  }
+
+  private readonly quarantineLoadIds = new WeakMap<LoadedBranchIdentity, string>();
+
+  private quarantineBinding(): CompressionQuarantineBinding | null {
+    if (!this.isLoadedBranchCurrent() || !this.loadedBranchIdentity) return null;
+    const identity = this.loadedBranchIdentity;
+    let loadId = this.quarantineLoadIds.get(identity);
+    if (!loadId) {
+      loadId = randomUUID();
+      this.quarantineLoadIds.set(identity, loadId);
+    }
+    return { namespace: identity.namespace, branch: identity.name, loadId };
+  }
+
+  /** Metadata only: no sweep, repair, journal write, or provider call. */
+  inspectCompressionRefusalQuarantine(options: { key?: string; limit?: number } = {}): CompressionQuarantineInspection {
+    if (!options || typeof options !== 'object' || Array.isArray(options) || (options.key !== undefined && !isCanonicalQuarantineKey(options.key)) ||
+        (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100))) {
+      return { status: 'invalidSelection' };
+    }
+    try {
+      const binding = this.quarantineBinding();
+      if (!binding) return { status: 'branchUnavailable' };
+      const projection = this.readCompressionQuarantineProjection(true);
+      const limit = options.limit ?? 50;
+      const chunksByHash = new Map(this.chunks.map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk]));
+      const selected = options.key === undefined ? [...projection.keys()].sort() : projection.has(options.key) ? [options.key] : [];
+      const records = selected.slice(0, limit).map((key): CompressionQuarantineRecordView => {
+        const active = projection.get(key)!;
+        const record = active.record;
+        const chunk = chunksByHash.get(record.chunkSourceHash);
+        const recordedIds = Array.isArray(record.sourceIds) && record.sourceIds.every((id) => typeof id === 'string') ? record.sourceIds : null;
+        const ids = recordedIds ?? chunk?.messages.map((message) => message.id) ?? null;
+        const siblings = [...projection.keys()].filter((other) => other !== key && projection.get(other)!.record.chunkSourceHash === record.chunkSourceHash).sort();
+        const generation = active.generationId.startsWith('legacy:') ? null : active.generationId;
+        return {
+          key, generation, selectable: generation !== null && isCanonicalQuarantineKey(key),
+          chunkSourceHash: record.chunkSourceHash,
+          familyKey: metadataString(record.familyKey), canonicalRequestHash: metadataString(record.canonicalRequestHash),
+          frontierHash: metadataString(record.frontierHash), created: metadataNumber(record.created),
+          recordedModel: metadataString(record.model), recordedProvider: null, recordedCategory: null,
+          sourceIds: ids?.slice(0, 100) ?? null, sourceIdsComplete: ids !== null && ids.length <= 100,
+          membership: recordedIds ? 'recorded' : chunk ? 'loaded-chunk' : 'unknown',
+          loadedChunkMatch: chunk !== undefined,
+          profile: {
+            accountingVersion: metadataNumber(record.normalizedConfig?.accountingVersion),
+            fallbackLimit: metadataNumber(record.fallbackLimit), contextBudgetTokens: metadataNumber(record.contextBudgetTokens),
+            sourceOnlyFallbackEnabled: typeof record.normalizedConfig?.sourceOnlyFallbackEnabled === 'boolean' ? record.normalizedConfig.sourceOnlyFallbackEnabled : null,
+          },
+          outcomes: active.outcomes.slice(0, 32).map((entry) => ({
+            outcome: ['refusal', 'topology_violation', 'unusable_empty', 'provider_error', 'admission_rejected', 'incomplete'].includes(entry.outcome) ? entry.outcome : 'unknown',
+            stopReason: ['end_turn', 'refusal', 'max_tokens', 'tool_use', 'abort', 'stop_sequence'].includes(entry.stopReason ?? '') ? entry.stopReason! : null,
+            requestHash: metadataString(entry.requestHash),
+          })),
+          outcomesComplete: active.outcomes.length <= 32,
+          sameSourceRecords: siblings.length + 1, siblingKeys: siblings.slice(0, 100), siblingKeysComplete: siblings.length <= 100,
+        };
+      });
+      return { status: 'ok', binding, records, totalRecords: projection.size, complete: selected.length <= limit,
+        configuredModel: metadataString(this.config.compressionModel), configuredProvider: null, configuredCredentialAlias: null };
+    } catch {
+      // Do not leak store error text (which can contain paths or payloads) into this metadata surface.
+      return { status: 'unreadable' };
+    }
+  }
+
+  /** One explicit generation, compared and cleared under the native branch/state lock. */
+  async releaseCompressionRefusalQuarantine(selection: CompressionQuarantineReleaseSelection): Promise<CompressionQuarantineReleaseResult> {
+    if (!selection || !isCanonicalQuarantineKey(selection.key) || !isUsableGenerationId(selection.expectedGeneration) ||
+        !selection.expectedBinding || typeof selection.expectedBinding.namespace !== 'string' ||
+        typeof selection.expectedBinding.branch !== 'string' || !isUsableGenerationId(selection.expectedBinding.loadId)) {
+      return { status: 'invalidSelection' };
+    }
+    // Copy caller-owned input before waiting; later edits cannot change what was authorized.
+    const { key, expectedGeneration } = selection;
+    const expected = { ...selection.expectedBinding };
+    let binding: CompressionQuarantineBinding | null;
+    try { binding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
+    if (!binding || !this.store) return { status: 'branchUnavailable' };
+    const store = this.store;
+    return withCompressionStateLock(store, binding.branch, this.compressionRefusalQuarantineLedgerStateId, () => {
+      let currentBinding: CompressionQuarantineBinding | null;
+      try { currentBinding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' } as const; }
+      if (!currentBinding) return { status: 'branchUnavailable' };
+      if (currentBinding.loadId !== expected.loadId || currentBinding.namespace !== expected.namespace || currentBinding.branch !== expected.branch) return { status: 'stale' };
+      let current: Map<string, ActiveCompressionQuarantine>;
+      try { current = this.readCompressionQuarantineProjection(true); } catch { return { status: 'unreadable' }; }
+      const active = current.get(key);
+      if (!active) return { status: 'not-held' };
+      if (active.generationId.startsWith('legacy:')) return { status: 'unsupported' };
+      if (active.generationId !== expectedGeneration) return { status: 'stale' };
+      // An attempted write can land and then throw. Mark an open alarm episode
+      // conservatively BEFORE writing, so a later empty read never calls that
+      // uncertainty proof of coverage. This flag is in-memory, not a receipt.
+      if (this.quarantineAlarmActive && this.quarantineAlarmScope?.ns === currentBinding.namespace && this.quarantineAlarmScope.branch === currentBinding.branch) {
+        this.quarantineAlarmOperatorWaived = true;
+      }
+      // As in the legacy native clear: progress first, then the targeted tombstone.
+      // From here on exceptions propagate; a landed write followed by a failure is uncertain.
+      this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey);
+      this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() });
+      store.sync();
+      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection(true);
+      return { status: 'released', key, generation: expectedGeneration, remainingRecords: this.compressionRefusalQuarantine.size };
     });
   }
 
@@ -5088,7 +5246,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * nothing (projectCompressionQuarantineEvents): its cleared records would
    * come back. A stored null reads as no value at all.
    */
-  private readCompressionQuarantineProjection(): Map<string, ActiveCompressionQuarantine> {
+  private readCompressionQuarantineProjection(strict = false): Map<string, ActiveCompressionQuarantine> {
     if (!this.store) return new Map();
     const ledger = this.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
     const legacy = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
@@ -5097,11 +5255,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
     if (ledgerHoldsNoList) unlisted.add('the ledger');
     if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
+    if (strict && unlisted.size > 0) throw new Error('Unreadable quarantine lists');
     const active = projectCompressionQuarantineEvents(
       Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
       !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
       dropped,
       unlisted,
+      strict,
     );
     if (dropped.size > 0) this.reportDroppedQuarantineEntries(dropped);
     if (unlisted.size > 0) this.reportUnlistedQuarantineState(unlisted);
@@ -5427,6 +5587,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private quarantineAlarmLastAt = 0;
   /** True while an alarm episode is open (alarmed and not yet all-cleared). */
   private quarantineAlarmActive = false;
+  private quarantineAlarmOperatorWaived = false;
   /**
    * The quarantine the open episode's alarm last sounded on, by namespace and
    * branch: its all-clear is said only when that quarantine reads empty. Not
@@ -5661,7 +5822,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.quarantineAlarmActive = false;
         this.quarantineAlarmLastAt = 0;
         this.diag.error(
-          '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
+          this.quarantineAlarmOperatorWaived
+            ? '[compression-quarantine] quarantine empty after operator waiver request; coverage and debt payment not established; alarm stands down'
+            : '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
         );
         try {
           this.onQuarantineAlarm?.(status);
@@ -5672,6 +5835,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
+    if (!this.quarantineAlarmActive || this.quarantineAlarmScope?.ns !== scope.ns || this.quarantineAlarmScope.branch !== scope.branch) {
+      this.quarantineAlarmOperatorWaived = false;
+    }
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
     this.quarantineAlarmScope = scope;
