@@ -35,3 +35,8 @@ export function readCompressionGolden(path: string) {
   assert.deepEqual(Object.keys(golden.requests), mainScenarios.map(scenarioKey));
   return golden;
 }
+
+/** Compare insertion order and own undefined properties, as the capture does. */
+export function requestBytes(value: unknown): string {
+  return JSON.stringify(value, (_key, child) => child === undefined ? { $cmGoldenUndefined: true } : child);
+}

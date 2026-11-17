@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readCompressionGolden } from './compression-golden-reader.js';
+import { readCompressionGolden, requestBytes } from './compression-golden-reader.js';
 import { join } from 'node:path';
 import { run, Probe, KnowledgeProbe } from './compression-instructions-harness.js';
 import { mainScenarios, scenarioKey, goldenReminders } from './compression-main-scenarios.js';
@@ -11,7 +11,7 @@ for (const s of mainScenarios) {
     for (const config of [undefined, {}, { preset: 'default' as const }]) {
       const actual = await run(s.mode, s.pin, config, s.variant === 'reminders' ? goldenReminders : {},
         s.variant === 'knowledge' ? KnowledgeProbe : Probe, s.level);
-      assert.equal(JSON.stringify(actual), JSON.stringify(golden.requests[scenarioKey(s)]));
+      assert.equal(requestBytes(actual), requestBytes(golden.requests[scenarioKey(s)]));
     }
   });
 }
@@ -20,4 +20,9 @@ it('historical reading/mixed keys are inherited aliases, not straddling coverage
   for (const variant of ['base', 'reminders', 'knowledge']) {
     assert.deepEqual(golden.requests[`${variant}/reading/mixed/L2`], golden.requests[`${variant}/reading/inherited/L2`]);
   }
+});
+
+it('request comparison detects missing undefined keys and reordered properties', () => {
+  assert.notEqual(requestBytes({ tools: undefined }), requestBytes({}));
+  assert.notEqual(requestBytes({ system: '', messages: [] }), requestBytes({ messages: [], system: '' }));
 });

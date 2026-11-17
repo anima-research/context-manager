@@ -22,6 +22,13 @@ export class ZeroRecallSurgeryStrategy extends AutobiographicalStrategy {
       && this.summaryAnswerContent(s).some(b => b.type === 'tool_result'))) {
       throw new Error('Split recall answer; refusing zero-recall surgery');
     }
+    // A carrier-only or empty answer can disappear on sanitization/retry,
+    // leaving unrelated raw history immediately after its header. Require a
+    // stable text payload in this opt-in operation rather than blessing it.
+    if (this.summaries.some(s => recallIds.includes(s.id)
+      && !this.summaryAnswerContent(s).some(b => b.type === 'text' && b.text.trim().length > 0))) {
+      throw new Error('Unstable or empty recall answer; refusing zero-recall surgery');
+    }
     this.construction = captureZeroRecallConstruction(request, recallIds);
   }
 }

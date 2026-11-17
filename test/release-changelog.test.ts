@@ -316,17 +316,36 @@ for (const [name, fixture, message] of refusals) {
 }
 
 
+function assertPendingFragments(fragments: Record<string, string>): void {
+  const dir = setup({ fragments });
+  try {
+    if (Object.keys(fragments).length === 0) {
+      const before = changelog(dir);
+      assert.throws(() => script.run(dir, [], VERSION_HOOK), /nothing to release/);
+      assert.equal(changelog(dir), before);
+    } else {
+      script.run(dir, [], VERSION_HOOK);
+      const released = changelog(dir);
+      for (const body of Object.values(fragments)) {
+        assert.ok(released.includes(body.replace(/\n{3,}/g, '\n\n').trim()));
+      }
+    }
+    assert.deepEqual(pending(dir), ['README.md']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('pending-fragment check accepts a released checkout with only README.md', () => {
+  assertPendingFragments({});
+});
+
+test('pending-fragment check compares normalized blank lines', () => {
+  assertPendingFragments({ 'spacing.fixed.md': '- First.\n\n\n- Second.\n' });
+});
+
 test('every pending repository fragment passes the release collector', () => {
   const source = join(process.cwd(), 'changelog.d');
   const entries = readdirSync(source, { withFileTypes: true }).filter(e => e.name !== 'README.md');
   // Do not filter by extension: the release collector must see every entry.
   for (const entry of entries) assert.ok(entry.isFile(), `unexpected fragment directory: ${entry.name}`);
-  const fragments = Object.fromEntries(entries.map(e => [e.name, readFileSync(join(source, e.name), 'utf8')]));
-  const dir = setup({ fragments });
-  try {
-    script.run(dir, [], VERSION_HOOK);
-    assert.deepEqual(readdirSync(join(dir, 'changelog.d')), ['README.md']);
-    const released = readFileSync(join(dir, 'CHANGELOG.md'), 'utf8');
-    for (const body of Object.values(fragments)) assert.ok(released.includes(body.trim()));
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  assertPendingFragments(Object.fromEntries(entries.map(e => [e.name, readFileSync(join(source, e.name), 'utf8')])));
 });

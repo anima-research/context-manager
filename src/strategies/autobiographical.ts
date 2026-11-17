@@ -2559,7 +2559,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let instructionSettings: unknown;
     // Match ordinary option enumeration: do not ask a proxy for a descriptor
     // of an absent key. Unrelated outer-option failures keep their own errors.
-    if (Reflect.ownKeys(config).includes('compressionInstructions')) {
+    if (Reflect.ownKeys(Object(config)).includes('compressionInstructions')) {
       let enumerable: boolean;
       try {
         enumerable = Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions');
@@ -2570,7 +2570,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (enumerable) {
         const original = config;
         const descriptors: PropertyDescriptorMap = {};
-        for (const key of Reflect.ownKeys(original)) {
+        for (const key of Reflect.ownKeys(original).filter((key): key is string => typeof key === 'string')) {
           let descriptor: PropertyDescriptor | undefined;
           try { descriptor = Object.getOwnPropertyDescriptor(original, key); }
           catch (error) {

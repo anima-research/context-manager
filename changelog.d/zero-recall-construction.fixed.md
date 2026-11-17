@@ -8,3 +8,5 @@
   are refused rather than risking partial removal.
 - Failed one-shot operations include backup-restoration guidance in their receipt
   even if a provider call was recorded before failure.
+
+- Surgery receipt readers should migrate `call.originalRequestSha256` to `call.originalMessagesSha256` and `call.transformedRequestSha256` to `call.transformedMessagesSha256`. Both old names remain transitional aliases; all four hash message arrays, not whole requests.

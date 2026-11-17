@@ -309,7 +309,7 @@ describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
   it('removes the same minted pairs whether or not answers are enveloped', async () => {
     const results = [];
     for (const mode of ['none', 'xml', 'bare'] as const) {
-      const rendered = await renderAdaptiveFixture({ recallEnvelope: mode });
+      const rendered = await renderAdaptiveFixture({ recallEnvelope: mode }, undefined, undefined, undefined, undefined, undefined, true);
       const ladders = rendered.compressionRequests.filter((messages) =>
         messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))) &&
         messages.some(m => textOf(m).includes('System: You will soon form a new memory')),

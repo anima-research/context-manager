@@ -60,7 +60,9 @@ async function exercise(content: ContentBlock[], options: AutobiographicalOption
     const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
     const messages = ctx.messageStore.getAll().filter(m => m.id === source);
     const compression = strategy.compress({ index: 1, startIndex: 2, endIndex: 3, messages, tokens: 100, compressed: false }, ctx);
-    if (content.some(b => b.type === 'tool_result')) {
+    if (!content.some(b => b.type === 'text' && b.text.trim())) {
+      await assert.rejects(compression, /Unstable or empty recall answer/);
+    } else if (content.some(b => b.type === 'tool_result')) {
       await assert.rejects(compression, /Split recall answer/);
       assert.equal(strategy.observed, 1, 'refusal happened in the construction observer, not a missing-tools deferral');
     } else await compression;
@@ -144,4 +146,10 @@ test('construction-bound surgery refuses a raw false opening that truncates reca
   ] } as NormalizedRequest;
   const construction = captureZeroRecallConstruction(request, ['L1-1', 'L1-2']);
   assert.throws(() => transformConstructedZeroRecallCompression(request, 'OPEN', construction), /Incomplete constructed recall removal/);
+});
+
+test('empty and carrier-only stored answers cannot capture an unrelated raw turn', async () => {
+  for (const content of [[text('')], [thinking]]) {
+    assert.equal((await exercise(content)).length, 0);
+  }
 });

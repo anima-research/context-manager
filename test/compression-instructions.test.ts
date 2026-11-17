@@ -1,3 +1,4 @@
+import { requestBytes } from './compression-golden-reader.js';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,7 @@ import { Probe, KnowledgeProbe, run, custom, instruction, texts } from './compre
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
   for (const pin of ['own', 'mixed', 'inherited'] as const) {
     it(`${mode}/${pin}: omitted and DEFAULT requests are byte-identical`, async () => {
-      assert.equal(JSON.stringify(await run(mode, pin)), JSON.stringify(await run(mode, pin, { preset: 'default' })));
+      assert.equal(requestBytes(await run(mode, pin)), requestBytes(await run(mode, pin, { preset: 'default' })));
     });
   }
 }
@@ -121,7 +122,7 @@ it('templates alone need no preset; partial overrides leave every other phase at
   assert.match(instruction((await run('chunk', 'own', config))[0]!), /^ONLY CHUNK \d+$/);
   for (const [mode, pin] of [['chunk', 'inherited'], ['reading', 'own'], ['merge', 'own'],
     ['fallback', 'inherited'], ['readingFallback', 'own'], ['transition', 'own']] as const) {
-    assert.deepEqual(await run(mode, pin, config), await run(mode, pin));
+    assert.equal(requestBytes(await run(mode, pin, config)), requestBytes(await run(mode, pin)));
   }
   const pieces = await run('readingSplit', 'mixed', config);
   for (const r of pieces.slice(-4)) assert.match(instruction(r), /^ONLY CHUNK \d+$/);
@@ -139,7 +140,7 @@ it('constructor snapshots templates; later caller edits cannot reach request hoo
 
 it('empty settings and an unused explicit participant do not select new wording', async () => {
   for (const config of [{}, { participant: 'Explicit actor' }, { preset: 'default', participant: 'Explicit actor' }] as CompressionInstructions[]) {
-    assert.deepEqual(await run('chunk', 'own', config), await run('chunk', 'own'));
+    assert.equal(requestBytes(await run('chunk', 'own', config)), requestBytes(await run('chunk', 'own')));
   }
 });
 
@@ -170,7 +171,7 @@ it('participant is explicit and required only by custom placeholders, never infe
 });
 
 it('explicit default still permits custom overrides', async () => {
-  assert.deepEqual(await run('chunk', 'own', { ...custom, preset: 'default' }), await run('chunk', 'own', custom));
+  assert.equal(requestBytes(await run('chunk', 'own', { ...custom, preset: 'default' })), requestBytes(await run('chunk', 'own', custom)));
 });
 
 for (const pin of ['own', 'mixed', 'inherited'] as const) {
@@ -408,7 +409,7 @@ it('legacy optional boolean modes remain type-compatible and delegate with the o
   }
   for (const mode of ['merge', 'readingMerge'] as const) {
     for (const config of [undefined, {}, { preset: 'default' }, custom] as (CompressionInstructions | undefined)[]) {
-      assert.deepEqual(await run(mode, 'own', config, {}, Legacy), await run(mode, 'own', config));
+      assert.equal(requestBytes(await run(mode, 'own', config, {}, Legacy)), requestBytes(await run(mode, 'own', config)));
     }
   }
 });
@@ -628,4 +629,27 @@ it('repeated instruction descriptor failures are sanitized', () => {
   });
   assert.throws(() => new Probe(options), error => error instanceof TypeError
     && error.message.includes('unable to inspect settings') && !error.message.includes('sensitive'));
+});
+
+it('instruction settings and templates reject custom prototypes and accept null prototypes', () => {
+  for (const value of [Object.create({}), { templates: Object.create({}) }]) {
+    assert.throws(() => validateCompressionInstructions(value), TypeError);
+    assert.throws(() => new Probe({ compressionInstructions: value }), TypeError);
+  }
+  for (const value of [Object.create(null), { templates: Object.assign(Object.create(null), { opening: 'OPEN' }) }]) {
+    validateCompressionInstructions(value);
+    assert.doesNotThrow(() => new Probe({ compressionInstructions: value }));
+  }
+});
+
+it('unrelated symbol descriptors are not inspected and primitive JS options retain defaults', () => {
+  const symbol = Symbol('unrelated');
+  const config = new Proxy({ compressionInstructions: {}, [symbol]: true }, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === symbol) throw new Error('symbol descriptor inspected');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  assert.doesNotThrow(() => new Probe(config));
+  for (const value of [false, 1]) assert.doesNotThrow(() => new Probe(value as never));
 });

@@ -249,12 +249,13 @@ export async function renderAdaptiveFixture(
   firstSelectOptions?: SelectOptions,
   /** Called with the manager after the rendered compile. */
   inspect?: (manager: ContextManager) => void | Promise<void>,
+  captureSurgery = false,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
     const strategy = new (class extends AutobiographicalStrategy {
       expectedAnswers: { id: string; answer: RenderedMessage }[] = [];
       protected override observeL1CompressionRequest(request: NormalizedRequest, ids: readonly string[]) {
-        this.expectedAnswers = captureZeroRecallConstruction(request, ids).expectedAnswers;
+        if (captureSurgery) this.expectedAnswers = captureZeroRecallConstruction(request, ids).expectedAnswers;
       }
     })({
       compressionModel: 'zz-mock-model',
