@@ -2951,11 +2951,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // As in the legacy native clear: progress first, then the targeted tombstone.
       // From here on exceptions propagate; a landed write followed by a failure is uncertain.
+      const identity = this.loadedBranchIdentity;
+      const sourceBranch = this.captureCompressionBranch();
+      const requireReleaseBinding = () => {
+        if (this.loadedBranchIdentity !== identity || !this.isBranchIdentityCurrent(identity)) {
+          throw new Error('Compression quarantine release uncertain: authorized branch binding changed after mutation');
+        }
+      };
       this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey);
+      requireReleaseBinding();
       this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() });
-      this.checkpointCompressionQuarantineIfNeeded(this.captureCompressionBranch());
+      requireReleaseBinding();
+      // Hygiene can return normally after losing branch currency. Neither it
+      // nor sync/postread may turn another branch's absence into an acknowledgement.
+      this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
+      requireReleaseBinding();
       store.sync();
-      this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection(true);
+      requireReleaseBinding();
+      const remaining = this.readCompressionQuarantineProjection(true);
+      requireReleaseBinding();
+      this.compressionRefusalQuarantine = remaining;
       return { status: 'released', key, generation: expectedGeneration, remainingRecords: this.compressionRefusalQuarantine.size };
     });
   }

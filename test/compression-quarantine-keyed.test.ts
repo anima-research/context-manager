@@ -806,6 +806,63 @@ describe('R1 native review regressions', () => {
     assert.equal(inspect(fx.strategy).totalRecords, 0, 'a later readable absence is not an acknowledgement');
   });
 
+  for (const phase of ['clear', 'checkpoint', 'redaction', 'compaction', 'sync', 'postread'] as const) {
+    it(`14 rejects uncertain release after a reentrant branch move during ${phase}`, async (t) => {
+      const fx = await fixture(t, `review-binding-${phase}`);
+      const selected = selection(fx.strategy);
+      pad(fx);
+      const originalBranch = fx.store.currentBranch().name;
+      fx.store.createBranch('elsewhere');
+      let moved = false;
+      let synced = false;
+      const move = () => {
+        fx.store.switchBranch('elsewhere');
+        moved = true;
+      };
+      const append = fx.store.appendToStateJsonWithIdentity.bind(fx.store);
+      const redact = fx.store.redactStateItems.bind(fx.store);
+      const compact = fx.store.compactState.bind(fx.store);
+      const sync = fx.store.sync.bind(fx.store);
+      const get = fx.store.getStateJson.bind(fx.store);
+      const hooks = [
+        mock.method(fx.store, 'appendToStateJsonWithIdentity', (...args: Parameters<typeof append>) => {
+          const result = append(...args);
+          if ((args[1] as Event).kind === phase) move();
+          return result;
+        }),
+        mock.method(fx.store, 'redactStateItems', (...args: Parameters<typeof redact>) => {
+          const result = redact(...args);
+          if (phase === 'redaction') move();
+          return result;
+        }),
+        mock.method(fx.store, 'compactState', (...args: Parameters<typeof compact>) => {
+          const result = compact(...args);
+          if (phase === 'compaction') move();
+          return result;
+        }),
+        mock.method(fx.store, 'sync', () => {
+          sync();
+          synced = true;
+          if (phase === 'sync') move();
+        }),
+        mock.method(fx.store, 'getStateJson', (id: string) => {
+          const result = get(id);
+          if (phase === 'postread' && synced && id === fx.strategy.ledgerId) move();
+          return result;
+        }),
+      ];
+      try {
+        await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /uncertain/);
+        assert.equal(moved, true, 'fault injection reached the selected post-write phase');
+      } finally {
+        for (const hook of hooks) hook.mock.restore();
+        fx.store.switchBranch(originalBranch);
+      }
+      assert.ok(fx.ledger().some((event) => event?.kind === 'clear' || event?.kind === 'checkpoint'),
+        'the mutation landed; branch loss must not become a no-mutation status');
+    });
+  }
+
   it('F11 partial checkpoint/redaction/compaction exceptions remain uncertain, never released', async (t) => {
     for (const failure of ['checkpoint', 'redactStateItems', 'compactState'] as const) {
       const fx = await fixture(t, `r1-failure-${failure}`);
