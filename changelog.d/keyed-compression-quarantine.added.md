@@ -13,3 +13,4 @@
   with release. Historical source-only cap accounting is not a prediction of
   today's prepared request hash; short damaged ledgers have no immediate repair
   through inspection or release.
+- Quarantine inspection and keyed release ignore history superseded by a checkpoint even before redaction, while resolving earlier legacy claims referenced by later exhaustion events.

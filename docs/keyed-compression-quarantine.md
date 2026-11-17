@@ -58,8 +58,8 @@ gate enforces, removing ignored damage; damage in a retained hold may still
 fail strict inspection afterwards. A checkpoint supersedes preceding events and the legacy snapshot;
 that snapshot is no longer read or validated, but is not rewritten or deleted.
 Below 256 ledger events, ignored damage can leave inspection and keyed release
-unreadable indefinitely. Neither restart nor legacy clear-all repairs it;
-a clear can trigger hygiene only if its appended events reach the threshold.
+unreadable indefinitely. Neither restart nor legacy clear-all guarantees repair; initialization alert
+delivery or a clear can trigger hygiene if its appended events reach the threshold.
 There is no immediate repair operation in this API. Do not use legacy clear-all
 as a repair fallback: it can waive holds while leaving inspection unreadable.
 

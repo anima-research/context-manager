@@ -255,7 +255,8 @@ A checkpoint retains every active exhausted family and its generation; it does
 not expire older families or cap active state at 1,024 families. Checkpointing
 bounds accumulated event history, not the number of active holds or checkpoint
 bytes. A family remains until its key changes, an exact-generation operator
-clear, or its ledger entry is found unusable.
+clear, an automatic paid-off/orphan sweep or successful-compression clear,
+or its ledger entry is found unusable.
 
 ## Observability
 

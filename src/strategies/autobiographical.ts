@@ -1514,7 +1514,20 @@ function projectCompressionQuarantineEvents(
     });
   }
   for (const [index, event] of events.entries()) {
-    if (index < firstEvent) continue;
+    if (index < firstEvent) {
+      // Checkpoints supersede active state, not claim identities referenced by
+      // later legacy exhaustions. Retain these without validating superseded
+      // history; a referenced record is validated at the exhaustion below.
+      if (event?.kind === 'claim' && typeof event.key === 'string' && event.eventId) {
+        legacyClaims.set(event.eventId, {
+          generationId: event.eventId,
+          record: event.record,
+          outcomes: [],
+          sentAlertKeys: new Set(),
+        });
+      }
+      continue;
+    }
     if (!event) {
       if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine event');
       continue;
@@ -5874,7 +5887,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // emitCompressionQuarantineAlert; the klaxon picks it up within one
     // interval and then sustains it.)
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
-    // Sweep BEFORE reading status: the klaxon must reflect real debt only.
+    // Best-effort stale-hold sweep before reading status; not proof of debt.
     const sweptIdentity = this.loadedBranchIdentity;
     await this.sweepPaidOffQuarantineRecords();
     // A strategy detached, or loaded again on another branch, during the
@@ -5970,8 +5983,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Sweep quarantine records whose debt is already paid, so the klaxon only
-   * ever sounds on REAL debt. Two ways a record goes stale (both observed
+   * Best-effort sweep of quarantine records whose debt appears paid. Skipped
+   * or failed sweeps can leave stale holds sounding the alarm; it is not proof
+   * of outstanding debt. Two ways a record goes stale (both observed
    * live, mythos 2026-07-16 — three records klaxoning on spans compressed
    * hours earlier as L1-625):
    *  - chunk-boundary drift: rebuildChunks re-cut the compressible zone, the

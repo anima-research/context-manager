@@ -869,6 +869,55 @@ describe('Anima Review regressions', () => {
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
   });
 
+  it('round 4b ends the alarm after reopening the same path with the same strategy', async (t) => {
+    const fx = await fixture(t, 'review-alarm-reopen');
+    const heard: CompressionQuarantineStatus[] = [];
+    fx.strategy.setQuarantineAlarmHandler((status) => heard.push(status));
+    await fx.strategy.alarm();
+    assert.equal(heard.length, 1);
+    await fx.manager.close();
+    const reopened = await ContextManager.open({ path: fx.path, strategy: fx.strategy });
+    t.after(() => reopened.close());
+    assert.notEqual(reopened.getStore(), fx.store, 'reopen replaces the native handle');
+    assert.equal(inspect(fx.strategy).totalRecords, 1);
+    assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy))).status, 'released');
+    await fx.strategy.alarm();
+    assert.equal(heard.length, 2, 'empty quarantine clears before the next repeat');
+    assert.equal(heard[1]!.clearReason, 'operator-waiver-requested');
+    await fx.strategy.alarm();
+    assert.equal(heard.length, 2, 'all-clear fires only once');
+  });
+
+  for (const checkpoints of [1, 2]) it(`round 4 resolves legacy claims across ${checkpoints} checkpoints`, async (t) => {
+    const fx = await fixture(t, `review-claim-checkpoints-${checkpoints}`);
+    const old = selection(fx.strategy);
+    const claimId = 'pre-checkpoint-claim';
+    const ledger = [
+      null, // Unrelated superseded damage must remain ignored.
+      { ...fx.event, kind: 'claim', eventId: 'unused-damaged-claim', record: null },
+      { ...fx.event, kind: 'claim', eventId: claimId },
+      ...Array.from({ length: checkpoints }, () => ({ kind: 'checkpoint', active: [] })),
+      { kind: 'exhausted', key: old.key, targetClaimId: claimId, outcomes: fx.event.outcomes },
+    ];
+    fx.store.setStateJson(fx.strategy.ledgerId, ledger);
+    assert.ok(fx.strategy.gate(fx.event.record));
+    assert.equal(compressionQuarantineHolds(ledger as never, []).holds(fx.event.record.sourceIds), true);
+    assert.equal(selection(fx.strategy).expectedGeneration, claimId);
+    assert.deepEqual(fx.ledger(), ledger, 'inspection does not rewrite the below-threshold ledger');
+    assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine({
+      ...old, expectedGeneration: claimId,
+    })).status, 'released');
+    assert.equal(inspect(fx.strategy).totalRecords, 0);
+
+    // Referenced damage is still rejected, unlike unrelated superseded damage.
+    ledger[2] = { ...fx.event, kind: 'claim', eventId: claimId, record: null };
+    fx.store.setStateJson(fx.strategy.ledgerId, ledger);
+    assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
+    assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({
+      ...old, expectedGeneration: claimId,
+    }), { status: 'unreadable', reason: 'ledger-entry' });
+  });
+
   for (const operation of ['inspection', 'release'] as const) it(`round 3 ${operation} reads the checkpoint before redaction`, async (t) => {
     const fx = await fixture(t, `review-before-redaction-${operation}`);
     const old = selection(fx.strategy);

@@ -1,0 +1,1 @@
+- Restore quarantine alarm all-clear when the same strategy reopens its store and quarantine empties before the next repeat; retain namespace and branch scoping rather than native-handle identity.
