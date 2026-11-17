@@ -2359,10 +2359,10 @@ export interface AutobiographicalConfig {
    */
   l1HoldbackChunks?: number;
 
-  // Legacy aliases (deprecated, use summary* instead)
-  /** @deprecated Use summarySystemPrompt */
+  // Legacy inactive fields; current compression request builders do not read them.
+  /** @deprecated Inactive; use compressionInstructions for base compression wording. */
   diarySystemPrompt?: string;
-  /** @deprecated Use summaryUserPrompt */
+  /** @deprecated Inactive; use compressionInstructions for base compression wording. */
   diaryUserPrompt?: string;
 
   // --- Hierarchical compression (L1/L2/L3 pyramid) ---

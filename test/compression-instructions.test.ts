@@ -481,3 +481,25 @@ it('skipped-level L4 telemetry retains the legacy shown level across defaults an
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+it('a recall-shaped custom opening does not split consecutive source turns', async () => {
+  class SameSpeaker extends Probe {
+    override compress(chunk: Parameters<Probe['compress']>[0], ctx: Parameters<Probe['compress']>[1]) {
+      return super.compress({ ...chunk, messages: chunk.messages.map(m => ({ ...m, participant: 'Participant' })) }, ctx);
+    }
+  }
+  for (const mode of ['chunk', 'split'] as const) {
+    const baseline = await run(mode, 'own', undefined, {}, SameSpeaker);
+    const opening = '[CM] Recall memory example.';
+    const calls = await run(mode, 'own', { templates: { opening } }, {}, SameSpeaker);
+    assert.equal(calls.length, baseline.length);
+    for (const [i, request] of calls.entries()) {
+      assert.ok(!texts(request).includes('[CM] The conversation resumes.'));
+      const originalOpening = baseline[i]!.messages.find(m => m.participant === 'Context Manager')!.content;
+      const restored = structuredClone(request);
+      restored.messages.find(m => m.participant === 'Context Manager')!.content = originalOpening;
+      assert.deepEqual(restored, baseline[i], 'only the opening changes; source turns still collapse identically');
+    }
+  }
+});

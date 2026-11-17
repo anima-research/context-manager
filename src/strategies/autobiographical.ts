@@ -11481,7 +11481,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
       // First each recall answer is kept apart from the agent's own raw turn
       // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
-      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
+      // Only the prefix can contain recall headers. A custom opening (or
+      // source text) may itself look like one, but is not a recall pair.
+      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages, sourceOnlyStartIndex));
 
       // Collapse consecutive same-participant messages for API compliance
       const collapsed = this.collapseConsecutiveMessages(split);
@@ -22169,13 +22171,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected separateRecallAnswers(
     messages: Array<{ participant: string; content: ContentBlock[] }>,
+    recallHeadersEnd = messages.length,
   ): Array<{ participant: string; content: ContentBlock[] }> {
     const carried = stripUnpairedToolBlocks(messages);
     const hasContent = (i: number): boolean => stripEmptyTextBlocks(carried[i]!.content).length > 0;
     const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
     messages.forEach((message, i) => {
       separated.push(message);
-      if (i === 0 || recallHeaderId(messages[i - 1]!) === undefined) return;
+      if (i === 0 || i - 1 >= recallHeadersEnd || recallHeaderId(messages[i - 1]!) === undefined) return;
       let withContent = i + 1;
       while (withContent < messages.length && !hasContent(withContent)) withContent++;
       if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {

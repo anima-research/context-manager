@@ -14,10 +14,11 @@
 - Keep the source-retry hook limited to target level, sources and target tokens;
   reading-body token counts remain on the ordinary reading-merge hook only.
 - Template settings require enumerable string keys and cloneable values;
-  inherited caller options are ignored. Combining `witnessedInstruction`
+  inherited outer strategy options are ignored; settings and templates require
+  plain objects with Object.prototype or null prototypes. Combining `witnessedInstruction`
   (including an empty string) with `templates.witnessedChunk` is rejected.
   Reading slots take precedence over witnessed slots except on split pieces
   and source-level refusal retries.
-- Instruction settings ignore inherited fields and normalize inspection errors
+- Instruction settings read own fields on plain objects and normalize internal inspection errors
   to value-free validation diagnostics. Existing skipped-level merge telemetry
   is preserved independently of custom template values.

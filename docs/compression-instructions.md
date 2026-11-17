@@ -31,7 +31,7 @@ built-in text. No migration of existing summaries is performed.
 | `opening` | L1 record marker, including split pieces; coordinate with `chunk` (the built-in chunk refers back to this notification) | `participant` |
 | `chunk` | Ordinary/mixed L1 and split pieces | `participant`, `targetTokens` |
 | `witnessedChunk` | Non-reading wholly inherited L1, and inherited split pieces | `participant`, `targetTokens` |
-| `readingChunk` | L1 portion of a larger sharded body, even wholly inherited | `participant`, `targetTokens`, `totalTokens` |
+| `readingChunk` | L1 portion of a sharded body whose total tokens are at least twice the chunk’s tokens, even wholly inherited | `participant`, `targetTokens`, `totalTokens` |
 | `merge` | Ordinary/mixed consolidation | `participant`, `targetTokens`, `sourceLevelShown`, `targetLevel` |
 | `witnessedMerge` | Non-reading consolidation with every source witnessed | same as `merge` |
 | `readingMerge` | Consolidation of portions of one larger body, even fully witnessed | same as `merge`, plus `totalTokens` |
@@ -76,12 +76,16 @@ is also exported for recipe loaders. Unknown keys within this object or its
 templates, unknown presets, wrong types, blank strings, malformed or
 unsupported placeholders, non-enumerable or Symbol keys, and absent required
 participant/context are errors.
-An empty `templates: {}` is an error; omit it instead. Errors are `TypeError`s
+A chunk containing 60% of a sharded body uses `chunk`/`witnessedChunk`, not `readingChunk`.
+An empty `templates: {}` is an error; omit it instead. Validator errors are `TypeError`s
 with allowlisted paths and reason categories after the existing value-free
 `Invalid compressionInstructions configuration` prefix; values and unknown keys
-are never echoed. Template settings are copied at construction;
+are never echoed. The separate witnessed-instruction conflict instead throws a
+`TypeError` beginning `Conflicting witnessedInstruction`. Template settings are copied at construction;
 mutating the caller's object afterward does not update a strategy. They are
-not hot-tunable. Inherited caller options are ignored; non-cloneable settings
+not hot-tunable. Inherited outer strategy options are ignored. Settings and
+`templates` must be plain objects (Object.prototype or null prototype); custom
+prototypes are rejected, not stripped of inherited fields. Non-cloneable settings
 are rejected with value-free errors. The validator is scoped to this object, not a schema for all
 existing strategy or host recipe options.
 
@@ -94,8 +98,9 @@ Precedence:
    configured `merge`/`witnessedMerge` text. Subclasses must override that hook
    separately to supply their own retry wording. `prepareCompressionRequest`
    still runs afterward. This option does not force subclasses to use it.
-2. Existing `witnessedInstruction` wins over the built-in witnessed L1 text,
-   including when custom templates are configured. Combining it with a
+2. A nonempty existing `witnessedInstruction` wins over the built-in witnessed L1 text,
+   including when custom templates are configured; an empty string retains the
+   built-in witnessed text. Combining it with a
    `templates.witnessedChunk` override (even when `witnessedInstruction` is empty) throws rather than hiding either one.
 3. A supplied template slot replaces that phase's built-in wording; omitted
    slots retain the existing default. `default` is the only accepted preset.
