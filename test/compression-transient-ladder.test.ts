@@ -1025,6 +1025,41 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  it('repeated local inspection failures after stripped answers reach the persistent-failure bound', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: rejected }, OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    const localError = failure('network');
+    let inspections = 0;
+    const internals = fx.strategy as unknown as { compressionResponseStopReason(response: unknown): string | undefined };
+    const inspect = internals.compressionResponseStopReason;
+    internals.compressionResponseStopReason = () => { inspections++; throw localError; };
+    try {
+      for (let i = 0; i < 7; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      }
+      assert.equal(inspections, 7, 'each provider answer reached the failing local inspection');
+      assert.equal(mock.calls.length, 8, 'one carrier rejection, then seven stripped answers');
+      assert.ok(carriesThinking(mock.calls[0]!) && mock.calls.slice(1).every(request => !carriesThinking(request)));
+      assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
+        key: runKey(fx.target().messages, 'canonical', false), failures: 7,
+      }], 'local errors accumulate outside the stripped provider run that each answer ends');
+      fx.strategy.land(mock.membrane);
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(inspections, 8);
+      assert.equal(mock.calls.length, 9);
+      const status = fx.strategy.getCompressionQuarantineStatus();
+      assert.equal(status.count, 1, 'the eighth local failure decides the family, rather than restarting at one');
+      assert.equal(status.spans[0]!.latestOutcome, 'provider_error:persistent-network');
+    } finally {
+      internals.compressionResponseStopReason = inspect;
+      fx.manager.close();
+    }
+  });
+
   for (const shared of [failure('server', { httpStatus: 503 }), 'primitive failure']) {
     it(`concurrent stripped and unstripped failures keep attempt-local attribution (${typeof shared})`, async () => {
       const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
@@ -2615,7 +2650,7 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     });
   }
 
-  it("a carrier rejection reused from progress ends the run of the request that carried them", async () => {
+  it("a carrier rejection reused from progress preserves a later local-error run", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const withdrawn = new CompressionWithdrawn();
     const mock = scripted([{ throw: rejected }, { throw: failure('network') }, { throw: withdrawn }]);
@@ -2628,12 +2663,15 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     const ctx = managerContext(fx.manager);
     await assert.rejects(fx.strategy.run(fx.target(), ctx), /zz network failure/);
     assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the carrier request was rejected, and its stripped retry failed');
+    // This unstripped-key run can now represent local errors after an answer.
     seedRung(fx.strategy, fx.target(), 'canonical', false);
     // The stripped request is withdrawn, which records nothing and ends no run.
     await assert.rejects(fx.strategy.run(fx.target(), ctx), (error) => error === withdrawn);
     assert.equal(mock.calls.length, 3, 'premise: one more call');
     assert.ok(!carries(mock.calls[2]!), 'premise: the known-rejected carrier request was not sent again');
-    assert.deepEqual(l1RunsOf(fx.strategy), [], "the reused rejection ended the carrier request's run");
+    assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
+      key: runKey(fx.target().messages, 'canonical', false), failures: 7,
+    }], 'a reused rejection must preserve a run that could now belong to post-answer local errors');
     fx.manager.close();
   });
 

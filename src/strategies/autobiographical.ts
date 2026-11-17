@@ -12084,10 +12084,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
           }
-          // The rejection answers the request with its carriers, whose
-          // failures ran under the rung's own label: it ends that run, whether
-          // it came now or is reused from progress.
-          this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
+          // A fresh rejection ends the carrier request's failure run. A known
+          // rejection already ended it; reuse must not end a new run of local
+          // errors raised after the stripped provider answered.
+          if (!known) this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -12104,6 +12104,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           attemptStripped = true;
           try {
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
+            // Later local errors are not failures of this settled provider call.
+            attemptStripped = false;
           } catch (retryError) {
             noteFailedAttempt(acceptedRequest);
             noteDispatchedModel(retryError, acceptedRequest);
