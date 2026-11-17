@@ -498,6 +498,17 @@ Given:
    shards via the rendering algorithm in §3.6.1.
 ```
 
+The adaptive plan-check refusal names the solver in its message and exposes
+`solver`, `pickerExhausted`, and `labelCeilingFallback` diagnostics. The
+picker's normalized exhaustion flag uses `FoldingSolution.exhausted` when
+supplied, preserving solver-specific semantics (for example, kv-unified
+reports an infeasible frontier); otherwise it is derived as no production
+requests and applied tokens above the soft target. It does not generally
+mean nothing remains to fold, nor does it trigger this refusal.
+`labelCeilingFallback` reports a live kv-unified ceiling fallback, not a
+shadow solve's ceiling hit, and is false for other solvers. Refusals before
+the plan omit these fields.
+
 `moves` is the number of chunks whose resolution changed from the level
 they started the solve at. It replaced the op walk's `iterations` in
 `PlanVsActual` and the preview surfaces when the walk was retired (see §3.5

@@ -24,6 +24,8 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   useRealPicker = false;
   /** When set, the fixture solver asks for an L1 over the middle, as a plan with summaries still to produce does. */
   produce = false;
+  /** Optional explicit solver flag, including values contrary to the picker fallback. */
+  exhausted: boolean | undefined;
   /** Puts the unmerged L1s past maxSpeculativeL1s, so the cap holds L1 production while an L1 merge is queued. */
   atCap = false;
   /** Blocks every queued merge, as a hold on a message its sources cover does. */
@@ -368,6 +370,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     if (this.useRealPicker) return super.buildPicker(inputs);
     const level = this.level;
     const produce = this.produce;
+    const exhausted = this.exhausted;
     class DriftPicker extends Picker {
       run(inputs: PickerInputs, budget: FoldingBudget) {
         const result = super.run(inputs, budget);
@@ -384,6 +387,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return new Constructor({
       name: 'diagnostic-fixture',
       solve: (inputs) => ({
+        ...(exhausted === undefined ? {} : { exhausted }),
         frontier: new Map(inputs.chunks.map(chunk => [chunk.id, chunk.pinned || !chunk.l1Id ? 0 : level])),
         produced: produce && inputs.chunks.length > 0
           ? [{ level: 1, range: { firstChunkId: inputs.chunks[0].id, lastChunkId: inputs.chunks[inputs.chunks.length - 1].id } }]
@@ -551,9 +555,14 @@ describe('OverBudgetError diagnostics', () => {
   }
 
   // #496: the plan check tests the plan's size, not the solver's `exhausted`,
-  // so its refusal says which solver planned and what that solver reported.
-  for (const produce of [true, false]) {
-    it(`names the solver and its exhaustion in the refusal of a plan over the budget (${produce ? 'summaries still to produce' : 'nothing left to fold'})`, async () => {
+  // so its refusal names the solver and the normalized picker flag.
+  for (const { produce, exhausted } of [
+    { produce: true, exhausted: undefined },
+    { produce: false, exhausted: undefined },
+    { produce: true, exhausted: true },
+    { produce: false, exhausted: false },
+  ]) {
+    it(`names the solver and normalized exhaustion (produce=${produce}, reported=${exhausted})`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: true,
         targetChunkTokens: 40,
@@ -564,17 +573,19 @@ describe('OverBudgetError diagnostics', () => {
         speculativeProduction: false,
       });
       strategy.produce = produce;
+      strategy.exhausted = exhausted;
+      const expected = exhausted ?? !produce;
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const error = await refusal(manager);
         checkBudget(error);
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'diagnostic-fixture');
-        // A plan that asks for summaries isn't exhausted, and is refused all the same.
-        assert.equal(Reflect.get(error.diagnostics, 'solverExhausted'), !produce);
+        // Explicit solver values take precedence even when contrary to the fallback.
+        assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), expected);
         assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), false);
         assert.ok(
           error.message.startsWith(
-            `Adaptive plan check: diagnostic-fixture returned its plan (exhausted=${!produce}, label-ceiling fallback=false) but ${error.actual} tokens still exceed hard budget 100 (`,
+            `Adaptive plan check: diagnostic-fixture returned its plan (exhausted=${expected}, label-ceiling fallback=false) but ${error.actual} tokens still exceed hard budget 100 (`,
           ),
           error.message,
         );
@@ -583,35 +594,38 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  it('says a plan over the budget is kv-unified\u2019s label-ceiling fallback', async (t) => {
-    t.mock.method(console, 'warn', () => {});
-    const solves = t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
-      throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
-    });
-    const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
-      overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false,
-      kvUnified: {
-        policy: {
-          alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
-          cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
-          continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
-          continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+  for (const ceiling of [true, false]) {
+    it(`reports kv-unified live label-ceiling fallback=${ceiling}`, async (t) => {
+      t.mock.method(console, 'warn', () => {});
+      // Synthetic failure injection tests diagnostic plumbing, not ceiling reachability.
+      const solves = ceiling ? t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
+        throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
+      }) : undefined;
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false,
+        kvUnified: {
+          policy: {
+            alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+            cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+            continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+            continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+          },
+          tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+          treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
         },
-        tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
-        treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
-      },
+      });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const error = await refusal(manager);
+        if (ceiling) assert.ok(solves!.mock.callCount() > 0, 'premise: injected ceiling failure');
+        assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
+        assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), ceiling);
+        assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), true, 'kv-unified reports infeasibility explicitly');
+        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (exhausted=true, label-ceiling fallback=${ceiling}) but `));
+      });
     });
-    await withManager(strategy, async (manager) => {
-      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
-      const error = await refusal(manager);
-      assert.ok(solves.mock.callCount() > 0, 'premise: the solve passed the ceiling');
-      assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
-      assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), true);
-      assert.equal(typeof Reflect.get(error.diagnostics, 'solverExhausted'), 'boolean');
-      assert.match(error.message, /^Adaptive plan check: kv-unified returned its plan \(exhausted=(true|false), label-ceiling fallback=true\) but /);
-    });
-  });
+  }
 
   it('leaves the solver fields out of a refusal that comes before the plan', async () => {
     const strategy = new AutobiographicalStrategy({
@@ -626,7 +640,7 @@ describe('OverBudgetError diagnostics', () => {
       manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
       const error = await refusal(manager);
       assert.match(error.message, /^Head\/tail reservation exceeded budget but /);
-      for (const field of ['solver', 'solverExhausted', 'labelCeilingFallback']) {
+      for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
         assert.equal(Reflect.has(error.diagnostics, field), false, field);
       }
     });

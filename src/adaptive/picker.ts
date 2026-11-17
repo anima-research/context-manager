@@ -99,8 +99,14 @@ export interface OverBudgetDiagnostics {
    * `kv-stable`, …).
    */
   solver?: string;
-  /** With `solver`: whether that solver reported it had nothing left to fold. A plan can be over the budget without it. */
-  solverExhausted?: boolean;
+  /**
+   * With `solver`: the picker's normalized `exhausted` flag. Uses the solver's
+   * value when supplied (with solver-specific semantics); otherwise true iff
+   * no production was requested and the applied plan exceeds the soft target.
+   * This does not generally mean there is nothing left to fold, and is not
+   * the condition tested by the plan check.
+   */
+  pickerExhausted?: boolean;
   /**
    * With `solver`: whether the plan is the minimum-token cut kv-unified takes
    * when its search passes `labelCeiling` (#252), rather than the cut its

@@ -15857,7 +15857,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ` (exhausted=${result.exhausted}, label-ceiling fallback=${labelCeilingFallback})`,
         diagnostics: {
           solver,
-          solverExhausted: result.exhausted,
+          pickerExhausted: result.exhausted,
           labelCeilingFallback,
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
