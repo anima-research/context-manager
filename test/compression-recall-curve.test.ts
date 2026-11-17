@@ -4235,6 +4235,7 @@ describe('tool-prose hoist admission', () => {
         assert.ok(trace?.admission, `the ${kind} attempt has a decomposition`);
         const curve = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === label(kind))?.metadata;
         assert.deepEqual(curve?.admission, trace.admission, 'early and final snapshots agree');
+        assert.equal(curve?.outcome, trace.outcome, 'early and final outcomes agree');
         assert.equal(trace.admittedTokens, trace.admission.admittedTokens);
         assert.equal(trace.budgetTokens, trace.admission.budgetTokens);
         for (const log of logs.filter(log => log.event === 'compression:attempt')) {
@@ -4562,6 +4563,8 @@ describe('tool-prose hoist admission', () => {
         const logs = await capture(fx);
         const succeeded = logs.find(log => log.event === 'compression:curve-succeeded')?.metadata;
         const attempt = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('expansion'))?.metadata;
+        assert.equal(logs.find(log => log.event === 'compression:curve-attempt'
+          && log.metadata?.curveLabel === label('expansion'))?.metadata?.outcome, 'success');
         assert.ok(succeeded?.admission);
         assert.deepEqual(succeeded, attempt && (({ chunk_message_ids, chunk_hash, model, ...trace }) => trace)(attempt));
         assert.equal(succeeded.persisted, true);
@@ -4684,6 +4687,38 @@ describe('tool-prose hoist admission', () => {
       } finally { fx.manager.close(); }
     });
 
+    for (const rejectedLabel of ['canonical-no-tools', 'canonical-toolless']) {
+      it(`canonical rejection identifies the rejected ${rejectedLabel} retry, not an answered request`, async () => {
+        const answers: AttemptHandler[] = [{ raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } }];
+        if (rejectedLabel === 'canonical-toolless') answers.push({ raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } });
+        const mock = flexibleMembrane([...answers, { error: Object.assign(new Error('bad retry'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const rejected = logs.find(log => log.event === 'compression:canonical-rejected')?.metadata;
+          assert.equal(rejected?.curveLabel, rejectedLabel);
+          const request = mock.calls.at(-1)!.request;
+          assert.equal(rejected?.requestHash, createHash('sha256').update(JSON.stringify(request)).digest('hex'));
+          assert.equal(rejected?.messageCount, request.messages.length);
+          const estimator = fx.strategy as unknown as { estimateCompressionRequestTokens(request: NormalizedRequest): number };
+          assert.equal(rejected?.estimatedTokens, estimator.estimateCompressionRequestTokens(request));
+          const attempts = logs.filter(log => log.event === 'compression:attempt');
+          for (const label of ['canonical', ...(rejectedLabel === 'canonical-toolless' ? ['canonical-no-tools'] : [])]) {
+            const answered = attempts.find(log => log.metadata?.curveLabel === label)?.metadata;
+            assert.equal(answered?.stopReason, 'tool_use');
+            assert.notEqual(answered?.outcome, 'provider_error', 'an answered request is not a provider rejection');
+          }
+          const final = attempts.find(log => log.metadata?.curveLabel === rejectedLabel)?.metadata;
+          assert.ok(final);
+          const { chunk_message_ids, chunk_hash, model, ...trace } = final;
+          assert.deepEqual(rejected, trace, 'rejection metadata is the failed retry trace, including latency');
+          assert.equal(mock.calls.length, answers.length + 1);
+        } finally { fx.manager.close(); }
+      });
+    }
+
     it('canonical and source-only-final provider rejections emit attempt traces', async () => {
       const rejected = { error: Object.assign(new Error('bad request'), {
         type: 'invalid_request', httpStatus: 400, retryable: false,
@@ -4696,6 +4731,11 @@ describe('tool-prose hoist admission', () => {
           const traces = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === curveLabel);
           assert.equal(traces.length, 1);
           assert.equal(traces[0]!.metadata?.outcome, 'provider_error');
+          if (curveLabel === 'source-only-final') {
+            const curve = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === curveLabel);
+            assert.equal(curve?.metadata?.outcome, 'provider_error');
+            assert.equal(curve?.metadata?.requestHash, traces[0]!.metadata?.requestHash);
+          }
         }
       } finally { fx.manager.close(); }
     });
@@ -4711,14 +4751,19 @@ describe('tool-prose hoist admission', () => {
           prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
         };
         const prepare = seam.prepareCompressionCandidate;
+        let reached = false;
         seam.prepareCompressionCandidate = function (request, curveLabel) {
-          if (curveLabel === label(kind)) throw Object.assign(new Error('preparation rejected'), {
-            type: 'invalid_request', httpStatus: 400, retryable: false,
-          });
+          if (curveLabel === label(kind)) {
+            reached = true;
+            throw Object.assign(new Error('preparation rejected'), {
+              type: 'invalid_request', httpStatus: 400, retryable: false,
+            });
+          }
           return prepare.call(this, request, curveLabel);
         };
         try {
           const logs = await capture(fx);
+          assert.equal(reached, true, 'target preparation hook ran');
           assert.equal(mock.calls.length, kind === 'source-hoist' ? 2 : 1);
           assert.equal(logs.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
             && log.metadata?.curveLabel === label(kind)), false);
@@ -4741,14 +4786,11 @@ describe('tool-prose hoist admission', () => {
         const mock = flexibleMembrane(handlers);
         const membrane = mock.membrane as unknown as { complete: (request: NormalizedRequest) => Promise<unknown> };
         const complete = membrane.complete;
-        const callTimes: { start: number; end: number }[] = [];
+        let monotonicTime = 100;
         membrane.complete = async request => {
-          const timing = { start: performance.now(), end: 0 };
-          callTimes.push(timing);
           try {
-            await new Promise(resolve => setTimeout(resolve, 30));
             return await complete(request);
-          } finally { timing.end = performance.now(); }
+          } finally { monotonicTime += 37.25; }
         };
         const fx = await fixture(mock.membrane, options(kind, 1_000_000));
         if (kind !== 'expansion') hoistableChunk(fx);
@@ -4769,7 +4811,11 @@ describe('tool-prose hoist admission', () => {
           };
         }
         try {
-          const logs = await capture(fx);
+          const now = performance.now;
+          let logs: Awaited<ReturnType<typeof capture>>;
+          performance.now = () => monotonicTime;
+          try { logs = await capture(fx); }
+          finally { performance.now = now; }
           const curves = logs.filter(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === label(kind));
           assert.equal(curves.length, 1);
           const trace = curves[0]?.metadata;
@@ -4782,10 +4828,8 @@ describe('tool-prose hoist admission', () => {
             ...(kind === 'expansion' ? ['expandedParentId', 'expandedChildIds'] : []),
           ].sort());
           assert.equal(trace.errorType, 'invalid_request');
-          const attemptStart = callTimes.at(stripped ? -2 : -1)!.start;
-          const attemptEnd = callTimes.at(-1)!.end;
-          assert.ok(Number(trace.latencyMs) >= attemptEnd - attemptStart,
-            'includes the entire observed attempt, including the carrier-rejected call');
+          assert.equal(trace.latencyMs, stripped ? 74.5 : 37.25,
+            'exact monotonic elapsed time, including the carrier-rejected call');
           assert.equal(trace.persisted, false);
           assert.equal(trace.messageCount, mock.calls.at(-1)!.request.messages.length);
           assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));

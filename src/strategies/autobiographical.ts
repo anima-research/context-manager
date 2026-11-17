@@ -12312,9 +12312,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stripped: boolean = false,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
-          // Counted against the request actually dispatched (the stripped one
-          // after a carrier rejection is its own run); the outcome at the
-          // bound is the rung's.
+          // Unsettled stripped provider failures have their own run. Once
+          // the provider answers, later local failures use the unstripped
+          // rung key; the outcome at the bound is always the rung's.
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
@@ -12413,6 +12413,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * source-only-final, and exhausts if that fails.
        */
       let canonicalRejection: CompressionRefusalOutcomeRecord | undefined;
+      let canonicalRejectionTrace: CompressionAttemptTrace | undefined;
       /**
        * The canonical-stage rung (canonical, no-tools or tools-less) whose
        * end_turn answer the summary is extracted from, or whose answer is known
@@ -12444,6 +12445,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       } else if (canonicalStep.outcome.outcome === 'provider_error') {
         canonicalRejection = canonicalStep.outcome;
+        canonicalRejectionTrace = canonicalStep.trace;
       } else {
         canonicalStopReason = canonicalStep.outcome.stopReason;
         if (canonicalStep.outcome.outcome === 'unusable_empty') {
@@ -12497,6 +12499,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         } else if (retryStep.outcome.outcome === 'provider_error') {
           canonicalRejection = retryStep.outcome;
+          canonicalRejectionTrace = retryStep.trace;
         } else {
           retryStopReason = retryStep.outcome.stopReason;
           if (retryStep.outcome.outcome === 'unusable_empty') {
@@ -12538,6 +12541,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
           } else if (toolslessStep.outcome.outcome === 'provider_error') {
             canonicalRejection = toolslessStep.outcome;
+            canonicalRejectionTrace = toolslessStep.trace;
           } else if (toolslessStep.outcome.outcome === 'unusable_empty') {
             canonicalStopReason = 'end_turn';
             answeredRung = { curveLabel: 'canonical-toolless', requestHash: toolslessHash };
@@ -12566,7 +12570,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceOnlyFallbackRequestHash,
         );
         const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
-        if (canonicalTrace) canonicalTrace.outcome = canonicalOutcome;
+        if (canonicalTrace && !canonicalRejection) canonicalTrace.outcome = canonicalOutcome;
+        // A later canonical-stage retry may be rejected after canonical answered.
+        // Its trace identifies the dispatched bytes (possibly carrier-stripped);
+        // the durable rejection instead identifies the planned rung.
+        const canonicalMetadata = canonicalRejection
+          ? canonicalRejectionTrace ?? canonicalRejection
+          : canonicalTrace ?? familyRecord.find((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel));
         successfulTrace = undefined;
         logCompressionCall({
           event: canonicalRejection
@@ -12575,7 +12585,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? 'compression:canonical-refused'
               : 'compression:canonical-incomplete',
           operation: 'compress_l1',
-          metadata: canonicalTrace ?? familyRecord.find((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel)),
+          metadata: canonicalMetadata,
         }, this.ns);
         let fallbackResponse: NormalizedResponse | undefined;
 
@@ -12785,12 +12795,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns, 'compression admission diagnostic failed:');
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
+          const assessment = this.assessFallbackCompressionResponse(variantResponse);
+          trace.outcome = assessment.outcome === 'valid' ? 'success' : assessment.outcome;
+          if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
           logCompressionCall({
             event: 'compression:curve-attempt',
             operation: 'compress_l1',
             metadata: trace,
           }, this.ns);
-          const assessment = this.assessFallbackCompressionResponse(variantResponse);
           if (assessment.outcome === 'refusal') {
             trace.outcome = 'refusal';
             const outcome: CompressionRefusalOutcomeRecord = {
@@ -12844,6 +12856,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ));
           if (result.kind === 'decided') {
             sourceOnlyOutcome = result.outcome.outcome;
+            if (result.trace) logCompressionCall({
+              event: 'compression:curve-attempt', operation: 'compress_l1', metadata: result.trace,
+            }, this.ns);
           } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(result.response);
