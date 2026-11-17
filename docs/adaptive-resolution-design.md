@@ -504,10 +504,16 @@ picker's normalized exhaustion flag uses `FoldingSolution.exhausted` when
 supplied, preserving solver-specific semantics (for example, kv-unified
 reports an infeasible frontier); otherwise it is derived as no production
 requests and applied tokens above the soft target. It does not generally
-mean nothing remains to fold, nor does it trigger this refusal.
+mean nothing remains to fold, nor does it trigger this refusal. The message
+labels it `solver-reported/picker-derived exhausted` to make that scope explicit.
 `labelCeilingFallback` reports a live kv-unified ceiling fallback, not a
 shadow solve's ceiling hit, and is false for other solvers. Refusals before
-the plan omit these fields.
+the plan omit these fields. With the real solver, an infeasible minimum
+frontier returns before search; a search that hits the ceiling falls back
+to an already-feasible minimum cut. Thus a live ceiling fallback is not a
+reason for this plan-check refusal; a synthetic pre-feasibility exception
+can exercise forwarding the fallback flag on refusal, but does not show
+that combination is reachable in a real solve.
 
 `moves` is the number of chunks whose resolution changed from the level
 they started the solve at. It replaced the op walk's `iterations` in

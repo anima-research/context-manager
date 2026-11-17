@@ -585,7 +585,7 @@ describe('OverBudgetError diagnostics', () => {
         assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), false);
         assert.ok(
           error.message.startsWith(
-            `Adaptive plan check: diagnostic-fixture returned its plan (exhausted=${expected}, label-ceiling fallback=false) but ${error.actual} tokens still exceed hard budget 100 (`,
+            `Adaptive plan check: diagnostic-fixture returned its plan (solver-reported/picker-derived exhausted=${expected}, label-ceiling fallback=false) but ${error.actual} tokens still exceed hard budget 100 (`,
           ),
           error.message,
         );
@@ -595,9 +595,12 @@ describe('OverBudgetError diagnostics', () => {
   }
 
   for (const ceiling of [true, false]) {
-    it(`reports kv-unified live label-ceiling fallback=${ceiling}`, async (t) => {
+    it(`reports kv-unified label-ceiling fallback=${ceiling} (${ceiling ? 'synthetic failure injection' : 'real infeasible frontier'})`, async (t) => {
       t.mock.method(console, 'warn', () => {});
       // Synthetic failure injection tests diagnostic plumbing, not ceiling reachability.
+      // It throws before the real solver checks minimum-frontier feasibility.
+      // Unmocked, this fixture returns infeasible before searching (ceiling=false);
+      // it cannot demonstrate a real ceiling-fallback refusal.
       const solves = ceiling ? t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
         throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
       }) : undefined;
@@ -622,7 +625,7 @@ describe('OverBudgetError diagnostics', () => {
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
         assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), ceiling);
         assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), true, 'kv-unified reports infeasibility explicitly');
-        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (exhausted=true, label-ceiling fallback=${ceiling}) but `));
+        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=true, label-ceiling fallback=${ceiling}) but `));
       });
     });
   }
