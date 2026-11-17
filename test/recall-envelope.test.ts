@@ -316,7 +316,13 @@ describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
       );
       assert.ok(ladders.length > 0, `${mode}: fixture must mint at least one request carrying a recall ladder`);
       const request = ladders[ladders.length - 1];
-      const surgery = transformZeroRecallCompression(request as never, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening());
+      const answers = request.filter((_, i) => i > 0 && /^\[CM\] Recall memory /.test(textOf(request[i - 1])));
+      assert.ok(answers.length > 0);
+      for (const answer of answers) {
+        if (mode === 'xml') assert.match(textOf(answer), /<cm-recall id=.*<\/cm-recall>/s);
+        else if (mode === 'none') assert.doesNotMatch(textOf(answer), /<cm-recall/);
+      }
+      const surgery = transformZeroRecallCompression(request as never, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening(), rendered.expectedRecallAnswers![rendered.compressionRequests.indexOf(request)]);
       results.push({
         mode,
         removed: surgery.removedRecallIds,

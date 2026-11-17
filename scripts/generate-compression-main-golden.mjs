@@ -26,10 +26,13 @@ function sourceFilesChanged() {
     try {
       const full = resolve(root, path);
       const bytes = lstatSync(full).isSymbolicLink() ? readlinkSync(full, { encoding: 'buffer' }) : readFileSync(full);
-      const hash = execFileSync('git', ['hash-object', '--stdin', '--no-filters'],
+      const hash = execFileSync('git', ['-C', root, 'hash-object', '--stdin', '--no-filters'],
         { input: bytes, encoding: 'utf8', env: gitEnv, timeout: 10000 }).trim();
       return hash !== git('rev-parse', 'HEAD:' + path);
-    } catch { throw new Error(`Unable to inspect source path ${JSON.stringify(path)}`); }
+    } catch (error) {
+      if (error.code === 'ENOENT') return true;
+      throw new Error(`Unable to inspect source path ${JSON.stringify(path)}`);
+    }
   });
 }
 function untrackedSource() {
@@ -38,7 +41,9 @@ function untrackedSource() {
   return [...new Set(paths)].filter(path => path !== 'test/compression-instructions-harness.ts');
 }
 // Permit only the legacy harness port among non-ignored untracked files.
-const changedPaths = [...sourceFilesChanged(), ...untrackedSource()];
+const statusPaths = [...git('diff', '--name-only', '-z', 'HEAD').split('\0'),
+  ...git('diff', '--cached', '--name-only', '-z', 'HEAD').split('\0')].filter(Boolean);
+const changedPaths = [...new Set([...sourceFilesChanged(), ...untrackedSource(), ...statusPaths])];
 if (git('status', '--porcelain', '--untracked-files=no') || changedPaths.length) {
   throw new Error(`Refusing dirty source worktree; restore/remove unintended files, clear index flags, or commit intentional changes. Paths: ${JSON.stringify(changedPaths.slice(0, 10)).slice(0, 2000)}`);
 }

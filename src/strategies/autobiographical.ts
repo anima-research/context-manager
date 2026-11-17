@@ -1,3 +1,4 @@
+import { recallHeaderId } from '../recall-header.js';
 import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
@@ -551,15 +552,6 @@ export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
  *  For a body the head and the recent window share, that's a recent message. */
 function lastSourceOf(entry: ContextEntry): MessageId | undefined {
   return entry.sourceMessageIds?.at(-1) ?? entry.sourceMessageId;
-}
-
-/** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
- *  any other message. A recall pair is such a header and the answer after it. */
-function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
-  if (message.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
-  const block = message.content[0];
-  if (block?.type !== 'text') return undefined;
-  return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
 }
 
 /**
@@ -2564,18 +2556,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   constructor(config: AutobiographicalOptions = {}) {
     // Retain TypeError for malformed caller settings before structuredClone runs.
-    if (Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions')) {
-      let settings: unknown;
-      try { settings = config.compressionInstructions; }
-      catch { throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings'); }
-      validateCompressionInstructions(settings);
-      // Read this newly supported outer accessor once, before the schema-agnostic
-      // resolver enumerates caller options (twice for provenance/defaults).
-      config = Object.defineProperties({}, {
-        ...Object.getOwnPropertyDescriptors(config),
-        compressionInstructions: { value: settings, enumerable: true, writable: true, configurable: true },
-      });
+    let instructionSettings: unknown;
+    try {
+      if (Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions')) {
+        const original = config;
+        const settings = instructionSettings = original.compressionInstructions;
+        const descriptors = Object.getOwnPropertyDescriptors(original);
+        // Preserve accessor receivers, including access to inherited settings.
+        for (const descriptor of Object.values(descriptors)) {
+          if (descriptor.get) descriptor.get = descriptor.get.bind(original);
+          if (descriptor.set) descriptor.set = descriptor.set.bind(original);
+        }
+        descriptors.compressionInstructions = { value: settings, enumerable: true, writable: true, configurable: true };
+        config = Object.defineProperties({}, descriptors);
+      }
+    } catch {
+      throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
     }
+    validateCompressionInstructions(instructionSettings);
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
       { source: 'caller', values: config as Record<string, unknown> },

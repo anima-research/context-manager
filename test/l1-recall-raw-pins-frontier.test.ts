@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { cpSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NativeFormatter } from '@animalabs/membrane';
+import { NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import { RECALL_RESUME_TEXT } from '../src/strategies/autobiographical.js';
 import { transformZeroRecallCompression } from '../src/surgery/zero-recall-compression.js';
@@ -537,10 +537,10 @@ describe('a recall answer stays apart from the agent\'s own turn after it', () =
   });
 
   it('and the zero-recall surgery, taking the recall pairs out, keeps that turn and the Context Manager\'s turn before it', async () => {
-    const { cm, ids, textOf, requests } = await agentFirstChunk('agent-first-surgery');
+    const { cm, internals, ids, textOf, requests } = await agentFirstChunk('agent-first-surgery');
     const request = await nextL1(cm, requests);
     assert.ok(request, 'the L1 request was sent');
-    const { messages, removedRecallIds } = transformZeroRecallCompression(request.messages, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening());
+    const { messages, removedRecallIds } = transformZeroRecallCompression(request.messages, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening(), internals.summaries.map(s => ({ id: s.id, answer: { participant: 'Claude', content: internals.summaryAnswerContent(s) as ContentBlock[] } })));
     assert.ok(removedRecallIds.length > 0, 'setup: the request recalls memories');
     assert.ok(!messages.some((m) => headerId(m) !== undefined), 'every recall pair is taken out');
     const raw = messages.findIndex((m) => m.content.some((b: any) => b.text === textOf.get(ids[212])));

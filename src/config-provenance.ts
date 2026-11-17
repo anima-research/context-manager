@@ -74,8 +74,8 @@ export function resolveEffectiveConfig(
   for (const layer of layers) {
     for (const [key, value] of Object.entries(layer.values)) {
       if (semantics === 'skip-nullish' && (value === undefined || value === null)) continue;
-      effective[key] = value;
-      provenance[key] = layer.source;
+      Object.defineProperty(effective, key, { value, enumerable: true, writable: true, configurable: true });
+      Object.defineProperty(provenance, key, { value: layer.source, enumerable: true, writable: true, configurable: true });
     }
   }
   return { effective, provenance };

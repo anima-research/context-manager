@@ -22,7 +22,7 @@ export function readCompressionGolden(path: string) {
     installedDependencyLockSha256?: string; scenarioModuleSha256?: string;
     mainHarnessSha256: string; requests: Record<string, NormalizedRequest[]>;
   };
-  assert.match(golden.source, /^[a-f0-9]{40}$/);
+  assert.match(golden.source, /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
   assert.match(golden.node, /^v\d+\.\d+\.\d+$/);
   assert.match(golden.compiler, /^\d+\.\d+\.\d+$/);
   // Preserve the original capture's provenance; do not relabel its old hashes.
@@ -30,7 +30,7 @@ export function readCompressionGolden(path: string) {
     ? [golden.dependencyLockSha256, golden.harnessSha256]
     : [golden.sourceDependencyLockSha256, golden.compiledHarnessSha256,
       golden.installedDependencyLockSha256, golden.scenarioModuleSha256];
-  if (golden.sourceTree !== undefined) assert.match(golden.sourceTree, /^[a-f0-9]{40}$/);
+  if (golden.sourceTree !== undefined) assert.match(golden.sourceTree, /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
   for (const hash of [...hashes, golden.mainHarnessSha256]) assert.match(hash!, /^[a-f0-9]{64}$/);
   assert.deepEqual(Object.keys(golden.requests), mainScenarios.map(scenarioKey));
   return golden;

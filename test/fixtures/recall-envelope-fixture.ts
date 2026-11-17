@@ -51,6 +51,7 @@ export interface FixtureRender {
    * Empty for fixtures that seed summaries instead of minting them.
    */
   compressionRequests: RenderedMessage[][];
+  expectedRecallAnswers?: { id: string; answer: RenderedMessage }[][];
   /** The strategy's calibration estimate of the compiled request, where the
    *  fixture reads it (renderAdaptiveFixture). */
   estimate?: number;
@@ -249,7 +250,11 @@ export async function renderAdaptiveFixture(
   inspect?: (manager: ContextManager) => void | Promise<void>,
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
-    const strategy = new AutobiographicalStrategy({
+    const strategy = new (class extends AutobiographicalStrategy {
+      expectedAnswers() { return this.summaries.map(s => ({ id: s.id, answer: {
+        participant: this.config.summaryParticipant ?? 'Claude', content: this.summaryAnswerContent(s),
+      } })); }
+    })({
       compressionModel: 'zz-mock-model',
       targetChunkTokens: 100,
       recentWindowTokens: 200,
@@ -259,7 +264,11 @@ export async function renderAdaptiveFixture(
       adaptiveResolution: true,
       ...options,
     });
-    const mock = makeMockMembrane(responseContentForCall);
+    const expectedRecallAnswers: { id: string; answer: RenderedMessage }[][] = [];
+    const mock = makeMockMembrane(count => {
+      expectedRecallAnswers.push(strategy.expectedAnswers());
+      return responseContentForCall(count);
+    });
     const manager = await ContextManager.open({
       path,
       strategy,
@@ -277,6 +286,6 @@ export async function renderAdaptiveFixture(
     const estimate = (strategy as unknown as { _lastCompileEstimate: number })._lastCompileEstimate;
     await inspect?.(manager);
     manager.close();
-    return { messages: project(compiled.messages), summaries, compressionRequests: mock.requests, estimate };
+    return { messages: project(compiled.messages), summaries, compressionRequests: mock.requests, expectedRecallAnswers, estimate };
   });
 }

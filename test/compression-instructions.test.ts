@@ -557,3 +557,26 @@ it('KnowledgeStrategy phase-specific overrides retain their wording with custom 
     assert.ok(texts(configured!).includes('CUSTOM OPEN'));
   }
 });
+
+it('option accessors retain their original receiver and inherited state', () => {
+  const options = Object.create({ limit: 1234 });
+  Object.defineProperties(options, {
+    recentWindowTokens: { enumerable: true, get() { assert.equal(this, options); return this.limit; } },
+    compressionInstructions: { enumerable: true, value: {} },
+  });
+  class Inspect extends Probe { window() { return this.config.recentWindowTokens; } }
+  assert.equal(new Inspect(options).window(), 1234);
+});
+
+it('JSON __proto__ cannot inject inherited compression settings', () => {
+  const options = JSON.parse('{"__proto__":{"compressionInstructions":{"templates":{"chunk":"Injected"}}}}');
+  class Inspect extends Probe { settings() { return this.config.compressionInstructions; } }
+  assert.equal(new Inspect(options).settings(), undefined);
+});
+
+it('outer option descriptor traps are sanitized before inspecting settings', () => {
+  const options = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('SECRET'); } });
+  assert.throws(() => new Probe(options), {
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings',
+  });
+});

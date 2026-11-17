@@ -11,7 +11,7 @@ import { readCompressionGolden } from './compression-golden-reader.js';
 const generator = resolve('scripts/generate-compression-main-golden.mjs');
 // Tiny synthetic module isolates provenance/serialization checks from strategy
 // runtime. Real modern + legacy request parity is checked separately.
-function fixture(check: (root: string, git: (...args: string[]) => string) => void) {
+function fixture(check: (root: string, git: (...args: string[]) => string) => void, objectFormat?: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cm-golden-source-')));
   const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
@@ -20,7 +20,7 @@ function fixture(check: (root: string, git: (...args: string[]) => string) => vo
     mkdirSync(join(root, 'src'));
     mkdirSync(join(root, 'test'));
     mkdirSync(join(root, 'dist/test'), { recursive: true });
-    symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
+    symlinkSync(resolve('node_modules'), join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
     writeFileSync(join(root, '.gitignore'), 'node_modules\ndist/\n');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     writeFileSync(join(root, 'package-lock.json'), '{}');
@@ -32,7 +32,7 @@ function fixture(check: (root: string, git: (...args: string[]) => string) => vo
       'export class Probe {}\nexport class KnowledgeProbe {}\nexport async function run() { return [{tools: undefined, system: "synthetic"}]; }\n');
     writeFileSync(join(root, 'dist/test/compression-instructions-harness.js'),
       'export class Probe {}\nexport class KnowledgeProbe {}\nexport async function run() { return [{tools: undefined, system: "synthetic"}]; }\n');
-    git('init', '-q');
+    git('init', '-q', ...(objectFormat ? ['--object-format=' + objectFormat] : []));
     git('add', '.');
     git('-c', 'user.name=Synthetic Fixture', '-c', 'user.email=fixture@example.invalid',
       '-c', 'commit.gpgsign=false', 'commit', '-qm', 'synthetic source');
@@ -170,7 +170,7 @@ it('generator rejects untracked helpers and hidden root-level changes', () => {
   });
 });
 
-it('generator hashes raw bytes, symlink text and NUL-delimited filenames', () => {
+it('generator hashes raw bytes, symlink text and NUL-delimited filenames', { skip: process.platform === 'win32' }, () => {
   fixture((root, git) => {
     const odd = 'src/café\tline\n.txt';
     writeFileSync(join(root, odd), 'original\n');
@@ -216,7 +216,7 @@ it('generator reports compiler diagnostics and source inspection errors distinct
     assert.match(result.stdout + result.stderr, /src\/product\.ts.*error TS2322/);
     git('update-index', '--assume-unchanged', 'src/product.ts');
     rmSync(join(root, 'src/product.ts'));
-    assert.match(capture(root).stderr, /Unable to inspect source path.*src\/product\.ts/);
+    assert.match(capture(root).stderr, /Refusing dirty source worktree.*src\/product\.ts/);
   });
 });
 
@@ -238,5 +238,48 @@ it('generator rebuilds producer scenarios rather than importing stale producer d
     assert.equal(Object.keys(golden.requests).length, 93);
     assert.notEqual(golden.scenarioModuleSha256, createHash('sha256')
       .update(readFileSync(join(root, 'dist/test/compression-main-scenarios.js'))).digest('hex'));
+  });
+});
+
+it('generator names staged-only changes and executable-bit changes in dirty refusals', () => {
+  fixture((root, git) => {
+    writeFileSync(join(root, 'src/product.ts'), 'staged change');
+    git('add', 'src/product.ts');
+    writeFileSync(join(root, 'src/product.ts'), 'export const value = 1;\n');
+    assert.match(capture(root).stderr, /Refusing dirty source worktree.*src\/product\.ts/);
+    git('reset', '--hard', 'HEAD');
+    git('update-index', '--chmod=+x', 'src/product.ts');
+    assert.match(capture(root).stderr, /Refusing dirty source worktree.*src\/product\.ts/);
+  });
+});
+
+it('generator and reader support SHA-256 source IDs from a different caller repository', () => {
+  fixture((root) => {
+    const result = capture(root);
+    assert.equal(result.status, 0, result.stderr);
+    const golden = readCompressionGolden(join(root, 'dist/capture.json'));
+    assert.equal(golden.source.length, 64);
+    assert.equal(golden.sourceTree!.length, 64);
+  }, 'sha256');
+});
+
+it('generator rebuilds separate producer scenarios, ignoring stale producer dist', () => {
+  fixture((producer, git) => {
+    mkdirSync(join(producer, 'scripts'));
+    writeFileSync(join(producer, 'scripts/generate-compression-main-golden.mjs'), readFileSync(generator));
+    writeFileSync(join(producer, 'test/compression-main-scenarios.ts'), readFileSync('test/compression-main-scenarios.ts'));
+    const harness = join(producer, 'test/compression-instructions-harness.ts');
+    writeFileSync(harness, 'export type Mode = string;\n' + readFileSync(harness, 'utf8'));
+    git('add', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'separate producer');
+    writeFileSync(join(producer, 'dist/test/compression-main-scenarios.js'), 'throw new Error("STALE SEPARATE PRODUCER");');
+    fixture(source => {
+      const result = spawnSync(process.execPath, [join(producer, 'scripts/generate-compression-main-golden.mjs'),
+        source, join(source, 'dist/capture.json')], { encoding: 'utf8', timeout: 360000 });
+      assert.equal(result.status, 0, result.stderr);
+      const golden = readCompressionGolden(join(source, 'dist/capture.json'));
+      assert.equal(Object.keys(golden.requests).length, 93);
+    });
   });
 });

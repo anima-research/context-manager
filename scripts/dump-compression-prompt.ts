@@ -62,23 +62,9 @@ function formatDocChunkInstruction(
   doc: { title: string; style: string; originalTokens: number },
   targetTokens: number,
 ): string {
-  return (
-    `You just read a slice of document "${doc.title}" (${doc.style}, approximately ` +
-    `${doc.originalTokens} tokens total in the full document). Earlier slices ` +
-    'of this same document are in your memory above as L1s — they are in ' +
-    'chronological order within the document. What comes after this slice ' +
-    'you have NOT yet read; treat yourself as reading the document in ' +
-    'order, not yet knowing what lies ahead.\n\n' +
-    'Write the memory of what this slice contained. Preserve concrete ' +
-    'detail aggressively:\n' +
-    '- Timestamps, dates, IDs, numeric values, quoted phrases\n' +
-    '- Key events, decisions, contradictions with earlier slices\n' +
-    '- Structural markers (section titles, entry boundaries) that help ' +
-    'you locate this slice within the whole later\n\n' +
-    `Speak in the first person. Target ~${targetTokens} tokens. Output ` +
-    'only the memory body — no preamble, no meta-commentary about ' +
-    'summarizing.'
-  );
+  return new (class extends AutobiographicalStrategy {
+    reading() { return this.getReadingChunkInstruction({} as never, doc.originalTokens, targetTokens); }
+  })().reading();
 }
 
 interface PromptMessage {
