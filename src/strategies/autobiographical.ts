@@ -14257,9 +14257,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sources,
               mergeReadingContext.totalTokens,
               targetTokens,
-              sourceLevelShown,
             )
-          : this.getMergeInstruction(targetLevel, sources, targetTokens, sourceLevelShown),
+          : this.getMergeInstruction(targetLevel, sources, targetTokens),
       // Only a merge whose every source is witnessed takes the witnessed
       // reminder. A mixed merge takes the live instruction and reminder, and
       // its request shows inherited and lived material together, with no
@@ -19388,16 +19387,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
     targetTokens: number,
-    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
     // Witnessed pin propagation: consolidating all-witnessed sources must keep
     // the witnessed voice, or the merge re-first-persons inherited lives.
     if (sources.length > 0 && sources.every((s) => s.witnessed)) {
-      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
+      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
         ?? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
     }
-    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
       ?? formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
   }
 
@@ -19429,10 +19427,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sources: SummaryEntry[],
     totalTokens: number,
     targetTokens: number,
-    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
-    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, totalTokens, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, totalTokens, targetTokens })
       ?? formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 

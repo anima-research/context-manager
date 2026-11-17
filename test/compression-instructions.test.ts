@@ -328,12 +328,12 @@ it('validates cloneable invalid text returned only at clone time', () => {
   assert.equal(reads, 3);
 });
 
-it('ordinary, witnessed and reading merge templates honor an explicit distinct shown level', () => {
+it('ordinary, witnessed and reading merge templates infer the declared shown level', () => {
   class Expose extends Probe {
     check(witnessed: boolean) {
-      const sources = [{ level: 2, witnessed }] as SummaryEntry[];
-      assert.equal(this.getMergeInstruction(3, sources, 100, 7), `CUSTOM ${witnessed ? 'W' : ''}MERGE 7 3 100`);
-      assert.equal(this.getReadingMergeInstruction(3, sources, 500, 100, 7), 'CUSTOM RMERGE 7 3 500 100');
+      const sources = [{ level: 2, sourceLevel: 0, witnessed }] as SummaryEntry[];
+      assert.equal(this.getMergeInstruction(3, sources, 100), `CUSTOM ${witnessed ? 'W' : ''}MERGE 0 3 100`);
+      assert.equal(this.getReadingMergeInstruction(3, sources, 500, 100), 'CUSTOM RMERGE 0 3 500 100');
     }
   }
   const probe = new Expose({ compressionInstructions: custom });
@@ -359,5 +359,52 @@ it('L4 merges of legacy L3 sources that skip a level show their L1 children', as
     const calls = await run(mode, 'own', custom, {}, Probe, 4);
     assert.match(instruction(calls[0]!), mode === 'merge' ? /^CUSTOM MERGE 1 4 / : /^CUSTOM RMERGE 1 4 /);
     assert.ok(texts(calls[0]!).some(text => text === '[CM] Recall memory L1-100.'));
+  }
+});
+
+for (const mode of ['merge', 'readingMerge'] as const) {
+  it(`${mode}: legacy optional numeric modes keep their defaults and call arities`, async () => {
+    class Legacy extends Probe {
+      protected override getMergeInstruction(
+        level: SummaryLevel, sources: SummaryEntry[], tokens: number, mode = 7,
+      ) {
+        assert.equal(arguments.length, 3);
+        return `LEGACY MERGE ${mode}`;
+      }
+      protected override getReadingMergeInstruction(
+        level: SummaryLevel, sources: SummaryEntry[], total: number, tokens: number, mode = 7,
+      ) {
+        assert.equal(arguments.length, 4);
+        return `LEGACY READING ${mode}`;
+      }
+    }
+    for (const config of [undefined, {}, { preset: 'default' }, custom] as (CompressionInstructions | undefined)[]) {
+      const calls = await run(mode, 'own', config, {}, Legacy);
+      assert.equal(instruction(calls[0]!), `LEGACY ${mode === 'merge' ? 'MERGE' : 'READING'} 7`);
+    }
+  });
+}
+
+it('legacy optional boolean modes remain type-compatible and delegate with the old call shape', async () => {
+  class Legacy extends Probe {
+    protected override getMergeInstruction(
+      level: SummaryLevel, sources: SummaryEntry[], tokens: number, mode = true,
+    ) {
+      assert.equal(mode, true);
+      assert.equal(arguments.length, 3);
+      return super.getMergeInstruction(level, sources, tokens);
+    }
+    protected override getReadingMergeInstruction(
+      level: SummaryLevel, sources: SummaryEntry[], total: number, tokens: number, mode = true,
+    ) {
+      assert.equal(mode, true);
+      assert.equal(arguments.length, 4);
+      return super.getReadingMergeInstruction(level, sources, total, tokens);
+    }
+  }
+  for (const mode of ['merge', 'readingMerge'] as const) {
+    for (const config of [undefined, {}, { preset: 'default' }, custom] as (CompressionInstructions | undefined)[]) {
+      assert.deepEqual(await run(mode, 'own', config, {}, Legacy), await run(mode, 'own', config));
+    }
   }
 });
