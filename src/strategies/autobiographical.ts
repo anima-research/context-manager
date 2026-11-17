@@ -135,22 +135,29 @@ function isCalibrationReset(v: unknown): v is CalibrationReset {
  * Every entry names the namespace whose compression it describes, since one
  * process's strategies share the log (#239).
  */
-function withCompressionLog(work: (logPath: string) => void, namespace: string, failure = 'compression log write failed:'): void {
+function withCompressionLog(work: (logPath: string) => void, namespace: string, failure: string | (() => string) = 'compression log write failed:'): void {
   const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
   if (!logPath) return;
   try {
     work(logPath);
   } catch (err) {
-    try { namespaceDiagnostics(() => namespace).warn(failure, err); } catch { /* Diagnostics remain nonfatal. */ }
+    try { namespaceDiagnostics(() => namespace).warn(typeof failure === 'function' ? failure() : failure, err); } catch { /* Diagnostics remain nonfatal. */ }
   }
 }
 
-function logCompressionCall(entry: Record<string, unknown>, namespace: string): void {
+function logCompressionCall(entry: Record<string, unknown>, namespace: string, chunkHash?: string): void {
+  let line: string | undefined;
+  let context = '';
+  withCompressionLog(() => {
+    const metadata = entry.metadata as Record<string, unknown> | undefined;
+    context = ` event=${entry.event ?? 'compression-call'} rung=${metadata?.curveLabel ?? 'n/a'} chunk=${chunkHash ?? metadata?.chunk_hash ?? 'n/a'}`;
+    line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
+  }, namespace, () => 'compression log serialization failed:' + context);
+  if (line === undefined) return;
   withCompressionLog((logPath) => {
     mkdirSync(dirname(logPath), { recursive: true });
-    const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
-    appendFileSync(logPath, line);
-  }, namespace);
+    appendFileSync(logPath, line!);
+  }, namespace, 'compression log write failed:' + context);
 }
 
 /**
@@ -12377,7 +12384,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ...failedAttempt!.plannedTrace!, latencyMs: failedAttempt!.latencyMs,
               requestIdentity: 'planned-fallback', persisted: false, outcome: 'provider_error', errorType, ...annotation };
             attemptTraces.push(trace);
-          }, this.ns, `compression planned-attempt diagnostic failed: rung=${failedAttempt.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+          }, this.ns, `compression planned-fallback diagnostic failed: rung=${failedAttempt.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           return trace;
         } finally {
           failedAttempt = undefined;
@@ -12713,7 +12720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens: admission.admittedTokens,
               budgetTokens: admission.budgetTokens,
             });
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
             return;
           }
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
@@ -12727,7 +12734,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
                 trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
               }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
-              logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+              logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
             }
             return;
           }
@@ -12753,7 +12760,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             };
             noteOutcome(outcome);
           }
-          logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+          logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
         };
 
         // ---- tool-prose hoist rung (compressionToolProseFallback) ----
@@ -12830,7 +12837,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             });
             logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-            }, this.ns);
+            }, this.ns, quarantineRecord.chunkSourceHash);
             continue;
           }
           const result = await ladderStep(curveLabel, variant.requestHash, () => runAttempt(
@@ -12852,7 +12859,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
               logCompressionCall({
                 event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-              }, this.ns);
+              }, this.ns, quarantineRecord.chunkSourceHash);
             }
             continue;
           }
@@ -12872,7 +12879,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt',
             operation: 'compress_l1',
             metadata: trace,
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           if (assessment.outcome === 'refusal') {
             trace.outcome = 'refusal';
             const outcome: CompressionRefusalOutcomeRecord = {
@@ -12927,7 +12934,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             sourceOnlyOutcome = result.outcome.outcome;
             if (result.trace) logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: result.trace,
-            }, this.ns);
+            }, this.ns, quarantineRecord.chunkSourceHash);
           } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(result.response);
@@ -12948,7 +12955,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               };
               noteOutcome(outcome);
             }
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
           }
         }
 

@@ -4769,7 +4769,7 @@ describe('tool-prose hoist admission', () => {
                 }
                 else if (mode === 'write') {
                   assert.ok(diagnostics > 0);
-                  assert.ok(warnings.some(w => w.includes('compression log write failed:')));
+                  assert.ok(warnings.some(w => w.includes(`compression log write failed: event=compression:curve-attempt rung=${label(kind)} chunk=`)));
                   assert.equal(warnings.some(w => w.includes('compression admission diagnostic failed:')), false);
                 } else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
               } finally { console.warn = warn; a.manager.close(); b.manager.close(); }
@@ -5033,6 +5033,35 @@ describe('tool-prose hoist admission', () => {
         assert.equal(trace?.admission?.expansionDeltaTokens, delta);
         assert.equal(trace?.admission?.boundedInputTokens, 50_000 + delta);
       } finally { fx.manager.close(); }
+    });
+
+    it('reports entry serialization separately with the curve rung and chunk', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      const warnings: string[] = [];
+      const path = `${freshPath()}-serialization.jsonl`;
+      paths.push(path);
+      const seam = fx.strategy as unknown as { compressionAdmissionTrace: () => unknown };
+      seam.compressionAdmissionTrace = () => ({ toJSON() { throw new Error('entry serialization failed'); } });
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = path;
+      console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        assert.equal(fx.target.compressed, true);
+        assert.equal(mock.calls.length, 2);
+        assert.ok(warnings.some(w => /compression log serialization failed: event=compression:curve-attempt rung=tool-prose-hoist chunk=[a-f0-9]+/.test(w)));
+        assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
+        assert.ok(readFileSync(path, 'utf8').trim().split('\n').every(line => JSON.parse(line)),
+          'failed serialization appends no partial entry');
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
     });
 
     it('an unwritable opt-in log remains nonfatal for an admitted hoist', async () => {

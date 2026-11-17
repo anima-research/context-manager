@@ -290,7 +290,13 @@ Here “provider-rejected” means a classified rejection from `membrane.complet
 not proof of adapter dispatch: host pre-request hooks run inside that boundary
 and can reject locally. Request hashes describe the final request handed to
 Membrane (including carrier-stripped retries), not verified wire bytes.
-Failed-request diagnostics are best-effort. If a final request cannot be
+Failed-request diagnostics are best-effort and inspect the live request after
+rejection, not an invocation-time snapshot. A host-installed serializer with
+side effects can therefore mutate shared request data during diagnostics;
+logging is not isolated from such hooks. Invocation-time snapshotting is deferred
+because it changes these traces from post-hook request identities to planned
+identities and needs explicit handling for carrier-stripped retries.
+If a final request cannot be
 serialized, diagnostics use scalar plan diagnostics captured before dispatch, explicitly
 marked `requestIdentity: planned-fallback`; its hash, count and estimate describe
 the plan, while latency remains the elapsed attempt time. If both diagnostic
@@ -304,9 +310,16 @@ acceptance; the stitched summary is still extracted before persistence.
 Answered calls end only their own provider failure key before lane resume.
 Split parts use part keys, while interrupted split-stitch work uses the rung key;
 that enclosing run ends on whole-fold completion, not on an individual answer.
-Local failures still share provider-run identities: answer-time resets can also
-reset repeated progress-write or resume errors. These diagnostics do not add
-separate local-error accounting.
+Local failures still share provider-run identities. Ending a run on an
+unstripped provider answer, before a carrier progress write or L1 lane resume,
+or on a merge answer before merge resume, can reset repeated local failures.
+For example, if a paused lane's diagnostic sink throws on each resumed warning,
+each successful unstripped answer deletes the run before the warning throws.
+The interrupt then starts the run again at one: even with other compression
+landing between retries, the rung may never be decided and paid calls can
+continue. Separate local/provider retry histories are deferred as a
+retry-accounting change, not a diagnostic correction; this round does not change
+that behavior.
 Canonical and plain-prose end-turn answers are not success until extraction
 succeeds; extraction errors are logged as `provider_error` / `malformed_content`.
 Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)
