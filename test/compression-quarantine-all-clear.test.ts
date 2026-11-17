@@ -199,9 +199,11 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
       ['checkpoint-n,checkpoint-o,checkpoint-e,claim-no-rec,no-record-no,exhausted-no,numeric-key,mismatched-k,no-generatio,object-gener,empty-genera,later-damage'],
     );
 
-    // On main, the quarantine check before a compression threw on a record-less entry.
-    await fx.strategy.run(fx.strategy.closedChunks()[1]!, context(fx.manager));
-    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 6, 'the second chunk was tried, and refused');
+    // On main, the quarantine check before a compression threw on a record-less entry. The second chunk's request is
+    // rejected for its shape, which charges the chunk: a second refusal in a row would start the refusal hold.
+    const rejecting = { complete: async () => { membraneCalls += 1; throw Object.assign(new Error('synthetic rejection'), { type: 'invalid_request' }); } };
+    await fx.strategy.run(fx.strategy.closedChunks()[1]!, { ...context(fx.manager), membrane: rejecting as never });
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 6, 'the second chunk was tried, and rejected');
     fx.manager.close();
   });
 

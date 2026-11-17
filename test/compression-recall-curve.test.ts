@@ -1542,7 +1542,12 @@ describe('compression refusal recall curves', () => {
   });
 
   it('one tick exhausts an all-quarantined queue without provider calls, warning once per chunk (#55)', async () => {
-    const mock = scriptedMembrane(['refusal']);
+    // A refusal, then a rejection of the request's shape, so each chunk is quarantined: two refusals in a row would
+    // start the strategy's refusal hold instead.
+    const mock = flexibleMembrane([
+      { stop: 'refusal' },
+      { error: Object.assign(new Error('synthetic rejection'), { type: 'invalid_request' }) },
+    ]);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
     try {
       const ctx = managerContext(fx.manager);
@@ -2434,10 +2439,12 @@ describe('compression refusal recall curves', () => {
       messages.push(messageStore.append(i % 2 ? 'Claude' : 'User', [text(`refused-${i}`)]));
     }
     let calls = 0;
+    // Every request's shape is rejected, so each chunk is quarantined: refusals in a row would start the strategy's
+    // refusal hold instead.
     const membrane = {
       complete: async () => {
         calls++;
-        return response('refusal');
+        throw Object.assign(new Error('synthetic rejection'), { type: 'invalid_request' });
       },
     } as never;
     const strategy = new ProbeStrategy({

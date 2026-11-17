@@ -392,6 +392,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
 }
 
 /** A membrane whose every model call is counted and fails. */
+/**
+ * A rejection of the request's shape, which charges its chunk: a provider
+ * that rejects every request so quarantines every chunk. One that refuses
+ * every request holds the chunks instead (the strategy's refusal hold).
+ */
+function rejection(): Error {
+  return Object.assign(new Error('the provider rejected the request as invalid'), { type: 'invalid_request' });
+}
+
 function countingMembrane(calls: { n: number }): Membrane {
   return { complete: async () => { calls.n++; throw new Error('no model in this test'); } } as unknown as Membrane;
 }
@@ -1264,11 +1273,11 @@ describe('OverBudgetError.clearedBy', () => {
       minChunkCharsForLLM: 0,
     });
     const calls = { n: 0 };
-    // Every request is refused, so each chunk's family exhausts into the quarantine.
+    // Every request is rejected, so each chunk's family exhausts into the quarantine.
     const refusing = {
       complete: async () => {
         calls.n++;
-        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+        throw rejection();
       },
     } as unknown as Membrane;
     await withManager(strategy, async (manager) => {
@@ -1287,7 +1296,7 @@ describe('OverBudgetError.clearedBy', () => {
   });
 
   /**
-   * A strategy whose every chunk needs a model call, a membrane that refuses
+   * A strategy whose every chunk needs a model call, a membrane that rejects
    * every request, and a drive that ticks every queued chunk into the
    * compression quarantine and answers the chunks a compile queues again.
    */
@@ -1309,7 +1318,7 @@ describe('OverBudgetError.clearedBy', () => {
     const membrane = {
       complete: async () => {
         calls.n++;
-        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+        throw rejection();
       },
     } as unknown as Membrane;
     const drive = async (manager: ContextManager): Promise<string[][]> => {
@@ -1352,7 +1361,7 @@ describe('OverBudgetError.clearedBy', () => {
 
   it("names compression for a quarantined chunk whose call goes out, a new request family's fresh attempt, while the call runs", async () => {
     const { strategy, drive } = quarantining();
-    // Refuses at once, as quarantining's membrane does, until `held` is set; then holds the call open.
+    // Rejects at once, as quarantining's membrane does, until `held` is set; then holds the call open.
     let held: { reached: () => void; release?: () => void } | undefined;
     const membrane = {
       complete: async () => {
@@ -1361,7 +1370,7 @@ describe('OverBudgetError.clearedBy', () => {
           at.reached();
           await new Promise<void>((resolve) => { at.release = resolve; });
         }
-        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+        throw rejection();
       },
     } as unknown as Membrane;
     await withManager(strategy, async (manager) => {

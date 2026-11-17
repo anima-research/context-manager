@@ -169,7 +169,7 @@ describe('a quarantined span and the requests after it', () => {
     await fx.manager.close();
   });
 
-  it("a chunk quarantined while its request carried another chunk, quarantined later, compresses on its next attempt without it", async () => {
+  it("a chunk refused while its request carried another chunk, then held with it, compresses on its next attempt without it", async () => {
     const path = join(dir, 'earlier-shape');
     const strategy = new ProbeStrategy(CONFIG as never);
     const { membrane, requests } = summarizer();
@@ -182,8 +182,10 @@ describe('a quarantined span and the requests after it', () => {
     const ctx = context(manager);
     await strategy.run(chunks[1]!, ctx);
     assert.equal(strategy.getCompressionQuarantineStatus().count, 1, 'premise: the second chunk, its request carrying the first, was quarantined');
+    // Two refusals in a row, with nothing landing between them, start the refusal hold: both chunks are held, and the
+    // second chunk's record is cleared.
     await strategy.run(chunks[0]!, ctx);
-    assert.equal(strategy.getCompressionQuarantineStatus().count, 2, 'premise: then the first was quarantined too');
+    assert.equal(strategy.getCompressionQuarantineStatus().count, 0, 'premise: then the first was refused too, and both are held');
     const spanTexts = chunks[0]!.messages.map((m) => label(m.content));
     const before = requests.length;
     await strategy.run(chunks[1]!, ctx);
@@ -191,7 +193,10 @@ describe('a quarantined span and the requests after it', () => {
     assert.equal(sent.length, 1, `the second chunk took one call (${sent.length})`);
     for (const text of spanTexts) assert.ok(!sent[0]!.includes(text), `its request leaves out the first chunk's ${text.trim()}`);
     assert.ok(chunks[1]!.compressed, 'the second chunk compressed');
+    // Its landing ends the hold, and the first chunk is asked again: refused again, it is quarantined.
+    for (let i = 0; i < 8 && strategy.getCompressionQuarantineStatus().count === 0; i++) await strategy.tick(ctx).catch(() => {});
     assert.equal(strategy.getCompressionQuarantineStatus().count, 1, 'and the quarantine holds only the first again');
+    assert.ok(!strategy.closedChunks()[0]!.compressed, 'the first chunk stays raw');
     await manager.close();
   });
 

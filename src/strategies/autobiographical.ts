@@ -1192,6 +1192,28 @@ function isNoCallDeferral(error: unknown): boolean {
   return isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait;
 }
 
+/** What a tick throws when it sends nothing because the lane holds chunks (see AutobiographicalStrategy's refusalHold). */
+class CompressionRefusalHold extends Error {
+  override name = 'CompressionRefusalHold';
+  constructor() {
+    super('Compression holds chunks that were refused in a row, on every request, with nothing landing between them: ' +
+      'they are held and not judged, and none is quarantined for it. They are asked again when the provider answers a new ' +
+      'chunk, or at a restart, which asks every one of them again at once. Check other agents on this account, whether ' +
+      'this history was imported, and what changed in the last update.');
+  }
+}
+
+/**
+ * Whether refusals exhausted a family: every answer a provider gave it was a
+ * refusal, a `refusal` stop reason or a thrown `safety`. A size or shape
+ * rejection, an empty answer or a rung its failures decided charges the chunk.
+ */
+function exhaustedByRefusals(outcomes: readonly CompressionRefusalOutcomeRecord[]): boolean {
+  const answers = outcomes.filter((entry) => entry.outcome !== 'admission_rejected' && entry.outcome !== 'topology_violation');
+  return answers.length > 0 &&
+    answers.every((entry) => entry.outcome === 'refusal' || (entry.outcome === 'provider_error' && entry.errorType === 'safety'));
+}
+
 class MergeDispositionRejection extends Error {
   readonly outcome: CompressionAttemptOutcome;
   readonly stopReason?: string;
@@ -2495,6 +2517,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private compressionNotBefore = new Map<string, number>();
   private toolsDeferredChunks = new Set<string>();
   private toolsDeferredMerge: string | undefined;
+
+  /**
+   * A refusal hold. A family that refusals exhaust (exhaustedByRefusals) is
+   * evidence about its chunk only while its domain works otherwise, as a
+   * transient failure is (CompressionFailureStreak). So when refusals
+   * exhaust a family and this lane's previous exhausted family, with no
+   * landing in their domain between them, the lane holds both chunks and
+   * quarantines neither: the previous one's record is cleared. While the hold
+   * lasts, every family that refusals exhaust in its domain is held the same
+   * way, the lane asks each queued chunk once and sends no merge in that
+   * domain, and held chunks' messages stay out of requests as quarantined
+   * ones do. A landing in the domain, this lane's or another strategy's in
+   * this process, ends the hold. From then on each landing in the domain
+   * lets the oldest held chunk be asked again, one at a time; one that
+   * refusals exhaust again is quarantined, and is no previous family for a
+   * hold. While any chunk is held, the lane isn't ready, a tick that sends
+   * nothing throws CompressionRefusalHold, and the quarantine alarm says no
+   * all-clear. Nothing of it outlives the process: a restart asks every held
+   * chunk again.
+   */
+  private refusalHold: { membrane: object; model: string | undefined } | null = null;
+  /** The lane's last family that refusals exhausted, quarantined, until another family is exhausted. */
+  private lastRefusedFamily: {
+    chunkKey: string; recordKey: string; sourceIds: readonly MessageId[]; membrane: object; model: string | undefined; landed: number;
+  } | null = null;
+  /** The held chunks, by chunkKey, with their messages' ids. */
+  private refusalHeldChunks = new Map<string, readonly MessageId[]>();
+  /** The domain the held chunks were held in, and its landed count when the hold began or a held chunk last went. */
+  private heldDomain: { membrane: object; model: string | undefined; landed: number } | null = null;
+  /** The held chunk being asked again, until it compresses, is quarantined or is gone. */
+  private heldAskedAgain: string | null = null;
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -5658,6 +5711,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           );
           return;
         }
+        // A held chunk's record may be the one the alarm sounded on: no all-clear while one is held (see refusalHold).
+        if (this.refusalHeldChunks.size > 0) return;
         this.quarantineAlarmActive = false;
         this.quarantineAlarmLastAt = 0;
         this.diag.error(
@@ -6011,6 +6066,103 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       await this.deliverPendingCompressionQuarantineAlerts(source);
     }
     return exhaustion;
+  }
+
+  /**
+   * An exhausted family's end: held, where it starts a refusal hold or one
+   * holds its domain ('withheld': no record is written, and the chunk is
+   * held; see refusalHold), or quarantined (exhaustCompressionRequestFamily).
+   * A held chunk asked again is quarantined, and is no previous family for a
+   * hold.
+   */
+  private async exhaustOrHold(
+    chunk: Chunk,
+    membrane: object,
+    model: string | undefined,
+    source: CompressionOperationBranch,
+    record: CompressionRefusalQuarantineRecord,
+    outcomes: CompressionRefusalOutcomeRecord[],
+    familyOpen: () => boolean,
+    spanInWindow: () => boolean,
+  ): Promise<'left' | 'written' | 'held' | 'dropped' | 'withheld' | undefined> {
+    const key = this.chunkKey(chunk);
+    const askedAgain = this.heldAskedAgain === key;
+    if (askedAgain) this.heldAskedAgain = null;
+    const refused = !askedAgain && exhaustedByRefusals(outcomes);
+    const landed = domainLanded(membrane, model);
+    const inDomain = (at: { membrane: object; model: string | undefined }) => at.membrane === membrane && at.model === model;
+    const last = this.lastRefusedFamily;
+    // A chunk asked again, after a clear or in another shape, is no company for itself: the spans may share no message.
+    const span = new Set(chunk.messages.map((message) => message.id));
+    const starts = this.refusalHold === null && last !== null && !last.sourceIds.some((id) => span.has(id)) &&
+      inDomain(last) && last.landed === landed;
+    // A family another process quarantined meanwhile stands as its record says (exhaustCompressionRequestFamily's 'held').
+    const recorded = this.readCompressionQuarantineProjection().has(record.key);
+    if (refused && !recorded && (starts || (this.refusalHold !== null && inDomain(this.refusalHold)))) {
+      this.lastRefusedFamily = null;
+      if (starts) {
+        this.refusalHold = { membrane, model };
+        this.heldDomain = { membrane, model, landed };
+        await this.clearCompressionRefusalQuarantine(last.recordKey);
+        this.refusalHeldChunks.set(last.chunkKey, last.sourceIds);
+      }
+      this.refusalHeldChunks.set(key, chunk.messages.map((message) => message.id));
+      this.diag.error(
+        `[autobiographical] ${starts ? 'a refusal hold begins' : 'the refusal hold holds another chunk'}: ` +
+          `${this.refusalHeldChunks.size} chunks held, none quarantined, until a compression lands on this route and model`,
+      );
+      logCompressionCall({
+        event: 'compression:refusal-hold',
+        operation: 'compress_l1',
+        metadata: { quarantine_key: record.key, model, began: starts, held: this.refusalHeldChunks.size },
+      }, this.ns);
+      return 'withheld';
+    }
+    const exhaustion = await this.exhaustCompressionRequestFamily(source, record, outcomes, familyOpen, spanInWindow);
+    if (exhaustion === 'written') {
+      this.lastRefusedFamily = refused
+        ? { chunkKey: key, recordKey: record.key, sourceIds: chunk.messages.map((message) => message.id), membrane, model, landed }
+        : null;
+    }
+    return exhaustion;
+  }
+
+  /**
+   * At each tick, while chunks are held: a landing in their domain since the
+   * hold began, or since a held chunk last went, ends the hold and puts the
+   * oldest held chunk at the head of the queue, one at a time (see
+   * refusalHold). A held chunk compressed or gone meanwhile isn't held.
+   */
+  private releaseHeldChunk(): void {
+    if (this.heldDomain === null) return;
+    const positions = new Map(this.chunks.map((chunk, index) => [this.chunkKey(chunk), index]));
+    const pending = (key: string): boolean => {
+      const index = positions.get(key);
+      return index !== undefined && !this.chunks[index]!.compressed;
+    };
+    for (const key of this.refusalHeldChunks.keys()) if (!pending(key)) this.refusalHeldChunks.delete(key);
+    if (this.heldAskedAgain !== null && !pending(this.heldAskedAgain)) this.heldAskedAgain = null;
+    const { membrane, model } = this.heldDomain;
+    const landed = domainLanded(membrane, model);
+    if (this.heldAskedAgain !== null || landed <= this.heldDomain.landed) return;
+    if (this.refusalHold !== null) {
+      this.refusalHold = null;
+      this.diag.warn(`[autobiographical] the refusal hold ends: a compression landed on its route and model; ${this.refusalHeldChunks.size} chunks held`);
+    }
+    let oldest: string | undefined;
+    for (const key of this.refusalHeldChunks.keys()) {
+      if (oldest === undefined || positions.get(key)! < positions.get(oldest)!) oldest = key;
+    }
+    if (oldest === undefined) {
+      this.heldDomain = null;
+      return;
+    }
+    this.refusalHeldChunks.delete(oldest);
+    this.heldAskedAgain = oldest;
+    this.heldDomain = { membrane, model, landed };
+    const index = positions.get(oldest)!;
+    this.compressionFailureOrder.delete(oldest);
+    this.compressionQueue = [index, ...this.compressionQueue.filter((queued) => queued !== index)];
   }
 
   /**
@@ -8163,6 +8315,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
       };
     }
+    // Held chunks keep the host ticking, so the hold is heard (see refusalHold).
+    if (this.refusalHeldChunks.size > 0) {
+      return {
+        ready: false,
+        description: `${this.refusalHeldChunks.size} chunks held after refusals in a row, ` +
+          'asked again when the provider answers a new chunk or at a restart',
+        ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
+      };
+    }
 
     const needsCompression = this.chunks.some(
       (c) => !c.compressed && this.isChunkOldEnough(c)
@@ -8908,6 +9069,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // no queue item consumed until the pause ends (see pauseCompressionLane).
     if (this.activeCompressionPause(ctx)) return;
 
+    this.releaseHeldChunk();
+    // A refusal hold sends no merge in its domain, and queued merges wait (see refusalHold).
+    const mergesHeld = this.refusalHold !== null && this.refusalHold.membrane === ctx.membrane &&
+      this.refusalHold.model === this.config.compressionModel;
+
     // Priority 1: Compress raw chunks → L1. Skipped while the speculative cap
     // (maxSpeculativeL1s) holds production, so we don't pile up more unmerged
     // L1s: past the cap with an L1 merge queued, which the merge priority below
@@ -8939,7 +9105,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         mergeTurn = 'speculative cap';
         break;
       }
-      if (this.toolsDeferredChunks.has(key)) continue;
+      if (this.toolsDeferredChunks.has(key) || this.refusalHeldChunks.has(key)) continue;
       // Resolve against the current queue: a rebuild may renumber chunks or
       // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
       // stale chunk object. Newly queued source identities wait for next tick.
@@ -8957,12 +9123,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
-      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
+      if (failedAt !== undefined && !mergesHeld && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
         mergeTurn = 'after a failed L1';
         break;
       }
       // A merge that takes more off the floor than this chunk's L1 goes first.
-      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
+      if (!mergesHeld && this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
         mergeTurn = 'relief';
         break;
       }
@@ -9082,6 +9248,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // now. Its runs end (endChunkFailureRuns): this request won't be
         // retried, so the merges beside its span stop waiting for it.
         if (this.endChunkFailureRuns(key)) this.checkMergeThreshold();
+        // A held chunk asked again that the quarantine holds is decided: the next held chunk may go (see refusalHold).
+        if (this.heldAskedAgain === key) this.heldAskedAgain = null;
         this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
         this.orderCompressionQueue();
       } else {
@@ -9134,6 +9302,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.mergePicksDeferred) {
       this.mergePicksDeferred = false;
       this.checkMergeThreshold();
+    }
+
+    // Nothing more to send while chunks are held: say so at each tick (see refusalHold).
+    if (this.refusalHeldChunks.size > 0 && (mergesHeld || !this.config.hierarchical || this.mergeQueue.length === 0)) {
+      throw new CompressionRefusalHold();
     }
 
     // Priority 2: Execute pending merges (hierarchical only)
@@ -12170,7 +12343,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * (onRequestStopped), so tick ends the chunk's runs; and only a record
        * this ladder wrote is logged.
        */
-      const settleExhaustion = (exhaustion: 'left' | 'written' | 'held' | 'dropped' | undefined): void => {
+      const settleExhaustion = (exhaustion: 'left' | 'written' | 'held' | 'dropped' | 'withheld' | undefined): void => {
         if (exhaustion === undefined) return;
         if (exhaustion === 'left') {
           if (!this.spanLeftWindowMidRequest(chunk)) {
@@ -13097,7 +13270,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           if (this.spanLeftWindowMidRequest(chunk)) return;
-          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow);
+          const exhaustion = await this.exhaustOrHold(
+            chunk, ctx.membrane!, model, sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow,
+          );
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           settleExhaustion(exhaustion);
           return;
@@ -13233,7 +13408,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           for (const outcome of ended) noteOutcome(outcome);
-          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow);
+          const exhaustion = await this.exhaustOrHold(
+            chunk, ctx.membrane!, model, sourceBranch, quarantineRecord, familyRecord, familyOpen, spanInWindow,
+          );
           if (this.isCompressionBranchCurrent(sourceBranch)) settleExhaustion(exhaustion);
         }
         return;
@@ -15069,6 +15246,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const listed = isIdList(record.sourceIds) ? record.sourceIds : undefined;
       if (!sources.get(record.chunkSourceHash)) sources.set(record.chunkSourceHash, listed);
     }
+    // A held chunk's messages stay out of requests as a quarantined chunk's do (see refusalHold).
+    for (const ids of this.refusalHeldChunks.values()) sources.set(sha256Json(ids), ids);
     return sources;
   }
 
