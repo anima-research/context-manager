@@ -84,10 +84,10 @@ export interface FoldingSolution {
   /** Summaries the solver wanted but that don't exist yet. */
   produced: ProduceRequest[];
   /**
-   * Solver-owned exhaustion semantics: true when the solver has no further
-   * way to shrink the plan and the result is genuinely problematic.
+   * Solver-owned exhaustion semantics, not proof that compression cannot
+   * shrink the plan. The hard-budget check is independent of this flag.
    *
-   * The two shipped semantics differ deliberately:
+   * The shipped semantics differ deliberately:
    *  - greedy solvers: above the SOFT target with nothing left to fold or
    *    produce (they fold until they reach the target or run out of moves,
    *    so "still above target" means capacity is exhausted);
@@ -98,6 +98,8 @@ export interface FoldingSolution {
    *    exhaustion (pre-2026-07 the generic formula flagged every healthy
    *    dead-band hold, so `exhausted=true` was chronic on healthy agents
    *    and indistinguishable from the real over-the-wall state).
+   *  - kv-unified: the realizable frontier is infeasible at the hard budget;
+   *    missing summaries may still be requested in `produced`.
    *
    * Optional for stub/test solvers: when absent the picker falls back to
    * the greedy formula over the APPLIED frontier's tokens.

@@ -15644,8 +15644,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // disagree the emitter can overrun a plan that "fit", and the overrun is
     // paid by whatever renders last — the recent window — which is how tail
     // eviction becomes reachable at all. Eviction is therefore a symptom of
-    // plan drift, not of scarce foldable material: the picker either reaches
-    // its target or raises OverBudgetError. Record the plan so rsEnd() can
+    // plan drift, not of scarce foldable material: a plan may miss the soft
+    // target and still pass the hard-budget check. Record the plan so rsEnd() can
     // compare it against what was actually committed (its other figures,
     // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;

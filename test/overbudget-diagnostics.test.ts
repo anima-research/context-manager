@@ -618,7 +618,7 @@ describe('OverBudgetError diagnostics', () => {
       });
       const originalRun = Picker.prototype.run;
       const picks: Array<{ exhausted: boolean; finalTokens: number }> = [];
-      if (retry) {
+      if (retry || shadowCeiling !== undefined) {
         t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
           const result = originalRun.call(this, inputs, budget);
           // Synthetic opposite flags exercise attribution, not solver reachability.
@@ -668,8 +668,12 @@ describe('OverBudgetError diagnostics', () => {
         assert.deepEqual(outcomes, shadowCeiling === undefined ? [ceiling] : [ceiling, shadowCeiling], 'premise: opposite live/shadow ceiling outcomes');
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
         assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), ceiling);
-        assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), true, 'kv-unified reports infeasibility explicitly');
-        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=true, label-ceiling fallback=${ceiling}) but `));
+        const liveExhausted = shadowCeiling === undefined ? true : ceiling;
+        if (shadowCeiling !== undefined) {
+          assert.deepEqual(picks.map(pick => pick.exhausted), [ceiling, !ceiling], 'opposite live/shadow exhaustion');
+        }
+        assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), liveExhausted, 'only the live pick supplies exhaustion');
+        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=${liveExhausted}, label-ceiling fallback=${ceiling}) but `));
       });
     });
   }
@@ -690,6 +694,30 @@ describe('OverBudgetError diagnostics', () => {
       for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
         assert.equal(Reflect.has(error.diagnostics, field), false, field);
       }
+    });
+  });
+
+  it('does not reuse earlier plan metadata in a later reservation refusal', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const planned = await refusal(manager);
+      assert.equal(planned.diagnostics.solver, 'diagnostic-fixture');
+      assert.ok(Reflect.get(strategy, '_plannedMeta'), 'earlier compile populated plan metadata');
+      strategy.setHeadWindowTokens(10_000);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget but /);
+      for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
+        assert.equal(Reflect.has(error.diagnostics, field), false, field);
+      }
+      assert.match(error.message, /fold plan=not computed/);
     });
   });
 
