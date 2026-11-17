@@ -1,108 +1,9 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { ContextManager, AutobiographicalStrategy, validateCompressionInstructions } from '../src/index.js';
-import type { AutobiographicalOptions, CompressionInstructions, SummaryEntry, StrategyContext } from '../src/index.js';
-import type { Chunk } from '../src/strategies/autobiographical.js';
-import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
-
-const text = (value: string): ContentBlock => ({ type: 'text', text: value });
-const instruction = (r: NormalizedRequest) => r.messages.at(-1)!.content
-  .filter(b => b.type === 'text').map(b => b.text).join('\n');
-const texts = (r: NormalizedRequest) => r.messages.flatMap(m => m.content.filter(b => b.type === 'text').map(b => b.text));
-const custom: CompressionInstructions = {
-  templates: {
-    opening: 'CUSTOM OPEN',
-    chunk: 'CUSTOM CHUNK {targetTokens}',
-    witnessedChunk: 'CUSTOM WITNESS {targetTokens}',
-    readingChunk: 'CUSTOM READ {totalTokens} {targetTokens}',
-    merge: 'CUSTOM MERGE {sourceLevelShown} {targetLevel} {targetTokens}',
-    witnessedMerge: 'CUSTOM WMERGE {sourceLevelShown} {targetLevel} {targetTokens}',
-    readingMerge: 'CUSTOM RMERGE {sourceLevelShown} {targetLevel} {totalTokens} {targetTokens}',
-    transition: 'CUSTOM TRANSITION {targetTokens}\n{context}',
-  },
-};
-const options: AutobiographicalOptions = {
-  compressionModel: 'mock-only', headWindowTokens: 0, recentWindowTokens: 0,
-  targetChunkTokens: 100, minChunkCharsForLLM: 0, mergeThreshold: 99,
-  autoTickOnNewMessage: false, quarantineAlarmIntervalMs: 0,
-  compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
-  compressionSplitFallback: true,
-};
-class Probe extends AutobiographicalStrategy {
-  pin(value: number) { this.config.witnessedBeforeSequence = value; }
-  compress(chunk: Chunk, ctx: StrategyContext) { return this.compressChunkHierarchical(chunk, ctx); }
-  seed(s: SummaryEntry) { this.pushSummary(s); }
-  async merge(ids: string[], ctx: StrategyContext, fallback = false) {
-    if (!fallback) return this.executeMerge(2, ids, ctx);
-    this.compressionQueue = []; // Isolate the seeded merge from unrelated shard work.
-    this.enqueueMerge({ level: 2, sourceIds: ids });
-    await this.tick(ctx);
-    await this.tick(ctx);
-    return this.summaries.some(s => s.level === 2);
-  }
-  summariesNow() { return this.summaries; }
-}
-type Mode = 'chunk' | 'reading' | 'split' | 'readingSplit' | 'merge' | 'readingMerge' | 'fallback' | 'readingFallback' | 'transition';
-async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: CompressionInstructions,
-  extra: AutobiographicalOptions = {}, Strategy = Probe) {
-  const path = mkdtempSync(join(process.cwd(), 'test-instructions-'));
-  const calls: NormalizedRequest[] = [];
-  const reading = mode.startsWith('reading');
-  const split = mode === 'split' || mode === 'readingSplit';
-  const strategy = new Strategy({ ...options, adaptiveResolution: reading,
-    ...(mode === 'transition' ? { headWindowTokens: 1000 } : {}),
-    ...extra, compressionInstructions: config });
-  const membrane = { complete: async (request: NormalizedRequest) => {
-    calls.push(structuredClone(request));
-    // Canonical/source-only split requests have four raw records. Pieces have one.
-    const rawCount = texts(request).filter(s => s.startsWith('raw-')).length;
-    return (split && rawCount > 1) || (mode.toLowerCase().includes('fallback') && calls.length === 1)
-      ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 } }
-      : { content: [text('A mock summary.')], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 } };
-  } };
-  const manager = await ContextManager.open({ path, strategy, membrane: membrane as never });
-  try {
-    if (reading) {
-      manager.addMessage('Reader', [text('raw-portion substantive shared text. '.repeat(200))]);
-    } else {
-      for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Participant' : 'Other', [text(`raw-${i} {participant} {targetTokens} $& ` + 'substantive '.repeat(15))]);
-    }
-    const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
-    const messages = ctx.messageStore.getAll();
-    if (reading) assert.ok(messages.length > 8, 'fixture really is sharded');
-    strategy.pin(pin === 'inherited' ? messages.at(-1)!.sequence + 1 : messages[pin === 'mixed' ? 2 : 0]!.sequence);
-    const before = structuredClone(messages);
-    if (['chunk', 'reading', 'split', 'readingSplit'].includes(mode)) {
-      const chosen = reading && !split ? messages.slice(0, 1) : messages.slice(0, 4);
-      await strategy.compress({ index: 0, startIndex: 0, endIndex: chosen.length,
-        messages: chosen, tokens: 100, compressed: false }, ctx);
-      assert.equal(strategy.summariesNow().length, 1, 'compression installed one native summary');
-    } else if (mode === 'transition') {
-      await strategy.generateTransitionSummary(ctx);
-    } else {
-      const sources = [0, 2].map((start, i): SummaryEntry => ({
-        id: `L1-${100 + i}`, level: 1, content: `attributed source ${i}`, tokens: 20,
-        sourceLevel: 0, sourceIds: messages.slice(start, start + 2).map(m => m.id),
-        sourceRange: { first: messages[start]!.id, last: messages[start + 1]!.id }, created: 1,
-        ...(pin === 'inherited' || (pin === 'mixed' && i === 0) ? { witnessed: true } : {}),
-      }));
-      for (const s of sources) strategy.seed(s);
-      assert.equal(await strategy.merge(sources.map(s => s.id), ctx, mode.toLowerCase().includes('fallback')), true);
-      const merged = strategy.summariesNow().find(s => s.level === 2)!;
-      assert.ok(merged, 'merge was actually installed');
-      assert.equal(!!merged.witnessed, pin === 'inherited');
-      assert.deepEqual(merged.sourceIds, sources.map(s => s.id));
-    }
-    assert.deepEqual(ctx.messageStore.getAll(), before, 'raw content and metadata untouched');
-    assert.equal(calls.length, split ? 8 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
-    return calls;
-  } finally {
-    await manager.close();
-    rmSync(path, { recursive: true, force: true });
-  }
-}
+import { validateCompressionInstructions } from '../src/index.js';
+import { compressionInstruction } from '../src/compression-instructions.js';
+import type { CompressionInstructions } from '../src/index.js';
+import { Probe, run, custom, instruction, texts } from './compression-instructions-harness.js';
 
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
   for (const pin of ['own', 'mixed', 'inherited'] as const) {
@@ -120,9 +21,9 @@ for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readi
         const s = instruction(request);
         const shown = mode.toLowerCase().includes('fallback') && index === 1 ? 1 : 0;
         if (mode === 'transition') assert.match(s, /^CUSTOM TRANSITION 1500\n/);
-        else if (mode === 'readingMerge' || mode === 'readingFallback') {
+        else if (mode === 'readingMerge' || (mode === 'readingFallback' && index === 0)) {
           assert.match(s, new RegExp(`^CUSTOM RMERGE ${shown} 2 \\d+ \\d+$`));
-        } else if (mode === 'merge' || mode === 'fallback') {
+        } else if (mode === 'merge' || mode === 'fallback' || mode === 'readingFallback') {
           assert.match(s, new RegExp(`^CUSTOM ${pin === 'inherited' ? 'WMERGE' : 'MERGE'} ${shown} 2 \\d+$`));
         } else if (mode === 'reading' || (mode === 'readingSplit' && index < 2)) {
           // Canonical/source-only calls use reading; all split attempts use chunk hooks.
@@ -159,7 +60,7 @@ it('every custom slot substitutes typed values; transition data and participant 
     assert.match(instruction((await run(mode, 'inherited', config)).at(-1)!), new RegExp(`^WMERGE ${shown} 2 \\d+$`));
   }
   for (const mode of ['readingMerge', 'readingFallback'] as const) {
-    assert.match(instruction((await run(mode, 'inherited', config)).at(-1)!), new RegExp(`^RMERGE ${mode === 'readingMerge' ? 0 : 1} 2 \\d+ \\d+$`));
+    assert.match(instruction((await run(mode, 'inherited', config)).at(-1)!), mode === 'readingMerge' ? /^RMERGE 0 2 \d+ \d+$/ : /^WMERGE 1 2 \d+$/);
   }
   const transition = instruction((await run('transition', 'own', config))[0]!);
   assert.match(transition, /^TRANSITION 1500\nDATA /);
@@ -167,18 +68,30 @@ it('every custom slot substitutes typed values; transition data and participant 
   assert.ok(transition.endsWith('\nEND'));
 });
 
-it('invalid configuration fails synchronously before any provider can be called, without leaking values', () => {
-  for (const value of [null, [], 'secret', { preset: 'unregistered-preset' }, { preset: 'DEFAULT' }, { preset: 1 }, { preset: null },
-    { participant: '' }, { participant: 1 }, { participant: null }, { typo: 'secret' },
-    { templates: {} }, { templates: [] }, { templates: { typo: 'secret' } },
-    ...['', '  ', 42, null, {}, [], () => 'secret', '{', '}', '{{participant}}', '{targetToken}', '{unknown}', '{totalTokens}', '{participant}'].map(chunk => ({ templates: { chunk } })),
-    { templates: { transition: 'no data' } }, { templates: { transition: '{context}{context}' } },
-    { templates: { opening: '{targetTokens}' } },
-  ]) {
-    assert.throws(() => new Probe({ compressionInstructions: value as never }), { name: 'TypeError', message: 'Invalid compressionInstructions configuration' });
+it('invalid configuration fails synchronously with exact value-free diagnostics before any provider call', () => {
+  const cases: [unknown, string][] = [
+    ...[null, [], 'secret'].map(value => [value, 'configuration: expected object'] as [unknown, string]),
+    ...['unregistered-preset', 'DEFAULT', 1, null].map(preset => [{ preset }, 'preset: unsupported preset'] as [unknown, string]),
+    ...['', 1, null].map(participant => [{ participant }, 'participant: expected nonblank string'] as [unknown, string]),
+    [{ typo: 'secret' }, 'configuration: unknown key'],
+    [{ templates: {} }, 'templates: expected nonempty object'],
+    [{ templates: [] }, 'templates: expected nonempty object'],
+    [{ templates: { typo: 'secret' } }, 'templates: unknown key'],
+    ...['', '  ', 42, null, {}, [], () => 'secret'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: expected nonblank string'] as [unknown, string]),
+    ...['{', '}', '{{participant}}'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: malformed braces'] as [unknown, string]),
+    ...['{targetToken}', '{unknown}', '{totalTokens}'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: unsupported placeholder'] as [unknown, string]),
+    [{ templates: { chunk: '{participant}' } }, 'participant: participant required'],
+    [{ templates: { transition: 'no data' } }, 'templates.transition: context must appear once'],
+    [{ templates: { transition: '{context}{context}' } }, 'templates.transition: context must appear once'],
+    [{ templates: { opening: '{targetTokens}' } }, 'templates.opening: unsupported placeholder'],
+  ];
+  for (const [value, suffix] of cases) {
+    for (const validate of [() => validateCompressionInstructions(value), () => new Probe({ compressionInstructions: value as never })]) {
+      assert.throws(validate, { name: 'TypeError', message: `Invalid compressionInstructions configuration: ${suffix}` });
+    }
   }
   validateCompressionInstructions(JSON.parse(JSON.stringify(custom)));
-  assert.throws(() => new Probe({ witnessedInstruction: 'old', compressionInstructions: { templates: { witnessedChunk: 'new' } } }), /Conflicting witnessed instruction configuration/);
+  assert.throws(() => new Probe({ witnessedInstruction: 'old', compressionInstructions: { templates: { witnessedChunk: 'new' } } }), { name: 'TypeError', message: 'Conflicting witnessed instruction configuration' });
 });
 
 it('existing hooks and reminders keep their precedence', async () => {
@@ -232,10 +145,10 @@ it('only the registered default preset is accepted, including with complete temp
   for (const preset of ['unregistered-preset', 'DEFAULT', '', '__proto__', 'constructor']) {
     for (const config of [{ preset }, { ...custom, preset, participant: 'Explicit actor' }]) {
       assert.throws(() => validateCompressionInstructions(config), {
-        name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+        name: 'TypeError', message: 'Invalid compressionInstructions configuration: preset: unsupported preset',
       });
       assert.throws(() => new Probe({ compressionInstructions: config as never }), {
-        name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+        name: 'TypeError', message: 'Invalid compressionInstructions configuration: preset: unsupported preset',
       });
     }
   }
@@ -246,7 +159,7 @@ it('participant is explicit and required only by custom placeholders, never infe
     const template = slot === 'transition' ? '{participant} {context}' : '{participant}';
     assert.throws(() => new Probe({ summaryParticipant: 'Not an implicit actor',
       compressionInstructions: { templates: { [slot]: template } } }), {
-      name: 'TypeError', message: 'Invalid compressionInstructions configuration',
+      name: 'TypeError', message: 'Invalid compressionInstructions configuration: participant: participant required',
     });
     validateCompressionInstructions({ participant: 'Explicit actor', templates: { [slot]: template } });
   }
@@ -254,4 +167,72 @@ it('participant is explicit and required only by custom placeholders, never infe
 
 it('explicit default still permits custom overrides', async () => {
   assert.deepEqual(await run('chunk', 'own', { ...custom, preset: 'default' }), await run('chunk', 'own', custom));
+});
+
+for (const pin of ['own', 'mixed', 'inherited'] as const) {
+  it(`reading retry/${pin}: partial merge settings ignore reading mode and preserve witnessed voice`, async () => {
+    const config: CompressionInstructions = { templates: {
+      merge: 'RETRY MERGE {sourceLevelShown}', witnessedMerge: 'RETRY WITNESS {sourceLevelShown}',
+    } };
+    const calls = await run('readingFallback', pin, config);
+    assert.ok(!instruction(calls[0]!).startsWith('RETRY'));
+    assert.equal(instruction(calls[1]!), `RETRY ${pin === 'inherited' ? 'WITNESS' : 'MERGE'} 1`);
+  });
+}
+
+it('ordinary merge-only overrides do not own the separate source-level retry hook', async () => {
+  class MergeOnly extends Probe {
+    protected override getMergeInstruction() { return 'ORDINARY SUBCLASS'; }
+  }
+  for (const pin of ['own', 'inherited'] as const) {
+    const defaults = await run('fallback', pin);
+    const calls = await run('fallback', pin, undefined, {}, MergeOnly);
+    assert.equal(instruction(calls[0]!), 'ORDINARY SUBCLASS');
+    assert.equal(instruction(calls[1]!), instruction(defaults[1]!));
+    const selected = await run('fallback', pin, custom, {}, MergeOnly);
+    assert.equal(instruction(selected[0]!), 'ORDINARY SUBCLASS');
+    assert.match(instruction(selected[1]!), pin === 'inherited' ? /^CUSTOM WMERGE 1 2 / : /^CUSTOM MERGE 1 2 /);
+  }
+});
+
+for (const mode of ['fallback', 'readingFallback'] as const) {
+  for (const pin of ['own', 'inherited'] as const) {
+    it(`${mode}/${pin}: L3 retry shows L2 sources`, async () => {
+      const calls = await run(mode, pin, custom, {}, Probe, 3);
+      assert.match(instruction(calls[1]!), pin === 'inherited' ? /^CUSTOM WMERGE 2 3 / : /^CUSTOM MERGE 2 3 /);
+    });
+  }
+}
+
+it('validation diagnostics identify only allowlisted paths and reasons, never supplied data', () => {
+  for (const [value, suffix] of [
+    [{ privateKey: 'PRIVATE PAYLOAD' }, 'configuration: unknown key'],
+    [{ preset: 'PRIVATE PAYLOAD' }, 'preset: unsupported preset'],
+    [{ participant: ' ', templates: { chunk: 'PRIVATE PAYLOAD' } }, 'participant: expected nonblank string'],
+    [{ templates: { privateKey: 'PRIVATE PAYLOAD' } }, 'templates: unknown key'],
+    [{ templates: { chunk: 'PRIVATE PAYLOAD {privateKey}' } }, 'templates.chunk: unsupported placeholder'],
+    [{ templates: { chunk: 'PRIVATE PAYLOAD {' } }, 'templates.chunk: malformed braces'],
+    [{ templates: { transition: 'PRIVATE PAYLOAD' } }, 'templates.transition: context must appear once'],
+    [{ templates: { chunk: '{participant}' } }, 'participant: participant required'],
+  ] as const) {
+    for (const validate of [() => validateCompressionInstructions(value), () => new Probe({ compressionInstructions: value as never })]) {
+      assert.throws(validate, { name: 'TypeError', message: `Invalid compressionInstructions configuration: ${suffix}` });
+    }
+  }
+});
+
+it('rendering ignores inherited slots and the stored clone is validated after getters run', () => {
+  const templates = Object.create({ opening: 'INHERITED' });
+  assert.equal(compressionInstruction({ templates }, 'opening', {}), undefined);
+  let reads = 0;
+  const config = { templates: { get opening() { return ++reads === 1 ? 'valid' : '{unknown}'; } } };
+  assert.throws(() => new Probe({ compressionInstructions: config }), {
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder',
+  });
+  class Expose extends Probe { opening() { return this.getCompressionOpening(); } }
+  let snapshotReads = 0;
+  const changing = { templates: { get opening() { return ++snapshotReads <= 2 ? 'validated snapshot' : '{unknown}'; } } };
+  const snapshot = new Expose({ compressionInstructions: changing });
+  assert.equal(snapshot.opening(), 'validated snapshot');
+  assert.equal(snapshotReads, 2, 'one caller validation, one clone; validate the stored clone without reading getters again');
 });

@@ -28,7 +28,7 @@ built-in text. No migration of existing summaries is performed.
 
 | Slot | Where it is used | Available placeholders |
 | --- | --- | --- |
-| `opening` | L1 record marker, including split pieces | `participant` |
+| `opening` | L1 record marker, including split pieces; coordinate with `chunk` (the built-in chunk refers back to this notification) | `participant` |
 | `chunk` | Ordinary/mixed L1 and split pieces | `participant`, `targetTokens` |
 | `witnessedChunk` | Wholly inherited L1 and split pieces | `participant`, `targetTokens` |
 | `readingChunk` | L1 portion of a larger sharded body | `participant`, `targetTokens`, `totalTokens` |
@@ -45,6 +45,13 @@ by a custom template. It is never inferred from history or `summaryParticipant`
 and does not change message ownership. Repeated placeholders are replaced in
 one pass.
 
+`targetTokens` is the requested summary target; for `transition` it is 1500,
+which is also the hard output cap (`maxTokens`), not a promise of complete output.
+`totalTokens` is the token count of the larger sharded body.
+`sourceLevelShown` is the numeric level of the material actually shown: **0 means
+raw messages**, not “L0 memories”; positive values mean summaries at that level.
+`targetLevel` is the level of the summary being produced (for example, 2 or 3).
+
 `context` is the existing transition payload (capped head text and recent
 higher-level summaries), **private data**, not template source. A transition
 template must contain `{context}` exactly once. Braces and dollar signs in
@@ -53,10 +60,10 @@ is not a prompt-injection security boundary: the model still sees the data.
 
 A source-level merge retry uses the applicable merge slot with
 `sourceLevelShown` equal to the sources' actual level, rather than the level
-of their expanded children. Reading retries retain `readingMerge` when
-selected; with no selected reading wording they retain the existing
-witnessed/general fallback text. Split pieces keep the parent chunk's
-ordinary/witnessed classification and use `chunk`/`witnessedChunk`, including
+of their expanded children. Retries ignore reading mode and use `witnessedMerge`
+when every source is witnessed, otherwise `merge`; an omitted slot uses the
+same built-in witnessed/general formatter. `readingMerge` never controls retries.
+Split pieces keep the parent chunk's ordinary/witnessed classification and use `chunk`/`witnessedChunk`, including
 pieces of reading-mode chunks. This does not change split/merge algorithms.
 
 ## Validation and precedence
@@ -67,7 +74,9 @@ is also exported for recipe loaders. Unknown keys within this object or its
 templates, unknown presets, wrong types, blank strings, malformed or
 unsupported placeholders, and absent required participant/context are errors.
 An empty `templates: {}` is an error; omit it instead. Errors are `TypeError`s
-with fixed, value-free messages. Template settings are copied at construction;
+with allowlisted paths and reason categories after the existing value-free
+`Invalid compressionInstructions configuration` prefix; values and unknown keys
+are never echoed. Template settings are copied at construction;
 mutating the caller's object afterward does not update a strategy. They are
 not hot-tunable. The validator is scoped to this object, not a schema for all
 existing strategy or host recipe options.
@@ -76,7 +85,10 @@ Precedence:
 
 1. Existing subclass instruction overrides still run. They can call `super`
    to use these settings; an override returning its own text wins, including
-   KnowledgeStrategy's phase/merge overrides. `prepareCompressionRequest`
+   KnowledgeStrategy's phase/ordinary-merge overrides. Source-level retries use
+   the separate `getSourceMergeInstruction` hook, whose base implementation uses
+   configured `merge`/`witnessedMerge` text. Subclasses must override that hook
+   separately to supply their own retry wording. `prepareCompressionRequest`
    still runs afterward. This option does not force subclasses to use it.
 2. Existing `witnessedInstruction` wins over the built-in witnessed L1 text,
    including when custom templates are configured. Combining it with a
@@ -105,8 +117,11 @@ recall carriers, provenance, and transition system prompt are unchanged.
 Custom wording is guidance, not a guarantee of accuracy, secrecy, attribution,
 provider acceptance, or improved compression quality. No real-provider
 qualification is implied. Existing retry additions (such as no-tools/plain
-prose instructions), request ceilings, and output caps still apply. Templates
-can increase input size; target token placeholders are not output validators.
+prose instructions), request ceilings, and output caps still apply. The
+“Attribution discipline” suffix also follows custom merge text whenever
+`compressionMergeSourceOnly` (or its source-only fallback) applies, not just
+on refusal retries. Templates can increase input size; target token placeholders
+are not output validators.
 
 ## Proposed host recipe (requires companion wiring)
 
@@ -126,12 +141,7 @@ can increase input size; target token placeholders are not output validators.
 }
 ```
 
-This is a recipe fragment, **not a working host feature shipped by this CM
-change alone**. Public connectome-host at
-`73730ee7ff8293aad376626523c32f137dfd8f7f` declares the option in
-`src/recipe.ts`, uses CM's shared validator in `src/recipe-strategy.ts`, and
-forwards it to the framework strategy. That companion remains dependency-blocked:
-both direct and framework-resolved CM must expose this API before stock host
-integration can work. Its preset documentation and tests also need to match
-this default/custom-only scope. No host edits, deployment, dependency upgrade,
-or automatic actor inference are part of this CM candidate.
+Hosts must forward this option and validate it before constructing the strategy.
+Companion integration and release coordination belong in the
+[connectome-host companion PR](https://github.com/anima-research/connectome-host/pull/648),
+not in version-pinned instructions here. This CM option does not itself add host wiring.
