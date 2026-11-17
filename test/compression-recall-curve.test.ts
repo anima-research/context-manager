@@ -4653,6 +4653,53 @@ describe('tool-prose hoist admission', () => {
       } finally { fx.manager.close(); }
     });
 
+    it('a local failure after a successful stripped retry does not reuse the carrier failure snapshot', async () => {
+      const mock = flexibleMembrane([
+        { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) },
+        { stop: 'end_turn', text: 'memory' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as {
+        prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        resumeCompressionLane(): void;
+      };
+      const prepare = seam.prepareCompressionCandidate;
+      seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      let resumed = false;
+      seam.resumeCompressionLane = () => {
+        resumed = true;
+        throw Object.assign(new Error('local resume failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+      };
+      try {
+        const logs = await capture(fx);
+        assert.equal(mock.calls.length, 2);
+        assert.ok(resumed);
+        assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
+      } finally { fx.manager.close(); }
+    });
+
+    it('canonical and source-only-final provider rejections emit attempt traces', async () => {
+      const rejected = { error: Object.assign(new Error('bad request'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) };
+      const mock = flexibleMembrane([rejected, rejected]);
+      const fx = await fixture(mock.membrane, { ...options('expansion', 1_000_000), compressionSourceOnlyFallback: true });
+      try {
+        const logs = await capture(fx);
+        for (const curveLabel of ['canonical', 'source-only-final']) {
+          const traces = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === curveLabel);
+          assert.equal(traces.length, 1);
+          assert.equal(traces[0]!.metadata?.outcome, 'provider_error');
+        }
+      } finally { fx.manager.close(); }
+    });
+
     for (const kind of kinds) {
       it(`${kind}: preparation rejection does not fabricate a provider attempt`, async () => {
         const mock = flexibleMembrane(kind === 'source-hoist'

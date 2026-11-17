@@ -15,6 +15,8 @@
   Answered hoists also expose top-level totals. Failed-request diagnostics do no
   serialization or hashing with logging disabled and cannot replace provider errors.
 
-- Preparation failures do not fabricate provider-attempt traces. Failed stripped
-  calls retain only run attribution, and attempt timing uses a monotonic clock;
+- Preparation failures do not fabricate provider-attempt traces. Failed calls retain request references only while constructing opt-in diagnostics;
+  successful stripped retries clear the failed snapshot. Run attribution is attempt-local,
+  including primitive errors. Canonical and source-only rejections also emit attempt traces.
+  Answered and rejected attempt timing uses a monotonic clock with fractional milliseconds;
   logging remains nonfatal even when its warning sink throws.

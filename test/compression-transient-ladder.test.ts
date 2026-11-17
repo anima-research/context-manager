@@ -1025,6 +1025,29 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  for (const shared of [failure('server', { httpStatus: 503 }), 'primitive failure']) {
+    it(`concurrent stripped and unstripped failures keep attempt-local attribution (${typeof shared})`, async () => {
+      const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+        type: 'invalid_request', retryable: false, httpStatus: 400,
+      });
+      const stripped = scripted([{ throw: rejected }, { throw: shared }]);
+      const plain = scripted([{ throw: shared }]);
+      const a = await withCarriers(stripped.membrane);
+      const b = await withCarriers(plain.membrane);
+      try {
+        const results = await Promise.allSettled([
+          a.strategy.run(a.target(), managerContext(a.manager)),
+          b.strategy.run(b.target(), managerContext(b.manager)),
+        ]);
+        assert.ok(results.every(result => result.status === 'rejected' && result.reason === shared));
+        assert.equal(stripped.calls.length, 2);
+        assert.ok(carriesThinking(stripped.calls[0]!) && !carriesThinking(stripped.calls[1]!));
+        assert.deepEqual(l1RunsOf(a.strategy).map(run => run.key), [runKey(a.target().messages, 'canonical', true)]);
+        assert.deepEqual(l1RunsOf(b.strategy).map(run => run.key), [runKey(b.target().messages, 'canonical', false)]);
+      } finally { a.manager.close(); b.manager.close(); }
+    });
+  }
+
   it('an unserializable stripped failure still uses the stripped run key', async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
       type: 'invalid_request', retryable: false, httpStatus: 400,
