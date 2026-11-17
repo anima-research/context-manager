@@ -141,7 +141,7 @@ function withCompressionLog(work: (logPath: string) => void, namespace: string, 
   try {
     work(logPath);
   } catch (err) {
-    namespaceDiagnostics(() => namespace).warn(failure, err);
+    try { namespaceDiagnostics(() => namespace).warn(failure, err); } catch { /* Diagnostics remain nonfatal. */ }
   }
 }
 
@@ -1112,12 +1112,10 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
 /**
- * The existing hash (or stripped request to hash only if needed) for each
- * failed L1 call, keyed by its error. A rung's outcome keeps the rung's identity, but after a carrier
- * rejection the rung dispatches its stripped request, whose failures are a
- * run of their own (chunkRunKey).
+ * Failed stripped calls have their own failure run. Keep only that fact,
+ * never the request body, even when a host retains the error.
  */
-const dispatchedRequestIdentity = new WeakMap<object, string | NormalizedRequest>();
+const dispatchedStrippedRequest = new WeakSet<object>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
@@ -12015,7 +12013,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             name: 'CompressionBranchDiscard',
           });
         }
-        const started = Date.now();
+        const started = performance.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
         // whatever comes back. It is `attemptRequest` unless the carrier
@@ -12028,9 +12026,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const noteFailedAttempt = (failedRequest: NormalizedRequest): void => {
           // Retain only a reference here. Serialization belongs to the guarded
           // trace construction after classification, never the provider catch.
-          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
-            failedAttempt = { request: failedRequest, latencyMs: Date.now() - started };
-          }
+          failedAttempt = { request: failedRequest, latencyMs: performance.now() - started };
         };
         // A call's error, when its work lost its branch or strategy
         // generation while the call was out (a detach, a branch move), is
@@ -12065,7 +12061,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!known) {
             noteFailedAttempt(attemptRequest);
             noteDispatchedModel(error, attemptRequest);
-            if (error !== null && typeof error === 'object') dispatchedRequestIdentity.set(error, attemptHash);
+            if (error !== null && typeof error === 'object') dispatchedStrippedRequest.delete(error);
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -12111,7 +12107,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteFailedAttempt(acceptedRequest);
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
-              dispatchedRequestIdentity.set(retryError, acceptedRequest);
+              dispatchedStrippedRequest.add(retryError);
             }
             throw retryError;
           }
@@ -12142,7 +12138,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           refusalCategory: response && typeof response === 'object'
             ? this.refusalCategory(response as NormalizedResponse)
             : undefined,
-          latencyMs: Date.now() - started,
+          latencyMs: performance.now() - started,
           persisted: false,
         };
         attemptTraces.push(trace);
@@ -12312,7 +12308,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: unknown,
         curveLabel: string,
         requestHash: string,
-        streakHash: string = requestHash,
+        stripped: boolean = false,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
           // Counted against the request actually dispatched (the stripped one
@@ -12321,7 +12317,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
-            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash),
+            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, stripped),
             compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched),
           );
           // The decision is the rung's outcome, which ends its run (noteOutcome).
@@ -12377,19 +12373,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const kind = compressionFailureKind(error);
           if (kind === 'abort') throw error;
-          // Only interrupted failures need a separate dispatched identity.
-          // Defer stripped-request hashing until here: successful retries pay
-          // only for their trace, and an unserializable request must never
-          // replace the provider error or alter its classification.
-          let failureRequestHash = requestHash;
-          if (kind !== 'rejection' && error !== null && typeof error === 'object') {
-            const identity = dispatchedRequestIdentity.get(error);
-            try {
-              if (identity !== undefined) {
-                failureRequestHash = typeof identity === 'string' ? identity : sha256Json(identity);
-              }
-            } catch { /* Preserve the rung identity if attribution is unavailable. */ }
-          }
+          const stripped = error !== null && typeof error === 'object' && dispatchedStrippedRequest.has(error);
           const decided: CompressionRefusalOutcomeRecord = kind === 'rejection'
             ? {
                 curveLabel,
@@ -12401,7 +12385,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 error,
                 curveLabel,
                 requestHash,
-                failureRequestHash,
+                stripped,
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
@@ -12650,14 +12634,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
           ));
           if (result.kind === 'decided') {
-            if (!result.reused && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            if (!result.reused && failedAttempt && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               const trace: CompressionAttemptTrace = {
                 curveLabel, recallIds, recallLevels, leafCoverageHash: coverageHash,
-                ...(failedAttempt ? this.compressionFailedAttemptTrace(failedAttempt) : {
-                  requestHash, messageCount: hoistedRequest.messages.length,
-                  estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
-                  latencyMs: 0,
-                }),
+                ...this.compressionFailedAttemptTrace(failedAttempt!),
                 persisted: false, outcome: 'provider_error',
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
                 admittedTokens: admission.admittedTokens, budgetTokens: admission.budgetTokens,
@@ -12781,7 +12761,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             variant.children.map((child) => child.id),
           ), { admittedTokens, budgetTokens: contextBudget });
           if (result.kind === 'decided') {
-            if (!result.reused && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            if (!result.reused && failedAttempt && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               const trace: CompressionAttemptTrace = {
                 curveLabel,
                 recallIds: variantFrontier.map((summary) => summary.id),
@@ -12789,12 +12769,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 expandedParentId: variant.parent.id,
                 expandedChildIds: variant.children.map((child) => child.id),
                 leafCoverageHash: variant.leafCoverageHash,
-                ...(failedAttempt ? this.compressionFailedAttemptTrace(failedAttempt) : {
-                  requestHash: variant.requestHash,
-                  messageCount: variant.request.messages.length,
-                  estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
-                  latencyMs: 0,
-                }),
+                ...this.compressionFailedAttemptTrace(failedAttempt!),
                 persisted: false,
                 outcome: 'provider_error',
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),

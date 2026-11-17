@@ -4604,7 +4604,7 @@ describe('tool-prose hoist admission', () => {
       const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
       const warn = console.warn;
       let warnings = 0;
-      console.warn = (...args) => { if (args.some(arg => String(arg).includes('compression log write failed'))) warnings++; };
+      console.warn = (...args) => { if (args.some(arg => String(arg).includes('compression log write failed'))) { warnings++; throw new Error('warning failed'); } };
       process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.'; // a directory, not a writable JSONL file
       try {
         await fx.strategy.run(fx.target, managerContext(fx.manager));
@@ -4653,6 +4653,32 @@ describe('tool-prose hoist admission', () => {
       } finally { fx.manager.close(); }
     });
 
+    for (const kind of kinds) {
+      it(`${kind}: preparation rejection does not fabricate a provider attempt`, async () => {
+        const mock = flexibleMembrane(kind === 'source-hoist'
+          ? [{ stop: 'max_tokens' }, { stop: 'refusal' }]
+          : [{ stop: 'refusal' }]);
+        const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+        if (kind !== 'expansion') hoistableChunk(fx);
+        const seam = fx.strategy as unknown as {
+          prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        };
+        const prepare = seam.prepareCompressionCandidate;
+        seam.prepareCompressionCandidate = function (request, curveLabel) {
+          if (curveLabel === label(kind)) throw Object.assign(new Error('preparation rejected'), {
+            type: 'invalid_request', httpStatus: 400, retryable: false,
+          });
+          return prepare.call(this, request, curveLabel);
+        };
+        try {
+          const logs = await capture(fx);
+          assert.equal(mock.calls.length, kind === 'source-hoist' ? 2 : 1);
+          assert.equal(logs.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
+            && log.metadata?.curveLabel === label(kind)), false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
     for (const kind of kinds) for (const stripped of (kind === 'source-hoist' ? [false] : [false, true])) {
       it(`${kind}: provider rejection logs the actual ${stripped ? 'stripped' : 'planned'} request and elapsed time`, async () => {
         const rejection = { error: Object.assign(new Error('bad request'), {
@@ -4668,9 +4694,14 @@ describe('tool-prose hoist admission', () => {
         const mock = flexibleMembrane(handlers);
         const membrane = mock.membrane as unknown as { complete: (request: NormalizedRequest) => Promise<unknown> };
         const complete = membrane.complete;
+        const callTimes: { start: number; end: number }[] = [];
         membrane.complete = async request => {
-          await new Promise(resolve => setTimeout(resolve, 30));
-          return complete(request);
+          const timing = { start: performance.now(), end: 0 };
+          callTimes.push(timing);
+          try {
+            await new Promise(resolve => setTimeout(resolve, 30));
+            return await complete(request);
+          } finally { timing.end = performance.now(); }
         };
         const fx = await fixture(mock.membrane, options(kind, 1_000_000));
         if (kind !== 'expansion') hoistableChunk(fx);
@@ -4704,7 +4735,10 @@ describe('tool-prose hoist admission', () => {
             ...(kind === 'expansion' ? ['expandedParentId', 'expandedChildIds'] : []),
           ].sort());
           assert.equal(trace.errorType, 'invalid_request');
-          assert.ok(Number(trace.latencyMs) >= 20, 'includes provider wait time');
+          const attemptStart = callTimes.at(stripped ? -2 : -1)!.start;
+          const attemptEnd = callTimes.at(-1)!.end;
+          assert.ok(Number(trace.latencyMs) >= attemptEnd - attemptStart,
+            'includes the entire observed attempt, including the carrier-rejected call');
           assert.equal(trace.persisted, false);
           assert.equal(trace.messageCount, mock.calls.at(-1)!.request.messages.length);
           assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));

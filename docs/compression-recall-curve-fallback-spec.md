@@ -280,7 +280,8 @@ Interrupted calls (for example a transient provider failure below the persistent
 threshold, withdrawal or branch discard) emit no attempt/admission trace. Their
 absence is not evidence that no provider call occurred. A later retry logs only
 its own attempt. Completed split parts can still emit traces when a later part
-interrupts the split-stitch rung. Provider-rejected attempt latency includes any carrier fallback, and its
+interrupts the split-stitch rung. Preparation failures before dispatch emit no provider-attempt trace.
+Provider-rejected attempt latency uses a monotonic clock, includes any carrier fallback, and its
 request hash, count and estimate describe the final dispatched request; admission
 continues to describe the planned rewrite. Admission-rejected traces instead
 describe the planned request with zero latency; no provider call occurred.

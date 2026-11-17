@@ -1025,6 +1025,27 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  it('an unserializable stripped failure still uses the stripped run key', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
+    const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+    const complete = membrane.complete;
+    membrane.complete = async request => {
+      if (!carriesThinking(request)) Object.defineProperty(request, 'toJSON', {
+        value: () => { throw new Error('cannot serialize stripped request'); },
+      });
+      return complete(request);
+    };
+    const fx = await withCarriers(mock.membrane);
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      assert.deepEqual(l1RunsOf(fx.strategy).map(run => run.key),
+        [runKey(fx.target().messages, 'canonical', true)]);
+    } finally { fx.manager.close(); }
+  });
+
   it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);

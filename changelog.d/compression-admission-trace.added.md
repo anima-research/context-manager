@@ -14,3 +14,7 @@
   the planned request with zero latency: no provider call occurred.
   Answered hoists also expose top-level totals. Failed-request diagnostics do no
   serialization or hashing with logging disabled and cannot replace provider errors.
+
+- Preparation failures do not fabricate provider-attempt traces. Failed stripped
+  calls retain only run attribution, and attempt timing uses a monotonic clock;
+  logging remains nonfatal even when its warning sink throws.
