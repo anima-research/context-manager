@@ -276,6 +276,11 @@ For canonical and each fallback attempt, record metadata only by default:
 - whether result was persisted;
 - opt-in `admission` decomposition on answered, deterministically provider-rejected or admission-rejected gated rungs (log-only, never persisted).
 
+Set `CONTEXT_MANAGER_COMPRESSION_LOG` before starting compression and keep it
+unchanged until that compression finishes. Snapshot capture, decision tracing
+and final writes check it independently; enabling it mid-flight cannot recover
+earlier attempts, and changing or disabling it can split or omit the trace.
+
 Interrupted calls (for example a transient provider failure below the persistent-failure
 threshold, withdrawal or branch discard) emit no attempt/admission trace. Their
 absence is not evidence that no provider call occurred. A later retry logs only

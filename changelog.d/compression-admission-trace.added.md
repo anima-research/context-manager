@@ -5,14 +5,10 @@
   delta, bounded input, output reserve, admitted total and configured budget.
   Source-only-final counts are distinguished from canonical counts. Admission
   decisions, dispatched requests and durable schemas are unchanged. Failure
-  attribution is not behavior-neutral: after a stripped provider answer, local
-  errors use the unstripped rung key. Reusing a carrier rejection resets that
-  key, including an older provider-failure run left by a sibling strategy.
-  Repeated post-answer local errors after a reused carrier rejection restart
-  the run rather than accumulating; preserving them requires a separate
-  local-error run identity, not implemented here. This reverts the earlier
-  change that preserved that run on reuse; retry counts, quarantine and
-  persisted family outcomes can therefore differ from that intermediate fix.
+  attribution is now attempt-local (see the compression failure-attribution fix),
+  which can affect retry counts and persisted outcomes leading to quarantine.
+  Set `CONTEXT_MANAGER_COMPRESSION_LOG` before compression starts and keep it
+  fixed until completion; mid-flight changes cannot guarantee a complete trace.
   Provider-rejected hoists now emit curve-attempt and chunk-associated
   compression:attempt entries with the same attempt trace shape as recall rungs.
   Interrupted calls have no attempt/admission trace and remain retryable; completed
@@ -41,7 +37,8 @@
   hash used in family outcomes. Match `curveLabel` for the rejected stage; reused
   outcomes or failures before dispatch still carry the durable outcome record.
   Durable family keys and outcome hashes are unchanged.
-- Mark earlier canonical tool-use answers incomplete when a later retry rejects.
+- Keep each answered canonical-stage retry’s refusal or incomplete outcome in
+  attempt logs, including when a later retry rejects.
 - Keep answered recall-variant outcomes in immediate curve-attempt logs, and emit
   curve-attempt logs for newly decided source-only-final provider failures. Recall
   answers that strip to empty are logged as unusable_empty, not success.

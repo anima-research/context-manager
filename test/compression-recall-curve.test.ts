@@ -4434,7 +4434,7 @@ describe('tool-prose hoist admission', () => {
                 );
                 if (mode === 'diagnostic') {
                   assert.ok(diagnostics > 0, 'the throwing diagnostic was exercised');
-                  assert.ok(warnings.some(w => w.includes('compression admission diagnostic failed:')));
+                  assert.ok(warnings.some(w => w.includes(`compression admission diagnostic failed: rung=${label(kind)} chunk=`)));
                   assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
                 }
                 else if (mode === 'write') {
@@ -4791,6 +4791,26 @@ describe('tool-prose hoist admission', () => {
         assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
       } finally { fx.manager.close(); }
     });
+
+    for (const retryLabel of ['canonical-no-tools', 'canonical-toolless']) {
+      for (const stopReason of ['refusal', 'max_tokens'] as const) {
+        it(`${retryLabel} keeps its answered ${stopReason} outcome in attempt logs`, async () => {
+          const toolUse: AttemptHandler = { raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } };
+          const answers = [toolUse, ...(retryLabel === 'canonical-toolless' ? [toolUse] : [])];
+          const mock = flexibleMembrane([...answers, { stop: stopReason }]);
+          const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+          try {
+            const logs = await capture(fx);
+            const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === retryLabel)?.metadata;
+            assert.ok(trace, 'the canonical-stage retry answered');
+            assert.equal(trace.stopReason, stopReason);
+            const expected = stopReason === 'refusal' ? 'refusal' : 'incomplete';
+            assert.equal(trace.outcome, expected);
+            assert.equal(exhaustedOutcomes(fx).find(o => o.curveLabel === retryLabel)?.outcome, expected);
+          } finally { fx.manager.close(); }
+        });
+      }
+    }
 
     for (const rejectedLabel of ['canonical-no-tools', 'canonical-toolless']) {
       it(`canonical rejection identifies the rejected ${rejectedLabel} retry, not an answered request`, async () => {
