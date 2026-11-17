@@ -247,16 +247,15 @@ cross-process coalescing if that boundary is bypassed. A process crash before
 exhaustion leaves no durable claim and therefore cannot suppress the family
 forever.
 
-The logical ledger is finitely retained. At 256 events, mutation under the same
-branch-pinned lock appends an active-projection checkpoint first, then redacts
-the preceding event range and asks Chronicle to compact the state. The
-append-first order makes both crash gaps replay-equivalent and avoids an unsafe
-read/replace whole-array snapshot. A checkpoint retains the newest 1,024 active
-exhausted families; older families expire and may make a new canonical-first
-attempt. Between checkpoints at most 128 two-event exhaustion/pending-alert
-groups can accumulate, so both active state and event history have a finite
-bound. Within that window, a family remains until its key changes, an
-exact-generation operator clear, or its ledger entry is found unusable.
+At 256 events, mutation under the same branch-pinned lock appends an
+active-projection checkpoint first, then redacts the preceding event range and
+asks Chronicle to compact the state. The append-first order makes both crash
+gaps replay-equivalent and avoids an unsafe read/replace whole-array snapshot.
+A checkpoint retains every active exhausted family and its generation; it does
+not expire older families or cap active state at 1,024 families. Checkpointing
+bounds accumulated event history, not the number of active holds or checkpoint
+bytes. A family remains until its key changes, an exact-generation operator
+clear, or its ledger entry is found unusable.
 
 ## Observability
 

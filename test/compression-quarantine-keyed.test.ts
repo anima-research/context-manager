@@ -10,6 +10,7 @@ import {
   AutobiographicalStrategy, ContextManager, PassthroughStrategy, isKeyedCompressionQuarantineStrategy,
   type CompressionQuarantineReleaseSelection,
 } from '../src/index.js';
+import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, CompressionQuarantineStatus } from '../src/types/index.js';
 
@@ -252,8 +253,10 @@ describe('metadata-only keyed L1 quarantine capability', () => {
       if (id === fx.strategy.ledgerId) throw new Error('DO-NOT-EXPOSE-SECRET-error-payload');
       return get(id);
     });
+    const beforeReadFailure = bytes(fx.path);
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'store-read' });
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'store-read' });
+    assert.deepEqual(bytes(fx.path), beforeReadFailure);
     read.mock.restore();
     fx.strategy.detach();
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
@@ -864,6 +867,46 @@ describe('Anima Review regressions', () => {
     }
     fx.store.setStateJson(fx.strategy.ledgerId, [{ kind: 'checkpoint', active: [null] }]);
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
+  });
+
+  for (const operation of ['inspection', 'release'] as const) it(`round 3 ${operation} reads the checkpoint before redaction`, async (t) => {
+    const fx = await fixture(t, `review-before-redaction-${operation}`);
+    const old = selection(fx.strategy);
+    fx.store.setStateJson(fx.strategy.ledgerId, [null, fx.event]);
+    pad(fx);
+    const redact = mock.method(fx.store, 'redactStateItems', () => { throw new Error('stop before redaction'); });
+    assert.throws(() => native(fx.strategy).checkpointCompressionQuarantineIfNeeded(native(fx.strategy).captureCompressionBranch()), /stop before redaction/);
+    redact.mock.restore();
+    assert.equal(fx.ledger()[0], null, 'damage remains before checkpoint');
+    const ledger = fx.ledger();
+    assert.throws(() => compressionQuarantineHolds([], () => { throw new Error('needed snapshot'); }), /needed snapshot/);
+    for (const legacy of [{ damaged: true }, () => { throw new Error('superseded snapshot read'); }]) {
+      const projection = compressionQuarantineHolds(ledger, legacy);
+      assert.deepEqual(projection.unlisted, []);
+      assert.equal(projection.holds(fx.event.record.sourceIds), true);
+    }
+    // Each operation gets its own interrupted ledger: release must not depend
+    // on a preceding successful inspection (or reopen's startup hygiene).
+    assert.equal(fx.ledger()[0], null, 'malformed prefix still exists at the strict operation');
+    assert.equal(fx.ledger().at(-1)?.kind, 'checkpoint');
+    if (operation === 'release') {
+      assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(old)).status, 'released');
+      assert.equal(inspect(fx.strategy).totalRecords, 0);
+      return;
+    }
+    assert.equal(selection(fx.strategy).expectedGeneration, old.expectedGeneration);
+    assert.deepEqual(fx.ledger(), ledger, 'strict inspection does not perform hygiene');
+
+    // Reopen is a persistence/startup-hygiene check, not proof of strict
+    // replay over damage: startup may redact the malformed prefix.
+    fx.manager.close();
+    const strategy = new Probe(config);
+    const manager = await ContextManager.open({ path: fx.path, strategy });
+    t.after(() => manager.close());
+    assert.equal(selection(strategy).expectedGeneration, old.expectedGeneration);
+    assert.equal((await strategy.releaseCompressionRefusalQuarantine(selection(strategy))).status, 'released');
+    manager.getStore().setStateJson(strategy.ledgerId, [...ledger, null]);
+    assert.deepEqual(strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
   });
 
   it('5 maps branch lookup failure consistently without writes', async (t) => {

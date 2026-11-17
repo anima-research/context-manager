@@ -143,7 +143,7 @@ const mergeQueue = stateArray<{ level: number; sourceIds: string[] }>(`${namespa
 const mergeQuarantine = stateArray<NonNullable<RepairInputs['mergeQuarantine']>[number]>(`${namespace}/autobio:merge-quarantine`);
 const quarantine = compressionQuarantineHolds(
   store.getStateJson(`${namespace}/autobio:compression-refusal-quarantine-events`),
-  store.getStateJson(`${namespace}/autobio:compression-refusal-quarantine`),
+  () => store.getStateJson(`${namespace}/autobio:compression-refusal-quarantine`),
 );
 if (quarantine.dropped.length > 0 || quarantine.unlisted.length > 0) {
   console.error(`the compression quarantine's stored state holds what the strategy reads as no entry: ` +

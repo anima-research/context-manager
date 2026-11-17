@@ -1486,6 +1486,18 @@ function projectCompressionQuarantineEvents(
 ): Map<string, ActiveCompressionQuarantine> {
   const active = new Map<string, ActiveCompressionQuarantine>();
   const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
+  // Strict reads validate only the state the latest checkpoint supersedes
+  // history with, even if append-first hygiene stopped before redaction.
+  let firstEvent = 0;
+  if (strict) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]?.kind === 'checkpoint') {
+        firstEvent = i;
+        legacyRecords = [];
+        break;
+      }
+    }
+  }
   for (const record of legacyRecords) {
     if (!isUsableQuarantineRecord(record)) {
       if (strict) throw new UnreadableCompressionQuarantineError('Unreadable legacy quarantine record');
@@ -1502,6 +1514,7 @@ function projectCompressionQuarantineEvents(
     });
   }
   for (const [index, event] of events.entries()) {
+    if (index < firstEvent) continue;
     if (!event) {
       if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine event');
       continue;
@@ -1594,6 +1607,7 @@ function projectCompressionQuarantineEvents(
   return active;
 }
 
+/** Pass a lazy legacy read to avoid accessing a snapshot superseded by a checkpoint. */
 export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
   holds(messageIds: readonly string[]): boolean;
   dropped: string[];
@@ -1601,6 +1615,8 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
 } {
   const dropped = new Set<string>();
   const unlisted = new Set<string>();
+  const hasCheckpoint = Array.isArray(ledger) && ledger.some((event) => event?.kind === 'checkpoint');
+  legacy = hasCheckpoint ? undefined : typeof legacy === 'function' ? legacy() : legacy;
   const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
   if (ledgerHoldsNoList) unlisted.add('the ledger');
   if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');

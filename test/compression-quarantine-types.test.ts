@@ -6,7 +6,7 @@ import { isKeyedCompressionQuarantineStrategy, type ContextManager, type Context
 async function documentedSelection(manager: ContextManager, operatorSelectedKey: string) {
   const strategy = manager.getStrategy();
   if (!isKeyedCompressionQuarantineStrategy(strategy)) throw new Error('unsupported');
-  const view = strategy.inspectCompressionRefusalQuarantine({ limit: 50 });
+  const view = strategy.inspectCompressionRefusalQuarantine({ key: operatorSelectedKey });
   if (view.status !== 'ok') throw new Error(`Quarantine unavailable: ${view.status}`);
   const selected = view.records.find((record) => record.key === operatorSelectedKey);
   if (!selected || !selected.selectable || selected.generation === null) throw new Error('unavailable');

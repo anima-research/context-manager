@@ -1,0 +1,1 @@
+- Quarantine inspection and keyed release ignore history superseded by a checkpoint even before redaction; topology repair no longer reads or warns about a superseded legacy snapshot.

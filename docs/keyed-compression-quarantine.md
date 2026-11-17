@@ -11,11 +11,11 @@ const strategy = manager.getStrategy(); // the existing loaded instance
 if (!isKeyedCompressionQuarantineStrategy(strategy)) {
   throw new Error('Keyed L1 quarantine capability unsupported');
 }
-const view = strategy.inspectCompressionRefusalQuarantine({ limit: 50 });
+const view = strategy.inspectCompressionRefusalQuarantine({ key: operatorSelectedKey });
 if (view.status !== 'ok') {
   throw new Error(`Quarantine unavailable: ${view.status}`);
 }
-// Present metadata; obtain a full key from explicit operator selection.
+// Use the full key obtained from explicit operator selection.
 const selected = view.records.find((record) => record.key === operatorSelectedKey);
 if (!selected || !selected.selectable || selected.generation === null) {
   throw new Error('Selected record is unavailable or unsupported');
@@ -51,10 +51,11 @@ returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
 not an empty list, with coarse `reason: 'store-read'` (the store threw) or
 `'ledger-entry'` (stored data failed validation). Store error text is never
 returned; unexpected projection/programmer errors propagate. Inspection
-conservatively refuses damaged historical events and never rewrites them.
+conservatively refuses damaged events since the latest checkpoint and never
+rewrites them.
 A later native hygiene pass can checkpoint the tolerant projection that the
 gate enforces, removing ignored damage; damage in a retained hold may still
-fail strict inspection afterwards. A checkpoint supersedes the legacy snapshot;
+fail strict inspection afterwards. A checkpoint supersedes preceding events and the legacy snapshot;
 that snapshot is no longer read or validated, but is not rewritten or deleted.
 Below 256 ledger events, ignored damage can leave inspection and keyed release
 unreadable indefinitely. Neither restart nor legacy clear-all repairs it;
