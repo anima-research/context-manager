@@ -594,18 +594,29 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  for (const ceiling of [true, false]) {
-    it(`reports kv-unified label-ceiling fallback=${ceiling} (${ceiling ? 'synthetic failure injection' : 'real infeasible frontier'})`, async (t) => {
+  for (const { ceiling, shadowCeiling } of [
+    { ceiling: true, shadowCeiling: undefined },
+    { ceiling: false, shadowCeiling: undefined },
+    { ceiling: true, shadowCeiling: false },
+    { ceiling: false, shadowCeiling: true },
+  ]) {
+    it(`reports live kv-unified label-ceiling fallback=${ceiling}, shadow=${shadowCeiling} (${ceiling ? 'synthetic failure injection' : 'real infeasible frontier'})`, async (t) => {
       t.mock.method(console, 'warn', () => {});
       // Synthetic failure injection tests diagnostic plumbing, not ceiling reachability.
       // It throws before the real solver checks minimum-frontier feasibility.
       // Unmocked, this fixture returns infeasible before searching (ceiling=false);
       // it cannot demonstrate a real ceiling-fallback refusal.
-      const solves = ceiling ? t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
-        throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
-      }) : undefined;
+      const originalSolve = ParetoKvUnifiedPolicySolver.prototype.solve;
+      const outcomes: boolean[] = [];
+      const solves = t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', function (this: ParetoKvUnifiedPolicySolver, options: ParetoSolveOptions) {
+        const inject = outcomes.length === 0 ? ceiling : (shadowCeiling ?? ceiling);
+        outcomes.push(inject);
+        if (inject) throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
+        return originalSolve.call(this, options);
+      });
       const strategy = new AutobiographicalStrategy({
         adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
+        ...(shadowCeiling === undefined ? {} : { productionBudgetTokens: 40 }),
         overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false,
         kvUnified: {
           policy: {
@@ -621,7 +632,8 @@ describe('OverBudgetError diagnostics', () => {
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const error = await refusal(manager);
-        if (ceiling) assert.ok(solves!.mock.callCount() > 0, 'premise: injected ceiling failure');
+        assert.equal(solves.mock.callCount(), shadowCeiling === undefined ? 1 : 2, 'one live solve and, when configured, one shadow solve');
+        assert.deepEqual(outcomes, shadowCeiling === undefined ? [ceiling] : [ceiling, shadowCeiling], 'premise: opposite live/shadow ceiling outcomes');
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
         assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), ceiling);
         assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), true, 'kv-unified reports infeasibility explicitly');
