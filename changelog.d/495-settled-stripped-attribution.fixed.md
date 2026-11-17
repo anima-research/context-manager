@@ -1,5 +1,8 @@
-- Attribute compression failures to the current attempt rather than to a reused
-  error object, including primitive thrown values. Provider failures during a
+- Attribute stripped-versus-unstripped compression failures to the current
+  attempt rather than to a reused error object, including primitive thrown
+  values. Dispatched-model attribution still uses an error-keyed WeakMap:
+  reusing an error across models can still affect its failure domain and retry
+  accounting. Provider failures during a
   carrier-stripped retry count against the stripped request; local errors after
   it answers count against the unstripped rung instead of inheriting a prior
   stripped failure identity. This can change retries and the persistent-failure

@@ -285,10 +285,19 @@ Interrupted calls (for example a transient provider failure below the persistent
 threshold, withdrawal or branch discard) emit no attempt/admission trace. Their
 absence is not evidence that no provider call occurred. A later retry logs only
 its own attempt. Completed split parts can still emit traces when a later part
-interrupts the split-stitch rung. Preparation failures before dispatch emit no provider-attempt trace.
+interrupts the split-stitch rung. Preparation failures outside `membrane.complete` emit no provider-attempt trace.
+Here “provider-rejected” means a classified rejection from `membrane.complete`,
+not proof of adapter dispatch: host pre-request hooks run inside that boundary
+and can reject locally. Request hashes describe the final request handed to
+Membrane (including carrier-stripped retries), not verified wire bytes.
+Failed-request diagnostics are best-effort. If a stripped request cannot be
+serialized, diagnostics retry with the unaffected planned request, explicitly
+marked `requestIdentity: planned-fallback`; its hash, count and estimate describe
+the plan, while latency remains the elapsed attempt time. If both diagnostic
+constructions fail, the durable outcome remains but its attempt trace can be absent.
 Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)
 and includes any carrier fallback. A provider-rejected attempt’s
-request hash, count and estimate describe the final dispatched request; admission
+request hash, count and estimate describe the final request handed to Membrane; admission
 continues to describe the planned rewrite. Admission-rejected traces instead
 describe the planned request with zero latency; no provider call occurred.
 

@@ -1652,6 +1652,8 @@ interface RecallCurveVariant {
 interface CompressionAttemptTrace {
   /** Opt-in, log-only; never copied into durable outcomes or progress. */
   admission?: CompressionAdmissionTrace;
+  /** Failed final-request diagnostics fell back to the planned request; log-only. */
+  requestIdentity?: 'planned-fallback';
   curveLabel: string;
   recallIds: string[];
   recallLevels: number[];
@@ -11965,7 +11967,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Log-only metadata for the most recent failed runAttempt. A stripped
     // retry replaces the planned request here, without changing rung identity
     // in durable progress. Reused decisions never consume this snapshot.
-    let failedAttempt: { request: NormalizedRequest; latencyMs: number;
+    let failedAttempt: { request: NormalizedRequest; plannedRequest: NormalizedRequest; latencyMs: number;
       metadata: Pick<CompressionAttemptTrace, 'curveLabel' | 'recallIds' | 'recallLevels' | 'leafCoverageHash' | 'expandedParentId' | 'expandedChildIds'> } | undefined;
     // Rungs within this chunk are sequential; never attribute through a shared error.
     let attemptStripped = false;
@@ -12026,7 +12028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Retain only a reference here. Serialization belongs to the guarded
           // trace construction after classification, never the provider catch.
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
-            failedAttempt = { request: failedRequest, latencyMs: performance.now() - started,
+            failedAttempt = { request: failedRequest, plannedRequest: attemptRequest, latencyMs: performance.now() - started,
               metadata: { curveLabel, recallIds, recallLevels, leafCoverageHash, expandedParentId, expandedChildIds } };
           }, this.ns, `compression attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
         };
@@ -12118,9 +12120,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (response && typeof response === 'object') countedStripped.add(response);
         }
         failedAttempt = undefined;
-        this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
-        // An answer ends the run of failures of the rung that gave it.
+        // End the provider run before resuming: a throwing local warning sink
+        // must not extend the answered call's old failure streak.
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
+        this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
@@ -12352,6 +12355,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               persisted: false, outcome: 'provider_error', errorType, ...annotation };
             attemptTraces.push(trace);
           }, this.ns, `compression attempt diagnostic failed: rung=${failedAttempt?.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+          // A transport may mutate the stripped copy into an unserializable
+          // object. Keep the decided rung visible using the unaffected plan,
+          // explicitly marked: never pretend its hash is the final request's.
+          if (!trace && failedAttempt && failedAttempt.request !== failedAttempt.plannedRequest &&
+              process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace = { ...failedAttempt!.metadata,
+              ...this.compressionFailedAttemptTrace({ request: failedAttempt!.plannedRequest, latencyMs: failedAttempt!.latencyMs }),
+              requestIdentity: 'planned-fallback', persisted: false, outcome: 'provider_error', errorType, ...annotation };
+            attemptTraces.push(trace);
+          }, this.ns, `compression planned-attempt diagnostic failed: rung=${failedAttempt.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           return trace;
         } finally {
           failedAttempt = undefined;
@@ -12705,12 +12718,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
-            trace.outcome = 'success';
+            trace.outcome = extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty';
             fallbackResponse = assessment.response;
             response = assessment.response;
             successfulTrace = trace;
           } else {
             trace.outcome = assessment.outcome;
+            if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
             const outcome: CompressionRefusalOutcomeRecord = {
               curveLabel, requestHash, outcome: assessment.outcome,
               ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
@@ -12898,13 +12912,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const assessment = this.assessFallbackCompressionResponse(result.response);
             progressSourceOnlyInputTokens = baseInputTokens(result.response);
             if (assessment.outcome === 'valid') {
-              trace.outcome = 'success';
+              trace.outcome = extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty';
               fallbackResponse = assessment.response;
               response = assessment.response;
               successfulTrace = trace;
             } else {
               sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
+              if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
               const outcome: CompressionRefusalOutcomeRecord = {
                 curveLabel, requestHash, outcome: assessment.outcome,
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
@@ -13099,7 +13114,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }
             }
             if (assessment.outcome === 'valid') {
-              trace.outcome = 'success';
+              trace.outcome = extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty';
               lastGood = assessment.response;
               inputTokens += assessment.response.usage?.inputTokens ?? 0;
               {
@@ -13117,7 +13132,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }
             } else {
               trace.outcome = assessment.outcome;
-              if (assessment.outcome === 'provider_error') { abortReason = `provider-error:${assessment.errorType ?? 'unclassified'}`; return false; }
+              if (assessment.outcome === 'provider_error') { trace.errorType = assessment.errorType; abortReason = `provider-error:${assessment.errorType ?? 'unclassified'}`; return false; }
             }
             }
             // Refused (or empty): split at a lawful boundary, never inside a tool round.
@@ -13272,7 +13287,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? extractSummaryText(acceptedResponse)
         : { text: '', recoveredWholeWrapper: false };
       let summaryText = extraction.text;
-      if (successfulTrace && CANONICAL_STAGE_LABELS.has(successfulTrace.curveLabel)) {
+      if (successfulTrace) {
         successfulTrace.outcome = summaryText.trim() ? 'success' : 'unusable_empty';
       }
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */

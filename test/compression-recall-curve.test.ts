@@ -4360,6 +4360,174 @@ describe('tool-prose hoist admission', () => {
       }
     });
 
+    for (const kind of kinds) {
+      for (const fallback of ['empty', 'malformed'] as const) {
+        it(`${kind} keeps extracted-empty outcomes and malformed error types in both logs (${fallback})`, async () => {
+          const answer: AttemptHandler = fallback === 'empty'
+            ? { stop: 'end_turn', text: '<thinking>hidden</thinking>' }
+            : { raw: { stopReason: 'end_turn', content: {} } };
+          const mock = flexibleMembrane(kind === 'source-hoist'
+            ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, answer, { stop: 'refusal' }]
+            : [{ stop: 'refusal' }, answer, { stop: 'refusal' }]);
+          const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') hoistableChunk(fx);
+          try {
+            const logs = await capture(fx);
+            for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+              const trace = logs.find(log => log.event === event && log.metadata?.curveLabel === label(kind))?.metadata;
+              assert.ok(trace, `${event} has the attempted rung`);
+              assert.equal(trace.outcome, fallback === 'empty' ? 'unusable_empty' : 'provider_error');
+              if (fallback === 'malformed') assert.equal(trace.errorType, 'malformed_content');
+            }
+            assert.equal(fx.target.compressed, false);
+          } finally { fx.manager.close(); }
+        });
+      }
+    }
+
+    for (const fallback of ['source-only', 'split'] as const) {
+      for (const malformed of [false, true]) it(`${fallback} assessment traces retain empty outcomes and error types (malformed=${malformed})`, async () => {
+        const answer: AttemptHandler = malformed
+          ? { raw: { stopReason: 'end_turn', content: {} } }
+          : { stop: 'end_turn', text: '<thinking>hidden</thinking>' };
+        const mock = flexibleMembrane([{ stop: 'refusal' }, ...(fallback === 'split' ? [{ stop: 'refusal' } as AttemptHandler] : []), answer, { stop: 'refusal' }]);
+        const fx = await fixture(mock.membrane, {
+          compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+          compressionSplitFallback: fallback === 'split',
+        });
+        try {
+          const logs = await capture(fx);
+          const matches = (log: Log) => fallback === 'split'
+            ? String(log.metadata?.curveLabel).startsWith('split:')
+            : log.metadata?.curveLabel === 'source-only-final';
+          const trace = logs.find(log => log.event === 'compression:attempt' && matches(log))?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.outcome, malformed ? 'provider_error' : 'unusable_empty');
+          if (malformed) assert.equal(trace.errorType, 'malformed_content');
+          if (fallback === 'source-only') {
+            const curve = logs.find(log => log.event === 'compression:curve-attempt' && matches(log))?.metadata;
+            assert.equal(curve?.outcome, trace.outcome);
+            assert.equal(curve?.errorType, trace.errorType);
+          }
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    it('a decided expansion retains marked planned-request traces when the stripped diagnostic cannot serialize', async () => {
+      const rejection = Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      });
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { error: rejection }, { error: rejection }, { stop: 'refusal' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+      const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = membrane.complete;
+      membrane.complete = async request => {
+        const stripped = mock.calls.length === 2;
+        try { return await complete(request); }
+        catch (error) {
+          if (stripped) Object.defineProperty(request, 'toJSON', { value: () => { throw new Error('transport serialization failed'); } });
+          throw error;
+        }
+      };
+      try {
+        const logs = await capture(fx);
+        for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+          const trace = logs.find(log => log.event === event && log.metadata?.curveLabel === label('expansion'))?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.requestIdentity, 'planned-fallback');
+          assert.equal(trace.outcome, 'provider_error');
+          assert.equal(trace.errorType, 'invalid_request');
+          assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1]!.request)).digest('hex'));
+          assert.ok(Number(trace.latencyMs) > 0);
+          assert.ok(trace.admission);
+        }
+        const durable = JSON.stringify(quarantineEvents(fx.manager));
+        assert.equal(durable.includes('planned-fallback'), false, 'the fallback marker is log-only');
+        assert.equal(fx.target.compressed, false);
+      } finally { fx.manager.close(); }
+    });
+
+    it('an answered rung ends its old provider streak before a throwing resume warning', async () => {
+      const mock = flexibleMembrane([{ stop: 'end_turn', text: 'memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const local = new Error('local resume warning failed');
+      const seam = fx.strategy as unknown as {
+        resumeCompressionLane(): void;
+        noteCompressionLanded(membrane: unknown, model: string): void;
+      };
+      try {
+        await seedFailureRun(fx, mock.membrane);
+        for (const entry of failureRuns(fx).values()) entry.run.failures = 7;
+        seam.noteCompressionLanded(mock.membrane, MODEL);
+        seam.resumeCompressionLane = () => { throw local; };
+        await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === local);
+        assert.equal(mock.calls.length, 1, 'the provider answered, no fallback was spent');
+        assert.equal(failureRuns(fx).size, 1);
+        assert.equal([...failureRuns(fx).values()][0]!.run.failures, 1, 'local failure starts a fresh run');
+        assert.equal(quarantineEvents(fx.manager).filter(e => e.kind === 'exhausted').length, 0);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const kind of kinds) it(`${kind} preserves interrupted gated failure history across logging modes`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      const snapshots: unknown[] = [];
+      try {
+        for (const mode of ['off', 'on', 'diagnostic', 'write'] as const) {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const outage = Object.assign(new Error('gated outage'), { type: 'server_error' });
+          const handlers: AttemptHandler[] = kind === 'source-hoist'
+            ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, { error: outage }]
+            : [{ stop: 'refusal' }, { error: outage }];
+          const mock = flexibleMembrane(handlers);
+          const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') hoistableChunk(fx);
+          const seam = fx.strategy as unknown as {
+            noteCompressionLanded(membrane: unknown, model: string): void;
+            compressionFailedAttemptTrace(...args: unknown[]): unknown;
+          };
+          try {
+            await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === outage);
+            assert.equal(failureRuns(fx).size, 1);
+            const entry = [...failureRuns(fx).values()][0]!;
+            assert.equal(entry.run.key, createHash('sha256').update(JSON.stringify({
+              runSubject: [...failureRuns(fx).keys()][0], curveLabel: label(kind), stripped: false,
+            })).digest('hex'), 'seed the gated rung, not canonical');
+            entry.run.failures = 3;
+            seam.noteCompressionLanded(mock.membrane, MODEL);
+            if (mode === 'diagnostic') seam.compressionFailedAttemptTrace = () => { throw new Error('failed diagnostic'); };
+            const path = `${freshPath()}-history.jsonl`;
+            paths.push(path);
+            if (mode !== 'off') process.env.CONTEXT_MANAGER_COMPRESSION_LOG = mode === 'write' ? '/dev/null/history.jsonl' : path;
+            console.warn = (...args) => {
+              if (mode === 'write' && String(args[0]).includes('compression log write failed:')) throw new Error('warning sink failed');
+            };
+            await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === outage);
+            assert.equal([...failureRuns(fx).values()][0]!.run.failures, 4, 'interruption preserves and extends the gated run');
+            const interrupted = failureSnapshot(fx);
+            [...failureRuns(fx).values()][0]!.run.failures = 7;
+            seam.noteCompressionLanded(mock.membrane, MODEL);
+            // Only the expansion has a later source-only rung. Let that refuse.
+            handlers.push({ error: outage }, { error: outage }, { stop: 'refusal' });
+            await fx.strategy.run(fx.target, managerContext(fx.manager));
+            const exhausted = quarantineEvents(fx.manager).filter(e => e.kind === 'exhausted').map(e => e.outcomes);
+            assert.ok(JSON.stringify(exhausted).includes('persistent-server_error'), 'the preserved history decides the gated rung');
+            snapshots.push({ interrupted, final: failureSnapshot(fx), exhausted, requests: mock.calls.map(c => c.request) });
+          } finally { fx.manager.close(); }
+        }
+        for (const snapshot of snapshots.slice(1)) assert.deepEqual(snapshot, snapshots[0]);
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
     it('logging leaves exact requests, call counts, family keys, plans and outcomes unchanged', async () => {
       const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
       try {
