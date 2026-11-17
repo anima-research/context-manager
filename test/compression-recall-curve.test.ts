@@ -4556,6 +4556,111 @@ describe('tool-prose hoist admission', () => {
       });
     }
 
+    it('a thinking-only recall expansion logs unusable_empty before the plain-prose retry', async () => {
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { stop: 'end_turn', text: '<thinking>hidden memory</thinking>' },
+        { stop: 'end_turn', text: 'plain memory' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      try {
+        const logs = await capture(fx);
+        for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+          assert.equal(logs.find(log => log.event === event && log.metadata?.curveLabel === label('expansion'))?.metadata?.outcome, 'unusable_empty');
+        }
+        assert.equal(mock.calls.length, 3);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const stripped of [false, true]) it(`answered attempts use exact monotonic latency (stripped=${stripped})`, async () => {
+      const rejection = { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) };
+      const mock = flexibleMembrane([...(stripped ? [rejection] : []), { stop: 'end_turn', text: 'memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as { prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest };
+      const prepare = seam.prepareCompressionCandidate;
+      if (stripped) seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = membrane.complete;
+      let time = 100;
+      membrane.complete = async request => {
+        try { return await complete(request); }
+        finally { time += 37.25; }
+      };
+      const now = performance.now;
+      try {
+        performance.now = () => time;
+        const logs = await capture(fx);
+        assert.equal(logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical')?.metadata?.latencyMs, stripped ? 74.5 : 37.25);
+        assert.equal(mock.calls.length, stripped ? 2 : 1);
+      } finally { performance.now = now; fx.manager.close(); }
+    });
+
+    it('local fallback-setup failures do not reuse the carrier provider snapshot', async () => {
+      const mock = flexibleMembrane([{ error: Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as {
+        prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        recordCompressionFamilyProgress(...args: unknown[]): void;
+      };
+      const prepare = seam.prepareCompressionCandidate;
+      seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      const record = seam.recordCompressionFamilyProgress;
+      let failed = false;
+      seam.recordCompressionFamilyProgress = function (...args) {
+        if (!failed) {
+          failed = true;
+          throw Object.assign(new Error('local setup failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+        }
+        record.apply(this, args);
+      };
+      try {
+        const logs = await capture(fx);
+        assert.ok(failed);
+        assert.equal(mock.calls.length, 1, 'fallback setup failed before the stripped call');
+        assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const persistent of [false, true]) it(`a decided split part logs the dispatched attempt (persistent=${persistent})`, async () => {
+      const error = Object.assign(new Error('split request failed'), persistent
+        ? { type: 'server_error', httpStatus: 503, retryable: true }
+        : { type: 'invalid_request', httpStatus: 400, retryable: false });
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error }]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionSplitFallback: true,
+      });
+      try {
+        if (persistent) {
+          const interrupted = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === error));
+          assert.equal(interrupted.some(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:')), false);
+          const seam = fx.strategy as unknown as {
+            compressionFailureRuns: Map<string, { run: { failures: number } }>;
+            noteCompressionLanded(membrane: unknown, model: string): void;
+          };
+          assert.equal(seam.compressionFailureRuns.size, 1);
+          for (const entry of seam.compressionFailureRuns.values()) entry.run.failures = 7;
+          seam.noteCompressionLanded(mock.membrane, MODEL);
+        }
+        const logs = await capture(fx);
+        const trace = logs.find(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:'))?.metadata;
+        assert.ok(trace);
+        assert.equal(trace.outcome, 'provider_error');
+        assert.equal(trace.errorType, persistent ? 'persistent-server_error:503' : 'invalid_request');
+        assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));
+      } finally { fx.manager.close(); }
+    });
+
     it('a successful recall expansion carries admission through curve-succeeded', async () => {
       const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 1234 }, { stop: 'end_turn', text: 'a memory' }]);
       const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
@@ -4708,7 +4813,7 @@ describe('tool-prose hoist admission', () => {
           for (const label of ['canonical', ...(rejectedLabel === 'canonical-toolless' ? ['canonical-no-tools'] : [])]) {
             const answered = attempts.find(log => log.metadata?.curveLabel === label)?.metadata;
             assert.equal(answered?.stopReason, 'tool_use');
-            assert.notEqual(answered?.outcome, 'provider_error', 'an answered request is not a provider rejection');
+            assert.equal(answered?.outcome, 'incomplete', 'the tool-use answer retains its own outcome');
           }
           const final = attempts.find(log => log.metadata?.curveLabel === rejectedLabel)?.metadata;
           assert.ok(final);

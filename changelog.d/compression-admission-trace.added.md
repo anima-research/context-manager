@@ -4,10 +4,15 @@
   provider input (or explicit unknown), accounting source, positive sent-form
   delta, bounded input, output reserve, admitted total and configured budget.
   Source-only-final counts are distinguished from canonical counts. Admission
-  decisions, dispatched requests and durable schemas are unchanged. Separately,
-  the settled-stripped attribution fix allows repeated post-answer local failures
-  to reach the persistent-failure bound after a known carrier rejection; this can
-  change retry counts, quarantine and persisted family outcomes.
+  decisions, dispatched requests and durable schemas are unchanged. Failure
+  attribution is not behavior-neutral: after a stripped provider answer, local
+  errors use the unstripped rung key. Reusing a carrier rejection resets that
+  key, including an older provider-failure run left by a sibling strategy.
+  Repeated post-answer local errors after a reused carrier rejection restart
+  the run rather than accumulating; preserving them requires a separate
+  local-error run identity, not implemented here. This reverts the earlier
+  change that preserved that run on reuse; retry counts, quarantine and
+  persisted family outcomes can therefore differ from that intermediate fix.
   Provider-rejected hoists now emit curve-attempt and chunk-associated
   compression:attempt entries with the same attempt trace shape as recall rungs.
   Interrupted calls have no attempt/admission trace and remain retryable; completed
@@ -18,8 +23,12 @@
   Answered hoists also expose top-level totals. Failed-request diagnostics do no
   serialization or hashing with logging disabled and cannot replace provider errors.
 
-- Preparation failures do not fabricate provider-attempt traces. Ladder-step failed calls retain request references only while constructing opt-in diagnostics;
-  successful stripped retries clear the failed snapshot. Stripped-versus-unstripped run attribution is attempt-local,
+- Preparation and local fallback-setup failures do not fabricate provider-attempt
+  traces. With logging enabled, failed calls retain a request reference through
+  failure classification, then release it whether or not a diagnostic is built;
+  interrupted ladder steps and split rungs release it on exit. Carrier fallback
+  setup and successful stripped retries clear the failed snapshot. Decided
+  split-part provider failures also emit attempt traces. Stripped-versus-unstripped run attribution is attempt-local,
   including primitive errors; dispatched-model attribution still uses the existing
   error-keyed WeakMap. Canonical and source-only rejections also emit attempt traces.
   Answered and rejected attempt timing uses a monotonic clock with fractional milliseconds;
@@ -32,5 +41,7 @@
   hash used in family outcomes. Match `curveLabel` for the rejected stage; reused
   outcomes or failures before dispatch still carry the durable outcome record.
   Durable family keys and outcome hashes are unchanged.
+- Mark earlier canonical tool-use answers incomplete when a later retry rejects.
 - Keep answered recall-variant outcomes in immediate curve-attempt logs, and emit
-  curve-attempt logs for newly decided source-only-final provider failures.
+  curve-attempt logs for newly decided source-only-final provider failures. Recall
+  answers that strip to empty are logged as unusable_empty, not success.

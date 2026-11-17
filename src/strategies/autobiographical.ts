@@ -12076,6 +12076,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           )) {
             throw error;
           }
+          // The carrier call has been classified. Fallback setup/progress
+          // failures are local, not failures of that dispatched request.
+          failedAttempt = undefined;
           if (!known) {
             noteOutcome({
               curveLabel: carrierLabel,
@@ -12084,10 +12087,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
           }
-          // A fresh rejection ends the carrier request's failure run. A known
-          // rejection already ended it; reuse must not end a new run of local
-          // errors raised after the stripped provider answered.
-          if (!known) this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
+          // A reused rejection may come from a sibling strategy, leaving this
+          // instance's old carrier-provider run open. End it before local errors
+          // can extend it. This also restarts post-answer local-error runs: they
+          // share this key, so preserving them would require a distinct identity.
+          this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -12330,6 +12334,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         persistProgress();
         throw error;
       };
+      const traceFailedAttempt = (
+        errorType: string | undefined,
+        annotation: Pick<CompressionRefusalOutcomeRecord, 'admittedTokens' | 'budgetTokens'> = {},
+      ): CompressionAttemptTrace | undefined => {
+        let trace: CompressionAttemptTrace | undefined;
+        try {
+          if (failedAttempt && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace = { ...failedAttempt!.metadata, ...this.compressionFailedAttemptTrace(failedAttempt!),
+              persisted: false, outcome: 'provider_error', errorType, ...annotation };
+            attemptTraces.push(trace);
+          }, this.ns, 'compression attempt diagnostic failed:');
+          return trace;
+        } finally {
+          failedAttempt = undefined;
+        }
+      };
       type LadderStep =
         | { kind: 'answered'; response: unknown }
         | { kind: 'decided'; outcome: CompressionRefusalOutcomeRecord; reused: boolean; trace?: CompressionAttemptTrace };
@@ -12390,16 +12410,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
-          let trace: CompressionAttemptTrace | undefined;
-          if (failedAttempt && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
-            trace = { ...failedAttempt!.metadata, ...this.compressionFailedAttemptTrace(failedAttempt!),
-              persisted: false, outcome: 'provider_error', errorType: outcome.errorType, ...annotation };
-            attemptTraces.push(trace);
-          }, this.ns, `compression attempt diagnostic failed (${curveLabel}):`);
+          const trace = traceFailedAttempt(outcome.errorType, annotation);
           return { kind: 'decided', outcome, reused: false, trace };
         } finally {
           failedAttempt = undefined;
         }
+      };
+
+      const extractSummaryText = (r: NormalizedResponse): { text: string; recoveredWholeWrapper: boolean } => {
+        const rawText = r.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+        // The opt-in reads an answer of text blocks alone; one with native
+        // reasoning beside its text is read as before.
+        const onlyTextBlocks = r.content.every((block) => block.type === 'text');
+        const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+        return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
       };
 
       // ---- Canonical stage: the canonical request, then its tool_use retries ----
@@ -12571,6 +12598,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
         if (canonicalTrace && !canonicalRejection) canonicalTrace.outcome = canonicalOutcome;
+        // Earlier tool-use answers remain incomplete when a later retry rejects.
+        for (const trace of attemptTraces) {
+          if (CANONICAL_STAGE_LABELS.has(trace.curveLabel) && trace.stopReason === 'tool_use') trace.outcome = 'incomplete';
+        }
         // A later canonical-stage retry may be rejected after canonical answered.
         // Its trace identifies the dispatched bytes (possibly carrier-stripped);
         // the durable rejection instead identifies the planned rung.
@@ -12796,7 +12827,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
           const assessment = this.assessFallbackCompressionResponse(variantResponse);
-          trace.outcome = assessment.outcome === 'valid' ? 'success' : assessment.outcome;
+          trace.outcome = assessment.outcome === 'valid'
+            ? (extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty')
+            : assessment.outcome;
           if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
           logCompressionCall({
             event: 'compression:curve-attempt',
@@ -12833,7 +12866,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteOutcome(outcome);
             continue;
           }
-          trace.outcome = 'success';
           fallbackResponse = assessment.response;
           response = assessment.response;
           successfulTrace = trace;
@@ -13036,7 +13068,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // abort) ends this attempt of it and propagates; only a
               // deterministic rejection of a piece abandons the rung.
               if (compressionFailureKind(error) !== 'rejection') throw error;
-              abortReason = `provider-error:${compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error)}`;
+              const errorType = compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error);
+              traceFailedAttempt(errorType);
+              abortReason = `provider-error:${errorType}`;
               return false;
             }
             const assessment = this.assessFallbackCompressionResponse(res);
@@ -13126,7 +13160,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // applying again. When the failures decide the request
             // (COMPRESSION_PERSISTENT_FAILURES), the rung ends here instead.
             const decision = interrupt(error, 'split-stitch', leafHash);
+            traceFailedAttempt(decision.errorType);
             abortReason = `provider-error:${decision.errorType ?? 'persistent'}`;
+          } finally {
+            failedAttempt = undefined;
           }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
@@ -13229,17 +13266,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // progress: an end_turn whose text stripped to empty (recorded below
       // before the plain-prose rung was interrupted). It has no text.
       let acceptedResponse = response as NormalizedResponse | undefined;
-      const extractSummaryText = (r: NormalizedResponse): { text: string; recoveredWholeWrapper: boolean } => {
-        const rawText = r.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map(b => b.text)
-          .join('\n');
-        // The opt-in reads an answer of text blocks alone; one with native
-        // reasoning beside its text is read as before.
-        const onlyTextBlocks = r.content.every((block) => block.type === 'text');
-        const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
-        return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
-      };
       let extraction = acceptedResponse
         ? extractSummaryText(acceptedResponse)
         : { text: '', recoveredWholeWrapper: false };

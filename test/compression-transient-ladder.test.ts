@@ -1025,7 +1025,46 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
-  it('repeated local inspection failures after stripped answers reach the persistent-failure bound', async () => {
+  it('a sibling carrier rejection ends an older provider-failure run before local inspection fails', async () => {
+    const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const fx = await withCarriers(mock.membrane);
+    const peer = new ProbeStrategy(config({}));
+    const peerMock = scripted([{ throw: rejected }, { throw: new CompressionWithdrawn() }]);
+    const peerManager = await ContextManager.open({ store: fx.manager.getStore(), strategy: peer, membrane: peerMock.membrane });
+    peerManager.setToolDefinitions(['skip_reply', 'journal'].map(tool));
+    (peer as unknown as { summaries: SummaryEntry[] }).summaries = structuredClone(fx.strategy.summariesView());
+    const localError = failure('network');
+    const seam = fx.strategy as unknown as { compressionResponseStopReason(response: unknown): string | undefined };
+    const inspect = seam.compressionResponseStopReason;
+    try {
+      for (let i = 0; i < 7; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      }
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 7);
+      await assert.rejects(peer.run(fx.target(), managerContext(peerManager)), error => error instanceof CompressionWithdrawn);
+      assert.equal(peerMock.calls.length, 2);
+      assert.ok(progressSlot(fx.manager).some(entry => JSON.stringify(entry).includes('canonical:carrier-rejected')));
+      const answered = scripted([OK('stripped memory')]);
+      // Keep the same domain; only replace the provider's behavior.
+      (mock.membrane as unknown as { complete: unknown }).complete = (answered.membrane as unknown as { complete: unknown }).complete;
+      seam.compressionResponseStopReason = () => { throw localError; };
+      fx.strategy.land(mock.membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      assert.equal(answered.calls.length, 1);
+      assert.ok(!carriesThinking(answered.calls[0]!));
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 1, 'the local error must not become the eighth old provider failure');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally {
+      seam.compressionResponseStopReason = inspect;
+      fx.manager.close();
+    }
+  });
+
+  it('repeated local inspection failures restart after reused carrier rejections', async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
       type: 'invalid_request', retryable: false, httpStatus: 400,
     });
@@ -1037,23 +1076,20 @@ describe('every rung keeps its own identity across a resume', () => {
     const inspect = internals.compressionResponseStopReason;
     internals.compressionResponseStopReason = () => { inspections++; throw localError; };
     try {
-      for (let i = 0; i < 7; i++) {
+      // Reuse must reset the shared unstripped key: it might still contain
+      // provider failures from before a sibling recorded the carrier rejection.
+      // Without a distinct local-error identity, repeated local errors reset too.
+      for (let i = 0; i < 8; i++) {
         fx.strategy.land(mock.membrane);
         await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
       }
-      assert.equal(inspections, 7, 'each provider answer reached the failing local inspection');
-      assert.equal(mock.calls.length, 8, 'one carrier rejection, then seven stripped answers');
+      assert.equal(inspections, 8, 'each provider answer reached the failing local inspection');
+      assert.equal(mock.calls.length, 9, 'one carrier rejection, then eight stripped answers');
       assert.ok(carriesThinking(mock.calls[0]!) && mock.calls.slice(1).every(request => !carriesThinking(request)));
       assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
-        key: runKey(fx.target().messages, 'canonical', false), failures: 7,
-      }], 'local errors accumulate outside the stripped provider run that each answer ends');
-      fx.strategy.land(mock.membrane);
-      await fx.strategy.run(fx.target(), managerContext(fx.manager));
-      assert.equal(inspections, 8);
-      assert.equal(mock.calls.length, 9);
-      const status = fx.strategy.getCompressionQuarantineStatus();
-      assert.equal(status.count, 1, 'the eighth local failure decides the family, rather than restarting at one');
-      assert.equal(status.spans[0]!.latestOutcome, 'provider_error:persistent-network');
+        key: runKey(fx.target().messages, 'canonical', false), failures: 1,
+      }], 'each reused carrier rejection restarts the shared unstripped run');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'local errors alone do not reach the bound here');
     } finally {
       internals.compressionResponseStopReason = inspect;
       fx.manager.close();
@@ -1065,21 +1101,31 @@ describe('every rung keeps its own identity across a resume', () => {
       const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
         type: 'invalid_request', retryable: false, httpStatus: 400,
       });
-      const stripped = scripted([{ throw: rejected }, { throw: shared }]);
-      const plain = scripted([{ throw: shared }]);
+      let releasePlain!: () => void;
+      let releaseStripped!: () => void;
+      const plainGate = new Promise<void>(resolve => { releasePlain = resolve; });
+      const strippedGate = new Promise<void>(resolve => { releaseStripped = resolve; });
+      const stripped = scripted([{ throw: rejected }, { gate: strippedGate, then: { throw: shared } }]);
+      const plain = scripted([{ gate: plainGate, then: { throw: shared } }]);
       const a = await withCarriers(stripped.membrane);
       const b = await withCarriers(plain.membrane);
       try {
-        const results = await Promise.allSettled([
+        const pending = Promise.allSettled([
           a.strategy.run(a.target(), managerContext(a.manager)),
           b.strategy.run(b.target(), managerContext(b.manager)),
         ]);
+        await until(() => stripped.calls.length === 2 && plain.calls.length === 1, 'both conflicting failures gated');
+        // Both runAttempt catches write attribution before either ladderStep
+        // classifies: the stripped write must overwrite the plain error-keyed one.
+        releasePlain();
+        releaseStripped();
+        const results = await pending;
         assert.ok(results.every(result => result.status === 'rejected' && result.reason === shared));
         assert.equal(stripped.calls.length, 2);
         assert.ok(carriesThinking(stripped.calls[0]!) && !carriesThinking(stripped.calls[1]!));
         assert.deepEqual(l1RunsOf(a.strategy).map(run => run.key), [runKey(a.target().messages, 'canonical', true)]);
         assert.deepEqual(l1RunsOf(b.strategy).map(run => run.key), [runKey(b.target().messages, 'canonical', false)]);
-      } finally { a.manager.close(); b.manager.close(); }
+      } finally { releasePlain(); releaseStripped(); a.manager.close(); b.manager.close(); }
     });
   }
 
@@ -2650,7 +2696,7 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     });
   }
 
-  it("a carrier rejection reused from progress preserves a later local-error run", async () => {
+  it("a carrier rejection reused from progress ends the shared unstripped run", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const withdrawn = new CompressionWithdrawn();
     const mock = scripted([{ throw: rejected }, { throw: failure('network') }, { throw: withdrawn }]);
@@ -2663,15 +2709,13 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     const ctx = managerContext(fx.manager);
     await assert.rejects(fx.strategy.run(fx.target(), ctx), /zz network failure/);
     assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the carrier request was rejected, and its stripped retry failed');
-    // This unstripped-key run can now represent local errors after an answer.
+    // The shared key may represent either old provider failures or local errors.
     seedRung(fx.strategy, fx.target(), 'canonical', false);
     // The stripped request is withdrawn, which records nothing and ends no run.
     await assert.rejects(fx.strategy.run(fx.target(), ctx), (error) => error === withdrawn);
     assert.equal(mock.calls.length, 3, 'premise: one more call');
     assert.ok(!carries(mock.calls[2]!), 'premise: the known-rejected carrier request was not sent again');
-    assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
-      key: runKey(fx.target().messages, 'canonical', false), failures: 7,
-    }], 'a reused rejection must preserve a run that could now belong to post-answer local errors');
+    assert.deepEqual(l1RunsOf(fx.strategy), [], 'reuse ends the shared unstripped run');
     fx.manager.close();
   });
 
