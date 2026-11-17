@@ -2,7 +2,7 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateCompressionInstructions } from '../src/index.js';
 import { compressionInstruction } from '../src/compression-instructions.js';
-import type { CompressionInstructions } from '../src/index.js';
+import type { CompressionInstructions, SummaryLevel, SummaryEntry } from '../src/index.js';
 import { Probe, run, custom, instruction, texts } from './compression-instructions-harness.js';
 
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
@@ -235,4 +235,22 @@ it('rendering ignores inherited slots and the stored clone is validated after ge
   const snapshot = new Expose({ compressionInstructions: changing });
   assert.equal(snapshot.opening(), 'validated snapshot');
   assert.equal(snapshotReads, 2, 'one caller validation, one clone; validate the stored clone without reading getters again');
+});
+
+it('source-retry subclasses receive only level, sources and target tokens, including reading retries', async () => {
+  const received: unknown[][] = [];
+  class SourceArgs extends Probe {
+    protected override getSourceMergeInstruction(targetLevel: SummaryLevel, sources: SummaryEntry[], targetTokens: number) {
+      received.push(Array.from(arguments));
+      return super.getSourceMergeInstruction(targetLevel, sources, targetTokens);
+    }
+  }
+  for (const mode of ['fallback', 'readingFallback'] as const) {
+    const calls = await run(mode, 'mixed', undefined, {}, SourceArgs);
+    assert.equal(received.at(-1)!.length, 3);
+    assert.equal(received.at(-1)![0], 2);
+    assert.equal((received.at(-1)![1] as unknown[]).length, 2);
+    assert.equal(typeof received.at(-1)![2], 'number');
+    assert.ok(calls.length === 2);
+  }
 });

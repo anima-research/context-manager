@@ -14244,7 +14244,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     let mergeInstructionText = this.applyIdentityReminder(
       refusalFallback
-        ? this.getSourceMergeInstruction(targetLevel, sources, targetTokens, mergeReadingContext?.totalTokens)
+        ? this.getSourceMergeInstruction(targetLevel, sources, targetTokens)
         : mergeReadingContext
           ? this.getReadingMergeInstruction(
               targetLevel,
@@ -19403,7 +19403,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
     targetTokens: number,
-    totalTokens?: number,
   ): string {
     const sourceLevelShown = sources[0].level;
     const witnessed = sources.every(s => s.witnessed);
