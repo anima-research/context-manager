@@ -11958,6 +11958,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Log-only traces: durable outcomes/progress copy named fields, never admission.
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
+    // Log-only metadata for the most recent failed runAttempt. A stripped
+    // retry replaces the planned request here, without changing rung identity
+    // in durable progress. Reused decisions never consume this snapshot.
+    let failedAttempt: Pick<CompressionAttemptTrace,
+      'requestHash' | 'messageCount' | 'estimatedTokens' | 'latencyMs'> | undefined;
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
     /**
@@ -11989,6 +11994,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedParentId?: string,
         expandedChildIds?: string[],
       ): Promise<unknown> => {
+        failedAttempt = undefined;
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         // Each attempt, a ladder's next rung included, checks before it calls
         // the provider: a strategy let go of between two attempts starts no
@@ -12009,6 +12015,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        const noteFailedAttempt = (failedRequest: NormalizedRequest): void => {
+          failedAttempt = {
+            requestHash: sha256Json(failedRequest),
+            messageCount: failedRequest.messages.length,
+            estimatedTokens: this.estimateCompressionRequestTokens(failedRequest),
+            latencyMs: Date.now() - started,
+          };
+        };
         // A call's error, when its work lost its branch or strategy
         // generation while the call was out (a detach, a branch move), is
         // discarded as the call's result would be: no rung counts it, a split
@@ -12040,6 +12054,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
+            noteFailedAttempt(attemptRequest);
             noteDispatchedModel(error, attemptRequest);
             if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
@@ -12084,6 +12099,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           try {
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
+            noteFailedAttempt(acceptedRequest);
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
               dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
@@ -12617,7 +12633,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 curveLabel, recallIds, recallLevels, leafCoverageHash: coverageHash,
                 requestHash, messageCount: hoistedRequest.messages.length,
                 estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
-                latencyMs: 0, persisted: false, outcome: 'provider_error',
+                latencyMs: 0, ...failedAttempt, persisted: false, outcome: 'provider_error',
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
                 admittedTokens: admission.admittedTokens, budgetTokens: admission.budgetTokens,
               };
@@ -12630,6 +12646,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return;
           }
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          trace.admittedTokens = admission.admittedTokens;
+          trace.budgetTokens = admission.budgetTokens;
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
             trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
           }, this.ns, 'compression admission diagnostic failed:');
@@ -12752,6 +12770,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 latencyMs: 0,
                 persisted: false,
                 outcome: 'provider_error',
+                ...failedAttempt,
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
                 admittedTokens,
                 budgetTokens: contextBudget,

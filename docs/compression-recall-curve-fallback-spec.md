@@ -274,7 +274,14 @@ For canonical and each fallback attempt, record metadata only by default:
 - stop reason and provider refusal category when available;
 - latency;
 - whether result was persisted;
-- opt-in `admission` decomposition on attempted or admission-rejected gated rungs (log-only, never persisted).
+- opt-in `admission` decomposition on answered, deterministically provider-rejected or admission-rejected gated rungs (log-only, never persisted).
+
+Interrupted rungs (for example a transient provider failure below the persistent-failure
+threshold, withdrawal or branch discard) emit no attempt/admission trace. Their
+absence is not evidence that no provider call occurred. A later retry logs only
+its own attempt. Rejected attempt latency includes any carrier fallback, and its
+request hash, count and estimate describe the final dispatched request; admission
+continues to describe the planned rewrite.
 
 Do not log new plaintext copies of summary bodies beyond existing configured compression logging.
 
