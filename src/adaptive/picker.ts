@@ -254,12 +254,14 @@ function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
 }
 
 /**
- * Error raised when the picker has folded everything it can and the
- * resulting context still exceeds the hard token budget.
+ * Error raised when a budget check refuses the current context or plan.
+ * A refusal does not imply that all possible folds have been exhausted:
+ * missing summaries may still be producible, or emission may exceed the plan.
  *
  * Thrown rather than silently dropping entries. The host application decides
  * how to respond — typical responses: raise the budget, switch to a
- * larger-context model, drop the head/tail windows explicitly, or surface a
+ * larger-context model, wait for compression when `clearedBy` names it,
+ * drop the head/tail windows explicitly, or surface a
  * "context too large" error to the user.
  *
  * Cross-package behavioral surface: agent-framework gates its OverBudget
@@ -271,9 +273,9 @@ function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
 export class OverBudgetError extends Error {
   /** The hard budget the strategy was trying to fit under. */
   readonly budget: number;
-  /** The token count the strategy could not reduce below `budget`. */
+  /** The token count refused by this budget check. */
   readonly actual: number;
-  /** Diagnostic snapshot of the picker's final state. */
+  /** Diagnostic snapshot at the refusing stage. */
   readonly diagnostics: OverBudgetDiagnostics;
   /**
    * What clears this refusal at run time besides a larger budget (see
@@ -287,9 +289,9 @@ export class OverBudgetError extends Error {
     diagnostics: OverBudgetError['diagnostics'];
     /** What clears the refusal besides a larger budget; empty when left out. */
     clearedBy?: readonly OverBudgetClearedBy[];
-    /** Which stage refused — defaults to the plan-stage wording. Emission
-     *  sites pass their own so a planner/emitter drift refusal doesn't
-     *  masquerade as picker exhaustion (it cost a debugging session once). */
+    /** Which stage refused — defaults to the legacy "Adaptive picker exhausted"
+     *  wording. The plan check and emission sites pass their own stage so a
+     *  refusal doesn't imply that no further folds are possible. */
     stage?: string;
   }) {
     const countLabels = {

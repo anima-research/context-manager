@@ -594,13 +594,15 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  for (const { ceiling, shadowCeiling } of [
+  for (const { ceiling, shadowCeiling, retry = false } of [
     { ceiling: true, shadowCeiling: undefined },
     { ceiling: false, shadowCeiling: undefined },
     { ceiling: true, shadowCeiling: false },
     { ceiling: false, shadowCeiling: true },
+    { ceiling: true, shadowCeiling: undefined, retry: true },
+    { ceiling: false, shadowCeiling: undefined, retry: true },
   ]) {
-    it(`reports live kv-unified label-ceiling fallback=${ceiling}, shadow=${shadowCeiling} (${ceiling ? 'synthetic failure injection' : 'real infeasible frontier'})`, async (t) => {
+    it(`tracks kv-unified ceiling attribution (initial=${ceiling}, shadow=${shadowCeiling}, retry=${retry})`, async (t) => {
       t.mock.method(console, 'warn', () => {});
       // Synthetic failure injection tests diagnostic plumbing, not ceiling reachability.
       // It throws before the real solver checks minimum-frontier feasibility.
@@ -609,11 +611,22 @@ describe('OverBudgetError diagnostics', () => {
       const originalSolve = ParetoKvUnifiedPolicySolver.prototype.solve;
       const outcomes: boolean[] = [];
       const solves = t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', function (this: ParetoKvUnifiedPolicySolver, options: ParetoSolveOptions) {
-        const inject = outcomes.length === 0 ? ceiling : (shadowCeiling ?? ceiling);
+        const inject = outcomes.length === 0 ? ceiling : (retry ? !ceiling : (shadowCeiling ?? ceiling));
         outcomes.push(inject);
         if (inject) throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
         return originalSolve.call(this, options);
       });
+      const originalRun = Picker.prototype.run;
+      const picks: Array<{ exhausted: boolean; finalTokens: number }> = [];
+      if (retry) {
+        t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+          const result = originalRun.call(this, inputs, budget);
+          // Synthetic opposite flags exercise attribution, not solver reachability.
+          const exhausted = picks.length === 0 ? ceiling : !ceiling;
+          picks.push({ exhausted, finalTokens: result.finalTokens });
+          return { ...result, exhausted };
+        });
+      }
       const strategy = new AutobiographicalStrategy({
         adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
         ...(shadowCeiling === undefined ? {} : { productionBudgetTokens: 40 }),
@@ -631,7 +644,26 @@ describe('OverBudgetError diagnostics', () => {
       });
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        if (retry) {
+          const internals = strategy as unknown as {
+            store: { setStateJson(id: string, value: unknown): void };
+            calibrationStateId: string;
+          };
+          internals.store.setStateJson(internals.calibrationStateId, { multiplier: 1.45, at: Date.now(), provisional: true });
+        }
         const error = await refusal(manager);
+        if (retry) {
+          assert.equal(solves.mock.callCount(), 2, 'discarded provisional pick, then retry');
+          assert.deepEqual(outcomes, [ceiling, !ceiling]);
+          assert.deepEqual(picks.map(pick => pick.exhausted), [ceiling, !ceiling]);
+          assert.ok(picks.every(pick => pick.finalTokens > error.budget), 'both attempts refuse');
+          assert.equal(Reflect.get(strategy, '_calibration'), 1, 'retry drops the provisional multiplier');
+          assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
+          assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), !ceiling);
+          assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), !ceiling);
+          assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=${!ceiling}, label-ceiling fallback=${!ceiling}) but `));
+          return;
+        }
         assert.equal(solves.mock.callCount(), shadowCeiling === undefined ? 1 : 2, 'one live solve and, when configured, one shadow solve');
         assert.deepEqual(outcomes, shadowCeiling === undefined ? [ceiling] : [ceiling, shadowCeiling], 'premise: opposite live/shadow ceiling outcomes');
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
@@ -763,6 +795,9 @@ describe('OverBudgetError diagnostics', () => {
       strategy.seedPyramid([id], 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
+        assert.equal(Reflect.has(error.diagnostics, field), false, field);
+      }
       checkBudget(error);
       assert.deepEqual(error.clearedBy, [], 'the plan has no summaries left to produce');
       assert.equal(error.diagnostics.deepestLevel, 5, 'the first raw emission fails, but the complete plan reaches L5');
@@ -807,6 +842,7 @@ describe('OverBudgetError diagnostics', () => {
     const error = new OverBudgetError({ actual: 6, budget: 5, diagnostics });
     assert.strictEqual(error.diagnostics, diagnostics);
     assert.equal(error.name, 'OverBudgetError');
+    assert.match(error.message, /^Adaptive picker exhausted but /);
     assert.match(error.message, /across 4 chunks/);
     assert.match(error.message, /deepest fold level=L0/);
     assert.doesNotMatch(error.message, /planned|attempted|picker chunks/);
@@ -1135,6 +1171,9 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
+        assert.equal(Reflect.has(error.diagnostics, field), false, field);
+      }
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
