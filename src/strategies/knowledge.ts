@@ -36,7 +36,14 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     super(config);
     // Merge knowledge-specific fields onto the base config so all KnowledgeConfig
     // fields are actually present (super() only stores AutobiographicalConfig fields).
-    this.knowledgeConfig = { ...this.config, ...config } as KnowledgeConfig;
+    const knowledgeOptions: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(config)) {
+      // The base already validated and snapshotted this accessor. Do not read
+      // it again while copying knowledge-specific options.
+      if (key === 'compressionInstructions' || !Object.prototype.propertyIsEnumerable.call(config, key)) continue;
+      Object.defineProperty(knowledgeOptions, key, { value: Reflect.get(config, key), enumerable: true });
+    }
+    this.knowledgeConfig = { ...this.config, ...knowledgeOptions } as KnowledgeConfig;
   }
 
   /**

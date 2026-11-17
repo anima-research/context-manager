@@ -4,7 +4,9 @@
   wording; host recipe use requires companion forwarding and validation.
 - Export `validateCompressionInstructions`, `CompressionInstructions`,
   `CompressionInstructionTemplates`, and `CompressionInstructionValues`.
-  Add protected `getCompressionOpening` and `getSourceMergeInstruction` hooks;
+  Add protected `getCompressionOpening`, `getSourceMergeInstruction`, and
+  `observeL1CompressionRequest` hooks (the observer runs before L1 dispatch,
+  including carrier retries);
   existing ordinary and reading merge hook signatures and call arities remain
   unchanged, preserving subclass optional argument defaults. Custom merge
   templates infer the shown source level from the source entries.
@@ -24,3 +26,6 @@
   is preserved independently of custom template values.
 - Keep recall-shaped custom compression openings from inserting a synthetic
   conversation-resumes turn between consecutive source turns.
+- Instruction-setting inspection avoids absent proxy option descriptors, preserves
+  unrelated option receivers, and reports instruction inspection failures without
+  caller values. Unrelated outer-option failures keep their original errors.

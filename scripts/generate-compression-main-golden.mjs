@@ -77,7 +77,9 @@ try {
   // Do not publish a clean-source label if source changed during the capture.
   if (git('rev-parse', 'HEAD') !== source || git('status', '--porcelain', '--untracked-files=no') ||
       untrackedSource().length || sourceFilesChanged().length) {
-    throw new Error('Source worktree changed during capture');
+    const paths = [...new Set([...sourceFilesChanged(), ...untrackedSource(),
+      ...git('diff', '--name-only', source).split('\n').filter(Boolean)])];
+    throw new Error(`Source worktree changed during capture: ${paths.length ? paths.map(p => JSON.stringify(p)).join(', ') : 'HEAD/index changed'}. Inspect these changes, restore or commit them, then retry capture from a clean worktree.`);
   }
   writeFileSync(output, JSON.stringify({
     source,

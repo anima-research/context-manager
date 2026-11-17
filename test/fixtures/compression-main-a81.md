@@ -68,7 +68,9 @@ p = sys.argv[1]
 s = open(p).read().replace('AutobiographicalOptions, CompressionInstructions, SummaryEntry',
                          'AutobiographicalOptions, SummaryEntry')
 s = 'type CompressionInstructions = unknown;\n' + s
-s = s.replace('...extra, compressionInstructions: config', '...extra')
+old = '...extra, ...(config === undefined ? {} : { compressionInstructions: config })'
+assert s.count(old) == 1, 'Legacy harness port no longer matches; inspect before retrying'
+s = s.replace(old, '...extra')
 open(p, 'w').write(s)
 PY
 fi

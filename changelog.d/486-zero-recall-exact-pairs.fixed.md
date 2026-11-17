@@ -1,1 +1,3 @@
-- Zero-recall surgery shares the strategy's header parser and requires independently rendered expected answers; collapsed, unmatched or duplicate pairs are refused rather than deleted.
+- Zero-recall surgery shares the strategy's header parser and uses expected
+  answers from the trusted construction-bound snapshot; collapsed, unmatched
+  or duplicate pairs are refused rather than deleted.

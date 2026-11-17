@@ -2569,7 +2569,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (enumerable) {
         const original = config;
-        const descriptors = Object.getOwnPropertyDescriptors(original);
+        const descriptors: PropertyDescriptorMap = {};
+        for (const key of Reflect.ownKeys(original)) {
+          let descriptor: PropertyDescriptor | undefined;
+          try { descriptor = Object.getOwnPropertyDescriptor(original, key); }
+          catch (error) {
+            if (key !== 'compressionInstructions') throw error;
+            throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
+          }
+          if (descriptor) Object.defineProperty(descriptors, key, { value: descriptor, enumerable: true, configurable: true, writable: true });
+        }
         // Resolve every other option via the original receiver, including proxy
         // get traps on data properties. Only instructions are snapshotted here.
         for (const key of Object.keys(descriptors)) {

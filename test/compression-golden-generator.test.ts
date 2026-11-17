@@ -258,7 +258,12 @@ it('generator names staged-only changes and executable-bit changes in dirty refu
   });
 });
 
-it('generator and reader support SHA-256 source IDs from a different caller repository', () => {
+it('generator and reader support SHA-256 source IDs from a different caller repository', t => {
+  const probe = mkdtempSync(join(tmpdir(), 'cm-sha256-'));
+  try {
+    const supported = spawnSync('git', ['init', '-q', '--object-format=sha256', probe], { encoding: 'utf8' });
+    if (supported.status !== 0) { t.skip('Git does not support SHA-256 repositories: ' + supported.stderr); return; }
+  } finally { rmSync(probe, { recursive: true, force: true }); }
   fixture((root) => {
     const result = capture(root);
     assert.equal(result.status, 0, result.stderr);

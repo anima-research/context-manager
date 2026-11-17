@@ -7,11 +7,11 @@ import { mainScenarios, scenarioKey, goldenReminders } from './compression-main-
 
 const golden = readCompressionGolden(join(process.cwd(), 'test/fixtures/compression-main-a81.json'));
 for (const s of mainScenarios) {
-  it(`${scenarioKey(s)}: omitted, empty and default requests match recorded baseline request structure`, async () => {
+  it(`${scenarioKey(s)}: omitted, empty and default requests match recorded baseline serialized request bytes`, async () => {
     for (const config of [undefined, {}, { preset: 'default' as const }]) {
       const actual = await run(s.mode, s.pin, config, s.variant === 'reminders' ? goldenReminders : {},
         s.variant === 'knowledge' ? KnowledgeProbe : Probe, s.level);
-      assert.deepEqual(actual, golden.requests[scenarioKey(s)]);
+      assert.equal(JSON.stringify(actual), JSON.stringify(golden.requests[scenarioKey(s)]));
     }
   });
 }

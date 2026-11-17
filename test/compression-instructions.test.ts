@@ -11,7 +11,7 @@ import { Probe, KnowledgeProbe, run, custom, instruction, texts } from './compre
 for (const mode of ['chunk', 'reading', 'split', 'readingSplit', 'merge', 'readingMerge', 'fallback', 'readingFallback', 'transition'] as const) {
   for (const pin of ['own', 'mixed', 'inherited'] as const) {
     it(`${mode}/${pin}: omitted and DEFAULT requests are byte-identical`, async () => {
-      assert.deepEqual(await run(mode, pin), await run(mode, pin, { preset: 'default' }));
+      assert.equal(JSON.stringify(await run(mode, pin)), JSON.stringify(await run(mode, pin, { preset: 'default' })));
     });
   }
 }
@@ -606,4 +606,26 @@ it('only instruction-specific inspection failures are reported as invalid instru
   assert.throws(() => new Probe(new Proxy({ compressionInstructions: {} }, {
     getOwnPropertyDescriptor() { throw failure; },
   })), { name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings' });
+});
+
+it('KnowledgeStrategy snapshots the outer instruction getter only once', () => {
+  let reads = 0;
+  const options = { get compressionInstructions() {
+    if (++reads > 1) throw new Error('sensitive second read');
+    return { preset: 'default' as const };
+  } };
+  assert.doesNotThrow(() => new KnowledgeProbe(options));
+  assert.equal(reads, 1);
+});
+
+it('repeated instruction descriptor failures are sanitized', () => {
+  let reads = 0;
+  const options = new Proxy({ compressionInstructions: {} }, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'compressionInstructions' && ++reads === 2) throw new Error('sensitive descriptor');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  assert.throws(() => new Probe(options), error => error instanceof TypeError
+    && error.message.includes('unable to inspect settings') && !error.message.includes('sensitive'));
 });
