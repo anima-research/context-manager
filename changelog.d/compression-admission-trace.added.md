@@ -37,8 +37,11 @@
   hash used in family outcomes. Match `curveLabel` for the rejected stage; reused
   outcomes or failures before dispatch still carry the durable outcome record.
   Durable family keys and outcome hashes are unchanged.
-- Keep each answered canonical-stage retry’s refusal or incomplete outcome in
-  attempt logs, including when a later retry rejects.
+- Keep each answered canonical-stage attempt’s own outcome in attempt logs,
+  including success and plain-prose retries, even when a later retry succeeds,
+  rejects or is interrupted. Answers that strip to empty are unusable_empty.
+  Diagnostic warning labels use the captured chunk source hash without invoking
+  overridable chunk-key code outside the logging guard.
 - Keep answered recall-variant outcomes in immediate curve-attempt logs, and emit
   curve-attempt logs for newly decided source-only-final provider failures. Recall
   answers that strip to empty are logged as unusable_empty, not success.

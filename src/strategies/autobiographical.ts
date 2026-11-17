@@ -12028,7 +12028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
             failedAttempt = { request: failedRequest, latencyMs: performance.now() - started,
               metadata: { curveLabel, recallIds, recallLevels, leafCoverageHash, expandedParentId, expandedChildIds } };
-          }, this.ns, `compression attempt diagnostic failed: rung=${curveLabel} chunk=${this.chunkKey(chunk)}`);
+          }, this.ns, `compression attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
         };
         // A call's error, when its work lost its branch or strategy
         // generation while the call was out (a detach, a branch move), is
@@ -12146,6 +12146,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           latencyMs: performance.now() - started,
           persisted: false,
         };
+        // Classify each canonical-stage answer before a later retry can interrupt
+        // or succeed. Extraction below corrects empty end_turn answers.
+        if (CANONICAL_STAGE_LABELS.has(curveLabel) || curveLabel === 'canonical-plain-prose') {
+          trace.outcome = stopReason === 'end_turn'
+            ? 'success'
+            : stopReason === 'refusal' ? 'refusal' : 'incomplete';
+        }
         attemptTraces.push(trace);
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
@@ -12344,7 +12351,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             trace = { ...failedAttempt!.metadata, ...this.compressionFailedAttemptTrace(failedAttempt!),
               persisted: false, outcome: 'provider_error', errorType, ...annotation };
             attemptTraces.push(trace);
-          }, this.ns, `compression attempt diagnostic failed: rung=${failedAttempt?.metadata.curveLabel} chunk=${this.chunkKey(chunk)}`);
+          }, this.ns, `compression attempt diagnostic failed: rung=${failedAttempt?.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           return trace;
         } finally {
           failedAttempt = undefined;
@@ -12597,14 +12604,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceOnlyFallbackRequestHash,
         );
         const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
-        if (canonicalTrace && !canonicalRejection) canonicalTrace.outcome = canonicalOutcome;
-        // Each answered canonical-stage rung keeps its own nonterminal outcome,
-        // even when a later retry answers differently or rejects.
-        for (const trace of attemptTraces) {
-          if (CANONICAL_STAGE_LABELS.has(trace.curveLabel) && trace.stopReason !== 'end_turn' && trace.outcome !== 'provider_error') {
-            trace.outcome = trace.stopReason === 'refusal' ? 'refusal' : 'incomplete';
-          }
-        }
         // A later canonical-stage retry may be rejected after canonical answered.
         // Its trace identifies the dispatched bytes (possibly carrier-stripped);
         // the durable rejection instead identifies the planned rung.
@@ -12670,7 +12669,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             attemptTraces.push(trace);
             if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
-            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12693,7 +12692,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               trace.budgetTokens = admission.budgetTokens;
               if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
                 trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
-              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
               logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
             }
             return;
@@ -12703,7 +12702,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           trace.budgetTokens = admission.budgetTokens;
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
             trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
-          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
             trace.outcome = 'success';
@@ -12784,7 +12783,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             attemptTraces.push(trace);
             if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
-            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12815,7 +12814,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               trace.budgetTokens = contextBudget;
               if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
                 trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
-              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
               logCompressionCall({
                 event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
               }, this.ns);
@@ -12826,7 +12825,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const trace = attemptTraces[attemptTraces.length - 1]!;
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
             trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
-          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${this.chunkKey(chunk)}`);
+          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
           const assessment = this.assessFallbackCompressionResponse(variantResponse);
@@ -13273,6 +13272,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? extractSummaryText(acceptedResponse)
         : { text: '', recoveredWholeWrapper: false };
       let summaryText = extraction.text;
+      if (successfulTrace && CANONICAL_STAGE_LABELS.has(successfulTrace.curveLabel)) {
+        successfulTrace.outcome = summaryText.trim() ? 'success' : 'unusable_empty';
+      }
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
       let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
       /** The rung whose answer stripped to empty, as recorded before the plain-prose retry. */
@@ -13321,6 +13323,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const proseExtraction = proseStop === 'end_turn'
             ? extractSummaryText(proseStep.response as NormalizedResponse)
             : { text: '', recoveredWholeWrapper: false };
+          const proseTrace = attemptTraces[attemptTraces.length - 1]!;
+          if (proseStop === 'end_turn') proseTrace.outcome = proseExtraction.text.trim() ? 'success' : 'unusable_empty';
           if (proseExtraction.text.trim()) {
             acceptedResponse = proseStep.response as NormalizedResponse;
             extraction = proseExtraction;

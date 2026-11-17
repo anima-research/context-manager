@@ -4213,6 +4213,33 @@ describe('tool-prose hoist admission', () => {
       return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Log);
     }
 
+    function countChunkKeys(fx: Fixture): () => number {
+      const seam = fx.strategy as unknown as { chunkKey(chunk: unknown): string };
+      const chunkKey = seam.chunkKey;
+      let calls = 0;
+      seam.chunkKey = function (chunk) { calls++; return chunkKey.call(this, chunk); };
+      return () => calls;
+    }
+
+    type FailureRun = { chunkKey: string; run: { key: string; domain: string; failures: number; atLanded: number } };
+    const failureRuns = (fx: Fixture) => (fx.strategy as unknown as {
+      compressionFailureRuns: Map<string, FailureRun>;
+    }).compressionFailureRuns;
+    const failureSnapshot = (fx: Fixture) => [...failureRuns(fx)].map(([subject, entry]) => ({
+      subject, ...entry, run: { ...entry.run, domain: entry.run.domain.split('\u0000').slice(1).join('\u0000') },
+    }));
+    async function seedFailureRun(fx: Fixture, membrane: ReturnType<typeof flexibleMembrane>['membrane']) {
+      const seam = membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = seam.complete;
+      const outage = Object.assign(new Error('seed provider failure'), { type: 'server_error' });
+      seam.complete = async () => { throw outage; };
+      try {
+        await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage);
+        assert.equal(failureRuns(fx).size, 1);
+        for (const entry of failureRuns(fx).values()) entry.run.failures = 3;
+      } finally { seam.complete = complete; }
+    }
+
     async function run(kind: Kind, usage: AttemptHandler, budget: number, carriers = false) {
       // A truncated canonical skips its hoist, making source-only-final the
       // source hoist's base. Its count deliberately differs from that base's.
@@ -4345,8 +4372,14 @@ describe('tool-prose hoist admission', () => {
           if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
           try {
             delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+            await seedFailureRun(a, off.membrane);
+            await seedFailureRun(b, on.membrane);
+            assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+            const aKeys = countChunkKeys(a);
+            const bKeys = countChunkKeys(b);
             await a.strategy.run(a.target, managerContext(a.manager));
             await capture(b);
+            assert.equal(bKeys(), aKeys(), 'logging invokes no extra chunkKey overrides');
             assert.deepEqual(on.calls.map(c => c.request), off.calls.map(c => c.request));
             const records = (fx: Fixture) => quarantineEvents(fx.manager)
               .filter(e => e.kind === 'exhausted')
@@ -4358,6 +4391,7 @@ describe('tool-prose hoist admission', () => {
             assert.equal(typeof records(a)[0]!.key, 'string');
             assert.equal(typeof records(a)[0]!.familyKey, 'string');
             assert.deepEqual(records(b), records(a));
+            assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
           } finally { a.manager.close(); b.manager.close(); }
         }
       } finally {
@@ -4402,6 +4436,11 @@ describe('tool-prose hoist admission', () => {
               try {
                 console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
                 delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+                await seedFailureRun(a, control.membrane);
+                await seedFailureRun(b, probe.membrane);
+                assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+                const aKeys = countChunkKeys(a);
+                const bKeys = countChunkKeys(b);
                 const [baseline] = await Promise.allSettled([a.strategy.run(a.target, managerContext(a.manager))]);
                 const [observed] = await Promise.allSettled([(async () => {
                   if (mode === 'write') {
@@ -4411,6 +4450,7 @@ describe('tool-prose hoist admission', () => {
                   else await b.strategy.run(b.target, managerContext(b.manager));
                 })()]);
                 assert.equal(observed!.status, baseline!.status);
+                assert.equal(bKeys(), aKeys(), 'diagnostics invoke no extra chunkKey overrides');
                 assert.equal(a.target.compressed, scenario === 'end_turn', 'the control reaches the intended outcome');
                 assert.equal(control.calls.length, (kind === 'source-hoist' ? 3 : 2)
                   - (scenario === 'admission-rejected' ? 1 : 0));
@@ -4428,6 +4468,7 @@ describe('tool-prose hoist admission', () => {
                     return { key: r.key, familyKey: r.familyKey, plan: r.plan, outcomes: e.outcomes };
                   });
                 assert.deepEqual(records(b), records(a));
+                assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
                 assert.deepEqual(
                   b.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
                   a.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
@@ -4791,6 +4832,69 @@ describe('tool-prose hoist admission', () => {
         assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
       } finally { fx.manager.close(); }
     });
+
+    for (const winner of ['canonical', 'canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`${winner} logs each answered outcome when the stage succeeds`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = winner === 'canonical' ? []
+          : winner === 'canonical-plain-prose' ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : winner === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const mock = flexibleMembrane([...prior, { stop: 'end_turn', text: 'usable memory' }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.equal(attempts.length, prior.length + 1);
+          assert.deepEqual(attempts.map(trace => trace.outcome), [
+            ...prior.map(() => winner === 'canonical-plain-prose' ? 'unusable_empty' : 'incomplete'), 'success',
+          ]);
+          assert.equal(attempts.at(-1)!.curveLabel, winner);
+          assert.equal(attempts.at(-1)!.persisted, true);
+          assert.equal(fx.target.compressed, true);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const next of ['canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`answered outcomes survive an interrupted ${next} retry`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = next === 'canonical-plain-prose'
+          ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : next === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const outage = Object.assign(new Error('temporary outage'), { type: 'server_error' });
+        const mock = flexibleMembrane([...prior, { error: outage }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx, () => assert.rejects(
+            fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage,
+          ));
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.equal(mock.calls.length, prior.length + 1);
+          assert.equal(attempts.length, prior.length, 'the interrupted call has no trace');
+          assert.deepEqual(attempts.map(trace => trace.outcome), prior.map(() =>
+            next === 'canonical-plain-prose' ? 'unusable_empty' : 'incomplete'));
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const stop of ['refusal', 'max_tokens', 'end_turn'] as const) {
+      it(`an answered plain-prose ${stop} retry logs its own unsuccessful outcome`, async () => {
+        const mock = flexibleMembrane([
+          { stop: 'end_turn', text: '<thinking>hidden</thinking>' },
+          { stop, text: stop === 'end_turn' ? '<thinking>still hidden</thinking>' : 'not a memory' },
+        ]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.deepEqual(attempts.map(trace => trace.outcome), [
+            'unusable_empty', stop === 'end_turn' ? 'unusable_empty' : stop === 'refusal' ? 'refusal' : 'incomplete',
+          ]);
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
 
     for (const retryLabel of ['canonical-no-tools', 'canonical-toolless']) {
       for (const stopReason of ['refusal', 'max_tokens'] as const) {
