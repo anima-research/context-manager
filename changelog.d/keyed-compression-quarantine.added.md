@@ -1,6 +1,12 @@
 - Add optional metadata-only inspection and generation/load-bound single-key L1
   compression-quarantine waiver APIs on the loaded autobiographical strategy,
-  with public capability types and explicit stale/unreadable/legacy outcomes.
+  through `inspectCompressionRefusalQuarantine` and
+  `releaseCompressionRefusalQuarantine`, with explicit stale/unreadable/legacy
+  outcomes. Export `isKeyedCompressionQuarantineStrategy` for feature detection
+  and the `KeyedCompressionQuarantineStrategy`, `CompressionQuarantineBinding`,
+  `CompressionQuarantineRecordView`, `CompressionQuarantineInspection`,
+  `CompressionQuarantineReleaseSelection` and `CompressionQuarantineReleaseResult`
+  types.
   Inspection validates native digest metadata, reports coarse unreadable reasons
   without store error text, and includes per-record current-config shape-cap
   participation and same-regime counts. Unexpected projection errors propagate.
@@ -16,6 +22,4 @@
   through inspection or release.
 - Quarantine inspection and keyed release ignore history superseded by a checkpoint even before redaction, while resolving earlier legacy claims referenced by later exhaustion events.
 - Inspection rejects reentrant branch changes during projection reads. Obsolete
-  checkpoint work does not consume the current load's failure warning, and
-  automatic-clear/status diagnostics omit store error payloads and do not
-  assert that a failed maintenance pass left holds intact.
+  checkpoint work does not consume the current load's failure warning.

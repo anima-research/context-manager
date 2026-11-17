@@ -172,8 +172,9 @@ the gate; ignored entries are discarded, not archived as forensic evidence.
 The tolerant ledger reader logs dropped-key prefixes (12 characters), once per
 key per load; unusable legacy snapshot records can be silently skipped. Checkpoints
 preserve every enforced hold, including more than 1,024 records, without
-slicing or a new byte bound. Store/mutation failures still throw; failed or
-stale hygiene is logged once per load. Inspection output bounds do not bound
+slicing or a new byte bound. Store/mutation failures still throw; hygiene failures or
+mid-pass loss of currency are logged once per load; work already stale on entry
+is skipped silently. Inspection output bounds do not bound
 ledger I/O or checkpoint bytes. Native generations survive checkpoints,
 including interruption between redaction and compaction.
 A failure during progress, append, checkpoint, sync or postread throws. A progress-only
@@ -188,8 +189,11 @@ or that a whole fallback ladder, provider retries or other work is isolated.
 Changing the global model affects other normal compression too.
 
 The next ordinary alarm check on the same live, already-open episode retains
-remaining raw siblings and eventually reports the observed record count on
-its existing interval. When a waiver-request episode reads empty it ends once,
+siblings with matching persisted raw chunk records and eventually reports the
+observed record count on its existing interval. The existing sweep treats a
+missing chunk record as orphanhood and may clear a sibling even if its source
+span remains raw; the raw-span alarm is not guaranteed in that case. When a
+waiver-request episode reads empty it ends once,
 without saying coverage/debt was paid. The optional status/callback field is
 `clearReason?: 'quarantine-empty' | 'operator-waiver-requested'`, set only on
 the episode-end callback. The latter means this live instance knows a waiver

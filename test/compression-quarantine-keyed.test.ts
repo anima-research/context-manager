@@ -831,7 +831,8 @@ describe('R1 native review regressions', () => {
         return result;
       });
       try {
-        await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /uncertain/);
+        if (phase === 'projection') assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'branchUnavailable' });
+        else await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /uncertain/);
         assert.equal(moved, true);
         assert.deepEqual(get(fx.strategy.progressId), progress, 'other branch progress must not be rewritten');
         assert.deepEqual(fx.ledger(), otherLedger, 'other branch ledger is untouched');
@@ -1068,6 +1069,8 @@ describe('Anima Review regressions', () => {
     const sync = mock.method(fx.store, 'sync');
     try {
       assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
+      assert.ok(hook.mock.calls.some((call) => call.arguments[0] === fx.strategy.ledgerId));
+      assert.equal(fx.store.currentBranch().name, 'elsewhere');
       assert.deepEqual([set.mock.callCount(), append.mock.callCount(), sync.mock.callCount()], [0, 0, 0]);
     } finally {
       set.mock.restore(); append.mock.restore(); sync.mock.restore();
@@ -1108,6 +1111,7 @@ describe('Anima Review regressions', () => {
       else await impl.clearQuarantineForCompressedChunk(fx.chunk);
       assert.equal(inspect(fx.strategy).totalRecords, 0, 'clear landed before maintenance threw');
       assert.ok(lines.some((line) => line.includes('clear may have landed')));
+      assert.ok(!lines.some((line) => /store operation failed|status will be reread/.test(line)));
       assert.ok(!lines.some((line) => /SECRET|private|records remain|klaxon persists/.test(line)));
     } finally { compact.mock.restore(); warn.mock.restore(); }
   });
@@ -1228,5 +1232,127 @@ describe('Anima Review regressions', () => {
     assert.equal(fresh.expectedGeneration, old.expectedGeneration);
     assert.deepEqual(await strategy.releaseCompressionRefusalQuarantine(old), { status: 'stale' });
     assert.equal((await strategy.releaseCompressionRefusalQuarantine(fresh)).status, 'released');
+  });
+});
+
+describe('round 8 binding and diagnostic regressions', () => {
+  it('never checkpoints A into B when a projection read starts B initialization', async (t) => {
+    const fx = await fixture(t, 'r8-checkpoint-binding');
+    const a = fx.store.currentBranch().name;
+    const source = native(fx.strategy).captureCompressionBranch();
+    fx.store.createBranch('r8-b');
+    fx.store.switchBranch('r8-b');
+    fx.store.setStateJson(fx.strategy.ledgerId, []);
+    fx.store.switchBranch(a);
+    pad(fx);
+    const get = fx.store.getStateJson.bind(fx.store);
+    let initialization: Promise<void> | undefined;
+    let moved = false;
+    const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+      const result = get(id);
+      if (id === fx.strategy.ledgerId && !moved) {
+        moved = true;
+        fx.store.switchBranch('r8-b');
+        initialization = fx.strategy.initialize(fx.ctx);
+      }
+      return result;
+    });
+    const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
+    try {
+      native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source);
+      await initialization;
+      assert.equal(moved, true);
+      assert.equal(append.mock.calls.filter((call) => (call.arguments[1] as Event).kind === 'checkpoint').length, 0);
+      assert.deepEqual(fx.ledger(), [], 'B must not acquire A holds');
+    } finally { hook.mock.restore(); append.mock.restore(); }
+  });
+
+  for (const shape of ['missing', 'legacy', 'replacement', 'matching']) {
+    for (const reload of [false, true]) it(`classifies lost binding before ${shape} result (reload=${reload})`, async (t) => {
+      const fx = await fixture(t, `r8-prewrite-${shape}-${reload}`);
+      const selected = selection(fx.strategy);
+      if (shape === 'missing') fx.store.setStateJson(fx.strategy.ledgerId, []);
+      if (shape === 'legacy') {
+        fx.store.setStateJson(fx.strategy.ledgerId, []);
+        fx.store.setStateJson(fx.strategy.legacyId, [fx.event.record]);
+      }
+      if (shape === 'replacement') fx.store.setStateJson(fx.strategy.ledgerId, [{ ...fx.event, eventId: 'replacement' }]);
+      const get = fx.store.getStateJson.bind(fx.store);
+      if (!reload) fx.store.createBranch('r8-other');
+      let moved = false;
+      let initialization: Promise<void> | undefined;
+      const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+        const result = get(id);
+        if (id === fx.strategy.ledgerId && !moved) {
+          moved = true;
+          if (reload) initialization = fx.strategy.initialize(fx.ctx);
+          else fx.store.switchBranch('r8-other');
+        }
+        return result;
+      });
+      const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
+      try {
+        assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'branchUnavailable' });
+        await initialization;
+        assert.equal(moved, true);
+        assert.equal(append.mock.callCount(), 0);
+      } finally { hook.mock.restore(); append.mock.restore(); }
+    });
+  }
+
+  for (const operation of ['inspect', 'release']) it(`rejects reinitialization inside the final currentBranch lookup for ${operation}`, async (t) => {
+    const fx = await fixture(t, `r8-final-lookup-${operation}`);
+    const selected = selection(fx.strategy);
+    const impl = fx.strategy as any;
+    const read = impl.readCompressionQuarantineProjection.bind(impl);
+    const current = fx.store.currentBranch.bind(fx.store);
+    let armed = false;
+    let cleared = false;
+    let lookups = 0;
+    let initialization: Promise<void> | undefined;
+    const projection = mock.method(impl, 'readCompressionQuarantineProjection', (...args: any[]) => {
+      const result = read(...args);
+      // Inspection has one projection; release's final projection follows sync.
+      if (operation === 'inspect' || cleared) armed = true;
+      return result;
+    });
+    const sync = mock.method(fx.store, 'sync', () => { cleared = true; });
+    const branch = mock.method(fx.store, 'currentBranch', () => {
+      const result = current();
+      // observeStoreBranch reads first; the second lookup is the final one.
+      if (armed && ++lookups === 2) {
+        armed = false;
+        initialization = fx.strategy.initialize(fx.ctx);
+      }
+      return result;
+    });
+    try {
+      if (operation === 'inspect') assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
+      else await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /binding changed/);
+      assert.ok(initialization, 'the reentrant lookup actually ran');
+      await initialization;
+    } finally { branch.mock.restore(); sync.mock.restore(); projection.mock.restore(); }
+  });
+
+  it('keeps a competing release outside a still-running lock callback', async (t) => {
+    const fx = await fixture(t, 'r8-lock-reentry');
+    const selected = selection(fx.strategy);
+    const impl = fx.strategy as any;
+    const read = impl.readCompressionQuarantineProjection.bind(impl);
+    let competing: ReturnType<Probe['releaseCompressionRefusalQuarantine']> | undefined;
+    let entered = 0;
+    const hook = mock.method(impl, 'readCompressionQuarantineProjection', (...args: any[]) => {
+      entered++;
+      if (entered === 1) {
+        competing = fx.strategy.releaseCompressionRefusalQuarantine(selected);
+        assert.equal(entered, 1, 'competing callback must not enter while the first is open');
+      }
+      return read(...args);
+    });
+    try {
+      assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
+      assert.ok(competing);
+      assert.equal((await competing).status, 'not-held');
+    } finally { hook.mock.restore(); }
   });
 });

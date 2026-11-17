@@ -185,7 +185,7 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
         '(keys=checkpoint-n,checkpoint-o,checkpoint-e,claim-no-rec,no-record-no,exhausted-no,numeric-key,mismatched-k,no-generatio,object-gener,empty-genera): ' +
         'they no longer hold their chunks back, no clear reaches them, and they stay in the ledger ' +
         "until a checkpoint rewrites the gate's tolerant projection on the next native hygiene pass with at least 256 events; " +
-        "failed or stale hygiene is logged once per load ns=default",
+        "hygiene failures or mid-pass loss of currency are logged once per load (already-stale work is skipped silently) ns=default",
     ], `each key left out named once, however often the ledger is read, and no key still in the quarantine:\n${repeat.lines.join('\n')}`);
     assert.deepEqual(counts(repeat.handled), [5], 'the alarm repeats on what stands');
     assert.ok(!repeat.lines.some(allClear), repeat.lines.join('\n'));
@@ -287,7 +287,7 @@ describe('the compression-quarantine all-clear is said only when the quarantine 
     });
     assert.deepEqual(status, { count: 0, keys: [], spans: [], unreadable: true });
     assert.deepEqual(failing.lines, [
-      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (store read or validation failed) ns=default',
+      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed) ns=default',
     ], 'one line, and no warning from the paid-off sweep');
     assert.deepEqual(failing.handled, [], 'no handler call, all-clear or alarm');
 

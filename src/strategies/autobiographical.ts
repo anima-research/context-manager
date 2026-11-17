@@ -2941,6 +2941,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (error instanceof CompressionQuarantineStoreReadError) return { status: 'unreadable', reason: 'store-read' };
         throw error;
       }
+      // Reads can reenter branch lifecycle code. Classify loss of the load
+      // before any selection result or mutation-path uncertainty guard.
+      try { currentBinding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
+      if (!currentBinding) return { status: 'branchUnavailable' };
+      if (currentBinding.loadId !== expected.loadId || currentBinding.namespace !== expected.namespace || currentBinding.branch !== expected.branch) return { status: 'stale' };
       const active = current.get(key);
       if (!active) return { status: 'not-held' };
       if (active.generationId.startsWith('legacy:')) return { status: 'unsupported' };
@@ -5428,7 +5433,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       `[compression-quarantine] on branch '${this.store?.currentBranch().name ?? ''}', left out ledger ${one ? 'entry' : 'entries'} it can't use ` +
         `(keys=${fresh.map((key) => key.slice(0, 12)).join(',')}): ${one ? 'it no longer holds its chunk' : 'they no longer hold their chunks'} back, ` +
         `no clear reaches ${one ? 'it' : 'them'}, and ${one ? 'it stays' : 'they stay'} in the ledger until a checkpoint ` +
-        `rewrites the gate's tolerant projection on the next native hygiene pass with at least ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events; failed or stale hygiene is logged once per load`,
+        `rewrites the gate's tolerant projection on the next native hygiene pass with at least ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events; hygiene failures or mid-pass loss of currency are logged once per load (already-stale work is skipped silently)`,
     );
   }
 
@@ -5493,10 +5498,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // detached or reinitialized no check reads the store, which its manager
     // may have closed by then.
     if (!identity || !this.store || this.compressionBranchGeneration !== identity.strategyGeneration) return false;
-    const observed = observeStoreBranch(this.store);
-    return this.store === identity.store &&
+    const store = this.store;
+    const observed = observeStoreBranch(store);
+    const branchName = store.currentBranch().name;
+    return this.compressionBranchGeneration === identity.strategyGeneration &&
+      this.store === store && store === identity.store &&
       this.ns === identity.namespace &&
-      this.store.currentBranch().name === identity.name &&
+      branchName === identity.name &&
       observed.name === identity.name &&
       observed.generation === identity.generation;
   }
@@ -5536,8 +5544,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private isCompressionBranchCurrent(source: CompressionOperationBranch): boolean {
     // Generation first, as in isBranchIdentityCurrent.
     if (!this.store || this.compressionBranchGeneration !== source.strategyGeneration) return false;
-    const observed = observeStoreBranch(this.store);
-    return this.store.currentBranch().name === source.name &&
+    const store = this.store;
+    const observed = observeStoreBranch(store);
+    const branchName = store.currentBranch().name;
+    return this.compressionBranchGeneration === source.strategyGeneration &&
+      this.store === store && branchName === source.name &&
       observed.name === source.name &&
       observed.generation === source.generation;
   }
@@ -5602,6 +5613,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
         sentAlertKeys: [...item.sentAlertKeys],
       }));
+      // The projection read can reenter initialization on another branch;
+      // the generic append guard alone would accept that new initializer.
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
       this.appendCompressionQuarantineEvent({
         kind: 'checkpoint',
         key: '__checkpoint__',
@@ -5920,7 +5937,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (now - this.quarantineUnreadableSaidAt < interval) return;
       this.quarantineUnreadableSaidAt = now;
       this.diag.error(
-        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (store read or validation failed)`,
+        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed)`,
       );
       return;
     }
@@ -6052,7 +6069,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch {
-      this.diag.warn('[compression-quarantine] paid-off sweep incomplete; clear may have landed, status will be reread (store operation failed)');
+      this.diag.warn('[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect status to confirm holds (maintenance failed)');
     }
   }
 
@@ -6168,7 +6185,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
       }
     } catch {
-      this.diag.warn('[compression-quarantine] success-clear incomplete; clear may have landed, status will be reread (store operation failed)');
+      this.diag.warn('[compression-quarantine] success-clear incomplete; clear may have landed, inspect status to confirm holds (maintenance failed)');
     }
   }
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
