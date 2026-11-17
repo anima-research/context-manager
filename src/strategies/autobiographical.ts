@@ -2564,7 +2564,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   constructor(config: AutobiographicalOptions = {}) {
     // Retain TypeError for malformed caller settings before structuredClone runs.
-    validateCompressionInstructions(config.compressionInstructions);
+    if (Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions')) {
+      validateCompressionInstructions(config.compressionInstructions);
+    }
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
       { source: 'caller', values: config as Record<string, unknown> },
@@ -2599,11 +2601,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.config = resolved.effective as unknown as AutobiographicalConfig;
     // Snapshot JSON settings so caller mutation cannot invalidate a checked template.
     if (this.config.compressionInstructions !== undefined) {
-      this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
+      validateCompressionInstructions(this.config.compressionInstructions);
+      try {
+        this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
+      } catch {
+        throw new TypeError('Invalid compressionInstructions configuration: configuration: expected object');
+      }
     }
     validateCompressionInstructions(this.config.compressionInstructions);
-    if (this.config.witnessedInstruction && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
-      throw new TypeError('Conflicting witnessed instruction configuration');
+    if (this.config.witnessedInstruction !== undefined && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
+      throw new TypeError('Conflicting witnessedInstruction and compressionInstructions.templates.witnessedChunk; remove one setting');
     }
     this.configProvenance = resolved.provenance;
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;

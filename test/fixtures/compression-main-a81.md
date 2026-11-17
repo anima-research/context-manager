@@ -36,10 +36,11 @@ Use an explicit, clean Git source worktree root, not an archive or a `dist`
 folder. The generator validates that root equals Git's top-level (so an archive
 under a PR checkout cannot acquire its parent's HEAD), ignores ambient `GIT_*`
 overrides, and records that worktree's actual HEAD/tree. It refuses tracked
-edits anywhere and untracked product files under `src`; commit deliberate
+edits anywhere and untracked (including ignored) product files under `src`; commit deliberate
 source changes first. Only untracked test harness instrumentation on a legacy
-tree is allowed. The harness hashes record that instrumentation. Build freshly
-at that source root: provenance is not a substitute for a fresh build.
+tree is allowed. Tracked source bytes are also compared with HEAD, independently
+of index flags. The generator builds into a fresh temporary output directory
+with the recorded compiler, then removes that directory after capture.
 
 For example, create a **local detached worktree** at the chosen public commit
 (no fetch/push needed). Keep it and its build artifacts for review:
@@ -70,15 +71,21 @@ s = s.replace('...extra, compressionInstructions: config', '...extra')
 open(p, 'w').write(s)
 PY
 fi
-(cd "$SOURCE_ROOT" && timeout 120s npm run build)
-timeout 120s npm run build
-timeout 300s node scripts/generate-compression-main-golden.mjs "$SOURCE_ROOT" /tmp/compression-candidate.json
+# GNU coreutils supplies timeout on Linux; on macOS install coreutils and use gtimeout.
+TIMEOUT=timeout
+command -v "$TIMEOUT" >/dev/null || TIMEOUT=gtimeout
+"$TIMEOUT" 120s npm run build
+"$TIMEOUT" 300s node scripts/generate-compression-main-golden.mjs "$SOURCE_ROOT" /tmp/compression-candidate.json
 ```
 
 The legacy port removes only the unavailable type and constructor property; no
 strategy source is patched. The producer loads the built harness/product from
-`SOURCE_ROOT`, and scenario enumeration from this checkout. It records source
-lockfile/compiler and both harness hashes. Compare the candidate's requests
+`SOURCE_ROOT`, and scenario enumeration from this checkout. It records the source lockfile and the installed node_modules/.package-lock.json
+separately (including when node_modules is linked), compiler version, source and
+freshly compiled harness hashes, and the actual loaded scenario-module hash.
+The installed lock is npm installation metadata, not a cryptographic inventory
+of every dependency file; use an unmodified npm ci installation. Do not mutate
+the compiler, dependencies, or harness during capture. Compare the candidate's requests
 strictly with the retained baseline, inspect metadata separately, and replace
 the fixture only under the intentional-change policy above. Use per-command
 bounds; no model API, live store, npm pack/lifecycle, or dependency re-resolution

@@ -60,9 +60,9 @@ is not a prompt-injection security boundary: the model still sees the data.
 
 A source-level merge retry uses the applicable merge slot with
 `sourceLevelShown` equal to the sources' actual level, rather than the level
-of their expanded children. Retries ignore reading mode and use `witnessedMerge`
+of their expanded children. These refusal retries ignore reading mode and use `witnessedMerge`
 when every source is witnessed, otherwise `merge`; an omitted slot uses the
-same built-in witnessed/general formatter. `readingMerge` never controls retries.
+same built-in witnessed/general formatter. `readingMerge` does not control source-level refusal retries.
 Split pieces keep the parent chunk's ordinary/witnessed classification and use `chunk`/`witnessedChunk`, including
 pieces of reading-mode chunks. This does not change split/merge algorithms.
 
@@ -92,19 +92,21 @@ Precedence:
    still runs afterward. This option does not force subclasses to use it.
 2. Existing `witnessedInstruction` wins over the built-in witnessed L1 text,
    including when custom templates are configured. Combining it with a
-   `templates.witnessedChunk` override throws rather than hiding either one.
+   `templates.witnessedChunk` override (even when `witnessedInstruction` is empty) throws rather than hiding either one.
 3. A supplied template slot replaces that phase's built-in wording; omitted
    slots retain the existing default. `default` is the only accepted preset.
 4. `identityReminder`/`witnessedIdentityReminder` are appended at their
    existing L1/merge sites, including custom instructions. Neither is added
    to transition requests, matching existing behavior.
 
-The existing merge retry did not call ordinary `getMergeInstruction` or
+The source-level refusal merge retry did not call ordinary `getMergeInstruction` or
 `getReadingMergeInstruction` overrides. It still does not; a new protected
 `getSourceMergeInstruction` hook covers that distinct payload. Ordinary merge
 hooks receive an optional final shown-level argument for selected wording.
 The source-retry hook takes only `(targetLevel, sources, targetTokens)`; it
 ignores reading mode and has no reading-body `totalTokens` argument.
+Non-refusal `tool_use` retries retain the ordinary/reading merge hook and template,
+with the no-tools addition; they do not use the source-retry hook.
 The new `getCompressionOpening` hook handles the L1 marker. Transition
 customization is inside `generateTransitionSummary`; overriding that method
 still owns the whole operation.

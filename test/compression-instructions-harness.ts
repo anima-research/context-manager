@@ -61,7 +61,7 @@ export class KnowledgeProbe extends KnowledgeStrategy {
 }
 export type Mode = 'chunk' | 'reading' | 'split' | 'readingSplit' | 'merge' | 'readingMerge' | 'fallback' | 'readingFallback' | 'transition';
 export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: CompressionInstructions,
-  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 = 2) {
+  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 = 2, firstResponse?: 'tool_use' | 'empty') {
   const path = mkdtempSync(join(tmpdir(), 'test-instructions-'));
   const calls: NormalizedRequest[] = [];
   let manager: ContextManager | undefined;
@@ -74,6 +74,10 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
     const membrane = { complete: async (request: NormalizedRequest) => {
       calls.push(structuredClone(request));
       // Canonical/source-only split requests have four raw records. Pieces have one.
+      if (firstResponse && calls.length === 1) return {
+        content: [], stopReason: firstResponse === 'empty' ? 'end_turn' : 'tool_use',
+        usage: { inputTokens: 100, outputTokens: 0 },
+      };
       const rawCount = texts(request).filter(s => s.startsWith('raw-')).length;
       return (split && rawCount > 1) || (mode.toLowerCase().includes('fallback') && calls.length === 1)
         ? { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 } }
@@ -119,7 +123,7 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       assert.deepEqual(merged.sourceIds, sources.map(s => s.id));
     }
     assert.deepEqual(ctx.messageStore.getAll(), before, 'raw content and metadata untouched');
-    assert.equal(calls.length, split ? 8 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
+    assert.equal(calls.length, split ? 8 : firstResponse ? 2 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
     return calls;
   } finally {
     try { await manager?.close(); }
