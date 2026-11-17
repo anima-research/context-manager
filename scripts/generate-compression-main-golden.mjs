@@ -1,6 +1,6 @@
 // Offline producer. The explicit source root must be a clean Git worktree root,
 // built with the synthetic harness. No upward-discovered archive provenance.
-import { readFileSync, writeFileSync, realpathSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync, mkdtempSync, mkdirSync, rmSync, lstatSync, readlinkSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -14,7 +14,7 @@ const root = realpathSync(resolve(sourceRoot));
 const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 gitEnv.GIT_CONFIG_NOSYSTEM = '1';
 gitEnv.GIT_CONFIG_GLOBAL = '/dev/null';
-const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: gitEnv, timeout: 10000 }).trim();
+const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: gitEnv, timeout: 10000 }).replace(/\n$/, '');
 if (realpathSync(git('rev-parse', '--show-toplevel')) !== root) {
   throw new Error('Source root must equal its Git top-level; archives/build subdirectories are not source worktrees');
 }
@@ -22,17 +22,24 @@ const source = git('rev-parse', 'HEAD');
 const sourceTree = git('rev-parse', 'HEAD^{tree}');
 // Compare bytes to HEAD independently of index stat/assume-unchanged flags.
 function sourceFilesChanged() {
-  return git('ls-tree', '-r', '--name-only', 'HEAD', '--', 'src', 'test', 'scripts', 'tsconfig.json', 'package.json', 'package-lock.json')
-    .split('\n').filter(Boolean).some(path => {
-      try { return git('hash-object', '--', path) !== git('rev-parse', 'HEAD:' + path); }
-      catch { return true; }
-    });
+  const paths = git('ls-tree', '-rz', '--name-only', 'HEAD').split('\0').filter(Boolean);
+  return paths.some(path => {
+    try {
+      const full = resolve(root, path);
+      const bytes = lstatSync(full).isSymbolicLink() ? readlinkSync(full, { encoding: 'buffer' }) : readFileSync(full);
+      const hash = execFileSync('git', ['hash-object', '--stdin', '--no-filters'],
+        { input: bytes, encoding: 'utf8', env: gitEnv, timeout: 10000 }).trim();
+      return hash !== git('rev-parse', 'HEAD:' + path);
+    } catch { return true; }
+  });
 }
-
-// Untracked test-only harness ports are allowed on legacy trees. Tracked edits
-// anywhere, or untracked product source, cannot claim clean-commit provenance.
-if (git('status', '--porcelain', '--untracked-files=no') ||
-    git('ls-files', '--others', '--', 'src') || sourceFilesChanged()) {
+function untrackedSource() {
+  const paths = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean);
+  paths.push(...git('ls-files', '-z', '--others', '--', 'src', 'test', 'scripts').split('\0').filter(Boolean));
+  return paths.some(path => path !== 'test/compression-instructions-harness.ts');
+}
+// Permit only the legacy harness port among non-ignored untracked files.
+if (git('status', '--porcelain', '--untracked-files=no') || untrackedSource() || sourceFilesChanged()) {
   throw new Error('Refusing dirty source worktree; commit intentional changes before capture');
 }
 const producerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -53,7 +60,7 @@ try {
   }
   // Do not publish a clean-source label if source changed during the capture.
   if (git('rev-parse', 'HEAD') !== source || git('status', '--porcelain', '--untracked-files=no') ||
-      git('ls-files', '--others', '--', 'src') || sourceFilesChanged()) {
+      untrackedSource() || sourceFilesChanged()) {
     throw new Error('Source worktree changed during capture');
   }
   writeFileSync(output, JSON.stringify({

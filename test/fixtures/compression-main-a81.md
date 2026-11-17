@@ -36,9 +36,10 @@ Use an explicit, clean Git source worktree root, not an archive or a `dist`
 folder. The generator validates that root equals Git's top-level (so an archive
 under a PR checkout cannot acquire its parent's HEAD), ignores ambient `GIT_*`
 overrides, and records that worktree's actual HEAD/tree. It refuses tracked
-edits anywhere and untracked (including ignored) product files under `src`; commit deliberate
-source changes first. Only untracked test harness instrumentation on a legacy
-tree is allowed. Tracked source bytes are also compared with HEAD, independently
+edits anywhere and untracked (including ignored) files under `src`, `test`, and `scripts`; commit deliberate
+source changes first. Among non-ignored untracked files, only `test/compression-instructions-harness.ts`
+is allowed for legacy instrumentation. Ignored build/dependency artifacts outside
+those source directories are trusted inputs, not audited source; do not import untracked helpers. Tracked source bytes are also compared with HEAD, independently
 of index flags. The generator builds into a fresh temporary output directory
 with the recorded compiler, then removes that directory after capture.
 

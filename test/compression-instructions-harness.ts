@@ -34,7 +34,7 @@ export class Probe extends AutobiographicalStrategy {
   pin(value: number) { this.config.witnessedBeforeSequence = value; }
   compress(chunk: Chunk, ctx: StrategyContext) { return this.compressChunkHierarchical(chunk, ctx); }
   seed(s: SummaryEntry) { this.pushSummary(s); }
-  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 = 2) {
+  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2) {
     if (!fallback) return this.executeMerge(targetLevel, ids, ctx);
     this.compressionQueue = []; // Isolate the seeded merge from unrelated shard work.
     this.enqueueMerge({ level: targetLevel, sourceIds: ids });
@@ -49,7 +49,7 @@ export class KnowledgeProbe extends KnowledgeStrategy {
   pin(value: number) { this.config.witnessedBeforeSequence = value; }
   compress(chunk: Chunk, ctx: StrategyContext) { return this.compressChunkHierarchical(chunk, ctx); }
   seed(s: SummaryEntry) { this.pushSummary(s); }
-  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 = 2) {
+  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2) {
     if (!fallback) return this.executeMerge(targetLevel, ids, ctx);
     this.compressionQueue = []; // Isolate the seeded merge from unrelated shard work.
     this.enqueueMerge({ level: targetLevel, sourceIds: ids });
@@ -61,7 +61,7 @@ export class KnowledgeProbe extends KnowledgeStrategy {
 }
 export type Mode = 'chunk' | 'reading' | 'split' | 'readingSplit' | 'merge' | 'readingMerge' | 'fallback' | 'readingFallback' | 'transition';
 export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: CompressionInstructions,
-  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 = 2, firstResponse?: 'tool_use' | 'empty') {
+  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 | 4 = 2, firstResponse?: 'tool_use' | 'empty') {
   const path = mkdtempSync(join(tmpdir(), 'test-instructions-'));
   const calls: NormalizedRequest[] = [];
   let manager: ContextManager | undefined;
@@ -111,8 +111,8 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
         ...(pin === 'inherited' || (pin === 'mixed' && i === 0) ? { witnessed: true } : {}),
       }));
       for (const s of sources) strategy.seed(s);
-      if (targetLevel === 3) {
-        sources = sources.map((s, i) => ({ ...s, id: `L2-${200 + i}`, level: 2,
+      if (targetLevel >= 3) {
+        sources = sources.map((s, i) => ({ ...s, id: `L${targetLevel - 1}-${200 + i}`, level: (targetLevel - 1) as 2 | 3,
           sourceLevel: 1, sourceIds: [s.id] }));
         for (const s of sources) strategy.seed(s);
       }

@@ -53,7 +53,7 @@ const presets: readonly string[] = ['default'];
 
 type Path = 'configuration' | 'preset' | 'participant' | 'templates' | `templates.${Slot}`;
 type Reason = 'expected object' | 'unknown key' | 'unsupported preset' | 'expected nonblank string'
-  | 'expected nonempty object' | 'malformed braces' | 'unsupported placeholder' | 'context must appear once' | 'participant required';
+  | 'expected enumerable string keys' | 'expected nonempty object' | 'malformed braces' | 'unsupported placeholder' | 'context must appear once' | 'participant required';
 function invalid(path: Path, reason: Reason): never {
   // Do not echo template text, participant names, unknown keys or payloads.
   throw new TypeError(`Invalid compressionInstructions configuration: ${path}: ${reason}`);
@@ -63,18 +63,27 @@ function record(value: unknown): value is Record<string, unknown> {
     && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 
+function checkKeys(value: object, path: Path): void {
+  if (Reflect.ownKeys(value).some(key => typeof key !== 'string'
+    || !Object.prototype.propertyIsEnumerable.call(value, key))) {
+    invalid(path, 'expected enumerable string keys');
+  }
+}
+
 /** Validate before constructing a strategy (also usable by a recipe loader).
  * Strict within this object, including unselected slots. No values in errors.
  */
 export function validateCompressionInstructions(value: unknown): asserts value is CompressionInstructions | undefined {
   if (value === undefined) return;
   if (!record(value)) invalid('configuration', 'expected object');
+  checkKeys(value, 'configuration');
   if (Object.keys(value).some(k => !['preset', 'participant', 'templates'].includes(k))) invalid('configuration', 'unknown key');
   if (value.preset !== undefined && (typeof value.preset !== 'string' || !presets.includes(value.preset))) invalid('preset', 'unsupported preset');
   if (value.participant !== undefined && (typeof value.participant !== 'string' || !value.participant.trim())) invalid('participant', 'expected nonblank string');
   let needsParticipant = false;
   if (value.templates !== undefined) {
     if (!record(value.templates) || Object.keys(value.templates).length === 0) invalid('templates', 'expected nonempty object');
+    checkKeys(value.templates, 'templates');
     for (const [slot, template] of Object.entries(value.templates)) {
       if (!Object.hasOwn(placeholders, slot)) invalid('templates', 'unknown key');
       const path: Path = `templates.${slot as Slot}`;

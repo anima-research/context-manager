@@ -1,15 +1,18 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+import { createHash } from 'node:crypto';
+import { readCompressionGolden } from './compression-golden-reader.js';
 
 const generator = resolve('scripts/generate-compression-main-golden.mjs');
 // Tiny synthetic module isolates provenance/serialization checks from strategy
 // runtime. Real modern + legacy request parity is checked separately.
 function fixture(check: (root: string, git: (...args: string[]) => string) => void) {
-  const root = mkdtempSync(join(tmpdir(), 'cm-golden-source-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cm-golden-source-')));
   const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
   const git = (...args: string[]) => execFileSync('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', ...args], { encoding: 'utf8', timeout: 10000, env }).trim();
@@ -50,6 +53,9 @@ it('generator records actual source HEAD/tree, ignores Git overrides and preserv
     assert.equal(golden.sourceTree, git('rev-parse', 'HEAD^{tree}'));
     assert.equal(Object.keys(golden.requests).length, 93);
     assert.deepEqual(golden.requests['base/chunk/own/L2'][0].tools, { $cmGoldenUndefined: true });
+    const restored = readCompressionGolden(join(root, 'dist/capture.json'));
+    assert.ok(Object.hasOwn(restored.requests['base/chunk/own/L2']![0]!, 'tools'));
+    assert.equal(restored.requests['base/chunk/own/L2']![0]!.tools, undefined);
   });
 });
 
@@ -97,7 +103,14 @@ it('fixture ignores inherited repository, index and global configuration overrid
   const previous = keys.map(key => process.env[key]);
   try {
     for (const key of keys) process.env[key] = '/nonexistent/cm-hostile';
-    fixture((root, git) => assert.equal(git('rev-parse', '--show-toplevel'), root));
+    fixture((root, git) => {
+      assert.equal(git('rev-parse', '--show-toplevel'), root);
+      const hostileConfig = join(root, 'dist/hostile.gitconfig');
+      writeFileSync(hostileConfig, '[invalid config');
+      const result = capture(root, { ...process.env, GIT_CONFIG_GLOBAL: hostileConfig });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readCompressionGolden(join(root, 'dist/capture.json')).source, git('rev-parse', 'HEAD'));
+    });
   } finally {
     keys.forEach((key, index) => {
       if (previous[index] === undefined) delete process.env[key];
@@ -113,7 +126,10 @@ it('generator rebuilds rather than trusting stale dist and records installed dep
     assert.equal(result.status, 0, result.stderr);
     const golden = JSON.parse(readFileSync(join(root, 'dist/capture.json'), 'utf8'));
     assert.equal(golden.requests['base/chunk/own/L2'][0].system, 'synthetic');
-    assert.notEqual(golden.sourceDependencyLockSha256, golden.installedDependencyLockSha256);
+    for (const [key, path] of [['sourceDependencyLockSha256', 'package-lock.json'],
+      ['installedDependencyLockSha256', 'node_modules/.package-lock.json']] as const) {
+      assert.equal(golden[key], createHash('sha256').update(readFileSync(join(root, path))).digest('hex'));
+    }
     assert.match(golden.compiledHarnessSha256, /^[a-f0-9]{64}$/);
     assert.equal(golden.harnessSha256, undefined, 'no unused producer harness claim');
   });
@@ -132,5 +148,40 @@ it('generator rejects ignored additions and tracked bytes hidden by index flags'
       writeFileSync(join(root, 'src/product.ts'), 'export const value = 1;\n');
       git('update-index', '--no-' + flag, 'src/product.ts');
     }
+  });
+});
+
+it('generator rejects untracked helpers and hidden root-level changes', () => {
+  fixture((root, git) => {
+    writeFileSync(join(root, 'test/helper.ts'), 'export const helper = 1;');
+    assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+    writeFileSync(join(root, '.git/info/exclude'), 'test/helper.ts\n');
+    assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+    rmSync(join(root, 'test/helper.ts'));
+    for (const flag of ['assume-unchanged', 'skip-worktree']) {
+      git('update-index', '--' + flag, '.gitignore');
+      writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\nextra\n');
+      assert.match(capture(root).stderr, /Refusing dirty source worktree/);
+      writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\n');
+      git('update-index', '--no-' + flag, '.gitignore');
+    }
+  });
+});
+
+it('generator hashes raw bytes, symlink text and NUL-delimited filenames', () => {
+  fixture((root, git) => {
+    const odd = 'src/café\tline\n.txt';
+    writeFileSync(join(root, odd), 'original\n');
+    symlinkSync('product.ts', join(root, 'src/link.txt'));
+    writeFileSync(join(root, '.gitattributes'), 'src/product.ts filter=restore\n');
+    git('add', '.');
+    git('-c', 'user.name=Synthetic Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'paths and filter');
+    const clean = capture(root);
+    assert.equal(clean.status, 0, clean.stderr);
+    git('config', 'filter.restore.clean', "printf 'export const value = 1;\\n'");
+    git('update-index', '--assume-unchanged', 'src/product.ts');
+    writeFileSync(join(root, 'src/product.ts'), 'export const value = 2;\n');
+    assert.match(capture(root).stderr, /Refusing dirty source worktree/);
   });
 });

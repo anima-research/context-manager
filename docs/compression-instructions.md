@@ -30,11 +30,11 @@ built-in text. No migration of existing summaries is performed.
 | --- | --- | --- |
 | `opening` | L1 record marker, including split pieces; coordinate with `chunk` (the built-in chunk refers back to this notification) | `participant` |
 | `chunk` | Ordinary/mixed L1 and split pieces | `participant`, `targetTokens` |
-| `witnessedChunk` | Wholly inherited L1 and split pieces | `participant`, `targetTokens` |
-| `readingChunk` | L1 portion of a larger sharded body | `participant`, `targetTokens`, `totalTokens` |
+| `witnessedChunk` | Non-reading wholly inherited L1, and inherited split pieces | `participant`, `targetTokens` |
+| `readingChunk` | L1 portion of a larger sharded body, even wholly inherited | `participant`, `targetTokens`, `totalTokens` |
 | `merge` | Ordinary/mixed consolidation | `participant`, `targetTokens`, `sourceLevelShown`, `targetLevel` |
-| `witnessedMerge` | Consolidation with every source witnessed | same as `merge` |
-| `readingMerge` | Consolidation of portions of one larger body | same as `merge`, plus `totalTokens` |
+| `witnessedMerge` | Non-reading consolidation with every source witnessed | same as `merge` |
+| `readingMerge` | Consolidation of portions of one larger body, even fully witnessed | same as `merge`, plus `totalTokens` |
 | `transition` | `generateTransitionSummary` | `participant`, `targetTokens`, `context` |
 
 Use single braces, for example `{targetTokens}`. Braces are reserved for
@@ -72,13 +72,15 @@ Construction validates the entire `compressionInstructions` object, including
 unused slots, before any provider call. `validateCompressionInstructions`
 is also exported for recipe loaders. Unknown keys within this object or its
 templates, unknown presets, wrong types, blank strings, malformed or
-unsupported placeholders, and absent required participant/context are errors.
+unsupported placeholders, non-enumerable or Symbol keys, and absent required
+participant/context are errors.
 An empty `templates: {}` is an error; omit it instead. Errors are `TypeError`s
 with allowlisted paths and reason categories after the existing value-free
 `Invalid compressionInstructions configuration` prefix; values and unknown keys
 are never echoed. Template settings are copied at construction;
 mutating the caller's object afterward does not update a strategy. They are
-not hot-tunable. The validator is scoped to this object, not a schema for all
+not hot-tunable. Inherited caller options are ignored; non-cloneable settings
+are rejected with value-free errors. The validator is scoped to this object, not a schema for all
 existing strategy or host recipe options.
 
 Precedence:
@@ -103,10 +105,14 @@ The source-level refusal merge retry did not call ordinary `getMergeInstruction`
 `getReadingMergeInstruction` overrides. It still does not; a new protected
 `getSourceMergeInstruction` hook covers that distinct payload. Ordinary merge
 hooks receive an optional final shown-level argument for selected wording.
+Delegating overrides should forward this argument; older overrides that omit it
+infer the custom template's shown level from the sources' declared child level.
 The source-retry hook takes only `(targetLevel, sources, targetTokens)`; it
 ignores reading mode and has no reading-body `totalTokens` argument.
-Non-refusal `tool_use` retries retain the ordinary/reading merge hook and template,
-with the no-tools addition; they do not use the source-retry hook.
+Before any refusal, `tool_use` retries retain the ordinary/reading merge hook
+and template with the no-tools addition. After a refusal, source-level retry
+selection stays sticky: a subsequent `tool_use` retry uses the source-retry hook
+plus the no-tools addition.
 The new `getCompressionOpening` hook handles the L1 marker. Transition
 customization is inside `generateTransitionSummary`; overriding that method
 still owns the whole operation.
@@ -149,3 +155,6 @@ Hosts must forward this option and validate it before constructing the strategy.
 Companion integration and release coordination belong in the
 [connectome-host companion PR](https://github.com/anima-research/connectome-host/pull/648),
 not in version-pinned instructions here. This CM option does not itself add host wiring.
+
+The developer prompt dump/replay scripts reconstruct built-in wording only;
+they do not recover custom templates from stored summaries.

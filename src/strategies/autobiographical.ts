@@ -14233,9 +14233,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 3. INSTRUCTION ----
     // sourceLevelShown is the level of content the model actually sees
-    // (one level below the sources themselves).
-    const sourceLevelShown =
-      sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
+    // Use the declared child level, including legacy sources that skip a level.
+    const sourceLevelShown = sources[0].sourceLevel;
 
     // Reading-mode detection: when ALL the merge's leaf messages are
     // shards of the same bodyGroup, we know the agent was reading a
@@ -19395,10 +19394,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Witnessed pin propagation: consolidating all-witnessed sources must keep
     // the witnessed voice, or the merge re-first-persons inherited lives.
     if (sources.length > 0 && sources.every((s) => s.witnessed)) {
-      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
+      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
         ?? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
     }
-    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
       ?? formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
   }
 
@@ -19433,7 +19432,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
-    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, totalTokens, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: shownLevel ?? sources[0]?.sourceLevel ?? sourceLevelShown, totalTokens, targetTokens })
       ?? formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 

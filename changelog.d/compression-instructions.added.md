@@ -12,3 +12,8 @@
   validation failures using value-free paths and reasons.
 - Keep the source-retry hook limited to target level, sources and target tokens;
   reading-body token counts remain on the ordinary reading-merge hook only.
+- Template settings require enumerable string keys and cloneable values;
+  inherited caller options are ignored. Combining `witnessedInstruction`
+  (including an empty string) with `templates.witnessedChunk` is rejected.
+  Reading slots take precedence over witnessed slots except on split pieces
+  and source-level refusal retries.

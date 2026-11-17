@@ -112,7 +112,6 @@ it('existing hooks and reminders keep their precedence', async () => {
   assert.match(instruction(calls[0]!), /^EXISTING \d+\n\nWITNESS-REMINDER$/);
 });
 
-
 it('templates alone need no preset; partial overrides leave every other phase at DEFAULT', async () => {
   const config: CompressionInstructions = { templates: { chunk: 'ONLY CHUNK {targetTokens}' } };
   assert.match(instruction((await run('chunk', 'own', config))[0]!), /^ONLY CHUNK \d+$/);
@@ -308,4 +307,57 @@ it('empty chunk retries retain custom text and request plain prose', async () =>
   assert.equal(instruction(calls[0]!), 'CUSTOM CHUNK 2000');
   assert.ok(instruction(calls[1]!).startsWith(instruction(calls[0]!)));
   assert.match(instruction(calls[1]!), /plain prose/);
+});
+
+it('rejects own symbols and non-enumerable settings rather than dropping them at clone time', () => {
+  for (const key of ['chunk', Symbol('private')]) {
+    const templates = Object.defineProperty({ opening: 'valid' }, key, { value: 'hidden' });
+    for (const value of [{ templates }, Object.defineProperty({}, key, { value: 'hidden' })]) {
+      assert.throws(() => validateCompressionInstructions(value), /expected enumerable string keys/);
+      assert.throws(() => new Probe({ compressionInstructions: value }), /expected enumerable string keys/);
+    }
+  }
+});
+
+it('validates cloneable invalid text returned only at clone time', () => {
+  let reads = 0;
+  const config = { templates: { get opening() { return ++reads < 3 ? 'valid' : '{unknown}'; } } };
+  assert.throws(() => new Probe({ compressionInstructions: config }), {
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder',
+  });
+  assert.equal(reads, 3);
+});
+
+it('ordinary, witnessed and reading merge templates honor an explicit distinct shown level', () => {
+  class Expose extends Probe {
+    check(witnessed: boolean) {
+      const sources = [{ level: 2, witnessed }] as SummaryEntry[];
+      assert.equal(this.getMergeInstruction(3, sources, 100, 7), `CUSTOM ${witnessed ? 'W' : ''}MERGE 7 3 100`);
+      assert.equal(this.getReadingMergeInstruction(3, sources, 500, 100, 7), 'CUSTOM RMERGE 7 3 500 100');
+    }
+  }
+  const probe = new Expose({ compressionInstructions: custom });
+  probe.check(false);
+  probe.check(true);
+});
+
+it('delegating legacy hooks infer the declared child level for custom templates', () => {
+  class Legacy extends Probe {
+    check(sourceLevel: 0 | 1) {
+      const sources = [{ level: 3, sourceLevel }] as SummaryEntry[];
+      assert.equal(super.getMergeInstruction(4, sources, 100), `CUSTOM MERGE ${sourceLevel} 4 100`);
+      assert.equal(super.getReadingMergeInstruction(4, sources, 500, 100), `CUSTOM RMERGE ${sourceLevel} 4 500 100`);
+    }
+  }
+  const probe = new Legacy({ compressionInstructions: custom });
+  probe.check(0);
+  probe.check(1);
+});
+
+it('L4 merges of legacy L3 sources that skip a level show their L1 children', async () => {
+  for (const mode of ['merge', 'readingMerge'] as const) {
+    const calls = await run(mode, 'own', custom, {}, Probe, 4);
+    assert.match(instruction(calls[0]!), mode === 'merge' ? /^CUSTOM MERGE 1 4 / : /^CUSTOM RMERGE 1 4 /);
+    assert.ok(texts(calls[0]!).some(text => text === '[CM] Recall memory L1-100.'));
+  }
 });
