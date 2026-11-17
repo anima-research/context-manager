@@ -10,3 +10,7 @@
   Callbacks add optional `clearReason: 'quarantine-empty' |
   'operator-waiver-requested'` only at episode end; existing fields remain
   compatible. Empty quarantine is not evidence of coverage or paid debt.
+- Native paid-off and success-clear loops retain each observed exhaustion
+  generation across earlier asynchronous clears, leaving replacement holds
+  for a fresh decision. Checkpoints supersede legacy snapshots even when the
+  obsolete snapshot is damaged; retained checkpoint entries still validate.

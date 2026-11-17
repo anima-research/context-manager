@@ -36,7 +36,7 @@ export interface CompressionQuarantineRecordView {
   outcomes: { outcome: string; stopReason: string | null; requestHash: string | null }[];
   outcomesComplete: boolean;
   sameSourceRecords: number;
-  /** Current accounting/fallback config matches this recorded request regime; not eligibility. */
+  /** Current accounting/fallback config matches this recorded request regime, NOT necessarily today’s prepared request hash or cap; not eligibility. */
   countsTowardShapeCap: boolean;
   /** Same-source records in that regime, including this one; zero when it does not count. */
   sameRegimeRecords: number;

@@ -1645,7 +1645,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         // finds its strategy detached by then does.
         const internals = strategy as unknown as {
           readCompressionQuarantineProjection: () => Map<string, unknown>;
-          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+          clearObservedCompressionQuarantine: (key?: string, generation?: string) => Promise<boolean>;
           quarantineAlarmActive: boolean;
         };
         const orphan = (key: string) => ({ record: { key, chunkSourceHash: key } });
@@ -1653,7 +1653,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         let openClear!: () => void;
         const clearing = new Promise<void>((resolve) => { openClear = resolve; });
         const cleared: string[] = [];
-        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        internals.clearObservedCompressionQuarantine = async (key) => { cleared.push(String(key)); await clearing; return false; };
         internals.quarantineAlarmActive = true;
         let ended = { outcome: 'pending' };
         const logged = await logsDuring(async () => {
@@ -1692,7 +1692,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         const hash = createHash('sha256').update(JSON.stringify(['chunk-a', 'chunk-b']), 'utf8').digest('hex');
         const internals = strategy as unknown as {
           readCompressionQuarantineProjection: () => Map<string, unknown>;
-          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+          clearObservedCompressionQuarantine: (key?: string, generation?: string) => Promise<boolean>;
           clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void>;
         };
         const debt = (key: string) => ({ record: { key, chunkSourceHash: hash } });
@@ -1700,7 +1700,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         let openClear!: () => void;
         const clearing = new Promise<void>((resolve) => { openClear = resolve; });
         const cleared: string[] = [];
-        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        internals.clearObservedCompressionQuarantine = async (key) => { cleared.push(String(key)); await clearing; return false; };
         let ended = { outcome: 'pending' };
         const logged = await logsDuring(async () => {
           const clearingChunk = internals.clearQuarantineForCompressedChunk(chunk);

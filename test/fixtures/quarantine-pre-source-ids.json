@@ -1,0 +1,115 @@
+{
+  "events": [
+    {
+      "kind": "exhausted",
+      "key": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+      "record": {
+        "key": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+        "familyKey": "8d887020dc7f17772eca59eb01082f7fb82932a1ac894b4980eb191224baeab4",
+        "model": "historical-fixture",
+        "chunkSourceHash": "6df6a9970970210531e053a5cc1b24d3d82baf1cebd4a35e657f89d7473fc5d1",
+        "frontierHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "canonicalRequestHash": "5a0fd8b898d0417e3d93939ad77a847acf8324244b5e80b1a370c2c7a70015d5",
+        "accountingSource": "provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2",
+        "canonicalRequestBoundTokens": 3344,
+        "canonicalProviderInputTokens": 100,
+        "normalizedConfig": {
+          "accountingVersion": 2,
+          "fallbackLimit": 0,
+          "contextBudgetTokens": 200000,
+          "requestConfig": {
+            "model": "historical-fixture",
+            "maxTokens": 16000
+          }
+        },
+        "fallbackLimit": 0,
+        "contextBudgetTokens": 200000,
+        "plan": [],
+        "created": 1794910849951
+      },
+      "outcomes": [
+        {
+          "curveLabel": "canonical",
+          "requestHash": "5a0fd8b898d0417e3d93939ad77a847acf8324244b5e80b1a370c2c7a70015d5",
+          "outcome": "refusal",
+          "stopReason": "refusal"
+        }
+      ],
+      "created": 1794910849952,
+      "eventId": "22",
+      "sequence": 22
+    },
+    {
+      "kind": "alert_pending",
+      "key": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+      "targetClaimId": "22",
+      "alertKey": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+      "created": 1794910849952,
+      "eventId": "23",
+      "sequence": 23
+    },
+    {
+      "kind": "alert_sent",
+      "key": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+      "targetClaimId": "22",
+      "alertKey": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+      "pendingEventId": "23",
+      "created": 1794910849952,
+      "eventId": "24",
+      "sequence": 24
+    }
+  ],
+  "checkpoint": [
+    {
+      "kind": "checkpoint",
+      "key": "__checkpoint__",
+      "active": [
+        {
+          "generationId": "22",
+          "record": {
+            "key": "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c",
+            "familyKey": "8d887020dc7f17772eca59eb01082f7fb82932a1ac894b4980eb191224baeab4",
+            "model": "historical-fixture",
+            "chunkSourceHash": "6df6a9970970210531e053a5cc1b24d3d82baf1cebd4a35e657f89d7473fc5d1",
+            "frontierHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "canonicalRequestHash": "5a0fd8b898d0417e3d93939ad77a847acf8324244b5e80b1a370c2c7a70015d5",
+            "accountingSource": "provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2",
+            "canonicalRequestBoundTokens": 3344,
+            "canonicalProviderInputTokens": 100,
+            "normalizedConfig": {
+              "accountingVersion": 2,
+              "fallbackLimit": 0,
+              "contextBudgetTokens": 200000,
+              "requestConfig": {
+                "model": "historical-fixture",
+                "maxTokens": 16000
+              }
+            },
+            "fallbackLimit": 0,
+            "contextBudgetTokens": 200000,
+            "plan": [],
+            "created": 1794910849951
+          },
+          "outcomes": [
+            {
+              "curveLabel": "canonical",
+              "requestHash": "5a0fd8b898d0417e3d93939ad77a847acf8324244b5e80b1a370c2c7a70015d5",
+              "outcome": "refusal",
+              "stopReason": "refusal"
+            }
+          ],
+          "pendingAlert": {
+            "eventId": "283",
+            "alertKey": "padding"
+          },
+          "sentAlertKeys": [
+            "e1da6cb938d5e8340898da61d221f2ac66becabdf7f39aa14a7c4c62a1a74d2c"
+          ]
+        }
+      ],
+      "created": 1794910850074,
+      "eventId": "284",
+      "sequence": 284
+    }
+  ]
+}

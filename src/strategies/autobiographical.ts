@@ -2752,8 +2752,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * drop would otherwise leave them).
    */
   async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
+    await this.clearObservedCompressionQuarantine(key);
+  }
+
+  // Internal decisions retain the generation observed before any earlier await.
+  private async clearObservedCompressionQuarantine(key?: string, expectedGeneration?: string): Promise<boolean> {
     this.requireLoadedBranch('clearCompressionRefusalQuarantine');
-    if (!this.store) return;
+    if (!this.store) return false;
     const sourceBranch = this.captureCompressionBranch();
     // Capture exhaustion identities at invocation. A delayed clear can
     // tombstone only those exact generations; it cannot erase a newer one.
@@ -2762,15 +2767,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? [...observed.values()].map((active) => ({
           key: active.record.key, generationId: active.generationId,
         }))
-      : observed.has(key)
+      : observed.has(key) && (expectedGeneration === undefined || observed.get(key)!.generationId === expectedGeneration)
         ? [{ key, generationId: observed.get(key)!.generationId }]
         : [];
-    await withCompressionStateLock(
+    return withCompressionStateLock(
       this.store,
       sourceBranch.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
-      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
       const current = this.readCompressionQuarantineProjection();
       const cleared = targets.flatMap((target) => {
         const active = current.get(target.key);
@@ -2793,6 +2798,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
+      return cleared.length > 0;
     });
   }
 
@@ -2815,8 +2821,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100))) {
       return { status: 'invalidSelection' };
     }
+    let binding: CompressionQuarantineBinding | null;
+    try { binding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
     try {
-      const binding = this.quarantineBinding();
       if (!binding) return { status: 'branchUnavailable' };
       const projection = this.readCompressionQuarantineProjection(true, true);
       const limit = options.limit ?? 50;
@@ -5307,7 +5314,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     };
     const ledger = read(this.compressionRefusalQuarantineLedgerStateId);
-    const legacy = read(this.compressionRefusalQuarantineStateId);
+    // A checkpoint completely replaces the legacy snapshot, including one
+    // left damaged by an older writer. Validate the checkpoint itself below.
+    const hasCheckpoint = Array.isArray(ledger) && ledger.some((event) => event?.kind === 'checkpoint');
+    const legacy = hasCheckpoint ? undefined : read(this.compressionRefusalQuarantineStateId);
     const dropped = new Set<string>();
     const unlisted = new Set<string>();
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
@@ -5984,12 +5994,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const reason = match
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
-        await this.clearCompressionRefusalQuarantine(key);
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId);
         // A strategy detached, loaded again on another branch, or whose
         // branch moved, while a clear waited stops sweeping here: that clear
         // may have written nothing, the chunk records read above are another
         // branch's, and the records stay for the next sweep.
         if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
+        if (!cleared) continue;
         this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
@@ -6097,11 +6108,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const projection = this.readCompressionQuarantineProjection();
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
-        await this.clearCompressionRefusalQuarantine(key);
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId);
         // As in the paid-off sweep: a strategy detached, loaded again on
         // another branch, or whose branch moved while a clear waited stops
         // here, since that clear may have written nothing.
         if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
+        if (!cleared) continue;
         this.diag.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
             `successfully under a newer request shape`,

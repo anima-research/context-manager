@@ -9,3 +9,7 @@
   later write failures remain uncertain. Capability detection narrows only to
   the two checked methods. A waiver is not coverage or a promise of a provider
   attempt; legacy optional-key clearing remains available.
+- Inspection reports `branchUnavailable` when branch lookup fails, consistently
+  with release. Historical source-only cap accounting is not a prediction of
+  today's prepared request hash; short damaged ledgers have no immediate repair
+  through inspection or release.
