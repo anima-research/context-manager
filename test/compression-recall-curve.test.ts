@@ -4402,13 +4402,52 @@ describe('tool-prose hoist admission', () => {
             : log.metadata?.curveLabel === 'source-only-final';
           const trace = logs.find(log => log.event === 'compression:attempt' && matches(log))?.metadata;
           assert.ok(trace);
-          assert.equal(trace.outcome, malformed ? 'provider_error' : 'unusable_empty');
+          assert.equal(trace.outcome, malformed ? 'provider_error' : fallback === 'split' ? 'success' : 'unusable_empty');
           if (malformed) assert.equal(trace.errorType, 'malformed_content');
           if (fallback === 'source-only') {
             const curve = logs.find(log => log.event === 'compression:curve-attempt' && matches(log))?.metadata;
             assert.equal(curve?.outcome, trace.outcome);
             assert.equal(curve?.errorType, trace.errorType);
           }
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    it('split traces describe the raw folds that contribute to a stitched memory', async () => {
+      const hidden = '<thinking>hidden</thinking>';
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { stop: 'refusal' },
+        { stop: 'end_turn', text: 'first memory' }, { stop: 'end_turn', text: hidden },
+      ]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+        compressionSplitFallback: true, recoverLiteralThinkingWrappedCompression: false,
+      });
+      try {
+        const logs = await capture(fx);
+        const parts = logs.filter(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:'));
+        assert.equal(parts.length, 2);
+        assert.ok(parts.every(log => log.metadata?.outcome === 'success'));
+        assert.equal(fx.target.compressed, true);
+        assert.ok(fx.strategy.summariesView().some(entry => entry.content.includes(hidden)), 'raw thinking-only fold is preserved, as before this PR');
+      } finally { fx.manager.close(); }
+    });
+
+    for (const stage of ['canonical', 'canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`${stage} extraction errors never log success`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = stage === 'canonical' ? []
+          : stage === 'canonical-plain-prose' ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : stage === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const mock = flexibleMembrane([...prior, { raw: { stopReason: 'end_turn' } }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), TypeError));
+          const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === stage)?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.outcome, 'provider_error');
+          assert.equal(trace.errorType, 'malformed_content');
           assert.equal(fx.target.compressed, false);
         } finally { fx.manager.close(); }
       });
@@ -4430,7 +4469,12 @@ describe('tool-prose hoist admission', () => {
         const stripped = mock.calls.length === 2;
         try { return await complete(request); }
         catch (error) {
-          if (stripped) Object.defineProperty(request, 'toJSON', { value: () => { throw new Error('transport serialization failed'); } });
+          if (stripped) {
+            request.config.maxTokens = 123;
+            const block = request.messages.flatMap(m => m.content).find(b => b.type === 'text');
+            if (block?.type === 'text') block.text = 'mutated shared content';
+            Object.assign(request, { cycle: request });
+          }
           throw error;
         }
       };
@@ -4500,12 +4544,20 @@ describe('tool-prose hoist admission', () => {
             })).digest('hex'), 'seed the gated rung, not canonical');
             entry.run.failures = 3;
             seam.noteCompressionLanded(mock.membrane, MODEL);
-            if (mode === 'diagnostic') seam.compressionFailedAttemptTrace = () => { throw new Error('failed diagnostic'); };
+            let diagnosticHits = 0;
+            let warningHits = 0;
+            if (mode === 'diagnostic') seam.compressionFailedAttemptTrace = () => {
+              diagnosticHits++;
+              throw new Error('failed diagnostic');
+            };
             const path = `${freshPath()}-history.jsonl`;
             paths.push(path);
             if (mode !== 'off') process.env.CONTEXT_MANAGER_COMPRESSION_LOG = mode === 'write' ? '/dev/null/history.jsonl' : path;
             console.warn = (...args) => {
-              if (mode === 'write' && String(args[0]).includes('compression log write failed:')) throw new Error('warning sink failed');
+              if (mode === 'write' && String(args[0]).includes('compression log write failed:')) {
+                warningHits++;
+                throw new Error('warning sink failed');
+              }
             };
             await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === outage);
             assert.equal([...failureRuns(fx).values()][0]!.run.failures, 4, 'interruption preserves and extends the gated run');
@@ -4517,6 +4569,8 @@ describe('tool-prose hoist admission', () => {
             await fx.strategy.run(fx.target, managerContext(fx.manager));
             const exhausted = quarantineEvents(fx.manager).filter(e => e.kind === 'exhausted').map(e => e.outcomes);
             assert.ok(JSON.stringify(exhausted).includes('persistent-server_error'), 'the preserved history decides the gated rung');
+            if (mode === 'diagnostic') assert.ok(diagnosticHits > 0, 'throwing diagnostic seam was reached');
+            if (mode === 'write') assert.ok(warningHits > 0, 'throwing warning sink was reached');
             snapshots.push({ interrupted, final: failureSnapshot(fx), exhausted, requests: mock.calls.map(c => c.request) });
           } finally { fx.manager.close(); }
         }

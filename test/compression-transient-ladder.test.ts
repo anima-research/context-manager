@@ -1025,6 +1025,32 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  it('a fresh carrier rejection ends the old run before a progress write fails', async () => {
+    const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: failure('server') }, { throw: rejected }]);
+    const fx = await withCarriers(mock.membrane);
+    const localError = new Error('local progress write failed');
+    const seam = fx.strategy as unknown as { recordCompressionFamilyProgress(...args: unknown[]): void };
+    const write = seam.recordCompressionFamilyProgress;
+    let writeHits = 0;
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      l1RunsOf(fx.strategy)[0]!.failures = 7;
+      fx.strategy.land(mock.membrane);
+      seam.recordCompressionFamilyProgress = function (...args) {
+        if (writeHits++ === 0) throw localError;
+        write.apply(this, args);
+      };
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      assert.ok(writeHits > 0);
+      assert.equal(mock.calls.length, 2, 'no stripped call after the local write failure');
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 1, 'the local write starts a fresh run');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally { seam.recordCompressionFamilyProgress = write; fx.manager.close(); }
+  });
+
   it('a sibling carrier rejection ends an older provider-failure run before local inspection fails', async () => {
     const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
       type: 'invalid_request', retryable: false, httpStatus: 400,
@@ -1115,8 +1141,8 @@ describe('every rung keeps its own identity across a resume', () => {
           b.strategy.run(b.target(), managerContext(b.manager)),
         ]);
         await until(() => stripped.calls.length === 2 && plain.calls.length === 1, 'both conflicting failures gated');
-        // Both runAttempt catches write attribution before either ladderStep
-        // classifies: the stripped write must overwrite the plain error-keyed one.
+        // Release both failures together: each attempt must retain its own
+        // stripped attribution even when they throw the same value.
         releasePlain();
         releaseStripped();
         const results = await pending;
@@ -1463,6 +1489,44 @@ describe('compression lane: failures are evidence only by the company they keep'
       'the merge ran ahead of the failed chunk');
     assert.equal(fx.strategy.compressionQueueView().length, 1, 'the failed chunk is still queued');
     fx.manager.close();
+  });
+
+  it('an answered merge ends its old run before a resume warning fails', async () => {
+    const mock = scripted([{ throw: failure('server') }, OK('merged memory')]);
+    const fx = await queued(mock.membrane, { config: { hierarchical: true } });
+    const ids = fx.manager.queryMessages({}).messages.map(m => m.id);
+    for (const [id, first, last] of [['L1-a', 0, 3], ['L1-b', 4, 7]] as const) fx.strategy.seed({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    const seam = fx.strategy as unknown as {
+      enqueueMerge(merge: { level: number; sourceIds: string[] }): void;
+      mergeFailureRuns: Map<string, { failures: number }>;
+      resumeCompressionLane(...args: unknown[]): void;
+    };
+    seam.enqueueMerge({ level: 2, sourceIds: ['L1-a', 'L1-b'] });
+    const resume = seam.resumeCompressionLane;
+    const localError = new Error('local merge resume warning failed');
+    let resumeHits = 0;
+    try {
+      // Covered L1 chunks may be skipped before the queued merge gets its turn.
+      for (let i = 0; i < 4 && mock.calls.length === 0; i++) {
+        try { await fx.strategy.tick(managerContext(fx.manager)); }
+        catch (error) { assert.match(String(error), /zz server failure/); }
+      }
+      assert.equal(mock.calls.length, 1);
+      assert.equal(seam.mergeFailureRuns.size, 1);
+      [...seam.mergeFailureRuns.values()][0]!.failures = 7;
+      fx.strategy.land(mock.membrane);
+      fx.strategy.expirePause();
+      seam.resumeCompressionLane = () => { resumeHits++; throw localError; };
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), error => error === localError);
+      assert.equal(resumeHits, 1);
+      assert.equal(mock.calls.length, 2);
+      assert.equal([...seam.mergeFailureRuns.values()][0]?.failures, 1, 'local resume error starts a fresh run');
+      assert.equal(laneOf(fx.strategy).mergeQueue.length, 1, 'merge stays queued, not persistently rejected');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally { seam.resumeCompressionLane = resume; fx.manager.close(); }
   });
 
   it('a failing chunk and a failing merge take turns, least recently failed first', async () => {

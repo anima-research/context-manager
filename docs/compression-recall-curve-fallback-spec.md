@@ -291,10 +291,16 @@ not proof of adapter dispatch: host pre-request hooks run inside that boundary
 and can reject locally. Request hashes describe the final request handed to
 Membrane (including carrier-stripped retries), not verified wire bytes.
 Failed-request diagnostics are best-effort. If a stripped request cannot be
-serialized, diagnostics retry with the unaffected planned request, explicitly
+serialized, diagnostics use scalar plan diagnostics captured before dispatch, explicitly
 marked `requestIdentity: planned-fallback`; its hash, count and estimate describe
 the plan, while latency remains the elapsed attempt time. If both diagnostic
 constructions fail, the durable outcome remains but its attempt trace can be absent.
+Split-part outcomes classify the raw text the fold accepts, not the text after
+summary extraction: a thinking-wrapped part can succeed and be stitched even
+with wrapper recovery disabled. This is existing fold behavior, not a change to
+acceptance; the stitched summary is still extracted before persistence.
+Canonical and plain-prose end-turn answers are not success until extraction
+succeeds; extraction errors are logged as `provider_error` / `malformed_content`.
 Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)
 and includes any carrier fallback. A provider-rejected attempt’s
 request hash, count and estimate describe the final request handed to Membrane; admission

@@ -24,8 +24,8 @@
   originate in a host pre-request hook before adapter dispatch; these traces
   identify the Membrane invocation, not proven network activity. Failed-request
   diagnostics are best-effort: an unserializable stripped request falls back to
-  the plan, marked `requestIdentity: planned-fallback` (hash, count and estimate
-  describe the plan, latency still measures the attempt). If that diagnostic
+  pre-dispatch scalar plan diagnostics, marked `requestIdentity: planned-fallback`
+  (hash, count and estimate describe the plan, latency still measures the attempt). If that diagnostic
   also fails, durable outcomes can remain without attempt traces. With logging enabled, failed calls retain a request reference through
   failure classification, then release it whether or not a diagnostic is built;
   interrupted ladder steps and split rungs release it on exit. Carrier fallback
@@ -51,3 +51,9 @@
 - Keep answered recall-variant outcomes in immediate curve-attempt logs, and emit
   curve-attempt logs for newly decided source-only-final provider failures. Recall
   answers that strip to empty are logged as unusable_empty, not success.
+- Split-part outcomes describe the raw text the fold accepts, without changing
+  fold acceptance or stitching; canonical extraction errors no longer log success.
+  Planned-fallback diagnostics use a pre-dispatch scalar snapshot, immune to
+  nested mutations shared with a stripped retry.
+- End carrier and merge provider-failure runs before local progress writes or
+  resume warnings can fail, so local errors cannot complete an old provider streak.
