@@ -7,6 +7,10 @@
   decisions, requests and durable records are unchanged.
   Provider-rejected hoists now emit curve-attempt and chunk-associated
   compression:attempt entries with the same attempt trace shape as recall rungs.
-  Interrupted rungs have no attempt/admission trace; they remain retryable.
-  Rejected traces identify the final dispatched request (including carrier-stripped
-  retries) and elapsed attempt time; answered hoists also expose top-level totals.
+  Interrupted calls have no attempt/admission trace and remain retryable; completed
+  split parts can still leave traces when a later part interrupts the rung.
+  Provider-rejected traces identify the final dispatched request (including
+  carrier-stripped retries) and elapsed attempt time. Admission rejections describe
+  the planned request with zero latency: no provider call occurred.
+  Answered hoists also expose top-level totals. Failed-request diagnostics do no
+  serialization or hashing with logging disabled and cannot replace provider errors.

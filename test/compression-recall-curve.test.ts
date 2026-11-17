@@ -4451,6 +4451,110 @@ describe('tool-prose hoist admission', () => {
       });
     }
 
+    for (const logging of [false, true]) for (const failure of ['rejection', 'transient'] as const) {
+      it(`failed snapshot is isolated: logging=${logging}, ${failure}`, async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const error = Object.assign(new Error('provider failure'), failure === 'rejection'
+          ? { type: 'invalid_request', httpStatus: 400, retryable: false }
+          : { type: 'server_error' });
+        const mock = flexibleMembrane([{ stop: 'refusal' }, { error }]);
+        const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+        const complete = membrane.complete;
+        let serializations = 0;
+        membrane.complete = async request => {
+          try { return await complete(request); }
+          catch (err) {
+            Object.defineProperty(request, 'toJSON', { value: () => {
+              serializations++;
+              throw new Error('request serialization failed');
+            } });
+            throw err;
+          }
+        };
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        let snapshots = 0;
+        const seam = fx.strategy as unknown as { compressionFailedAttemptTrace(...args: unknown[]): unknown };
+        const snapshot = seam.compressionFailedAttemptTrace;
+        seam.compressionFailedAttemptTrace = function (...args) {
+          snapshots++;
+          return snapshot.apply(this, args);
+        };
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const run = async () => {
+            if (failure === 'transient') {
+              await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), err => err === error);
+            } else {
+              await fx.strategy.run(fx.target, managerContext(fx.manager));
+              assert.equal(exhaustedOutcomes(fx).find(o => o.curveLabel === label('expansion'))?.outcome, 'provider_error');
+            }
+          };
+          if (logging) await capture(fx, run);
+          else await run();
+          assert.equal(mock.calls.length, 2);
+          if (!logging || failure === 'transient') {
+            assert.equal(serializations, 0, 'no serialization for disabled or interrupted diagnostics');
+            assert.equal(snapshots, 0, 'no snapshot construction');
+          } else assert.ok(serializations > 0, 'throwing serialization was exercised without changing classification');
+        } finally {
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
+    for (const throwBeforeDispatch of [false, true]) {
+      it(throwBeforeDispatch ? 'a pre-dispatch stripped serializer failure cannot prevent dispatch'
+        : 'a successful stripped retry with logging off serializes only for its trace', async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const stringify = JSON.stringify;
+        const mock = flexibleMembrane([
+          { stop: 'refusal' },
+          { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+            type: 'invalid_request', httpStatus: 400, retryable: false,
+          }) },
+          { stop: 'end_turn', text: 'a memory' },
+        ]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+        let serializations = 0;
+        let strippedDispatch = false;
+        let carrierRequest: NormalizedRequest | undefined;
+        const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+        const complete = membrane.complete;
+        membrane.complete = async request => {
+          if (mock.calls.length === 1) carrierRequest = request;
+          if (mock.calls.length === 2) strippedDispatch = true;
+          return complete(request);
+        };
+        JSON.stringify = ((value: unknown, ...args: unknown[]) => {
+          const request = value as NormalizedRequest | undefined;
+          if (carrierRequest && request?.messages && request.messages !== carrierRequest.messages
+            && request.system === carrierRequest.system
+            && !request.messages.some(m => m.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking'))) {
+            serializations++;
+            if (throwBeforeDispatch && !strippedDispatch) throw new Error('serializer unavailable before dispatch');
+          }
+          return (stringify as (...args: unknown[]) => string)(value, ...args);
+        }) as typeof JSON.stringify;
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          await fx.strategy.run(fx.target, managerContext(fx.manager));
+          assert.equal(mock.calls.length, 3);
+          assert.equal(strippedDispatch, true);
+          assert.equal(fx.target.compressed, true);
+          assert.equal(serializations, 2, 'only the success trace hash and token estimate serialize the stripped request');
+        } finally {
+          JSON.stringify = stringify;
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
     it('a successful recall expansion carries admission through curve-succeeded', async () => {
       const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 1234 }, { stop: 'end_turn', text: 'a memory' }]);
       const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
@@ -4573,6 +4677,18 @@ describe('tool-prose hoist admission', () => {
         if (stripped) {
           for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
           fx.strategy.flushSummaries();
+          const seam = fx.strategy as unknown as {
+            prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+          };
+          const prepare = seam.prepareCompressionCandidate;
+          seam.prepareCompressionCandidate = function (request, curveLabel) {
+            const prepared = prepare.call(this, request, curveLabel);
+            if (curveLabel === label(kind)) prepared.messages.push({
+              ...prepared.messages[0]!,
+              content: carrierBlocks('standalone', '').slice(0, 2),
+            });
+            return prepared;
+          };
         }
         try {
           const logs = await capture(fx);
@@ -4593,7 +4709,8 @@ describe('tool-prose hoist admission', () => {
           assert.equal(trace.messageCount, mock.calls.at(-1)!.request.messages.length);
           assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));
           if (stripped) {
-            assert.notDeepEqual(mock.calls.at(-1)!.request, mock.calls.at(-2)!.request);
+            assert.equal(mock.calls.at(-1)!.request.messages.length,
+              mock.calls.at(-2)!.request.messages.length - 1, 'stripping removes the carrier-only message');
           }
           const estimator = fx.strategy as unknown as { estimateCompressionRequestTokens(request: NormalizedRequest): number };
           assert.equal(trace.estimatedTokens, estimator.estimateCompressionRequestTokens(mock.calls.at(-1)!.request));

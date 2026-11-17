@@ -1112,12 +1112,12 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
 /**
- * The hash of the request each failed L1 call actually dispatched, keyed by
- * its error. A rung's outcome keeps the rung's identity, but after a carrier
+ * The existing hash (or stripped request to hash only if needed) for each
+ * failed L1 call, keyed by its error. A rung's outcome keeps the rung's identity, but after a carrier
  * rejection the rung dispatches its stripped request, whose failures are a
  * run of their own (chunkRunKey).
  */
-const dispatchedRequestHash = new WeakMap<object, string>();
+const dispatchedRequestIdentity = new WeakMap<object, string | NormalizedRequest>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
@@ -4581,6 +4581,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     return canonical;
+  }
+
+  private compressionFailedAttemptTrace(
+    failed: { request: NormalizedRequest; latencyMs: number },
+  ): Pick<CompressionAttemptTrace, 'requestHash' | 'messageCount' | 'estimatedTokens' | 'latencyMs'> {
+    return {
+      requestHash: sha256Json(failed.request),
+      messageCount: failed.request.messages.length,
+      estimatedTokens: this.estimateCompressionRequestTokens(failed.request),
+      latencyMs: failed.latencyMs,
+    };
   }
 
   private estimateCompressionRequestTokens(request: NormalizedRequest): number {
@@ -11961,8 +11972,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Log-only metadata for the most recent failed runAttempt. A stripped
     // retry replaces the planned request here, without changing rung identity
     // in durable progress. Reused decisions never consume this snapshot.
-    let failedAttempt: Pick<CompressionAttemptTrace,
-      'requestHash' | 'messageCount' | 'estimatedTokens' | 'latencyMs'> | undefined;
+    let failedAttempt: { request: NormalizedRequest; latencyMs: number } | undefined;
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
     /**
@@ -12016,12 +12026,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
         const noteFailedAttempt = (failedRequest: NormalizedRequest): void => {
-          failedAttempt = {
-            requestHash: sha256Json(failedRequest),
-            messageCount: failedRequest.messages.length,
-            estimatedTokens: this.estimateCompressionRequestTokens(failedRequest),
-            latencyMs: Date.now() - started,
-          };
+          // Retain only a reference here. Serialization belongs to the guarded
+          // trace construction after classification, never the provider catch.
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
+            failedAttempt = { request: failedRequest, latencyMs: Date.now() - started };
+          }
         };
         // A call's error, when its work lost its branch or strategy
         // generation while the call was out (a detach, a branch move), is
@@ -12056,7 +12065,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!known) {
             noteFailedAttempt(attemptRequest);
             noteDispatchedModel(error, attemptRequest);
-            if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
+            if (error !== null && typeof error === 'object') dispatchedRequestIdentity.set(error, attemptHash);
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -12102,7 +12111,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteFailedAttempt(acceptedRequest);
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
-              dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
+              dispatchedRequestIdentity.set(retryError, acceptedRequest);
             }
             throw retryError;
           }
@@ -12368,6 +12377,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const kind = compressionFailureKind(error);
           if (kind === 'abort') throw error;
+          // Only interrupted failures need a separate dispatched identity.
+          // Defer stripped-request hashing until here: successful retries pay
+          // only for their trace, and an unserializable request must never
+          // replace the provider error or alter its classification.
+          let failureRequestHash = requestHash;
+          if (kind !== 'rejection' && error !== null && typeof error === 'object') {
+            const identity = dispatchedRequestIdentity.get(error);
+            try {
+              if (identity !== undefined) {
+                failureRequestHash = typeof identity === 'string' ? identity : sha256Json(identity);
+              }
+            } catch { /* Preserve the rung identity if attribution is unavailable. */ }
+          }
           const decided: CompressionRefusalOutcomeRecord = kind === 'rejection'
             ? {
                 curveLabel,
@@ -12379,7 +12401,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 error,
                 curveLabel,
                 requestHash,
-                (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
+                failureRequestHash,
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
@@ -12628,12 +12650,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
           ));
           if (result.kind === 'decided') {
-            if (!result.reused) {
+            if (!result.reused && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               const trace: CompressionAttemptTrace = {
                 curveLabel, recallIds, recallLevels, leafCoverageHash: coverageHash,
-                requestHash, messageCount: hoistedRequest.messages.length,
-                estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
-                latencyMs: 0, ...failedAttempt, persisted: false, outcome: 'provider_error',
+                ...(failedAttempt ? this.compressionFailedAttemptTrace(failedAttempt) : {
+                  requestHash, messageCount: hoistedRequest.messages.length,
+                  estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
+                  latencyMs: 0,
+                }),
+                persisted: false, outcome: 'provider_error',
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
                 admittedTokens: admission.admittedTokens, budgetTokens: admission.budgetTokens,
               };
@@ -12642,7 +12667,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
               }, this.ns, 'compression admission diagnostic failed:');
               logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
-            }
+            }, this.ns, 'compression attempt diagnostic failed:');
             return;
           }
           const trace = attemptTraces[attemptTraces.length - 1]!;
@@ -12756,7 +12781,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             variant.children.map((child) => child.id),
           ), { admittedTokens, budgetTokens: contextBudget });
           if (result.kind === 'decided') {
-            if (!result.reused) {
+            if (!result.reused && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
               const trace: CompressionAttemptTrace = {
                 curveLabel,
                 recallIds: variantFrontier.map((summary) => summary.id),
@@ -12764,13 +12789,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 expandedParentId: variant.parent.id,
                 expandedChildIds: variant.children.map((child) => child.id),
                 leafCoverageHash: variant.leafCoverageHash,
-                requestHash: variant.requestHash,
-                messageCount: variant.request.messages.length,
-                estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
-                latencyMs: 0,
+                ...(failedAttempt ? this.compressionFailedAttemptTrace(failedAttempt) : {
+                  requestHash: variant.requestHash,
+                  messageCount: variant.request.messages.length,
+                  estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
+                  latencyMs: 0,
+                }),
                 persisted: false,
                 outcome: 'provider_error',
-                ...failedAttempt,
                 ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
                 admittedTokens,
                 budgetTokens: contextBudget,
@@ -12782,7 +12808,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               logCompressionCall({
                 event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
               }, this.ns);
-            }
+            }, this.ns, 'compression attempt diagnostic failed:');
             continue;
           }
           const variantResponse = result.response;
