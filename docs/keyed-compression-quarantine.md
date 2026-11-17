@@ -12,17 +12,27 @@ if (!isKeyedCompressionQuarantineStrategy(strategy)) {
   throw new Error('Keyed L1 quarantine capability unsupported');
 }
 const view = strategy.inspectCompressionRefusalQuarantine({ limit: 50 });
-// Present metadata to the operator. Do not automatically select records.
-// Retain view.binding and the explicitly selected record's key + generation.
+if (view.status !== 'ok') {
+  throw new Error(`Quarantine unavailable: ${view.status}`);
+}
+// Present metadata; obtain a full key from explicit operator selection.
+const selected = view.records.find((record) => record.key === operatorSelectedKey);
+if (!selected || !selected.selectable || selected.generation === null) {
+  throw new Error('Selected record is unavailable or unsupported');
+}
+const intent = {
+  key: selected.key,
+  expectedGeneration: selected.generation,
+  expectedBinding: view.binding,
+};
+// Retain this intent, never automatically choose the first record.
 ```
 
 After separate operator confirmation, on that same loaded instance:
 
 ```ts
 const result = await strategy.releaseCompressionRefusalQuarantine({
-  key: selected.key,                       // one full lowercase SHA-256 key
-  expectedGeneration: selected.generation, // non-null actual native identity
-  expectedBinding: observedBinding,        // namespace + branch + opaque loadId
+  ...intent, // revalidate confirmation and instance before submitting this retained intent
 });
 ```
 
@@ -54,8 +64,10 @@ if a later checkpoint could supersede them; it never rewrites them.
 - `generation` is the actual active exhaustion event id, or the actual claim
   id in the older claim/exhaustion format. Checkpoints preserve that identity.
   Legacy snapshot-only lineage has `generation: null`, `selectable: false`.
-  Noncanonical historical keys are also not selectable; there is no synthetic
-  generation upgrade or schema repair.
+  Invalid key/source digests make strict inspection unreadable. Missing or
+  malformed family identity is `null` and unselectable; native release refuses
+  it as `unreadable` before any write. There is no synthetic generation upgrade,
+  family inference or schema repair. Legacy lineage remains `unsupported`.
 - `binding.loadId` is opaque and local to a committed strategy load. It binds
   the store, namespace and branch lifecycle, not the conversation head. A
   normal append leaves it valid; reinitialize, detach, manager branch switch
@@ -69,9 +81,18 @@ if a later checkpoint could supersede them; it never rewrites them.
   membership or a source-hash mismatch is unreadable, not an empty span.
 - Family key, canonical request hash, frontier hash, recorded model, creation
   time and the small numeric/boolean profile are included only as recorded.
-  Missing profile booleans are `null`, not retroactively defaulted. No full
-  request config, tool arguments, instructions, raw text, thinking, signatures,
-  provider response bodies, error bodies or authentication material is returned.
+  Known native digest fields (key, source, family, canonical/frontier and
+  outcome request hashes, including sibling keys) use lowercase 64-hex SHA-256.
+  Invalid optional digest metadata becomes `null`; invalid key/source digests
+  make inspection unreadable. Missing profile booleans are `null`, not
+  retroactively defaulted. Request config, tool arguments, instructions, raw
+  response/error bodies, thinking and signatures are not projected as fields.
+  **Trust boundary:** free-form configured/recorded models, source message IDs
+  and opaque native event/claim IDs are trusted metadata, not digest fields.
+  This allowlist is not a sanitizer for an arbitrarily edited/corrupted ledger
+  and cannot guarantee redaction of unknown credentials placed in metadata
+  (even a valid-looking digest can contain sensitive data). An untrusted export
+  boundary must omit free-form fields rather than rely on this inspection.
 - Only bounded normalized outcome/stop-reason labels and recorded request
   hashes are returned. Unrecognized labels become `unknown`/`null`, not copied
   arbitrary text. There is no inference from the latest aggregate or topics.
@@ -112,11 +133,16 @@ newly serialized. Hosts must retain the native single-writer ownership model.
 
 On a match the operation first forgets **all progress for that family**,
 then appends one native targeted `clear` event with additive
-`reason: 'operator-waiver'`, syncs and rereads before acknowledging. Old event
+`reason: 'operator-waiver'`, runs native checkpoint hygiene under the same lock,
+syncs and strictly rereads before acknowledging. Old event
 readers ignore the extra reason and use the unchanged target identity. There
 is no registration/strategy/schema or dependency change. Normal future native
 checkpoints can discard tombstones: this is not a permanent operation ledger.
-A failure during progress, append, sync or postread throws. A progress-only
+Checkpoint hygiene skips destructive compaction for damaged projections or
+more than 1,024 active holds, preserving every sibling rather than truncating
+them; bounded output is **not** a bounded-replay guarantee. Native generations
+survive checkpoints, including interruption between redaction and compaction.
+A failure during progress, append, checkpoint, sync or postread throws. A progress-only
 partial write can leave the hold standing but remove its old ladder answers.
 
 Only this active shape leaves the shape-cap count. Retained exhaustion history
@@ -130,7 +156,14 @@ Changing the global model affects other normal compression too.
 The next ordinary alarm check on the same live, already-open episode retains
 remaining raw siblings and eventually reports the observed record count on
 its existing interval. When a waiver-request episode reads empty it ends once,
-without saying coverage/debt was paid. Release does not drive a background tick
+without saying coverage/debt was paid. The optional status/callback field is
+`clearReason?: 'quarantine-empty' | 'operator-waiver-requested'`, set only on
+the episode-end callback. The latter means this live instance knows a waiver
+was requested, even if its write was uncertain; it is not a release receipt.
+Generic empty, legacy clears, other-instance clears and absent/unknown reasons
+are always neutral: zero means no held records, not debt paid. The native
+sweep also removes orphan holds, so even sweep-driven empty is not a coverage
+receipt. Existing count/keys/spans callbacks remain compatible. Release does not drive a background tick
 or call the alarm handler. Episode state is not persisted; reopen-before-first-
 alarm and the native paid-off sweep's other limitations are unchanged.
 

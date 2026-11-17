@@ -1298,6 +1298,9 @@ export class StoreTopologyError extends Error {
 function isCanonicalQuarantineKey(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
+function metadataDigest(value: unknown): string | null {
+  return isCanonicalQuarantineKey(value) ? value : null;
+}
 function metadataString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
@@ -1422,11 +1425,17 @@ function isUsableQuarantineRecord(record: unknown): record is CompressionRefusal
     typeof (record as { chunkSourceHash?: unknown }).chunkSourceHash === 'string';
 }
 
-/** Optional recorded membership must agree with the record's source hash. No repair on this surface. */
+/** Distinguishes damaged stored data from store execution/I/O failures. */
+class UnreadableCompressionQuarantineError extends Error {}
+
+/** Native key/source digests and optional recorded membership must be readable. No repair. */
 function requireReadableQuarantineMembership(record: CompressionRefusalQuarantineRecord): void {
+  if (!isCanonicalQuarantineKey(record.key) || !isCanonicalQuarantineKey(record.chunkSourceHash)) {
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine key/source digest');
+  }
   if (record.sourceIds !== undefined &&
       (!isIdList(record.sourceIds) || sha256Json(record.sourceIds) !== record.chunkSourceHash)) {
-    throw new Error('Unreadable quarantine source membership');
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine source membership');
   }
 }
 
@@ -1460,7 +1469,7 @@ function projectCompressionQuarantineEvents(
   const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
   for (const record of legacyRecords) {
     if (!isUsableQuarantineRecord(record)) {
-      if (strict) throw new Error('Unreadable legacy quarantine record');
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable legacy quarantine record');
       continue;
     }
     if (strict) requireReadableQuarantineMembership(record);
@@ -1475,23 +1484,23 @@ function projectCompressionQuarantineEvents(
   }
   for (const [index, event] of events.entries()) {
     if (!event) {
-      if (strict) throw new Error('Unreadable quarantine event');
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine event');
       continue;
     }
     if (strict && !['checkpoint', 'claim', 'clear', 'exhausted', 'alert_pending', 'alert_sent'].includes(event.kind)) {
-      throw new Error('Unknown quarantine event');
+      throw new UnreadableCompressionQuarantineError('Unknown quarantine event');
     }
     // A checkpoint is known by its kind; its key isn't read.
     if (event.kind === 'checkpoint') {
       active.clear();
       if (!Array.isArray(event.active)) {
-        if (strict) throw new Error('Unreadable quarantine checkpoint');
+        if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine checkpoint');
         unlisted?.add(`the ledger's checkpoint at index ${index}`);
         continue;
       }
       for (const item of event.active) {
         if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
-          if (strict) throw new Error('Unreadable checkpoint generation/record');
+          if (strict) throw new UnreadableCompressionQuarantineError('Unreadable checkpoint generation/record');
           const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
           if (typeof key === 'string') dropped?.add(key);
           continue;
@@ -1508,13 +1517,13 @@ function projectCompressionQuarantineEvents(
       continue;
     }
     if (typeof event.key !== 'string') {
-      if (strict) throw new Error('Unreadable quarantine key');
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine key');
       continue;
     }
     if (event.kind === 'claim') {
       const generationId = event.eventId;
       if (strict && (!isUsableGenerationId(generationId) || !isUsableQuarantineRecord(event.record))) {
-        throw new Error('Unreadable quarantine claim');
+        throw new UnreadableCompressionQuarantineError('Unreadable quarantine claim');
       }
       if (!generationId) continue;
       if (strict) requireReadableQuarantineMembership(event.record);
@@ -1535,7 +1544,7 @@ function projectCompressionQuarantineEvents(
         : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
       const generationId = own ? event.eventId : event.targetClaimId;
       if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
-        if (strict) throw new Error('Unreadable exhaustion generation/record');
+        if (strict) throw new UnreadableCompressionQuarantineError('Unreadable exhaustion generation/record');
         dropped?.add(event.key);
         continue;
       }
@@ -1548,7 +1557,7 @@ function projectCompressionQuarantineEvents(
       });
       continue;
     }
-    if (strict && !isUsableGenerationId(event.targetClaimId)) throw new Error('Unreadable quarantine target');
+    if (strict && !isUsableGenerationId(event.targetClaimId)) throw new UnreadableCompressionQuarantineError('Unreadable quarantine target');
     const current = active.get(event.key);
     if (!current || current.generationId !== event.targetClaimId) continue;
     if (event.kind === 'clear') {
@@ -1591,7 +1600,7 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
 function outcomeList(value: unknown, strict = false): CompressionRefusalOutcomeRecord[] {
   if (strict && (!Array.isArray(value) || value.some((entry) =>
     typeof entry !== 'object' || entry === null || typeof entry.outcome !== 'string'))) {
-    throw new Error('Unreadable quarantine outcomes');
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine outcomes');
   }
   return Array.isArray(value)
     ? value.filter((entry): entry is CompressionRefusalOutcomeRecord =>
@@ -2804,10 +2813,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const siblings = [...projection.keys()].filter((other) => other !== key && projection.get(other)!.record.chunkSourceHash === record.chunkSourceHash).sort();
         const generation = active.generationId.startsWith('legacy:') ? null : active.generationId;
         return {
-          key, generation, selectable: generation !== null && isCanonicalQuarantineKey(key),
+          key, generation, selectable: generation !== null && isCanonicalQuarantineKey(key) && isCanonicalQuarantineKey(record.familyKey),
           chunkSourceHash: record.chunkSourceHash,
-          familyKey: metadataString(record.familyKey), canonicalRequestHash: metadataString(record.canonicalRequestHash),
-          frontierHash: metadataString(record.frontierHash), created: metadataNumber(record.created),
+          familyKey: metadataDigest(record.familyKey), canonicalRequestHash: metadataDigest(record.canonicalRequestHash),
+          frontierHash: metadataDigest(record.frontierHash), created: metadataNumber(record.created),
           recordedModel: metadataString(record.model), recordedProvider: null, recordedCategory: null,
           sourceIds: ids?.slice(0, 100) ?? null, sourceIdsComplete: ids !== null && ids.length <= 100,
           membership: recordedIds ? 'recorded' : chunk ? 'loaded-chunk' : 'unknown',
@@ -2820,7 +2829,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           outcomes: active.outcomes.slice(0, 32).map((entry) => ({
             outcome: ['refusal', 'topology_violation', 'unusable_empty', 'provider_error', 'admission_rejected', 'incomplete'].includes(entry.outcome) ? entry.outcome : 'unknown',
             stopReason: ['end_turn', 'refusal', 'max_tokens', 'tool_use', 'abort', 'stop_sequence'].includes(entry.stopReason ?? '') ? entry.stopReason! : null,
-            requestHash: metadataString(entry.requestHash),
+            requestHash: metadataDigest(entry.requestHash),
           })),
           outcomesComplete: active.outcomes.length <= 32,
           sameSourceRecords: siblings.length + 1, siblingKeys: siblings.slice(0, 100), siblingKeysComplete: siblings.length <= 100,
@@ -2859,6 +2868,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!active) return { status: 'not-held' };
       if (active.generationId.startsWith('legacy:')) return { status: 'unsupported' };
       if (active.generationId !== expectedGeneration) return { status: 'stale' };
+      // Never waive a native hold without the identity needed to forget ALL
+      // of its family's progress. Do not guess from its source, key or model.
+      if (!isCanonicalQuarantineKey(active.record.familyKey)) return { status: 'unreadable' };
       // An attempted write can land and then throw. Mark an open alarm episode
       // conservatively BEFORE writing, so a later empty read never calls that
       // uncertainty proof of coverage. This flag is in-memory, not a receipt.
@@ -2869,6 +2881,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // From here on exceptions propagate; a landed write followed by a failure is uncertain.
       this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey);
       this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() });
+      this.checkpointCompressionQuarantineIfNeeded(this.captureCompressionBranch());
       store.sync();
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection(true);
       return { status: 'released', key, generation: expectedGeneration, remainingRecords: this.compressionRefusalQuarantine.size };
@@ -5255,7 +5268,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
     if (ledgerHoldsNoList) unlisted.add('the ledger');
     if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
-    if (strict && unlisted.size > 0) throw new Error('Unreadable quarantine lists');
+    if (strict && unlisted.size > 0) throw new UnreadableCompressionQuarantineError('Unreadable quarantine lists');
     const active = projectCompressionQuarantineEvents(
       Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
       !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
@@ -5474,10 +5487,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store || !this.isCompressionBranchCurrent(source)) return;
     const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
     if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
-    const projection = this.readCompressionQuarantineProjection();
+    // Preservation first: never compact a damaged or oversized projection
+    // into a truncated checkpoint that silently evicts held siblings. Skipping
+    // hygiene here deliberately makes no bounded-replay promise.
+    let projection: Map<string, ActiveCompressionQuarantine>;
+    try { projection = this.readCompressionQuarantineProjection(true); } catch (error) {
+      if (error instanceof UnreadableCompressionQuarantineError) return;
+      throw error; // Store/read failures remain uncertain, not successful hygiene.
+    }
+    if (projection.size > COMPRESSION_QUARANTINE_MAX_ACTIVE) return;
     const retained = [...projection.values()]
-      .sort((a, b) => b.record.created - a.record.created)
-      .slice(0, COMPRESSION_QUARANTINE_MAX_ACTIVE);
+      .sort((a, b) => b.record.created - a.record.created);
     const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
       generationId: item.generationId,
       record: item.record,
@@ -5614,7 +5634,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Called with `count > 0` for each repeating alarm, and ONCE with
    * `count === 0` when an alarm episode ends (the quarantine it spoke of is
-   * empty) — hosts should route the all-clear under a DISTINCT alert kind so a
+   * empty, NOT coverage or debt payment). Its optional `clearReason` reports
+   * only known episode intent; absent/unknown reasons remain neutral. Hosts
+   * should route this empty notification under a DISTINCT alert kind so a
    * same-kind cooldown cannot swallow it. The alarm speaks of the quarantine
    * the strategy is reading: an episode follows the namespace and branch its
    * alarm last sounded on, and only that quarantine reading empty ends it.
@@ -5824,10 +5846,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.error(
           this.quarantineAlarmOperatorWaived
             ? '[compression-quarantine] quarantine empty after operator waiver request; coverage and debt payment not established; alarm stands down'
-            : '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
+            : '[compression-quarantine] quarantine empty; coverage and debt payment not established; alarm stands down',
         );
         try {
-          this.onQuarantineAlarm?.(status);
+          this.onQuarantineAlarm?.({ ...status, clearReason: this.quarantineAlarmOperatorWaived ? 'operator-waiver-requested' : 'quarantine-empty' });
         } catch (error) {
           this.diag.error('[compression-quarantine] all-clear handler failed:', error);
         }

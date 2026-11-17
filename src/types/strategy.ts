@@ -1608,6 +1608,13 @@ export interface CompressionQuarantineStatus {
    * its all-clear nor calls its handler until a read succeeds.
    */
   unreadable?: true;
+  /**
+   * Optional episode-end intent, never proof of coverage or debt payment.
+   * `quarantine-empty` means only no held records (sweeps also clear orphans).
+   * `operator-waiver-requested` is known only in the observing live episode;
+   * a write may still have failed. Absent/unknown reasons remain neutral.
+   */
+  clearReason?: 'quarantine-empty' | 'operator-waiver-requested';
 }
 
 /** Why a load's repair dropped a summary that held text (LoadRepairReport). */
