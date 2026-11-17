@@ -1682,7 +1682,7 @@ export interface LoadRepairReport {
   emptyDropped: number;
 }
 
-/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+/** One held span; retained records can outlive raw debt after cleanup failures. */
 export interface CompressionQuarantineSpan {
   /** The span's identity: the hash of its chunk's message ids. */
   chunkSourceHash: string;
@@ -1880,7 +1880,8 @@ export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
    * registered handler) while ANY chunk is quarantined. Quarantined chunks
-   * are a guaranteed eventual outage — the alarm repeats until the
+   * can exhaust the context budget while raw; stale holds can remain after
+   * best-effort cleanup failures, so the alarm is not proof of debt. It repeats until the
    * quarantine empties. Default 15 min; 0 disables (tests only).
    */
   quarantineAlarmIntervalMs?: number;

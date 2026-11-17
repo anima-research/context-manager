@@ -1088,7 +1088,8 @@ describe('Anima Review regressions', () => {
     const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
     try {
       native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source);
-      assert.equal(lines.length, 0, 'obsolete invocation must not warn for this load');
+      assert.equal(lines.filter((line) => line.includes('obsolete checkpoint hygiene')).length, 1);
+      assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 0, 'obsolete work must not use the current load warning');
       pad(fx);
       const compact = mock.method(fx.store, 'compactState', () => { throw new Error('checkpoint failed'); });
       try {
@@ -1473,7 +1474,9 @@ describe('round 9 progress authorization', () => {
     });
     try {
       assert.equal(impl.isCompressionBranchCurrent(source), false);
-      assert.equal(impl.isBranchIdentityCurrent(identity), false);
+      const freshIdentity = { ...identity, generation: impl.captureCompressionBranch().generation };
+      lookups = 0;
+      assert.equal(impl.isBranchIdentityCurrent(freshIdentity), false);
     } finally { hook.mock.restore(); }
   });
 
@@ -1498,4 +1501,110 @@ describe('round 9 progress authorization', () => {
       await initialization;
     } finally { hook.mock.restore(); syncA.mock.restore(); syncB.mock.restore(); }
   });
+});
+
+describe('round 10 operation source capture', () => {
+  for (const operation of ['capture', 'public-clear', 'progress-sweep', 'success-clear', 'quarantine-sweep', 'mutation-guard']) {
+    it(`does not authorize B when A ${operation} looks up its branch`, async (t) => {
+      const fx = await fixture(t, `r10-capture-${operation}`);
+      const impl = fx.strategy as any;
+      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
+        outcomes: fx.event.outcomes, sourceIds: fx.event.record.sourceIds, updated: 0 }];
+      fx.store.setStateJson(fx.strategy.progressId, progress);
+      fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
+      fx.store.createBranch('r10-b');
+      const current = fx.store.currentBranch.bind(fx.store);
+      let initialization: Promise<void> | undefined;
+      let armed = true;
+      let lookups = 0;
+      const hook = mock.method(fx.store, 'currentBranch', () => {
+        if (armed && ++lookups === (operation === 'public-clear' ? 2 : 1)) {
+          armed = false;
+          fx.store.switchBranch('r10-b');
+          initialization = fx.strategy.initialize(fx.ctx);
+        }
+        return current();
+      });
+      try {
+        if (operation === 'capture') {
+          const source = impl.captureCompressionBranch();
+          assert.equal(impl.isCompressionBranchCurrent(source), false);
+        }
+        if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /reinitialization|stale branch/);
+        if (operation === 'progress-sweep') impl.sweepPaidOffCompressionProgress(fx.ctx);
+        if (operation === 'quarantine-sweep') await impl.sweepPaidOffQuarantineRecords();
+        if (operation === 'mutation-guard') assert.throws(() => impl.requireBranchMutation('test'), /stale branch/);
+        if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk);
+        assert.ok(initialization);
+        await initialization;
+        assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
+        assert.equal(fx.ledger().filter((event) => event.kind === 'clear').length, 0);
+      } finally { hook.mock.restore(); }
+    });
+  }
+
+  for (const operation of ['progress-sweep', 'success-clear']) {
+    it(`contains branch lookup failure in ${operation} maintenance`, async (t) => {
+      const fx = await fixture(t, `r10-throw-${operation}`);
+      const impl = fx.strategy as any;
+      const warn = mock.method(impl.diag, 'warn');
+      const hook = mock.method(fx.store, 'currentBranch', () => { throw new Error('lookup failed'); });
+      try {
+        if (operation === 'progress-sweep') assert.doesNotThrow(() => impl.sweepPaidOffCompressionProgress(fx.ctx));
+        else await assert.doesNotReject(impl.clearQuarantineForCompressedChunk(fx.chunk));
+        assert.equal(warn.mock.callCount(), 1);
+      } finally { hook.mock.restore(); warn.mock.restore(); }
+    });
+  }
+
+  it('preserves the released alarm diagnostic history', () => {
+    const changelog = readFileSync(new URL('../../CHANGELOG.md', import.meta.url), 'utf8');
+    const entry = changelog.split('\n').find((line) => line.startsWith('- The compression-quarantine alarm no longer announces'))!;
+    assert.ok(entry.includes("the alarm logs the read's error at most once an interval"));
+    assert.ok(!entry.includes('payload-free'));
+  });
+});
+
+  it('accepts callable keyed strategies', () => {
+    const callable = Object.assign(() => {}, {
+      inspectCompressionRefusalQuarantine() {}, releaseCompressionRefusalQuarantine() {},
+    });
+    assert.equal(isKeyedCompressionQuarantineStrategy(callable), true);
+  });
+
+  it('does not read a legacy snapshot beside a non-list ledger', async (t) => {
+    const fx = await fixture(t, 'r10-non-list-ledger');
+    fx.store.setStateJson(fx.strategy.ledgerId, { damaged: true });
+    const get = fx.store.getStateJson.bind(fx.store);
+    const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+      if (id === fx.strategy.legacyId) throw new Error('must not read legacy snapshot');
+      return get(id);
+    });
+    try {
+      assert.equal((fx.strategy as any).readCompressionQuarantineProjection().size, 0);
+      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
+    } finally { hook.mock.restore(); }
+  });
+
+describe('round 10 nested maintenance sources', () => {
+  for (const operation of ['progress-sweep', 'quarantine-sweep', 'success-clear']) {
+    it(`retains the caller's source in ${operation}`, async (t) => {
+      const fx = await fixture(t, `r10-nested-${operation}`);
+      const impl = fx.strategy as any;
+      const source = impl.requireLoadedBranch('test');
+      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
+        outcomes: fx.event.outcomes, sourceIds: fx.event.record.sourceIds, updated: 0 }];
+      fx.store.setStateJson(fx.strategy.progressId, progress);
+      fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
+      fx.store.createBranch('r10-nested-b');
+      fx.store.switchBranch('r10-nested-b');
+      await fx.strategy.initialize(fx.ctx);
+      const ledger = fx.ledger();
+      if (operation === 'progress-sweep') impl.sweepPaidOffCompressionProgress(fx.ctx, source);
+      if (operation === 'quarantine-sweep') await impl.sweepPaidOffQuarantineRecords(source);
+      if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk, source);
+      assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
+      assert.deepEqual(fx.ledger(), ledger);
+    });
+  }
 });

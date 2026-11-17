@@ -1,3 +1,4 @@
+import { callStrategy } from './branch-operation-scope.js';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type {
@@ -1083,9 +1084,10 @@ export class ContextManager {
         content: ContentBlock[]
       ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
     };
-    if (typeof strategyAny.chunkIngressMessage === 'function') {
-      const decision = strategyAny.chunkIngressMessage(participant, content);
-      if (decision && decision.shards.length > 1) {
+    const decision = callStrategy(strategyAny, 'chunkIngressMessage', (strategy) =>
+      typeof strategy.chunkIngressMessage === 'function' ? strategy.chunkIngressMessage(participant, content) : null);
+    if (decision) {
+      if (decision.shards.length > 1) {
         // Every shard declares its group's size, so a group an interrupted
         // write left short reads as partial, not whole (compile provenance).
         // That needs indices exactly 0..n-1: refuse anything else before
@@ -1645,14 +1647,14 @@ export class ContextManager {
    * ready rather than dropped.
    */
   private notifyHoldsReleased(): void {
-    if (!this.strategy.onCompressionHoldsReleased || this.closed) return;
+    if (this.closed) return;
     if (this.initializedAttempt !== this.initializationAttempt) {
       this.holdReleaseNotifyPending = true;
       return;
     }
     this.holdReleaseNotifyPending = false;
     try {
-      this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
+      callStrategy(this.strategy, 'onCompressionHoldsReleased', (strategy) => strategy.onCompressionHoldsReleased?.(this.createStrategyContext()));
     } catch (err) {
       // Holds are already gone; the strategy's next rebuild (addMessage,
       // compile) re-queues the work.
@@ -2940,9 +2942,10 @@ export class ContextManager {
     // else everything under its namespace prefix (`{namespace}/autobio:*`,
     // `{namespace}/windowed:anchor`, ...). A manifest lets a strategy leave
     // its work queues and failure ledgers behind.
-    const manifest = isDerivationManifestStrategy(this.strategy)
-      ? this.strategy.derivationManifest(this.strategyNamespace, options.inherit ?? {})
-      : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] };
+    const manifest = callStrategy(this.strategy, 'derivationManifest', (strategy) =>
+      isDerivationManifestStrategy(strategy)
+        ? strategy.derivationManifest(this.strategyNamespace, options.inherit ?? {})
+        : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] });
     const filter = {
       stateIds: [...new Set([...stateIds, ...manifest.stateIds])],
       statePrefixes: [...manifest.statePrefixes],
@@ -2951,8 +2954,9 @@ export class ContextManager {
     // ---- Synchronous from here to the seeded stores: the checkpoint is ----
     // ---- this manager's state at one instant, with no turn in between. ----
     const frontier =
-      solve === 'reuse' && atHead && isRenderingFrontierStrategy(this.strategy)
-        ? this.strategy.exportRenderingFrontier()
+      solve === 'reuse' && atHead
+        ? callStrategy(this.strategy, 'exportRenderingFrontier', (strategy) =>
+          isRenderingFrontierStrategy(strategy) ? strategy.exportRenderingFrontier() : undefined)
         : undefined;
 
     const branch = options.branch;
@@ -3012,17 +3016,21 @@ export class ContextManager {
         },
       };
 
-      if (frontier !== undefined && isRenderingFrontierStrategy(derived.strategy)) {
-        derived.strategy.prepareFromRenderingFrontier?.(frontier);
+      if (frontier !== undefined) {
+        callStrategy(derived.strategy, 'prepareFromRenderingFrontier', (strategy) => {
+          if (isRenderingFrontierStrategy(strategy)) strategy.prepareFromRenderingFrontier?.(frontier);
+        });
       }
       await derived.initializeStrategy(observeStoreBranch(view));
 
-      if (isRenderingFrontierStrategy(derived.strategy)) {
-        if (solve === 'fresh') {
-          derived.strategy.discardRenderingFrontier();
-        } else if (frontier !== undefined) {
-          derived.strategy.adoptRenderingFrontier(frontier);
-        }
+      if (solve === 'fresh') {
+        callStrategy(derived.strategy, 'discardRenderingFrontier', (strategy) => {
+          if (isRenderingFrontierStrategy(strategy)) strategy.discardRenderingFrontier();
+        });
+      } else if (frontier !== undefined) {
+        callStrategy(derived.strategy, 'adoptRenderingFrontier', (strategy) => {
+          if (isRenderingFrontierStrategy(strategy)) strategy.adoptRenderingFrontier(frontier);
+        });
       }
       return derived;
     } catch (error) {
@@ -3126,7 +3134,7 @@ export class ContextManager {
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
-    return this.strategy.checkReadiness().ready;
+    return callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness()).ready;
   }
 
   /**
@@ -3134,7 +3142,7 @@ export class ContextManager {
    */
   getPendingWork(): PendingWork | null {
     this.requireInitialized('getPendingWork');
-    const state = this.strategy.checkReadiness();
+    const state = callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness());
     if (state.ready) {
       return null;
     }
@@ -3152,7 +3160,7 @@ export class ContextManager {
    */
   getWaitingWork(): WaitingWork | null {
     this.requireInitialized('getWaitingWork');
-    const state = this.strategy.checkReadiness();
+    const state = callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness());
     if (state.waitingOn === undefined) return null;
     return { waitingOn: state.waitingOn, description: state.waitingDescription ?? 'Background work waits on the host' };
   }
@@ -3227,10 +3235,11 @@ export class ContextManager {
       selectOpts = rest;
     }
     selectOpts = this.withThinkingStanding(selectOpts, false);
-    const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
-    const selectionCause = this.strategy.takeSelectionCause?.();
+    const entries = callStrategy(this.strategy, 'select', (strategy) => strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts));
+    const selectionCause = callStrategy(this.strategy, 'takeSelectionCause', (strategy) => strategy.takeSelectionCause?.());
     // Read now, before anything else selects: these are this select's own.
-    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
+    const renderStats = callStrategy(this.strategy, 'getLastSelectStats', (strategy) =>
+      isRenderStatsCapable(strategy) ? strategy.getLastSelectStats?.() ?? null : null);
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
     if (opts?.requestLimitTokens !== undefined) {
       this.refuseOverRequestLimit(opts, effectiveBudget, entries, renderStats, view, messageInjections);
@@ -3320,7 +3329,7 @@ export class ContextManager {
         branch,
         messages: messageSources,
         layout,
-        strategy: this.strategy.name,
+        strategy: callStrategy(this.strategy, 'name', (strategy) => strategy.name),
         // Only a layout is ever accepted, so only then ask where the journal stands.
         ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
@@ -3342,7 +3351,7 @@ export class ContextManager {
           );
           if (binding.leftOut.length > 0) {
             try {
-              this.strategy.noteThinkingLeftOut?.(binding.leftOut);
+              callStrategy(this.strategy, 'noteThinkingLeftOut', (strategy) => strategy.noteThinkingLeftOut?.(binding.leftOut));
             } catch (err) {
               this.diag.error('[context-manager] the strategy failed to take note of thinking left out:', describeThrown(err));
             }
@@ -3519,7 +3528,7 @@ export class ContextManager {
     sameHeadAssumed: boolean,
     whatever = false,
   ): T | undefined {
-    if (opts?.thinkingBinding?.binds === true && (whatever || this.strategy.readsThinkingStanding?.() === true)) {
+    if (opts?.thinkingBinding?.binds === true && (whatever || callStrategy(this.strategy, 'readsThinkingStanding', (strategy) => strategy.readsThinkingStanding?.()) === true)) {
       return { ...opts, thinkingStanding: this.thinkingStandingFor(opts as SelectOptions, sameHeadAssumed) };
     }
     if (opts?.thinkingStanding === undefined) return opts;
@@ -3569,11 +3578,11 @@ export class ContextManager {
     injected: ContentBlock[][],
     cause: string | undefined,
   ): RenderedLayout | null {
-    if (!this.strategy.renderedForms) return null;
+    if (!callStrategy(this.strategy, 'renderedForms', (strategy) => strategy.renderedForms)) return null;
     const summaryIds = new Set<string>();
     for (const entry of entries) for (const s of entry.summaries ?? []) summaryIds.add(s.id);
     const summaryInfo = summaryIds.size > 0
-      ? this.strategy.describeRenderedSummaries?.([...summaryIds]) ?? new Map<string, RenderedSummaryInfo>()
+      ? callStrategy(this.strategy, 'describeRenderedSummaries', (strategy) => strategy.describeRenderedSummaries?.([...summaryIds])) ?? new Map<string, RenderedSummaryInfo>()
       : new Map<string, RenderedSummaryInfo>();
     const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
     if (undescribed.length > 0) {
@@ -3581,7 +3590,7 @@ export class ContextManager {
       if (fresh.length > 0) {
         for (const id of fresh) this.undescribedSummariesReported.add(id);
         this.diag.warn(
-          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+          `[context-manager] ${callStrategy(this.strategy, 'name', (strategy) => strategy.name)} rendered summaries it cannot describe ` +
           `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
           'no rendered layout is reported for a compile that renders them',
         );
@@ -3733,7 +3742,8 @@ export class ContextManager {
    * report its rendered layout at all.
    */
   describeRenderedForms(): { strategy: string; forms: ReadonlyArray<'raw' | 'summary' | 'omitted'> | null } {
-    return { strategy: this.strategy.name, forms: this.strategy.renderedForms ?? null };
+    return callStrategy(this.strategy, 'renderedForms', (strategy) =>
+      ({ strategy: strategy.name, forms: strategy.renderedForms ?? null }));
   }
 
   /**
@@ -3804,12 +3814,12 @@ export class ContextManager {
   private detachStrategy(strategy: ContextStrategy): void {
     // The manager lets go either way: a replacement still initializes and
     // close() still closes the store.
-    const failed = (err: unknown) => this.diag.error('Strategy detach failed:', strategy.name, err);
+    const failed = (err: unknown) => this.diag.error('Strategy detach failed:', callStrategy(strategy, 'name', (strategy) => strategy.name), err);
     try {
       // detach() is synchronous by contract. A promise or other thenable one
       // returns anyway isn't awaited, and its rejection is logged rather than
       // left unhandled.
-      const returned = strategy.detach?.() as unknown;
+      const returned = callStrategy(strategy, 'detach', (strategy) => strategy.detach?.()) as unknown;
       if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
         Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
       }
@@ -3865,8 +3875,8 @@ export class ContextManager {
           'give each message by the id addMessage returned for it',
       );
     }
-    if (typeof this.strategy.renderAsNewest !== 'function') return undefined;
-    return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
+    return callStrategy(this.strategy, 'renderAsNewest', (strategy) =>
+      typeof strategy.renderAsNewest === 'function' ? strategy.renderAsNewest(this.strategyMessageView(), ids) : undefined);
   }
 
   /**
@@ -4093,17 +4103,21 @@ export class ContextManager {
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
     this.requireInitialized('getHotContextSettings');
-    if (!isHotConfigurableStrategy(this.strategy)) return null;
-    return this.strategy.getHotContextSettings();
+    return callStrategy(this.strategy, 'getHotContextSettings', (strategy) => {
+      if (!isHotConfigurableStrategy(strategy)) return null;
+      return strategy.getHotContextSettings();
+    });
   }
 
   /** Update only settings the active strategy explicitly declares hot-safe. */
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
     this.requireInitialized('updateHotContextSettings');
-    if (!isHotConfigurableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support live context settings');
-    }
-    return this.strategy.updateHotContextSettings(update);
+    return callStrategy(this.strategy, 'updateHotContextSettings', (strategy) => {
+      if (!isHotConfigurableStrategy(strategy)) {
+        throw new Error('Active strategy does not support live context settings');
+      }
+      return strategy.updateHotContextSettings(update);
+    });
   }
 
   /**
@@ -4142,15 +4156,17 @@ export class ContextManager {
         opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
       ) => PreviewResult | null;
     };
-    if (typeof s.previewContext !== 'function') return null;
     try {
-      return s.previewContext(
-        this.strategyMessageView(),
-        this.contextLog.createView(),
-        budget,
-        overrides,
-        this.withThinkingStanding(opts, true, true),
-      );
+      return callStrategy(s, 'previewContext', (strategy) => {
+        if (typeof strategy.previewContext !== 'function') return null;
+        return strategy.previewContext(
+          this.strategyMessageView(),
+          this.contextLog.createView(),
+          budget,
+          overrides,
+          this.withThinkingStanding(opts, true, true),
+        );
+      });
     } catch (err) {
       if (err instanceof NoFoldPlanToPreviewError) return null;
       throw err;
@@ -4199,10 +4215,12 @@ export class ContextManager {
    */
   pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
     this.requireInitialized('pinRange');
-    if (!isPinnableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support pins');
-    }
-    return this.strategy.pinRange(firstMessageId, lastMessageId, opts);
+    return callStrategy(this.strategy, 'pinRange', (strategy) => {
+      if (!isPinnableStrategy(strategy)) {
+        throw new Error('Active strategy does not support pins');
+      }
+      return strategy.pinRange(firstMessageId, lastMessageId, opts);
+    });
   }
 
   /**
@@ -4241,26 +4259,32 @@ export class ContextManager {
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
     this.requireInitialized('markDocument');
-    if (!isPinnableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support documents');
-    }
-    return this.strategy.markDocument(messageId, opts);
+    return callStrategy(this.strategy, 'markDocument', (strategy) => {
+      if (!isPinnableStrategy(strategy)) {
+        throw new Error('Active strategy does not support documents');
+      }
+      return strategy.markDocument(messageId, opts);
+    });
   }
 
   /** Remove a pin or document mark. Returns true if removed. */
   unpin(pinId: string): boolean {
     this.requireInitialized('unpin');
-    if (!isPinnableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support pins');
-    }
-    return this.strategy.unpin(pinId);
+    return callStrategy(this.strategy, 'unpin', (strategy) => {
+      if (!isPinnableStrategy(strategy)) {
+        throw new Error('Active strategy does not support pins');
+      }
+      return strategy.unpin(pinId);
+    });
   }
 
   /** List all current pins. Returns empty array if strategy is not pinnable. */
   listPins(): ReadonlyArray<ProtectedRange> {
     this.requireInitialized('listPins');
-    if (!isPinnableStrategy(this.strategy)) return [];
-    return this.strategy.listPins();
+    return callStrategy(this.strategy, 'listPins', (strategy) => {
+      if (!isPinnableStrategy(strategy)) return [];
+      return strategy.listPins();
+    });
   }
 
   // ==========================================================================
@@ -4276,15 +4300,19 @@ export class ContextManager {
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
     this.requireInitialized('searchSummaries');
-    if (!isSearchableStrategy(this.strategy)) return [];
-    return this.strategy.searchSummaries(query);
+    return callStrategy(this.strategy, 'searchSummaries', (strategy) => {
+      if (!isSearchableStrategy(strategy)) return [];
+      return strategy.searchSummaries(query);
+    });
   }
 
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
     this.requireInitialized('getSummary');
-    if (!isSearchableStrategy(this.strategy)) return null;
-    return this.strategy.getSummary(id);
+    return callStrategy(this.strategy, 'getSummary', (strategy) => {
+      if (!isSearchableStrategy(strategy)) return null;
+      return strategy.getSummary(id);
+    });
   }
 
   /**
@@ -4301,8 +4329,10 @@ export class ContextManager {
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
     this.requireInitialized('getSummariesInRange');
-    if (!isSummaryOverviewStrategy(this.strategy)) return [];
-    return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
+    return callStrategy(this.strategy, 'listSummariesInRange', (strategy) => {
+      if (!isSummaryOverviewStrategy(strategy)) return [];
+      return strategy.listSummariesInRange(this.strategyMessageView(), opts);
+    });
   }
 
   /**
@@ -4311,7 +4341,8 @@ export class ContextManager {
    */
   getMaxSummaryLevel(): number {
     this.requireInitialized('getMaxSummaryLevel');
-    return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
+    return callStrategy(this.strategy, 'getMaxSummaryLevel', (strategy) =>
+      isSummaryOverviewStrategy(strategy) ? strategy.getMaxSummaryLevel() : 0);
   }
 
   /**
@@ -4328,8 +4359,10 @@ export class ContextManager {
    */
   getRenderStats(): RenderStats | null {
     this.requireInitialized('getRenderStats');
-    if (!isRenderStatsCapable(this.strategy)) return null;
-    return this.strategy.getRenderStats(this.strategyMessageView());
+    return callStrategy(this.strategy, 'getRenderStats', (strategy) => {
+      if (!isRenderStatsCapable(strategy)) return null;
+      return strategy.getRenderStats(this.strategyMessageView());
+    });
   }
 
   /**
@@ -4379,14 +4412,17 @@ export class ContextManager {
    */
   async resetHeadWindow(transitionText?: string, options?: { metadata?: MessageMetadata }): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
-    if (!isResettableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support head window reset');
-    }
+    const resettable = callStrategy(this.strategy, 'resetHeadWindow', (strategy) => {
+      if (!isResettableStrategy(strategy)) {
+        throw new Error('Active strategy does not support head window reset');
+      }
+      return strategy;
+    });
 
     const ctx = this.createStrategyContext();
 
     // Generate transition summary if not provided
-    const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
+    const summary = transitionText ?? await callStrategy(resettable, 'generateTransitionSummary', (strategy) => strategy.generateTransitionSummary(ctx));
     this.requireInitialized('resetHeadWindow', attempt);
 
     // The branch the add stores the transition on, for whereNow below, and
@@ -4539,7 +4575,7 @@ export class ContextManager {
     }
 
     // Reset head window to start from this message
-    this.strategy.resetHeadWindow(msgId);
+    callStrategy(resettable, 'resetHeadWindow', (strategy) => strategy.resetHeadWindow(msgId));
 
     return summary;
   }
@@ -4557,10 +4593,13 @@ export class ContextManager {
    */
   async generateTransitionSummary(): Promise<string> {
     const attempt = this.requireInitialized('generateTransitionSummary');
-    if (!isResettableStrategy(this.strategy)) {
-      throw new Error('Active strategy does not support head window reset');
-    }
-    const summary = await this.strategy.generateTransitionSummary(this.createStrategyContext());
+    const resettable = callStrategy(this.strategy, 'resetHeadWindow', (strategy) => {
+      if (!isResettableStrategy(strategy)) {
+        throw new Error('Active strategy does not support head window reset');
+      }
+      return strategy;
+    });
+    const summary = await callStrategy(resettable, 'generateTransitionSummary', (strategy) => strategy.generateTransitionSummary(this.createStrategyContext()));
     this.requireInitialized('generateTransitionSummary', attempt);
     return summary;
   }
@@ -4572,9 +4611,7 @@ export class ContextManager {
   async tick(): Promise<void> {
     this.requireInitialized('tick');
     this.expireCompressionHolds();
-    if (this.strategy.tick) {
-      await this.strategy.tick(this.createStrategyContext());
-    }
+    await callStrategy(this.strategy, 'tick', (strategy) => strategy.tick?.(this.createStrategyContext()));
   }
 
   // ==========================================================================
@@ -4590,16 +4627,19 @@ export class ContextManager {
     const strategy = this.strategy;
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
-    if (strategy.initialize) {
-      try {
-        await strategy.initialize(this.createStrategyContext());
-      } catch (error) {
-        // An initialize() that rejects after close() or a replacement let go
-        // of the strategy is detached again too, as below; its own error is
-        // the one the caller sees.
-        if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
-        throw error;
-      }
+    try {
+      const initialization = callStrategy(strategy, 'initialize', (strategy) => {
+        const initialize = strategy.initialize;
+        // Preserve synchronous completion when no initializer is installed.
+        return initialize ? { returned: initialize.call(strategy, this.createStrategyContext()) } : null;
+      });
+      if (initialization) await initialization.returned;
+    } catch (error) {
+      // An initialize() that rejects after close() or a replacement let go
+      // of the strategy is detached again too, as below; its own error is
+      // the one the caller sees.
+      if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
+      throw error;
     }
     // close() ran while the strategy initialized: the call that started this
     // fails rather than leave a closed manager's strategy marked initialized.
@@ -5070,12 +5110,13 @@ export class ContextManager {
   private tellPresented(rows: readonly StoredMessage[]): void {
     if (rows.length === 0 || this.closed) return;
     const strategy = this.strategy;
-    if (!strategy.onPresented && !strategy.onNewMessage) return;
+    const presented = callStrategy(strategy, 'onPresented', (strategy) => Boolean(strategy.onPresented));
+    if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return;
     const ctx = this.createStrategyContext();
-    if (strategy.onPresented) {
+    if (presented) {
       const failed = (err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag);
       try {
-        Promise.resolve(strategy.onPresented(rows, ctx)).catch(failed);
+        Promise.resolve(callStrategy(strategy, 'onPresented', (strategy) => strategy.onPresented!(rows, ctx))).catch(failed);
       } catch (err) {
         failed(err);
       }
@@ -5119,7 +5160,7 @@ export class ContextManager {
       const failed = (err: unknown) =>
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
       try {
-        Promise.resolve(strategy.onNewMessage!(message, ctx)).catch(failed);
+        Promise.resolve(callStrategy(strategy, 'onNewMessage', (strategy) => strategy.onNewMessage!(message, ctx))).catch(failed);
       } catch (err) {
         failed(err);
       }
@@ -5234,13 +5275,13 @@ export class ContextManager {
   private tellRetracted(left: readonly RetractedRow[], info: Retraction): void {
     if (left.length === 0 || this.closed) return;
     const strategy = this.strategy;
-    if (!strategy.onRetracted) return;
+    if (!callStrategy(strategy, 'onRetracted', (strategy) => Boolean(strategy.onRetracted))) return;
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
     const ids = left.map((l) => l.id);
     const ctx = this.createStrategyContext();
     const failed = (err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag);
     try {
-      Promise.resolve(strategy.onRetracted(rows, ctx, { ...info, ids })).catch(failed);
+      Promise.resolve(callStrategy(strategy, 'onRetracted', (strategy) => strategy.onRetracted!(rows, ctx, { ...info, ids }))).catch(failed);
     } catch (err) {
       failed(err);
     }

@@ -51,8 +51,9 @@ returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
 not an empty list, with coarse `reason: 'store-read'` (the store threw) or
 `'ledger-entry'` (stored data failed validation). Store error text is never
 returned; unexpected projection/programmer errors propagate. Inspection
-conservatively refuses damaged events since the latest checkpoint and never
-rewrites them.
+validates replay-relevant fields since the latest checkpoint, not every event
+field (for example, an alert event missing its ID can be ignored). An `ok`
+result is not a full ledger-integrity certification. Inspection never rewrites events.
 A later native hygiene pass can checkpoint the tolerant projection that the
 gate enforces, removing ignored damage; damage in a retained hold may still
 fail strict inspection afterwards. A checkpoint supersedes preceding active state and the legacy snapshot;

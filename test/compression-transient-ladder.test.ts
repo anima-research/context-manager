@@ -974,6 +974,40 @@ describe('every rung keeps its own identity across a resume', () => {
   const carriesThinking = (request: NormalizedRequest): boolean =>
     request.messages.some((m) => m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'));
 
+  it('stops carrier fallback when its progress read reinitializes the branch', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    const provider = scripted([{ throw: rejected }, OK('must not call stripped fallback')]);
+    const fx = await withCarriers(provider.membrane);
+    const impl = fx.strategy as any;
+    const ctx = managerContext(fx.manager);
+    const store = fx.manager.getStore();
+    store.createBranch('carrier-progress-b');
+    const record = impl.recordCompressionFamilyProgress.bind(impl);
+    const get = store.getStateJson.bind(store);
+    let armed = false;
+    let moved = false;
+    let initialization: Promise<void> | undefined;
+    const boundary = testMock.method(impl, 'recordCompressionFamilyProgress', (...args: any[]) => {
+      armed = true;
+      return record(...args);
+    });
+    const hook = testMock.method(store, 'getStateJson', (id: string) => {
+      const value = get(id);
+      if (armed && !moved && id.endsWith('compression-family-progress')) {
+        moved = true;
+        store.switchBranch('carrier-progress-b');
+        initialization = fx.strategy.initialize(ctx);
+      }
+      return value;
+    });
+    try {
+      await fx.strategy.run(fx.target(), ctx);
+      assert.ok(moved, 'the rejection progress read reentered initialization');
+      await initialization;
+      assert.equal(provider.calls.length, 1, 'no stripped call follows a skipped progress write');
+    } finally { hook.mock.restore(); boundary.mock.restore(); fx.manager.close(); }
+  });
+
   it('a genuine carrier rejection is recorded under its own identity: a resume goes straight to the stripped request', async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const mock = scripted([{ throw: rejected }, { throw: failure('network') }, OK('stripped memory')]);
@@ -3040,9 +3074,10 @@ describe('a window wait after a branch switch ends the scan', () => {
     lane.compressChunkHierarchical = async (chunk, ctx, onSkip) => {
       attempts++;
       if (attempts === 1) {
-        await fx.manager.switchBranch(fork);
         lane.splitCallTimes = [Date.now() - 1_000];
-        throw lane.splitWindowWait(1, 1, 60_000);
+        const wait = lane.splitWindowWait(1, 1, 60_000);
+        await fx.manager.switchBranch(fork);
+        throw wait;
       }
       return original(chunk, ctx, onSkip);
     };

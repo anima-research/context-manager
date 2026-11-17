@@ -23,3 +23,5 @@
 - Quarantine inspection and keyed release ignore history superseded by a checkpoint even before redaction, while resolving earlier legacy claims referenced by later exhaustion events.
 - Inspection rejects reentrant branch changes during projection reads. Obsolete
   checkpoint work does not consume the current load's failure warning.
+- Keyed release reclassifies a lost load after projection reads before returning
+  selection results or entering its uncertain mutation path.

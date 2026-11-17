@@ -83,6 +83,6 @@ export interface KeyedCompressionQuarantineStrategy extends ContextStrategy {
 export function isKeyedCompressionQuarantineStrategy(strategy: unknown): strategy is Pick<KeyedCompressionQuarantineStrategy,
   'inspectCompressionRefusalQuarantine' | 'releaseCompressionRefusalQuarantine'> {
   const candidate = strategy as Partial<KeyedCompressionQuarantineStrategy>;
-  return candidate !== null && typeof candidate === 'object' && typeof candidate.inspectCompressionRefusalQuarantine === 'function' &&
+  return candidate !== null && (typeof candidate === 'object' || typeof candidate === 'function') && typeof candidate.inspectCompressionRefusalQuarantine === 'function' &&
     typeof candidate.releaseCompressionRefusalQuarantine === 'function';
 }

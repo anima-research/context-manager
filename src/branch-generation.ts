@@ -9,8 +9,12 @@ const branchGenerations = new WeakMap<JsStore, StoreBranchGeneration>();
 
 /** Observe direct/non-manager switches without advancing ordinary same-branch opens. */
 export function observeStoreBranch(store: JsStore): StoreBranchGeneration {
-  const name = store.currentBranch().name;
   const previous = branchGenerations.get(store);
+  const name = store.currentBranch().name;
+  // A currentBranch hook can initialize another load and observe its branch.
+  // Never overwrite that newer observation with the outer read's old result.
+  const reentered = branchGenerations.get(store);
+  if (reentered !== previous && reentered) return reentered;
   if (previous?.name === name) return previous;
   const current = { name, generation: (previous?.generation ?? -1) + 1 };
   branchGenerations.set(store, current);
