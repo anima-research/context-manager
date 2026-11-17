@@ -1428,6 +1428,25 @@ function isUsableQuarantineRecord(record: unknown): record is CompressionRefusal
 /** Distinguishes damaged stored data from store execution/I/O failures. */
 class UnreadableCompressionQuarantineError extends Error {}
 
+/** Only errors thrown by the store-read boundary, not projection/programmer errors. */
+class CompressionQuarantineStoreReadError extends Error {
+  constructor(cause: unknown) { super('Compression quarantine store read failed', { cause }); }
+}
+
+/** Shared by the native shape cap and metadata inspection; never counts old accounting. */
+function compressionQuarantineCountsTowardShapeCap(
+  record: CompressionRefusalQuarantineRecord,
+  chunkSourceHash: string,
+  regime: Pick<CompressionRefusalNormalizedConfig,
+    'sourceOnlyFallbackEnabled' | 'sourceOnlyFallbackRequestHash' | 'toolProseFallback'>,
+): boolean {
+  return record.chunkSourceHash === chunkSourceHash &&
+    record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION &&
+    record.normalizedConfig?.sourceOnlyFallbackEnabled === regime.sourceOnlyFallbackEnabled &&
+    record.normalizedConfig?.sourceOnlyFallbackRequestHash === regime.sourceOnlyFallbackRequestHash &&
+    canonicalJson(record.normalizedConfig?.toolProseFallback ?? null) === canonicalJson(regime.toolProseFallback ?? null);
+}
+
 /** Native key/source digests and optional recorded membership must be readable. No repair. */
 function requireReadableQuarantineMembership(record: CompressionRefusalQuarantineRecord): void {
   if (!isCanonicalQuarantineKey(record.key) || !isCanonicalQuarantineKey(record.chunkSourceHash)) {
@@ -1764,7 +1783,6 @@ const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
   'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
-const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
 async function withCompressionStateLock<T>(
   store: JsStore,
@@ -2800,7 +2818,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       const binding = this.quarantineBinding();
       if (!binding) return { status: 'branchUnavailable' };
-      const projection = this.readCompressionQuarantineProjection(true);
+      const projection = this.readCompressionQuarantineProjection(true, true);
       const limit = options.limit ?? 50;
       const chunksByHash = new Map(this.chunks.map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk]));
       const selected = options.key === undefined ? [...projection.keys()].sort() : projection.has(options.key) ? [options.key] : [];
@@ -2812,6 +2830,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const ids = recordedIds ?? chunk?.messages.map((message) => message.id) ?? null;
         const siblings = [...projection.keys()].filter((other) => other !== key && projection.get(other)!.record.chunkSourceHash === record.chunkSourceHash).sort();
         const generation = active.generationId.startsWith('legacy:') ? null : active.generationId;
+        // Inspect each recorded source-only request regime under today's config.
+        // No request is rebuilt here: this is cap accounting, not eligibility.
+        const regime = {
+          sourceOnlyFallbackEnabled: this.config.compressionSourceOnlyFallback === true ? true : undefined,
+          sourceOnlyFallbackRequestHash: this.config.compressionSourceOnlyFallback === true
+            ? record.normalizedConfig?.sourceOnlyFallbackRequestHash : undefined,
+          toolProseFallback: this.toolProseHoistOptions(),
+        };
+        const countsTowardShapeCap = compressionQuarantineCountsTowardShapeCap(record, record.chunkSourceHash, regime);
+        const sameRegimeRecords = countsTowardShapeCap ? [...projection.values()].filter((item) =>
+          compressionQuarantineCountsTowardShapeCap(item.record, record.chunkSourceHash, regime)).length : 0;
         return {
           key, generation, selectable: generation !== null && isCanonicalQuarantineKey(key) && isCanonicalQuarantineKey(record.familyKey),
           chunkSourceHash: record.chunkSourceHash,
@@ -2832,14 +2861,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             requestHash: metadataDigest(entry.requestHash),
           })),
           outcomesComplete: active.outcomes.length <= 32,
+          countsTowardShapeCap, sameRegimeRecords,
           sameSourceRecords: siblings.length + 1, siblingKeys: siblings.slice(0, 100), siblingKeysComplete: siblings.length <= 100,
         };
       });
       return { status: 'ok', binding, records, totalRecords: projection.size, complete: selected.length <= limit,
         configuredModel: metadataString(this.config.compressionModel), configuredProvider: null, configuredCredentialAlias: null };
-    } catch {
-      // Do not leak store error text (which can contain paths or payloads) into this metadata surface.
-      return { status: 'unreadable' };
+    } catch (error) {
+      // Never return store error text (paths/payloads), or disguise programmer errors.
+      if (error instanceof UnreadableCompressionQuarantineError) return { status: 'unreadable', reason: 'ledger-entry' };
+      if (error instanceof CompressionQuarantineStoreReadError) return { status: 'unreadable', reason: 'store-read' };
+      throw error;
     }
   }
 
@@ -2863,14 +2895,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!currentBinding) return { status: 'branchUnavailable' };
       if (currentBinding.loadId !== expected.loadId || currentBinding.namespace !== expected.namespace || currentBinding.branch !== expected.branch) return { status: 'stale' };
       let current: Map<string, ActiveCompressionQuarantine>;
-      try { current = this.readCompressionQuarantineProjection(true); } catch { return { status: 'unreadable' }; }
+      try { current = this.readCompressionQuarantineProjection(true, true); } catch (error) {
+        if (error instanceof UnreadableCompressionQuarantineError) return { status: 'unreadable', reason: 'ledger-entry' };
+        if (error instanceof CompressionQuarantineStoreReadError) return { status: 'unreadable', reason: 'store-read' };
+        throw error;
+      }
       const active = current.get(key);
       if (!active) return { status: 'not-held' };
       if (active.generationId.startsWith('legacy:')) return { status: 'unsupported' };
       if (active.generationId !== expectedGeneration) return { status: 'stale' };
       // Never waive a native hold without the identity needed to forget ALL
       // of its family's progress. Do not guess from its source, key or model.
-      if (!isCanonicalQuarantineKey(active.record.familyKey)) return { status: 'unreadable' };
+      if (!isCanonicalQuarantineKey(active.record.familyKey)) return { status: 'unreadable', reason: 'ledger-entry' };
       // An attempted write can land and then throw. Mark an open alarm episode
       // conservatively BEFORE writing, so a later empty read never calls that
       // uncertainty proof of coverage. This flag is in-memory, not a receipt.
@@ -3315,6 +3351,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.namedDroppedQuarantineKeys.clear();
     this.floorFailure = undefined;
     this.namedUnlistedQuarantineState.clear();
+    this.quarantineHygieneSkipLogged = false;
     this.compressionDebtFailureLogged = null;
 
     // Bind to the chronicle store + namespace for persistent strategy state.
@@ -5259,10 +5296,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * nothing (projectCompressionQuarantineEvents): its cleared records would
    * come back. A stored null reads as no value at all.
    */
-  private readCompressionQuarantineProjection(strict = false): Map<string, ActiveCompressionQuarantine> {
+  private readCompressionQuarantineProjection(strict = false, classifyStoreReadErrors = false): Map<string, ActiveCompressionQuarantine> {
     if (!this.store) return new Map();
-    const ledger = this.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
-    const legacy = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
+    // Only keyed prewrite reads classify store exceptions for a public result.
+    // Native/mutation reads keep throwing the original failure as before.
+    const read = (id: string): unknown => {
+      try { return this.store!.getStateJson(id); } catch (error) {
+        if (classifyStoreReadErrors) throw new CompressionQuarantineStoreReadError(error);
+        throw error;
+      }
+    };
+    const ledger = read(this.compressionRefusalQuarantineLedgerStateId);
+    const legacy = read(this.compressionRefusalQuarantineStateId);
     const dropped = new Set<string>();
     const unlisted = new Set<string>();
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
@@ -5324,7 +5369,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       `[compression-quarantine] on branch '${this.store?.currentBranch().name ?? ''}', left out ledger ${one ? 'entry' : 'entries'} it can't use ` +
         `(keys=${fresh.map((key) => key.slice(0, 12)).join(',')}): ${one ? 'it no longer holds its chunk' : 'they no longer hold their chunks'} back, ` +
         `no clear reaches ${one ? 'it' : 'them'}, and ${one ? 'it stays' : 'they stay'} in the ledger until a checkpoint ` +
-        `rewrites the ledger, which needs ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events in it`,
+        `rewrites the gate's tolerant projection on the next native hygiene pass with at least ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events; failed or stale hygiene is logged once per load`,
     );
   }
 
@@ -5351,28 +5396,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // record, or of one by its key, which leaves the span's other shapes
     // counting toward the cap. A shape whose ledger entry is found unusable
     // is left out of the projection, and so stops counting too.
-    const sameHash = [...projection.values()].filter(
-      (active) => active.record.chunkSourceHash === record.chunkSourceHash &&
-        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
-    );
-    // The shape cap is per request regime, not merely per source chunk. Enabling
-    // the final source-only rung is a genuine request-family change and must
-    // earn a fresh bounded family even when the old regime already filled its
-    // cap. Within the new regime the cap remains sticky.
-    const sameRegime = sameHash.filter((active) =>
-      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
-        record.normalizedConfig.sourceOnlyFallbackEnabled &&
-      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
-        record.normalizedConfig.sourceOnlyFallbackRequestHash &&
-      // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since the options
-      // of a record chronicle before 0.5.1 stored or reads back can have their
-      // keys in another order than toolProseHoistOptions builds them in
-      // (0.5.1 and later keep the written order, chronicle #67).
-      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
-    );
+    // Enabling/repointing a fallback is a genuine request-family change.
+    // Canonical tool-prose options also survive Chronicle key-order changes.
+    const sameRegime = [...projection.values()].filter((active) =>
+      compressionQuarantineCountsTowardShapeCap(active.record, record.chunkSourceHash, record.normalizedConfig));
     return projection.get(record.key)
       ?? sameRegime.find((active) => active.record.familyKey === record.familyKey)
       ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
@@ -5483,40 +5510,62 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }, this.ns);
   }
 
+  private quarantineHygieneSkipLogged = false;
+
+  /** No store text/payloads; repeated failures or stale work must not spam a load. */
+  private reportSkippedQuarantineHygiene(): void {
+    if (this.quarantineHygieneSkipLogged) return;
+    this.quarantineHygieneSkipLogged = true;
+    this.diag.warn('[compression-quarantine] checkpoint hygiene skipped or incomplete; ledger replay may grow (further skips suppressed until next load)');
+  }
+
   private checkpointCompressionQuarantineIfNeeded(source: CompressionOperationBranch): void {
-    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
-    const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
-    if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
-    // Preservation first: never compact a damaged or oversized projection
-    // into a truncated checkpoint that silently evicts held siblings. Skipping
-    // hygiene here deliberately makes no bounded-replay promise.
-    let projection: Map<string, ActiveCompressionQuarantine>;
-    try { projection = this.readCompressionQuarantineProjection(true); } catch (error) {
-      if (error instanceof UnreadableCompressionQuarantineError) return;
-      throw error; // Store/read failures remain uncertain, not successful hygiene.
+    try {
+      if (!this.store || !this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
+      if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
+      let projection: Map<string, ActiveCompressionQuarantine>;
+      try { projection = this.readCompressionQuarantineProjection(true); } catch (error) {
+        if (!(error instanceof UnreadableCompressionQuarantineError)) throw error;
+        // This is exactly the set enforced by the gate. Damage already ignored
+        // there must not disable compaction; the tolerant read names dropped keys.
+        projection = this.readCompressionQuarantineProjection();
+      }
+      // Lossless even above 1,024 holds: bound replay events, never held records.
+      const retained = [...projection.values()]
+        .sort((a, b) => b.record.created - a.record.created);
+      const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
+        generationId: item.generationId,
+        record: item.record,
+        outcomes: item.outcomes,
+        ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
+        sentAlertKeys: [...item.sentAlertKeys],
+      }));
+      this.appendCompressionQuarantineEvent({
+        kind: 'checkpoint',
+        key: '__checkpoint__',
+        active: serialized,
+        created: Date.now(),
+      });
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      // Append first: before redaction the gate projects the same holds;
+      // afterwards the checkpoint contains every hold the gate enforces.
+      this.store.redactStateItems(this.compressionRefusalQuarantineLedgerStateId, 0, length);
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
+    } catch (error) {
+      this.reportSkippedQuarantineHygiene();
+      throw error; // In particular, never acknowledge uncertain mutation hygiene.
     }
-    if (projection.size > COMPRESSION_QUARANTINE_MAX_ACTIVE) return;
-    const retained = [...projection.values()]
-      .sort((a, b) => b.record.created - a.record.created);
-    const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
-      generationId: item.generationId,
-      record: item.record,
-      outcomes: item.outcomes,
-      ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
-      sentAlertKeys: [...item.sentAlertKeys],
-    }));
-    this.appendCompressionQuarantineEvent({
-      kind: 'checkpoint',
-      key: '__checkpoint__',
-      active: serialized,
-      created: Date.now(),
-    });
-    if (!this.isCompressionBranchCurrent(source)) return;
-    // Append-first makes every crash point safe: before redaction both histories
-    // project identically; afterwards the checkpoint is the complete projection.
-    this.store.redactStateItems(this.compressionRefusalQuarantineLedgerStateId, 0, length);
-    if (!this.isCompressionBranchCurrent(source)) return;
-    this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
   }
 
   /** How many quarantine records exist, for a health read that needs only the
