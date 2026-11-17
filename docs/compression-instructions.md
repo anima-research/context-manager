@@ -19,7 +19,8 @@ const strategy = new AutobiographicalStrategy({
 ```
 
 Omitting the entire option, using `{}`, or selecting `preset: 'default'`
-keeps today's instruction text byte-for-byte. A partial `templates` object
+keeps today's instruction text byte-for-byte. `default` is the only accepted
+preset; all other names are rejected. A partial `templates` object
 replaces only its named slots; every unspecified slot inherits the current
 built-in text. No migration of existing summaries is performed.
 
@@ -39,9 +40,10 @@ built-in text. No migration of existing summaries is performed.
 Use single braces, for example `{targetTokens}`. Braces are reserved for
 placeholders; there is no escaping, expression syntax, evaluation, callback,
 or recursive substitution. Numeric values come from request construction;
-`participant` is the configured string. It is required when referenced, and
-for the optional factual preset. It does not change `summaryParticipant` or
-message ownership. Repeated placeholders are replaced in one pass.
+`participant` is the explicitly configured string, required only when referenced
+by a custom template. It is never inferred from history or `summaryParticipant`
+and does not change message ownership. Repeated placeholders are replaced in
+one pass.
 
 `context` is the existing transition payload (capped head text and recent
 higher-level summaries), **private data**, not template source. A transition
@@ -77,10 +79,10 @@ Precedence:
    KnowledgeStrategy's phase/merge overrides. `prepareCompressionRequest`
    still runs afterward. This option does not force subclasses to use it.
 2. Existing `witnessedInstruction` wins over the built-in witnessed L1 text,
-   including when a preset is selected. Combining it with a
+   including when custom templates are configured. Combining it with a
    `templates.witnessedChunk` override throws rather than hiding either one.
-3. A supplied template slot wins over its preset. An omitted preset means
-   `default`; omitted slots inherit that preset.
+3. A supplied template slot replaces that phase's built-in wording; omitted
+   slots retain the existing default. `default` is the only accepted preset.
 4. `identityReminder`/`witnessedIdentityReminder` are appended at their
    existing L1/merge sites, including custom instructions. Neither is added
    to transition requests, matching existing behavior.
@@ -98,25 +100,9 @@ are not read by these current request-building paths. They are not aliases
 for this option. The host-supplied live system prompt, tools, native content,
 recall carriers, provenance, and transition system prompt are unchanged.
 
-## Optional factual preset
+## Scope and limits
 
-```json
-{
-  "compressionInstructions": {
-    "preset": "factual",
-    "participant": "Participant"
-  }
-}
-```
-
-This opt-in wording asks for factual, attributed event notes, distinguishes
-claims from outcomes, and treats inherited/reading content as attributed
-reference data rather than autobiography. It is based on a public pure
-formatter reference. Templates can override individual factual slots too.
-The default preset is named **DEFAULT** (`'default'` in JSON), not `legacy`;
-`legacy` is not accepted. Participant identity comes only from trusted config.
-
-Wording is guidance, not a guarantee of factuality, secrecy, attribution,
+Custom wording is guidance, not a guarantee of accuracy, secrecy, attribution,
 provider acceptance, or improved compression quality. No real-provider
 qualification is implied. Existing retry additions (such as no-tools/plain
 prose instructions), request ceilings, and output caps still apply. Templates
@@ -140,15 +126,12 @@ can increase input size; target token placeholders are not output validators.
 }
 ```
 
-This is a proposed recipe fragment, **not a working host feature shipped by
-this CM change alone**. Public connectome-host at
-`3e715b4e08cfcc423e90593fc8305cfb12370fa9` declares `RecipeStrategy` in
-`src/recipe.ts`, validates it in `validateRecipe`, and constructs options in
-`src/framework-strategy.ts` through an explicit `PASSTHROUGH_KEYS` allowlist.
-That source does not declare, validate, or forward `compressionInstructions`.
-A companion must add the type, validate the object on recipe load (including
-unknown keys), and forward it unchanged; it must resolve a CM/framework
-version exposing this API and test recipe-to-request propagation. Hosts must
-also reject misspelled outer recipe option names rather than drop them.
-No host edits, deployment, or automatic actor inference are part of this CM
-candidate.
+This is a recipe fragment, **not a working host feature shipped by this CM
+change alone**. Public connectome-host at
+`73730ee7ff8293aad376626523c32f137dfd8f7f` declares the option in
+`src/recipe.ts`, uses CM's shared validator in `src/recipe-strategy.ts`, and
+forwards it to the framework strategy. That companion remains dependency-blocked:
+both direct and framework-resolved CM must expose this API before stock host
+integration can work. Its preset documentation and tests also need to match
+this default/custom-only scope. No host edits, deployment, dependency upgrade,
+or automatic actor inference are part of this CM candidate.
