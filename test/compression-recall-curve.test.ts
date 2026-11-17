@@ -4228,7 +4228,7 @@ describe('tool-prose hoist admission', () => {
     const failureSnapshot = (fx: Fixture) => [...failureRuns(fx)].map(([subject, entry]) => ({
       subject, ...entry, run: { ...entry.run, domain: entry.run.domain.split('\u0000').slice(1).join('\u0000') },
     }));
-    async function seedFailureRun(fx: Fixture, membrane: ReturnType<typeof flexibleMembrane>['membrane']) {
+    async function seedFailureRun(fx: Fixture, membrane: ReturnType<typeof flexibleMembrane>['membrane'], kind?: Kind) {
       const seam = membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
       const complete = seam.complete;
       const outage = Object.assign(new Error('seed provider failure'), { type: 'server_error' });
@@ -4236,8 +4236,27 @@ describe('tool-prose hoist admission', () => {
       try {
         await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage);
         assert.equal(failureRuns(fx).size, 1);
-        for (const entry of failureRuns(fx).values()) entry.run.failures = 3;
+        for (const [subject, entry] of failureRuns(fx)) {
+          entry.run.failures = 3;
+          // Keep an open gated-rung history through the canonical answer.
+          if (kind) entry.run.key = createHash('sha256').update(JSON.stringify({
+            runSubject: subject, curveLabel: label(kind), stripped: false,
+          })).digest('hex');
+        }
       } finally { seam.complete = complete; }
+      if (kind) {
+        const strategy = fx.strategy as unknown as {
+          prepareCompressionCandidate(request: NormalizedRequest, curveLabel: string): NormalizedRequest;
+        };
+        const prepare = strategy.prepareCompressionCandidate;
+        strategy.prepareCompressionCandidate = function (request, curveLabel) {
+          if (curveLabel === label(kind)) {
+            assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
+              'the gated rung still has its open failure history after canonical answers');
+          }
+          return prepare.call(this, request, curveLabel);
+        };
+      }
     }
 
     async function run(kind: Kind, usage: AttemptHandler, budget: number, carriers = false) {
@@ -4414,11 +4433,12 @@ describe('tool-prose hoist admission', () => {
       });
     }
 
-    it('split traces describe the raw folds that contribute to a stitched memory', async () => {
+    for (const thinkingFirst of [false, true]) it(`thinking-only split parts trace success with wrapper recovery disabled (thinkingFirst=${thinkingFirst})`, async () => {
       const hidden = '<thinking>hidden</thinking>';
       const mock = flexibleMembrane([
         { stop: 'refusal' }, { stop: 'refusal' },
-        { stop: 'end_turn', text: 'first memory' }, { stop: 'end_turn', text: hidden },
+        { stop: 'end_turn', text: thinkingFirst ? hidden : 'first memory' },
+        { stop: 'end_turn', text: thinkingFirst ? 'first memory' : hidden },
       ]);
       const fx = await fixture(mock.membrane, {
         compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
@@ -4430,7 +4450,10 @@ describe('tool-prose hoist admission', () => {
         assert.equal(parts.length, 2);
         assert.ok(parts.every(log => log.metadata?.outcome === 'success'));
         assert.equal(fx.target.compressed, true);
-        assert.ok(fx.strategy.summariesView().some(entry => entry.content.includes(hidden)), 'raw thinking-only fold is preserved, as before this PR');
+        const memory = fx.strategy.summariesView().find(entry => entry.content.includes('first memory'));
+        assert.ok(memory, 'the raw thinking-only fold does not prevent stitching');
+        assert.equal(memory.content.includes(hidden), !thinkingFirst,
+          'post-stitch extraction removes only a leading thinking block; fold acceptance is unchanged');
       } finally { fx.manager.close(); }
     });
 
@@ -4453,23 +4476,67 @@ describe('tool-prose hoist admission', () => {
       });
     }
 
-    it('a decided expansion retains marked planned-request traces when the stripped diagnostic cannot serialize', async () => {
+    it('planned diagnostics add no pre-dispatch request serializations', async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const counts: number[] = [];
+      try {
+        for (const logging of [false, true]) {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const mock = flexibleMembrane([{ stop: 'end_turn', text: 'a memory' }]);
+          const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+          const seam = fx.strategy as unknown as {
+            prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+          };
+          const prepare = seam.prepareCompressionCandidate;
+          let serializations = 0;
+          seam.prepareCompressionCandidate = function (request, label) {
+            const prepared = prepare.call(this, request, label);
+            Object.defineProperty(prepared, 'serializationProbe', {
+              configurable: true, enumerable: true,
+              get() { serializations++; return undefined; },
+            });
+            return prepared;
+          };
+          const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+          const complete = membrane.complete;
+          membrane.complete = async request => {
+            counts.push(serializations);
+            return complete(request);
+          };
+          try {
+            if (logging) await capture(fx);
+            else await fx.strategy.run(fx.target, managerContext(fx.manager));
+            assert.equal(fx.target.compressed, true);
+          } finally { fx.manager.close(); }
+        }
+        assert.equal(counts.length, 2);
+        assert.ok(counts[0]! > 0, 'the request serialization probe was reached');
+        assert.equal(counts[1], counts[0], 'enabled logging adds no pre-dispatch serialization');
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
+    for (const stripped of [false, true]) it(`a decided expansion retains marked planned-request traces when its final diagnostic cannot serialize (stripped=${stripped})`, async () => {
       const rejection = Object.assign(new Error('thinking blocks cannot be modified'), {
         type: 'invalid_request', httpStatus: 400, retryable: false,
       });
       const mock = flexibleMembrane([
-        { stop: 'refusal' }, { error: rejection }, { error: rejection }, { stop: 'refusal' },
+        { stop: 'refusal' }, { error: rejection }, ...(stripped ? [{ error: rejection }] : []), { stop: 'refusal' },
       ]);
       const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
-      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
-      fx.strategy.flushSummaries();
+      if (stripped) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+      }
       const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
       const complete = membrane.complete;
       membrane.complete = async request => {
-        const stripped = mock.calls.length === 2;
+        const mutate = mock.calls.length === (stripped ? 2 : 1);
         try { return await complete(request); }
         catch (error) {
-          if (stripped) {
+          if (mutate) {
             request.config.maxTokens = 123;
             const block = request.messages.flatMap(m => m.content).find(b => b.type === 'text');
             if (block?.type === 'text') block.text = 'mutated shared content';
@@ -4594,8 +4661,8 @@ describe('tool-prose hoist admission', () => {
           if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
           try {
             delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-            await seedFailureRun(a, off.membrane);
-            await seedFailureRun(b, on.membrane);
+            await seedFailureRun(a, off.membrane, kind);
+            await seedFailureRun(b, on.membrane, kind);
             assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
             const aKeys = countChunkKeys(a);
             const bKeys = countChunkKeys(b);
@@ -4658,8 +4725,8 @@ describe('tool-prose hoist admission', () => {
               try {
                 console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
                 delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-                await seedFailureRun(a, control.membrane);
-                await seedFailureRun(b, probe.membrane);
+                await seedFailureRun(a, control.membrane, kind);
+                await seedFailureRun(b, probe.membrane, kind);
                 assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
                 const aKeys = countChunkKeys(a);
                 const bKeys = countChunkKeys(b);

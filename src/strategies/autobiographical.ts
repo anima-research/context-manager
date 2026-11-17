@@ -12024,21 +12024,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
-        // Capture scalar plan diagnostics before any hook can mutate objects
-        // shared with the stripped retry. This snapshot is log-only.
+        let attemptHash: string;
         let plannedTrace: Pick<CompressionAttemptTrace, 'requestHash' | 'messageCount' | 'estimatedTokens'> | undefined;
-        if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
-          plannedTrace = {
-            requestHash: sha256Json(attemptRequest),
-            messageCount: attemptRequest.messages.length,
-            estimatedTokens: this.estimateCompressionRequestTokens(attemptRequest),
-          };
-        }, this.ns, `compression planned-attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+        {
+          // Reuse the required carrier-identity serialization for the log-only
+          // snapshot, before hooks can mutate the plan. Retain only scalars.
+          const attemptJson = JSON.stringify(attemptRequest);
+          attemptHash = createHash('sha256').update(attemptJson, 'utf8').digest('hex');
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            plannedTrace = {
+              requestHash: attemptHash,
+              messageCount: attemptRequest.messages.length,
+              estimatedTokens: Math.ceil(attemptJson.length / 4),
+            };
+          }, this.ns, `compression planned-attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+        }
         const noteFailedAttempt = (failedRequest: NormalizedRequest): void => {
           // Retain the final request reference and the pre-dispatch plan's
           // scalar snapshot. Never serialize in the provider catch.
           if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
-            failedAttempt = { request: failedRequest, plannedTrace: failedRequest !== attemptRequest ? plannedTrace : undefined, latencyMs: performance.now() - started,
+            failedAttempt = { request: failedRequest, plannedTrace, latencyMs: performance.now() - started,
               metadata: { curveLabel, recallIds, recallLevels, leafCoverageHash, expandedParentId, expandedChildIds } };
           }, this.ns, `compression attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
         };
@@ -12060,7 +12065,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // is a deterministic answer like any rung's, kept under its own
         // identity: a resumed ladder goes straight to the stripped request.
         const carrierLabel = `${curveLabel}:carrier-rejected`;
-        const attemptHash = sha256Json(attemptRequest);
         const carrierKnownRejected = knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
           requestCarriesReasoning(attemptRequest);
         try {
@@ -12130,8 +12134,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (response && typeof response === 'object') countedStripped.add(response);
         }
         failedAttempt = undefined;
-        // End the provider run before resuming: a throwing local warning sink
-        // must not extend the answered call's old failure streak.
+        // End this call's provider run before resuming. For split parts this
+        // is the part key, not the enclosing split-stitch rung's failure key;
+        // that run ends only after the whole fold completes.
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
         this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
@@ -12363,7 +12368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               persisted: false, outcome: 'provider_error', errorType, ...annotation };
             attemptTraces.push(trace);
           }, this.ns, `compression attempt diagnostic failed: rung=${failedAttempt?.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
-          // A transport may mutate the stripped copy into an unserializable
+          // A hook/transport may mutate any final request into an unserializable
           // object. Keep the decided rung visible using the pre-dispatch
           // scalar snapshot, never a retained mutable plan.
           if (!trace && failedAttempt?.plannedTrace &&
@@ -13140,7 +13145,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 successfulLeaves++;
                 if (d?.model?.actual) { modelReportedLeaves++; leafModels.add(`${d.model.actual}|${d.model.provider ?? ''}`); }
               }
-              // Classify exactly the raw text the existing fold accepts.
+              // Classify trimmed raw text, not extracted summary text. With
+              // wrapper recovery disabled, even a thinking-only part is success
+              // and folded; extraction happens only after stitching (unchanged).
               const txt = textOf(assessment.response).trim();
               trace.outcome = txt ? 'success' : 'unusable_empty';
               if (txt.length > 0) {
