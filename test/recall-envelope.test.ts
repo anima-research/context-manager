@@ -15,9 +15,9 @@
  *     MECHANICALLY on the pre-change tree and re-captured only when the
  *     store's read-back changed (see recall-envelope-golden.generate.ts). A
  *     red here is a compat break in the change, never a stale golden.
- *  2. Nothing downstream keys on answer bytes. Q-side labels are untouched in
- *     both modes, and zero-recall surgery removes enveloped pairs exactly as
- *     it removes bare ones.
+ *  2. Q-side labels are untouched in both modes. Zero-recall surgery supports
+ *     enveloped and bare pairs, but requires exact constructed answer bytes;
+ *     changed, extended or collapsed answers must fail closed.
  */
 
 import { describe, it } from 'node:test';

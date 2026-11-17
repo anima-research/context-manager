@@ -70,7 +70,7 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
     const split = mode === 'split' || mode === 'readingSplit';
     const strategy = new Strategy({ ...options, adaptiveResolution: reading,
       ...(mode === 'transition' ? { headWindowTokens: 1000 } : {}),
-      ...extra, compressionInstructions: config });
+      ...extra, ...(config === undefined ? {} : { compressionInstructions: config }) });
     const membrane = { complete: async (request: NormalizedRequest) => {
       calls.push(structuredClone(request));
       // Canonical/source-only split requests have four raw records. Pieces have one.
@@ -124,6 +124,12 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       assert.deepEqual(merged.sourceIds, sources.map(s => s.id));
     }
     assert.deepEqual(ctx.messageStore.getAll(), before, 'raw content and metadata untouched');
+    for (const summary of strategy.summariesNow()) {
+      assert.doesNotMatch(summary.content, /CUSTOM (?:OPEN|CHUNK|WITNESS|READ|MERGE|WMERGE|RMERGE|TRANSITION)/,
+        'custom instructions are not persisted into summary prose');
+      assert.doesNotMatch(JSON.stringify(summary.responseContent) ?? '', /CUSTOM /,
+        'custom instructions are not persisted into summary carriers');
+    }
     assert.equal(calls.length, split ? 8 : firstResponse ? 2 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
     return calls;
   } finally {

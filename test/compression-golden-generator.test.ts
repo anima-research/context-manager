@@ -217,6 +217,11 @@ it('generator reports compiler diagnostics and source inspection errors distinct
     git('update-index', '--assume-unchanged', 'src/product.ts');
     rmSync(join(root, 'src/product.ts'));
     assert.match(capture(root).stderr, /Refusing dirty source worktree.*src\/product\.ts/);
+    mkdirSync(join(root, 'src/product.ts'));
+    const inspection = capture(root);
+    assert.notEqual(inspection.status, 0);
+    assert.match(inspection.stderr, /Unable to inspect source path.*src\/product\.ts.*EISDIR/);
+    assert.match(inspection.stderr, /Check source-path type, permissions and readability/);
   });
 });
 

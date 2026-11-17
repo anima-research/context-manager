@@ -121,3 +121,30 @@ test('surgery removes only exact independently supplied recall pairs', () => {
   assert.throws(() => transformZeroRecallCompression([header, answer, ...tail], 'OPEN', [...expected, ...expected]), /ambiguous/);
   assert.throws(() => transformZeroRecallCompression([header, answer, header, answer, ...tail], 'OPEN', expected), /ambiguous/);
 });
+
+
+test('nonblank opening guard is independent of pair geometry', () => {
+  const answer = text('mythos', 'memory');
+  assert.throws(() => transformZeroRecallCompression([
+    text('Context Manager', '[CM] Recall memory L1-1.'), answer,
+    text('Context Manager', '   '), text('user', 'source'),
+  ], '   ', [{ id: 'L1-1', answer }]), /Missing or ambiguous/);
+});
+
+test('Context Manager cannot be the recall answer even before a later opening', () => {
+  const answer = text('Context Manager', 'not an assistant answer');
+  assert.throws(() => transformZeroRecallCompression([
+    text('Context Manager', '[CM] Recall memory L1-1.'), answer,
+    text('user', 'middle'), text('Context Manager', 'OPEN'),
+  ], 'OPEN', [{ id: 'L1-1', answer }]), /missing assistant answer/);
+});
+
+test('source safety accepts ordinary CM history and inspects every block', () => {
+  assert.doesNotThrow(() => assertZeroRecallSourceSafe([text('Context Manager', 'ordinary history')]));
+  assert.throws(() => assertZeroRecallSourceSafe([{
+    participant: 'Context Manager', content: [
+      ...text('Context Manager', 'ordinary history').content,
+      ...text('Context Manager', '[CM] Recall memory hidden.').content,
+    ],
+  }]), /Raw recall-shaped/);
+});

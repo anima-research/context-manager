@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { recallHeaderId } from '../recall-header.js';
 import { createHash } from 'node:crypto';
-import type { NormalizedMessage } from '@animalabs/membrane';
+import type { NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
 
 export interface ZeroRecallTransformResult {
   messages: NormalizedMessage[];
@@ -12,8 +12,54 @@ export interface ZeroRecallTransformResult {
   transformedSha256: string;
 }
 
+/** Snapshot ONLY inside the strategy's trusted L1 construction hook, never in
+ * the proxy that edits a request. These are the actual constructed answers:
+ * normalization, sanitization, seams, preparation and carrier retry have all
+ * already run through the production path, so no parallel renderer can drift.
+ * The caller must reject recall-shaped raw history before construction.
+ */
+export function captureZeroRecallConstruction(request: NormalizedRequest, recallIds: readonly string[]) {
+  const snapshot = structuredClone(request);
+  const expectedAnswers = snapshot.messages.flatMap((message, i) => {
+    const id = recallHeaderId(message);
+    if (id === undefined || !recallIds.includes(id)) return [];
+    const answer = snapshot.messages[i + 1];
+    if (!answer) throw new Error(`Missing constructed recall answer for ${id}`);
+    return [{ id, answer: { participant: answer.participant, content: answer.content } }];
+  });
+  if (new Set(recallIds).size !== recallIds.length || expectedAnswers.length !== recallIds.length
+    || recallIds.some(id => expectedAnswers.filter(answer => answer.id === id).length !== 1)) {
+    throw new Error('Missing or ambiguous constructed recalls; refusing zero-recall surgery');
+  }
+  return { request: snapshot, expectedAnswers };
+}
+
+/** Bind an intercepted request to the trusted construction snapshot in full. */
+export function assertZeroRecallConstruction(request: NormalizedRequest, snapshot: NormalizedRequest): void {
+  if (!isDeepStrictEqual(request, snapshot)) {
+    throw new Error('Request differs from trusted L1 construction; refusing zero-recall surgery');
+  }
+}
+
+/** One construction-bound transform, including complete recalled-set coverage. */
+export function transformConstructedZeroRecallCompression(
+  request: NormalizedRequest, opening: string,
+  construction: ReturnType<typeof captureZeroRecallConstruction>,
+): ZeroRecallTransformResult {
+  assertZeroRecallConstruction(request, construction.request);
+  const result = transformZeroRecallCompression(request.messages, opening, construction.expectedAnswers);
+  if (result.removedRecallIds.length !== construction.expectedAnswers.length) {
+    throw new Error('Incomplete constructed recall removal; refusing zero-recall surgery');
+  }
+  return result;
+}
+
 /** Reject source histories that cannot be distinguished from synthetic recalls. */
-export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMessage, 'participant' | 'content'>[]): void {
+export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMessage, 'participant' | 'content'>[], opening?: string): void {
+  if (opening !== undefined && messages.some(message => message.participant === 'Context Manager'
+    && message.content.some(block => block.type === 'text' && block.text === opening))) {
+    throw new Error('Raw history collides with compression opening; refusing zero-recall surgery');
+  }
   if (messages.some(message => message.participant === 'Context Manager'
     && message.content.some(block => block.type === 'text' && block.text.includes('[CM] Recall memory ')))) {
     throw new Error('Raw recall-shaped Context Manager history; refusing zero-recall surgery');
@@ -27,8 +73,11 @@ export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMes
  * configured opening only. Ambiguous, collapsed or missing recall geometry fails closed. The
  * expectedAnswers must come from the strategy's summaries, NOT be inferred from
  * the request being edited: even an unfenced single text block can contain raw
- * history. Exact participant/content equality is required before any result.
- * The caller must establish that the prefix contains no raw recall-shaped history.
+ * history. They may instead be snapshotted in the trusted construction hook
+ * after the production transformations, provided source safety is established.
+ * Exact participant/content equality is required before any result.
+ * The caller must establish that the prefix contains no raw recall-shaped history
+ * or raw text equal to the opening (source safety can check both).
  * It does not annotate the request, generated summary, or prior turns; all
  * operation provenance belongs in the caller's external receipt.
  * It never edits Chronicle or any source message. Callers must bind its use to

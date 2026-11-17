@@ -31,7 +31,7 @@ function sourceFilesChanged() {
       return hash !== git('rev-parse', 'HEAD:' + path);
     } catch (error) {
       if (error.code === 'ENOENT') return true;
-      throw new Error(`Unable to inspect source path ${JSON.stringify(path)}`);
+      throw new Error(`Unable to inspect source path ${JSON.stringify(path)}: ${error.message}. Check source-path type, permissions and readability, then retry.`, { cause: error });
     }
   });
 }
@@ -45,7 +45,7 @@ const statusPaths = [...git('diff', '--name-only', '-z', 'HEAD').split('\0'),
   ...git('diff', '--cached', '--name-only', '-z', 'HEAD').split('\0')].filter(Boolean);
 const changedPaths = [...new Set([...sourceFilesChanged(), ...untrackedSource(), ...statusPaths])];
 if (git('status', '--porcelain', '--untracked-files=no') || changedPaths.length) {
-  throw new Error(`Refusing dirty source worktree; restore/remove unintended files, clear index flags, or commit intentional changes. Paths: ${JSON.stringify(changedPaths.slice(0, 10)).slice(0, 2000)}`);
+  throw new Error(`Refusing dirty source worktree; restore/remove unintended files, clear index flags, or commit intentional changes. Raw-byte provenance requires a byte-matching checkout: disable line-ending conversion/filters and check out again if Git reports clean. Paths: ${JSON.stringify(changedPaths.slice(0, 10)).slice(0, 2000)}`);
 }
 const producerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');

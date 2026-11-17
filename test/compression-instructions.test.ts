@@ -574,9 +574,36 @@ it('JSON __proto__ cannot inject inherited compression settings', () => {
   assert.equal(new Inspect(options).settings(), undefined);
 });
 
-it('outer option descriptor traps are sanitized before inspecting settings', () => {
-  const options = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('SECRET'); } });
-  assert.throws(() => new Probe(options), {
-    name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings',
+it('absent instruction settings never probe an absent descriptor', () => {
+  const options = new Proxy({ recentWindowTokens: 1234 }, {
+    getOwnPropertyDescriptor(target, key) {
+      if (!Reflect.has(target, key)) throw new Error('absent descriptor');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
   });
+  for (const Strategy of [Probe, KnowledgeProbe]) assert.doesNotThrow(() => new Strategy(options));
+});
+
+it('proxy get traps on other options retain their values with instruction settings', () => {
+  const options = new Proxy({ compressionInstructions: {}, recentWindowTokens: 1 }, {
+    get(target, key, receiver) { return key === 'recentWindowTokens' ? 1234 : Reflect.get(target, key, receiver); },
+  });
+  class Inspect extends Probe { window() { return this.config.recentWindowTokens; } }
+  class KnowledgeInspect extends KnowledgeProbe { window() { return this.config.recentWindowTokens; } }
+  for (const Strategy of [Inspect, KnowledgeInspect]) assert.equal(new Strategy(options).window(), 1234);
+});
+
+it('only instruction-specific inspection failures are reported as invalid instructions', () => {
+  const failure = new Error('outer options failure');
+  assert.throws(() => new Probe(new Proxy({}, { ownKeys() { throw failure; } })), error => error === failure);
+  assert.throws(() => new Probe(null as never), error => error instanceof TypeError && !error.message.includes('compressionInstructions'));
+  assert.throws(() => new Probe(new Proxy({ compressionInstructions: {}, other: true }, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'other') throw failure;
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  })), error => error === failure);
+  assert.throws(() => new Probe(new Proxy({ compressionInstructions: {} }, {
+    getOwnPropertyDescriptor() { throw failure; },
+  })), { name: 'TypeError', message: 'Invalid compressionInstructions configuration: configuration: unable to inspect settings' });
 });

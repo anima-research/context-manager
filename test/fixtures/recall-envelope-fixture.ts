@@ -23,7 +23,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ContentBlock } from '@animalabs/membrane';
+import { captureZeroRecallConstruction } from '../../src/surgery/zero-recall-compression.js';
+import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
 import type { AutobiographicalOptions, SelectOptions, SummaryEntry } from '../../src/types/index.js';
 
@@ -251,9 +252,10 @@ export async function renderAdaptiveFixture(
 ): Promise<FixtureRender> {
   return withTempStore(async (path) => {
     const strategy = new (class extends AutobiographicalStrategy {
-      expectedAnswers() { return this.summaries.map(s => ({ id: s.id, answer: {
-        participant: this.config.summaryParticipant ?? 'Claude', content: this.summaryAnswerContent(s),
-      } })); }
+      expectedAnswers: { id: string; answer: RenderedMessage }[] = [];
+      protected override observeL1CompressionRequest(request: NormalizedRequest, ids: readonly string[]) {
+        this.expectedAnswers = captureZeroRecallConstruction(request, ids).expectedAnswers;
+      }
     })({
       compressionModel: 'zz-mock-model',
       targetChunkTokens: 100,
@@ -266,7 +268,7 @@ export async function renderAdaptiveFixture(
     });
     const expectedRecallAnswers: { id: string; answer: RenderedMessage }[][] = [];
     const mock = makeMockMembrane(count => {
-      expectedRecallAnswers.push(strategy.expectedAnswers());
+      expectedRecallAnswers.push(strategy.expectedAnswers);
       return responseContentForCall(count);
     });
     const manager = await ContextManager.open({

@@ -2,18 +2,19 @@
 /** Explicit, reusable, default-off zero-recall compression surgery.
  *
  * Usage: bun dist/scripts/one-shot-zero-recall-surgery.js --config op.json --execute
- * Without --execute it validates hashes/config and makes no branch or provider call.
+ * Without --execute it validates hashes and instruction settings (not source history) and makes no branch or provider call.
  * Execution is not transactional: even a transform refusal can leave a fork,
  * cleared quarantine and interrupted queue progress. Keep the original stopped
- * store untouched and execute on a disposable copy. On failure, retain the
- * receipt, discard that copy and restore a fresh copy of the original backup;
+ * store untouched and execute on a disposable copy. On failure, retain any receipt and the config/output (early failures may
+ * precede receipt creation), discard that copy and restore a fresh copy of the original backup;
  * do not just update the expected hash or reuse the treatment branch.
  */
 import { createHash } from 'node:crypto';
 import { createReadStream, readFileSync, writeFileSync } from 'node:fs';
 import { ContextManager } from '../src/context-manager.js';
+import { ZeroRecallSurgeryStrategy as SurgeryStrategy } from '../src/surgery/zero-recall-strategy.js';
 import { AutobiographicalStrategy } from '../src/strategies/autobiographical.js';
-import { transformZeroRecallCompression, assertZeroRecallSourceSafe } from '../src/surgery/zero-recall-compression.js';
+import { transformConstructedZeroRecallCompression, assertZeroRecallSourceSafe } from '../src/surgery/zero-recall-compression.js';
 import { Membrane, AnthropicAdapter, NativeFormatter, type NormalizedRequest } from '@animalabs/membrane';
 
 interface Config {
@@ -45,21 +46,17 @@ const recordsSha256=await hashFile(`${config.storePath}/records.log`); if(record
 const toolBytes=readFileSync(config.toolsPath); const toolsSha256=createHash('sha256').update(toolBytes).digest('hex'); if(toolsSha256!==config.expectedToolsSha256)throw new Error(`tools hash mismatch ${toolsSha256}`);
 const tools=JSON.parse(toolBytes.toString('utf8'));
 const preview={createdAt:new Date().toISOString(),execute,config:{...config,strategyConfig:'[recorded in config file]'},recordsSha256,toolsSha256,toolCount:tools.length};
+// Constructor validation is also part of preview; no store is opened here.
+const strategy=new SurgeryStrategy({...config.strategyConfig,summaryParticipant:config.summaryParticipant,autoTickOnNewMessage:false} as never);
 if(!execute){console.log(JSON.stringify(preview,null,2));process.exit(0);}
 if(!process.env.ANTHROPIC_API_KEY)throw new Error('ANTHROPIC_API_KEY required only with --execute');
 const actual=new Membrane(new AnthropicAdapter({apiKey:process.env.ANTHROPIC_API_KEY}),{formatter:new NativeFormatter()});
 let call: Record<string,unknown>|null=null;
-const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest)=>{if(call)throw new Error('ONE_CALL_CAP');const tr=transformZeroRecallCompression(req.messages, strategy.opening(), SurgeryStrategy.prototype.expectedAnswers.call(manager.getStrategy()));const sent={...req,messages:tr.messages};const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};try{const response=await target.complete(sent);const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:(e as Error).name,message:(e as Error).message}};throw e;}};}});
-class SurgeryStrategy extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); }
-  expectedAnswers() {
-    return this.summaries.map(s => ({ id: s.id, answer: {
-      participant: this.config.summaryParticipant ?? 'Claude', content: this.summaryAnswerContent(s),
-    } }));
-  } }
-const strategy=new SurgeryStrategy({...config.strategyConfig,summaryParticipant:config.summaryParticipant,autoTickOnNewMessage:false} as never);
+const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest)=>{if(call)throw new Error('ONE_CALL_CAP');const active=manager.getStrategy() as SurgeryStrategy;const construction=active.construction;if(!construction)throw new Error('No trusted L1 construction');const tr=transformConstructedZeroRecallCompression(req,active.opening(),construction);const sent={...req,messages:tr.messages};const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};try{const response=await target.complete(sent);const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:(e as Error).name,message:(e as Error).message}};throw e;}};}});
 const manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace});
 manager.setToolDefinitions(tools);
-assertZeroRecallSourceSafe(manager.queryMessages({ participant: 'Context Manager' }).messages);
+const cmSource=manager.queryMessages({ participant: 'Context Manager' }).messages;
+assertZeroRecallSourceSafe(cmSource, strategy.opening());
 const parent=manager.currentBranch(); if(parent.name!==config.expectedParentBranch)throw new Error(`parent branch mismatch ${parent.name}`);
 const chunks=(strategy as unknown as {chunks:Array<{index:number,messages:Array<{id:string}>}>}).chunks;const chunk=chunks.find(c=>c.index===config.targetChunkIndex);if(!chunk)throw new Error(`chunk ${config.targetChunkIndex} absent`);const range:[string,string]=[String(chunk.messages[0]?.id),String(chunk.messages.at(-1)?.id)];if(JSON.stringify(range)!==JSON.stringify(config.expectedSourceRange))throw new Error(`source range mismatch ${range}`);const parentQuarantine=strategy.getCompressionQuarantineStatus();if(!parentQuarantine.keys.includes(config.expectedQuarantineKey))throw new Error(`expected quarantine key absent on parent ${config.expectedQuarantineKey}`);
 const branch=await manager.fork(config.branchName);const activeStrategy=manager.getStrategy() as AutobiographicalStrategy;const qBefore=activeStrategy.getCompressionQuarantineStatus();if(!qBefore.keys.includes(config.expectedQuarantineKey))throw new Error(`expected quarantine key absent after fork ${config.expectedQuarantineKey}`);await activeStrategy.clearCompressionRefusalQuarantine(config.expectedQuarantineKey);(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue=[config.targetChunkIndex];const beforeSummaryIds=new Set((activeStrategy as unknown as {summaries:Array<{id:string}>}).summaries.map(s=>s.id));let error:null|{name?:string;message?:string}=null;try{await manager.tick();}catch(e){error={name:(e as Error).name,message:(e as Error).message};}

@@ -2557,21 +2557,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   constructor(config: AutobiographicalOptions = {}) {
     // Retain TypeError for malformed caller settings before structuredClone runs.
     let instructionSettings: unknown;
-    try {
-      if (Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions')) {
+    // Match ordinary option enumeration: do not ask a proxy for a descriptor
+    // of an absent key. Unrelated outer-option failures keep their own errors.
+    if (Reflect.ownKeys(config).includes('compressionInstructions')) {
+      let enumerable: boolean;
+      try {
+        enumerable = Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions');
+        if (enumerable) instructionSettings = config.compressionInstructions;
+      } catch {
+        throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
+      }
+      if (enumerable) {
         const original = config;
-        const settings = instructionSettings = original.compressionInstructions;
         const descriptors = Object.getOwnPropertyDescriptors(original);
-        // Preserve accessor receivers, including access to inherited settings.
-        for (const descriptor of Object.values(descriptors)) {
-          if (descriptor.get) descriptor.get = descriptor.get.bind(original);
-          if (descriptor.set) descriptor.set = descriptor.set.bind(original);
+        // Resolve every other option via the original receiver, including proxy
+        // get traps on data properties. Only instructions are snapshotted here.
+        for (const key of Object.keys(descriptors)) {
+          const descriptor = descriptors[key]!;
+          if (!descriptor.enumerable) continue;
+          descriptors[key] = { enumerable: true, configurable: true, get: () => Reflect.get(original, key, original) };
         }
-        descriptors.compressionInstructions = { value: settings, enumerable: true, writable: true, configurable: true };
+        descriptors.compressionInstructions = { value: instructionSettings as AutobiographicalOptions['compressionInstructions'], enumerable: true, writable: true, configurable: true };
         config = Object.defineProperties({}, descriptors);
       }
-    } catch {
-      throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
     }
     validateCompressionInstructions(instructionSettings);
     const suppliedLayers: ConfigLayer[] = [
@@ -3303,6 +3311,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionBranchGeneration++;
     for (const call of this.callsOut) call.abort();
   }
+
+  /** Trusted construction-side observation, after all L1 wire transformations.
+   * Consumers must snapshot here, not infer recall provenance in a transport proxy.
+   * Also runs for the explicit carrier-stripped retry. Never persisted.
+   */
+  protected observeL1CompressionRequest(_request: NormalizedRequest, _recallIds: readonly string[]): void {}
 
   /**
    * `membrane.complete()` for the current generation's work, with a
@@ -12008,6 +12022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
+          this.observeL1CompressionRequest(attemptRequest, recallIds);
           response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
@@ -12056,6 +12071,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           try {
+            this.observeL1CompressionRequest(acceptedRequest, recallIds);
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
