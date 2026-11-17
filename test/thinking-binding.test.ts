@@ -1473,7 +1473,7 @@ describe('thinking binding: a summary\u2019s carriers', () => {
     ];
     await assert.rejects(
       renderAdaptiveFixture({ carrierPolicy: 'full' }, carriers, 900),
-      /Adaptive picker exhausted/,
+      /Adaptive plan check: /,
       'setup: rendered and priced with their carriers, these summaries don\u2019t fit',
     );
     const stripped = await renderAdaptiveFixture({ carrierPolicy: 'live-strip' }, carriers, 900);

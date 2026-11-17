@@ -57,7 +57,7 @@ export interface OverBudgetDiagnostics {
    * `tokens` is the raw tokens they keep there together, estimated as the
    * plan prices them, and each pin gives its own; a message two pins cover
    * counts once in `tokens` and toward each pin. Set only by the refusal of a
-   * plan whose middle is over the budget ("Adaptive picker exhausted but …");
+   * plan whose middle is over the budget ("Adaptive plan check: …");
    * every other refusal leaves it out, as does that one when no pin keeps
    * any.
    */
@@ -92,6 +92,21 @@ export interface OverBudgetDiagnostics {
    */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /**
+   * Set only by the refusal of an adaptive plan over the budget ("Adaptive
+   * plan check: …"), which tests the plan's size and not whether the solver
+   * could fold further (#496): the folding solver that planned (`kv-unified`,
+   * `kv-stable`, …).
+   */
+  solver?: string;
+  /** With `solver`: whether that solver reported it had nothing left to fold. A plan can be over the budget without it. */
+  solverExhausted?: boolean;
+  /**
+   * With `solver`: whether the plan is the minimum-token cut kv-unified takes
+   * when its search passes `labelCeiling` (#252), rather than the cut its
+   * search chose. False under every other solver.
+   */
+  labelCeilingFallback?: boolean;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */

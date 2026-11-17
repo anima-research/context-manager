@@ -15842,11 +15842,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // plan count other things (an emitted prefix, a shard's text alone)
       // and don't name pins.
       const rawPins = this.rawPinsDiagnostics(store, middlePrice);
+      // What was tested is the plan's size, not `result.exhausted`: a solver
+      // can return a plan over the budget while it still has folds to ask
+      // for, or as its label-ceiling fallback (#252), so the refusal says
+      // which solver planned and both of those rather than "exhausted" (#496).
+      // The shadow pick above put the live pick's strategy back.
+      const solver = picker.solverName;
+      const labelCeilingFallback = solver === 'kv-unified' && this._lastKvUnified?.lastTimings?.ceiling?.live !== undefined;
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
         clearedBy: planClearedBy(),
+        stage: `Adaptive plan check: ${solver} returned its plan` +
+          ` (exhausted=${result.exhausted}, label-ceiling fallback=${labelCeilingFallback})`,
         diagnostics: {
+          solver,
+          solverExhausted: result.exhausted,
+          labelCeilingFallback,
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
           headTokens,
