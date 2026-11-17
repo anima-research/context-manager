@@ -55,8 +55,11 @@ conservatively refuses damaged events since the latest checkpoint and never
 rewrites them.
 A later native hygiene pass can checkpoint the tolerant projection that the
 gate enforces, removing ignored damage; damage in a retained hold may still
-fail strict inspection afterwards. A checkpoint supersedes preceding events and the legacy snapshot;
+fail strict inspection afterwards. A checkpoint supersedes preceding active state and the legacy snapshot;
 that snapshot is no longer read or validated, but is not rewritten or deleted.
+Later legacy exhaustion events can still reference pre-checkpoint claims, whose
+records are resolved and strictly validated; damage there can make inspection
+and release unreadable.
 Below 256 ledger events, ignored damage can leave inspection and keyed release
 unreadable indefinitely. Neither restart nor legacy clear-all guarantees repair; initialization alert
 delivery or a clear can trigger hygiene if its appended events reach the threshold.
@@ -145,7 +148,7 @@ pretending configuration is actual use or correlating an unrelated call.
 | `unreadable` | Authoritative projection could not be read/validated before writes. Coarse `reason` distinguishes `store-read` from `ledger-entry`, without store error text. No mutation. Surface failure, not an empty quarantine. `ledger-entry` can persist below 256 events; restart and clear-all are not repair operations. |
 | `branchUnavailable` | Strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle rather than retrying against another instance. |
 | `invalidSelection` | Missing/empty/partial/wildcard/all key, absent generation/binding, or invalid inspect bounds. No clear-all interpretation. |
-| Rejected promise / exception | Mutation-path failure, potentially after a landed write. Preserve intent as **uncertain**. Do not fabricate `released` from a missing key or automatically resend. |
+| Rejected promise / exception | Unexpected projection or mutation-path failure, potentially before any write or after a landed write. Preserve intent as **uncertain**. Do not fabricate `released` from a missing key or automatically resend. |
 
 Comparison and mutation run together inside the existing in-process
 `withCompressionStateLock`, keyed by JsStore, branch and native quarantine
@@ -166,7 +169,8 @@ Shared native checkpoint hygiene runs at 256 ledger events for existing
 exhaustion, legacy clear and sweep callers as well as selected waivers. On
 strict validation failure it checkpoints the tolerant projection enforced by
 the gate; ignored entries are discarded, not archived as forensic evidence.
-Dropped keys are named once per load by the tolerant reader. Checkpoints
+The tolerant ledger reader logs dropped-key prefixes (12 characters), once per
+key per load; unusable legacy snapshot records can be silently skipped. Checkpoints
 preserve every enforced hold, including more than 1,024 records, without
 slicing or a new byte bound. Store/mutation failures still throw; failed or
 stale hygiene is logged once per load. Inspection output bounds do not bound

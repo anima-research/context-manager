@@ -1,1 +1,0 @@
-- Reject keyed compression quarantine release as uncertain if its authorized branch/load binding changes after mutation, including during checkpoint hygiene, sync, or postread.

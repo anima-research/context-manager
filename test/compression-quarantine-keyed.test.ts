@@ -806,6 +806,44 @@ describe('R1 native review regressions', () => {
     assert.equal(inspect(fx.strategy).totalRecords, 0, 'a later readable absence is not an acknowledgement');
   });
 
+  for (const phase of ['projection', 'progress'] as const) {
+    it(`round 7 preserves both branches when ${phase} read changes the release binding`, async (t) => {
+      const fx = await fixture(t, `review-first-write-${phase}`);
+      const selected = selection(fx.strategy);
+      const originalBranch = fx.store.currentBranch().name;
+      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
+        sourceIds: fx.event.record.sourceIds, outcomes: [{ outcome: 'refusal', requestHash: 'synthetic', curveLabel: 'canonical' }], updated: Date.now() }];
+      fx.store.setStateJson(fx.strategy.progressId, progress);
+      fx.store.createBranch('elsewhere');
+      fx.store.switchBranch('elsewhere');
+      fx.store.setStateJson(fx.strategy.progressId, progress);
+      const otherLedger = fx.ledger();
+      fx.store.switchBranch(originalBranch);
+      const originalLedger = fx.ledger();
+      const get = fx.store.getStateJson.bind(fx.store);
+      let moved = false;
+      const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+        const result = get(id);
+        if (!moved && id === (phase === 'projection' ? fx.strategy.ledgerId : fx.strategy.progressId)) {
+          fx.store.switchBranch('elsewhere');
+          moved = true;
+        }
+        return result;
+      });
+      try {
+        await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /uncertain/);
+        assert.equal(moved, true);
+        assert.deepEqual(get(fx.strategy.progressId), progress, 'other branch progress must not be rewritten');
+        assert.deepEqual(fx.ledger(), otherLedger, 'other branch ledger is untouched');
+      } finally {
+        hook.mock.restore();
+        fx.store.switchBranch(originalBranch);
+      }
+      assert.deepEqual(get(fx.strategy.progressId), progress, 'authorized branch progress is untouched');
+      assert.deepEqual(fx.ledger(), originalLedger);
+    });
+  }
+
   for (const phase of ['clear', 'checkpoint', 'redaction', 'compaction', 'sync', 'postread'] as const) {
     it(`14 rejects uncertain release after a reentrant branch move during ${phase}`, async (t) => {
       const fx = await fixture(t, `review-binding-${phase}`);
@@ -1013,6 +1051,124 @@ describe('Anima Review regressions', () => {
     assert.equal((await strategy.releaseCompressionRefusalQuarantine(selection(strategy))).status, 'released');
     manager.getStore().setStateJson(strategy.ledgerId, [...ledger, null]);
     assert.deepEqual(strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
+  });
+
+  it('round 7 inspection rejects projection read branch changes', async (t) => {
+    const fx = await fixture(t, 'review-inspection-binding');
+    const branch = fx.store.currentBranch().name;
+    fx.store.createBranch('elsewhere');
+    const get = fx.store.getStateJson.bind(fx.store);
+    const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+      const result = get(id);
+      if (id === fx.strategy.ledgerId) fx.store.switchBranch('elsewhere');
+      return result;
+    });
+    const set = mock.method(fx.store, 'setStateJson');
+    const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
+    const sync = mock.method(fx.store, 'sync');
+    try {
+      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
+      assert.deepEqual([set.mock.callCount(), append.mock.callCount(), sync.mock.callCount()], [0, 0, 0]);
+    } finally {
+      set.mock.restore(); append.mock.restore(); sync.mock.restore();
+      hook.mock.restore(); fx.store.switchBranch(branch);
+    }
+  });
+
+  it('round 7 stale below-threshold hygiene does not suppress the current load failure', async (t) => {
+    const fx = await fixture(t, 'review-stale-warning');
+    const source = native(fx.strategy).captureCompressionBranch();
+    await fx.strategy.initialize(fx.ctx);
+    assert.ok(fx.ledger().length < 256);
+    const lines: string[] = [];
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
+    try {
+      native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source);
+      assert.equal(lines.length, 0, 'obsolete invocation must not warn for this load');
+      pad(fx);
+      const compact = mock.method(fx.store, 'compactState', () => { throw new Error('checkpoint failed'); });
+      try {
+        assert.throws(() => native(fx.strategy).checkpointCompressionQuarantineIfNeeded(
+          native(fx.strategy).captureCompressionBranch()), /checkpoint failed/);
+      } finally { compact.mock.restore(); }
+      assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 1);
+    } finally { warn.mock.restore(); }
+  });
+
+  for (const sweep of [true, false]) it(`round 7 ${sweep ? 'sweep' : 'success clear'} reports landed clear uncertainty without store payloads`, async (t) => {
+    const fx = await fixture(t, `review-clear-diagnostic-${sweep}`);
+    const impl = fx.strategy as any;
+    pad(fx);
+    if (sweep) fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
+    const lines: string[] = [];
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
+    const compact = mock.method(fx.store, 'compactState', () => { throw new Error('/private/store SECRET-payload'); });
+    try {
+      if (sweep) await impl.sweepPaidOffQuarantineRecords();
+      else await impl.clearQuarantineForCompressedChunk(fx.chunk);
+      assert.equal(inspect(fx.strategy).totalRecords, 0, 'clear landed before maintenance threw');
+      assert.ok(lines.some((line) => line.includes('clear may have landed')));
+      assert.ok(!lines.some((line) => /SECRET|private|records remain|klaxon persists/.test(line)));
+    } finally { compact.mock.restore(); warn.mock.restore(); }
+  });
+
+  it('round 7 unreadable status does not log thrown store payloads', async (t) => {
+    const fx = await fixture(t, 'review-status-diagnostic');
+    const get = fx.store.getStateJson.bind(fx.store);
+    const lines: string[] = [];
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
+    const error = mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.join(' ')); });
+    const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
+      if (id === fx.strategy.ledgerId) throw new Error('/private/store SECRET-payload');
+      return get(id);
+    });
+    try {
+      await fx.strategy.alarm();
+      assert.ok(lines.some((line) => line.includes('quarantine status unreadable')));
+      assert.ok(!lines.some((line) => /SECRET|private/.test(line)));
+    } finally { hook.mock.restore(); warn.mock.restore(); error.mock.restore(); }
+  });
+
+  it('round 7 locked branch lookup failure returns branchUnavailable without writes', async (t) => {
+    const fx = await fixture(t, 'review-locked-lookup');
+    const selected = selection(fx.strategy);
+    const current = fx.store.currentBranch.bind(fx.store);
+    // Count the successful public precheck, then fail the same lookup under the lock.
+    const counter = mock.method(fx.store, 'currentBranch');
+    (fx.strategy as any).quarantineBinding();
+    const precheckCalls = counter.mock.callCount();
+    counter.mock.restore();
+    let calls = 0;
+    const hook = mock.method(fx.store, 'currentBranch', () => {
+      if (++calls > precheckCalls) throw new Error('private locked lookup failure');
+      return current();
+    });
+    try {
+      await noWrites(fx, async () => {
+        assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'branchUnavailable' });
+      });
+      assert.equal(calls, precheckCalls + 1, 'lookup failed inside the lock');
+    } finally { hook.mock.restore(); }
+  });
+
+  it('round 7 an open episode retains waiver intent when a clear lands then throws', async (t) => {
+    const fx = await fixture(t, 'review-open-waiver-uncertain');
+    const heard: CompressionQuarantineStatus[] = [];
+    fx.strategy.setQuarantineAlarmHandler((status) => heard.push(status));
+    await fx.strategy.alarm();
+    assert.equal(heard.length, 1);
+    const selected = selection(fx.strategy);
+    const append = fx.store.appendToStateJsonWithIdentity.bind(fx.store);
+    const hook = mock.method(fx.store, 'appendToStateJsonWithIdentity', (...args: Parameters<typeof append>) => {
+      const result = append(...args);
+      if ((args[1] as Event).kind === 'clear') throw new Error('lost clear acknowledgement');
+      return result;
+    });
+    try { await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /lost clear acknowledgement/); }
+    finally { hook.mock.restore(); }
+    await fx.strategy.alarm();
+    assert.equal(heard.length, 2);
+    assert.equal(heard[1]!.clearReason, 'operator-waiver-requested');
   });
 
   it('5 maps branch lookup failure consistently without writes', async (t) => {
