@@ -1030,6 +1030,24 @@ describe('estimator calibration band', () => {
     stillOver.internals.store!.setStateJson(stillOver.internals.calibrationStateId, unstamped);
     stillOver.cm.close();
     const stillOverReopened = await openSharded('picker-over', false);
+    const state = stillOverReopened.strategy as unknown as Internals & {
+      _calibrationReset: { discardedMultiplier: number; fromEpoch: number | null; at: number } | null;
+      _calibrationDeclared: boolean;
+      loadCalibration(store: unknown, options: { dryRun: boolean }): void;
+    };
+    state.loadCalibration((stillOverReopened.cm as unknown as { messageStore: MessageStoreView }).messageStore, { dryRun: true });
+    assert.equal(state._calibration, 1.45, 'premise: the provisional multiplier is already loaded');
+    state._calibrationReset = { discardedMultiplier: 1.6, fromEpoch: 0, at: 123 };
+    state._calibrationDeclared = true;
+    const calibrationState = () => structuredClone({
+      multiplier: state._calibration,
+      provisional: state._calibrationProvisional,
+      reset: state._calibrationReset,
+      declared: state._calibrationDeclared,
+      storeMultiplier: (stillOverReopened.cm as unknown as { messageStore: MessageStoreView }).messageStore.getTokenCalibration!(),
+      persisted: state.store!.getStateJson(state.calibrationStateId),
+    });
+    const beforeRefusal = calibrationState();
     flags.length = 0;
     t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
       const result = originalRun.call(this, inputs, budget);
@@ -1042,6 +1060,11 @@ describe('estimator calibration band', () => {
     assert.equal(overPreview.exhausted, false, 'the over-budget retry owns the flag too');
     assert.equal(overPreview.fits, false);
     assert.ok(overPreview.finalTokens < P * 1.1, `reported at the dropped multiplier: ${overPreview.finalTokens} vs ${P} at 1.0`);
+    assert.deepEqual(calibrationState(), beforeRefusal, 'both refused preview attempts restore all calibration state');
+    flags.length = 0;
+    await assert.rejects(stillOverReopened.cm.compile(over, undefined, { dryRun: true }), /Adaptive plan check/);
+    assert.deepEqual(flags, [true, false], 'ordinary dry compilation also retries then refuses at the plan gate');
+    assert.deepEqual(calibrationState(), beforeRefusal, 'throwing dry compilation restores all calibration state too');
     stillOverReopened.cm.close();
   });
 

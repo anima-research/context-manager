@@ -410,42 +410,67 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
     reader.manager.close();
   });
 
-  it('deduplicates floor warnings across polling previews, dry refusals and live selects', async (t) => {
+  it('deduplicates dry and live floor warnings independently through polling and refusals', async (t) => {
     const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
     reader.read(24);
     await reader.drain();
     const budget = { maxTokens: 20_000, reserveForResponse: 0 };
     const forest = CanonicalSummaryForest.prototype;
     const minimumTokens = forest.minimumTokens;
-    const breakIt = () => { forest.minimumTokens = () => { throw new Error('dry floor failure'); }; };
+    let cause = 'original floor failure';
+    const failures: string[] = [];
+    const breakIt = () => { forest.minimumTokens = () => { failures.push(cause); throw new Error(cause); }; };
     const floor = collectFloorWarnings();
+    const failsFloor = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+      const before = failures.length;
+      const result = await fn();
+      assert.ok(failures.length > before, 'this select actually attempted and failed the floor');
+      assert.ok(failures.slice(before).every((failure) => failure === cause), 'the expected cause failed');
+      return result;
+    };
+    const warned = (...causes: string[]) => {
+      assert.deepStrictEqual(floor.warnings.map((line) => line.split('until it is: Error: ')[1]?.replace(/ ns=default$/, '')), causes);
+    };
     try {
       breakIt();
-      await reader.manager.compile(budget, undefined, { dryRun: true });
-      assert.strictEqual(floor.warnings.length, 1, 'the dry failure is reported');
-      for (let i = 0; i < 5; i++) reader.manager.previewContext(budget);
-      assert.strictEqual(floor.warnings.length, 1, 'polling previews do not repeat the warning');
+      await failsFloor(() => reader.manager.compile(budget, undefined, { dryRun: true }));
+      warned(cause);
+      for (let i = 0; i < 5; i++) await failsFloor(() => reader.manager.previewContext(budget));
+      warned(cause);
       const run = Picker.prototype.run;
       const pick = t.mock.method(Picker.prototype, 'run', function (this: Picker, ...args: Parameters<Picker['run']>) {
         return { ...run.apply(this, args), finalTokens: budget.maxTokens * 2 };
       });
-      const preview = reader.manager.previewContext(budget)!;
+      await failsFloor(() => assert.rejects(reader.manager.compile(budget, undefined, { dryRun: true }), /Adaptive plan check/));
+      const preview = (await failsFloor(() => reader.manager.previewContext(budget)))!;
+      assert.strictEqual(preview.fits, false);
       pick.mock.restore();
-      assert.strictEqual(preview.fits, false, 'premise: a refused dry select');
-      assert.strictEqual(floor.warnings.length, 1, 'a refused preview shares suppression');
-      await reader.manager.compile(budget);
-      assert.strictEqual(floor.warnings.length, 1, 'the live select shares the already reported cause');
+      warned(cause);
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause); // The preview never silences the first live warning.
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause);
       forest.minimumTokens = minimumTokens;
       const recovered = await reader.manager.compile(budget, undefined, { dryRun: true });
-      assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined, 'premise: the dry floor succeeded');
+      assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined);
       breakIt();
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause); // Dry recovery never clears live suppression.
+      cause = 'different dry failure';
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned('original floor failure', 'original floor failure', cause);
+      cause = 'original floor failure';
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause, 'different dry failure');
+      // Live recovery must not clear the separate dry record either.
+      forest.minimumTokens = minimumTokens;
       await reader.manager.compile(budget);
-      assert.strictEqual(floor.warnings.length, 1, 'a successful dry floor does not clear the live suppression');
-      forest.minimumTokens = () => { throw new Error('a different dry failure'); };
-      reader.manager.previewContext(budget);
       breakIt();
-      await reader.manager.compile(budget);
-      assert.strictEqual(floor.warnings.length, 2, 'another dry cause cannot clear suppression for the live cause');
+      cause = 'different dry failure';
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned('original floor failure', 'original floor failure', cause);
+      await failsFloor(() => reader.manager.compile(budget));
+      warned('original floor failure', 'original floor failure', cause, cause);
     } finally {
       forest.minimumTokens = minimumTokens;
       floor.restore();

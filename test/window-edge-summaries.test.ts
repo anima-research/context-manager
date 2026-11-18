@@ -424,7 +424,7 @@ describe('a live select with those summaries left out that fails after its dry r
     assert.fail('premise: a compile sends the select with summaries left out');
   }
 
-  it('flat-profile: a fitting leave probe and its live run share floor-warning suppression', async (t) => {
+  it('flat-profile: a fitting leave probe never suppresses its live run floor warning', async (t) => {
     const lines = capture(t);
     const { manager, strategy, budget } = await leaving('flat-profile');
     const modes: string[] = [];
@@ -434,11 +434,23 @@ describe('a live select with those summaries left out that fails after its dry r
       throw new Error('leave probe floor failure');
     });
     lines.length = 0;
+    const warningModes: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => {
+      const line = args.map(String).join(' ');
+      lines.push(line);
+      if (line.includes('floor not computed')) {
+        const state = strategy as unknown as { _dryRunSelect: boolean };
+        warningModes.push(state._dryRunSelect ? 'dry' : 'live');
+      }
+    });
     try {
       await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.deepStrictEqual(warningModes, ['dry', 'live'], 'the probe does not silence the first live warning');
+      await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.deepStrictEqual(warningModes, ['dry', 'live'], 'subsequent probes and live runs each dedup');
       assert.ok(modes.includes('leave:dry'), 'premise: the leave probe computed the floor');
       assert.ok(modes.includes('leave:live'), 'premise: the live leave run computed the floor too');
-      assert.strictEqual(lines.filter((l) => l.includes('floor not computed')).length, 1, 'the probe and live run warn only once');
+      assert.strictEqual(lines.filter((l) => l.includes('floor not computed')).length, 2, 'one dry warning and one live warning');
     } finally {
       await manager.close();
     }

@@ -494,8 +494,10 @@ Given:
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the hard budget × (1 +
    overBudgetGraceRatio), default ×1.02 — throw OverBudgetError in live
-   and dry compilation alike. previewContext catches the refusal and returns
-   the plan with fits: false, without entries or stats even with render: true.
+   and dry compilation alike. A provisional calibration multiplier above 1
+   may first be dropped and the selection retried at 1. previewContext reports
+   that retry (including entries and stats with render: true if it fits).
+   Only a final refusal returns fits: false without entries or stats.
    (Rev 5.1: the throw no longer
    consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
@@ -985,8 +987,9 @@ solve(tree, F_prev, W, P):
 [strategy layer, after picker.run:]
   finalTokens > W·(1 + overBudgetGraceRatio)
       → OverBudgetError in live and dry compilation alike
-      → previewContext reports fits: false without rendering (no entries or
-        stats, even with render: true)
+      → provisional calibration above 1 may retry at 1 first
+      → previewContext reports the retry if it fits (and can render it);
+        only final refusal reports fits: false without entries or stats
 ```
 
 Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally

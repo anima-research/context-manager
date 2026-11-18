@@ -3146,6 +3146,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (setStrategy(getStrategy())).
     this.namedDroppedQuarantineKeys.clear();
     this.floorFailures.clear();
+    this.dryFloorFailures.clear();
     this.namedUnlistedQuarantineState.clear();
     this.compressionDebtFailureLogged = null;
 
@@ -6808,8 +6809,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.noteFloorFailure(`no cut meets the plan's constraints (${floor.certificate.reason}, ${conflicts} conflicting leaves)`);
         return null;
       }
-      // Dry selects may add warning suppression, but only live recovery clears it.
-      if (!this._dryRunSelect) this.floorFailures.clear();
+      // Recovery clears only this lane's warning suppression.
+      (this._dryRunSelect ? this.dryFloorFailures : this.floorFailures).clear();
       return floor.floorTokens;
     } catch (error) {
       this.noteFloorFailure(describeCompressionFailure(error));
@@ -6817,14 +6818,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Says once per cause until a live floor succeeds why the report is
-   *  missing. Dry selects share suppression but cannot clear it, so polling
-   *  previews and internal leave probes do not repeat warnings. Causes that
-   *  differ only in their numbers or ids count as one. */
+  /** Says once per cause until this lane's floor succeeds. Dry selects
+   *  (including leave probes) dedup independently and never read or write
+   *  live suppression. Numbers and long hexadecimal strings are normalized. */
   private noteFloorFailure(cause: string): void {
     const kind = cause.replace(/[0-9a-f]{8,}|\d+/gi, '#');
-    if (this.floorFailures.has(kind)) return;
-    this.floorFailures.add(kind);
+    const failures = this._dryRunSelect ? this.dryFloorFailures : this.floorFailures;
+    if (failures.has(kind)) return;
+    failures.add(kind);
     this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
   }
 
@@ -10557,6 +10558,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
   /** Causes reported since the last successful live floor computation (floorTokens). */
   private floorFailures = new Set<string>();
+  /** Independent causes reported since the last successful dry floor computation. */
+  private dryFloorFailures = new Set<string>();
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
@@ -22721,8 +22724,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * What a dry select puts back on every path out (see the dry branch in
    * `select`), saved now: the returned function puts it back. A dry select
    * and `renderAsNewest` share it, so a render leaves what the next compile
-   * reads as it found it. Warning suppression is deliberately shared: dry
-   * floor failures add causes, but only a live floor success clears them.
+   * reads as it found it. Dry floor-warning dedup persists separately from
+   * this snapshot and never touches the live warning record.
    */
   private saveDryRunState(store: MessageStoreView): () => void {
     const saved = {

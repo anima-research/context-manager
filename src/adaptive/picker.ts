@@ -503,7 +503,8 @@ export interface PickerResult {
   /** True if the applied frontier is at or below the soft target. */
   budgetMet: boolean;
   /** Solver-owned exhaustion (see FoldingSolution.exhausted): greedy =
-   *  above soft target with nothing left to fold/produce; kv-stable = even
+   *  above soft target with no production requested after search (possibly
+   *  replaying a cheaper raw frontier); kv-stable = even
    *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
    *  kv-unified = realizable frontier infeasible at pre-grace totalBudget,
    *  even when missing summaries are requested; this can still fit the

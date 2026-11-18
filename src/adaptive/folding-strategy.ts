@@ -88,9 +88,9 @@ export interface FoldingSolution {
    * shrink the plan. The hard-budget check is independent of this flag.
    *
    * The shipped semantics differ deliberately:
-   *  - greedy solvers: above the SOFT target with nothing left to fold or
-   *    produce (they fold until they reach the target or run out of moves,
-   *    so "still above target" means capacity is exhausted);
+   *  - greedy solvers: above the SOFT target with no production
+   *    requested after the greedy search; a cheaper raw frontier may be
+   *    replayed even when a cost-increasing summary remains available;
    *  - kv-stable: even FULL folding exceeds the HARD wall W
    *    (`ControlPlan.escalated`). Sitting above the soft target inside the
    *    [target, W] dead band is kv-stable's designed resting state — zero
