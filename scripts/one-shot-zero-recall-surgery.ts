@@ -63,10 +63,11 @@ if (!fromStore || (!fromStore.startsWith('..' + sep) && fromStore !== '..' && !i
 }
 // Exclusive creation rejects existing files AND dangling symlinks before opening
 // the store. Retain the descriptor; later writes never follow a replaced path.
-const receiptFd = openSync(receiptDestination, 'wx');
+let receiptFd: number | undefined;
 const recovery = 'Execution may have changed the disposable copy. Preserve this receipt and config, discard the copy, and restore a fresh copy of the original stopped backup before retrying with a new, unused receiptPath.';
 let receipt: Record<string, unknown> = { ...preview, status: 'preflight', recovery };
 function saveReceipt() {
+  if (receiptFd === undefined) throw new Error('Receipt was not reserved; use a fresh receiptPath');
   const bytes = Buffer.from(JSON.stringify(receipt, null, 2));
   let offset = 0;
   while (offset < bytes.length) offset += writeSync(receiptFd, bytes, offset, bytes.length - offset, offset);
@@ -74,16 +75,65 @@ function saveReceipt() {
   fsyncSync(receiptFd);
   return createHash('sha256').update(bytes).digest('hex');
 }
-saveReceipt();
 console.error('Execution may change the disposable copy. On failure preserve output/config and any receipt, discard the copy, and restore a fresh copy of the original stopped backup before retrying with a new, unused receiptPath.');
 
-const adapter = new AnthropicAdapter({apiKey:process.env.ANTHROPIC_API_KEY, cacheKeepalive:{enabled:false}});
-limitSurgeryTransport(adapter);
-const actual=new Membrane(adapter,{formatter:new NativeFormatter()});
-let call: Record<string,unknown>|null=null;
-const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw Object.assign(new CompressionWithdrawn('ONE_CALL_CAP'),{providerAdmission:'deferred'});const active=manager!.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw Object.assign(new CompressionWithdrawn('No trusted L1 authoring'),{providerAdmission:'deferred'});assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};receipt={...receipt,status:'calling',call};saveReceipt();try{const response=await target.complete(sent,{...options,retry:false});const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){const safe=sanitizeSurgeryProviderError(e);call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:safe.name,message:safe.message,type:safe.type,httpStatus:safe.httpStatus,retryable:safe.retryable}};throw safe;}};}});
+let call: Record<string, unknown> | null = null;
 let manager: ContextManager | undefined;
 try {
+  receiptFd = openSync(receiptDestination, 'wx');
+  saveReceipt();
+  const adapter = new AnthropicAdapter({ apiKey: process.env.ANTHROPIC_API_KEY, cacheKeepalive: { enabled: false } });
+  limitSurgeryTransport(adapter);
+  const actual = new Membrane(adapter, { formatter: new NativeFormatter() });
+  const proxy = new Proxy(actual, {
+    get(target, prop, receiver) {
+      if (prop !== 'complete') {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+      return async (request: NormalizedRequest, options?: Parameters<Membrane['complete']>[1]) => {
+        if (call) throw new CompressionWithdrawn('ONE_CALL_CAP');
+        const active = manager!.getStrategy() as SurgeryStrategy;
+        const transformation = active.transformation;
+        if (!transformation || !active.authoredRequest) throw new CompressionWithdrawn('No trusted L1 authoring');
+        try {
+          assertZeroRecallConstruction(request, active.authoredRequest);
+        } catch (cause) {
+          throw new CompressionWithdrawn('Request differs from trusted L1 construction; refusing zero-recall surgery', { cause });
+        }
+        const raw = JSON.stringify(request);
+        call = {
+          startedAt: new Date().toISOString(), removedRecallIds: transformation.removedRecallIds,
+          originalMessages: transformation.originalMessageCount, sentMessages: transformation.sentMessageCount,
+          originalMessagesSha256: transformation.originalSha256, transformedMessagesSha256: transformation.transformedSha256,
+          originalRequestSha256: transformation.originalSha256, transformedRequestSha256: transformation.transformedSha256,
+          transformedBytes: Buffer.byteLength(raw), status: 'started',
+        };
+        receipt = { ...receipt, status: 'calling', call };
+        try {
+          saveReceipt();
+        } catch (cause) {
+          // The provider was never entered. Keep this distinct from a call
+          // whose dispatch or response may have been interrupted.
+          call = { ...call, endedAt: new Date().toISOString(), status: 'not-sent' };
+          throw new CompressionWithdrawn('Pre-call receipt save failed; request not sent', { cause });
+        }
+        try {
+          const response = await target.complete(request, { ...options, retry: false });
+          const usage = response.details?.usage ?? response.usage;
+          call = { ...call, endedAt: new Date().toISOString(), status: 'completed', stopReason: response.stopReason,
+            usage, contentTypes: response.content.map(block => block.type) };
+          return response;
+        } catch (error) {
+          const safe = sanitizeSurgeryProviderError(error);
+          call = { ...call, endedAt: new Date().toISOString(), status: 'error', providerError: {
+            name: safe.name, message: safe.message, type: safe.type, httpStatus: safe.httpStatus, retryable: safe.retryable,
+          } };
+          throw safe;
+        }
+      };
+    },
+  });
 manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace,isolate:config.isolate});
 manager.setToolDefinitions(tools);
 const cmSource=manager.queryMessages({ participant: 'Context Manager' }).messages;
@@ -121,5 +171,5 @@ try {
   console.log(JSON.stringify(receipt, null, 2));
   console.error('Final receipt save failed; preserve stdout. No saved receipt digest is available.');
 } finally {
-  closeSync(receiptFd);
+  if (receiptFd !== undefined) closeSync(receiptFd);
 }

@@ -82,3 +82,23 @@
   those outcomes as ordinary quarantine. Do not resume service or downgrade on
   the disposable treatment copy; rollback means restoring the untouched original
   backup, not reopening the treatment branch with older code.
+
+- One-shot execution finalizes initial receipt-sync and transport-setup failures
+  before store access, with recovery output and descriptor cleanup. A failed
+  pre-call receipt save reports `not-sent` with an end time; local snapshot
+  mismatches withdraw the call without provider-failure accounting.
+- Failed recall-curve traces use the last authored/carrier-stripped dispatch's
+  hash, size and recall identity. Branded pre-send withdrawals do not replace
+  the preceding dispatched log snapshot. Split-piece scope is captured per
+  dispatch even when the rung is refused, fails or waits for its window.
+- L1 recall telemetry skips empty-ID lookups and reuses a per-operation lookup
+  across retries. Nonempty lookups still scan the full persisted projection;
+  no large-history benchmark or bounded-history claim is made. Unavailable
+  recall totals are `null` with one bounded warning, not fabricated zeros.
+  `prior_summary_token_estimate` identifies `stored-summary-estimate`,
+  `text-content-estimate` (carrier-stripped retries), or `unavailable`.
+  Text-content estimates retain pair/envelope overhead but are not sent-token
+  measurements. Ordinary stored-summary estimates may include reasoning.
+- Instruction validation names bounded, JSON-escaped unknown keys, presets and
+  placeholders alongside supported alternatives; template bodies and participant
+  values remain omitted. Malformed braces are diagnosed separately.

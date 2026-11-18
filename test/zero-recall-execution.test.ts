@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch', 'wrong-range', 'summary-without-call', 'error-then-cap', 'receipt-sync-error']) {
+for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch', 'wrong-range', 'summary-without-call', 'error-then-cap', 'receipt-sync-error', 'initial-sync-error', 'initial-sync-persistent', 'transport-setup-error', 'pre-call-sync-error']) {
   test(`executing surgery CLI offline: ${scenario}`, (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -44,13 +44,27 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         SURGERY_TRACE: tracePath, SURGERY_RECEIPT: receiptPath, SURGERY_CASE: scenario } });
       if (scenario === 'receipt-inside' || scenario === 'receipt-existing' || scenario === 'receipt-dangling') {
         assert.equal(result.status, 1);
-        assert.match(result.stderr, scenario === 'receipt-inside' ? /outside the disposable store/ : /EEXIST/);
+        assert.match(result.stderr + result.stdout, scenario === 'receipt-inside' ? /outside the disposable store/ : /EEXIST/);
         assert.ok(!existsSync(tracePath), 'receipt safety is checked before opening the store');
         if (scenario === 'receipt-dangling') return;
         assert.equal(readFileSync(receiptPath, 'utf8'), scenario === 'receipt-inside' ? 'stopped backup' : 'preserve me');
         return;
       }
       assert.match(result.stderr, /restore a fresh copy/, 'recovery guidance precedes mutation');
+      if (scenario.startsWith('initial-sync') || scenario === 'transport-setup-error') {
+        assert.equal(result.status, 1);
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, 'utf8') : '';
+        assert.ok(!trace.includes('"opened":true'), 'setup failure never opens the store');
+        if (scenario.startsWith('initial-sync')) assert.match(trace, /"receiptClosed":true/, 'acquired receipt descriptor closed');
+        assert.match(result.stdout, /"status": "failed"|"status": "uncertain"/);
+        assert.match(result.stdout, /new, unused receiptPath/);
+        assert.equal(readFileSync(join(storePath, 'records.log'), 'utf8'), 'stopped backup');
+        if (scenario === 'initial-sync-persistent') {
+          assert.match(result.stdout, /"status": "uncertain"/);
+          assert.ok(!result.stdout.includes('RECEIPT_SHA256'));
+        } else assert.equal(JSON.parse(readFileSync(receiptPath, 'utf8')).status, 'failed');
+        return;
+      }
       assert.ok(existsSync(tracePath), result.stderr || result.stdout);
       const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const sent = trace.filter(event => event.sent).map(event => event.sent);
@@ -125,7 +139,13 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       if (scenario === 'summary-without-call') { assert.equal(receipt.call, null); assert.equal(receipt.after.newSummaries.length, 1); }
       if (scenario === 'error-then-cap') assert.match(receipt.error.message, /ONE_CALL_CAP/);
       if (scenario === 'repeat') assert.match(receipt.error.message, /ONE_CALL_CAP/);
-      if (scenario === 'mismatch') assert.match(receipt.error.message, /differs from trusted/);
+      if (scenario === 'mismatch') { assert.match(receipt.error.message, /differs from trusted/); assert.equal(receipt.error.name, 'CompressionWithdrawn'); }
+      if (scenario === 'pre-call-sync-error') {
+        assert.equal(receipt.call.status, 'not-sent');
+        assert.ok(receipt.call.endedAt);
+        assert.equal(receipt.error.name, 'CompressionWithdrawn');
+        assert.match(receipt.error.message, /request not sent/);
+      }
       if (scenario === 'provider-error') assert.equal(receipt.call.status, 'error');
       if (scenario !== 'success') assert.match(receipt.recovery, /restore a fresh copy/);
       else { assert.equal(receipt.after.newSummaries.length, 1); assert.equal(receipt.branch, 'surgery/offline'); }

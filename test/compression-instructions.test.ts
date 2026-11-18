@@ -75,22 +75,22 @@ it('every custom slot substitutes typed values; transition data and participant 
   assert.ok(transition.endsWith('\nEND'));
 });
 
-it('invalid configuration fails synchronously with exact value-free diagnostics before any provider call', () => {
+it('invalid configuration fails synchronously with exact actionable diagnostics before any provider call', () => {
   const cases: [unknown, string][] = [
     ...[null, [], 'secret'].map(value => [value, 'configuration: expected object'] as [unknown, string]),
-    ...['unregistered-preset', 'DEFAULT', 1, null].map(preset => [{ preset }, 'preset: unsupported preset'] as [unknown, string]),
+    ...['unregistered-preset', 'DEFAULT', 1, null].map(preset => [{ preset }, `preset: unsupported preset ${typeof preset === 'string' ? JSON.stringify(preset) : `<${preset === null ? 'null' : typeof preset}>`}; supported: default`] as [unknown, string]),
     ...['', 1, null].map(participant => [{ participant }, 'participant: expected nonblank string'] as [unknown, string]),
-    [{ typo: 'secret' }, 'configuration: unknown key'],
+    [{ typo: 'secret' }, 'configuration: unknown key "typo"; supported: preset, participant, templates'],
     [{ templates: {} }, 'templates: expected nonempty object'],
     [{ templates: [] }, 'templates: expected nonempty object'],
-    [{ templates: { typo: 'secret' } }, 'templates: unknown key'],
+    [{ templates: { typo: 'secret' } }, 'templates: unknown key "typo"; supported: opening, chunk, witnessedChunk, readingChunk, merge, witnessedMerge, readingMerge, transition'],
     ...['', '  ', 42, null, {}, [], () => 'secret'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: expected nonblank string'] as [unknown, string]),
     ...['{', '}', '{{participant}}'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: malformed braces'] as [unknown, string]),
-    ...['{targetToken}', '{unknown}', '{totalTokens}'].map(chunk => [{ templates: { chunk } }, 'templates.chunk: unsupported placeholder'] as [unknown, string]),
+    ...['{targetToken}', '{unknown}', '{totalTokens}', '{target_tokens}'].map(chunk => [{ templates: { chunk } }, `templates.chunk: unsupported placeholder ${JSON.stringify(chunk.slice(1, -1))}; supported: {participant}, {targetTokens}`] as [unknown, string]),
     [{ templates: { chunk: '{participant}' } }, 'participant: participant required'],
     [{ templates: { transition: 'no data' } }, 'templates.transition: context must appear once'],
     [{ templates: { transition: '{context}{context}' } }, 'templates.transition: context must appear once'],
-    [{ templates: { opening: '{targetTokens}' } }, 'templates.opening: unsupported placeholder'],
+    [{ templates: { opening: '{targetTokens}' } }, 'templates.opening: unsupported placeholder "targetTokens"; supported: {participant}'],
   ];
   for (const [value, suffix] of cases) {
     for (const validate of [() => validateCompressionInstructions(value), () => new Probe({ compressionInstructions: value as never })]) {
@@ -151,10 +151,10 @@ it('only the registered default preset is accepted, including with complete temp
   for (const preset of ['unregistered-preset', 'DEFAULT', '', '__proto__', 'constructor']) {
     for (const config of [{ preset }, { ...custom, preset, participant: 'Explicit actor' }]) {
       assert.throws(() => validateCompressionInstructions(config), {
-        name: 'TypeError', message: 'Invalid compressionInstructions configuration: preset: unsupported preset',
+        name: 'TypeError', message: `Invalid compressionInstructions configuration: preset: unsupported preset ${JSON.stringify(preset)}; supported: default`,
       });
       assert.throws(() => new Probe({ compressionInstructions: config as never }), {
-        name: 'TypeError', message: 'Invalid compressionInstructions configuration: preset: unsupported preset',
+        name: 'TypeError', message: `Invalid compressionInstructions configuration: preset: unsupported preset ${JSON.stringify(preset)}; supported: default`,
       });
     }
   }
@@ -211,13 +211,13 @@ for (const mode of ['fallback', 'readingFallback'] as const) {
   }
 }
 
-it('validation diagnostics identify only allowlisted paths and reasons, never supplied data', () => {
+it('validation diagnostics bound and escape spellings without echoing template bodies', () => {
   for (const [value, suffix] of [
-    [{ privateKey: 'PRIVATE PAYLOAD' }, 'configuration: unknown key'],
-    [{ preset: 'PRIVATE PAYLOAD' }, 'preset: unsupported preset'],
+    [{ privateKey: 'PRIVATE PAYLOAD' }, 'configuration: unknown key "privateKey"; supported: preset, participant, templates'],
+    [{ preset: 'misspelled' }, 'preset: unsupported preset "misspelled"; supported: default'],
     [{ participant: ' ', templates: { chunk: 'PRIVATE PAYLOAD' } }, 'participant: expected nonblank string'],
-    [{ templates: { privateKey: 'PRIVATE PAYLOAD' } }, 'templates: unknown key'],
-    [{ templates: { chunk: 'PRIVATE PAYLOAD {privateKey}' } }, 'templates.chunk: unsupported placeholder'],
+    [{ templates: { privateKey: 'PRIVATE PAYLOAD' } }, 'templates: unknown key "privateKey"; supported: opening, chunk, witnessedChunk, readingChunk, merge, witnessedMerge, readingMerge, transition'],
+    [{ templates: { chunk: 'PRIVATE PAYLOAD {privateKey}' } }, 'templates.chunk: unsupported placeholder "privateKey"; supported: {participant}, {targetTokens}'],
     [{ templates: { chunk: 'PRIVATE PAYLOAD {' } }, 'templates.chunk: malformed braces'],
     [{ templates: { transition: 'PRIVATE PAYLOAD' } }, 'templates.transition: context must appear once'],
     [{ templates: { chunk: '{participant}' } }, 'participant: participant required'],
@@ -228,13 +228,27 @@ it('validation diagnostics identify only allowlisted paths and reasons, never su
   }
 });
 
+it('diagnostic spellings are bounded, escaped and name supported alternatives', () => {
+  for (const value of [{ templates: { witnessedchunk: 'SECRET BODY' } }, { templates: { chunk: '{targetToken}' } },
+    { ['line\n' + 'x'.repeat(1000)]: 'SECRET BODY' }]) {
+    assert.throws(() => validateCompressionInstructions(value), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(error.message.length < 400);
+      assert.ok(!error.message.includes('SECRET BODY') && !error.message.includes('\n'));
+      assert.match(error.message, /supported: /);
+      if ('templates' in value) assert.match(error.message, /witnessedChunk|targetTokens/);
+      return true;
+    });
+  }
+});
+
 it('rendering ignores inherited slots and the stored clone is validated after getters run', () => {
   const templates = Object.create({ opening: 'INHERITED' });
   assert.equal(compressionInstruction({ templates }, 'opening', {}), undefined);
   let reads = 0;
   const config = { templates: { get opening() { return ++reads === 1 ? 'valid' : '{unknown}'; } } };
   assert.throws(() => new Probe({ compressionInstructions: config }), {
-    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder',
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder "unknown"; supported: {participant}',
   });
   class Expose extends Probe { opening() { return this.getCompressionOpening(); } }
   let snapshotReads = 0;
@@ -308,6 +322,15 @@ it('non-refusal tool-use reading merge retries retain reading template and no-to
   assert.ok(instruction(calls[1]!).includes('Write the memory as plain text directly in your response — do not call any tools for this.'));
 });
 
+it('refusal then tool-use reading merge retries retain the source hook and full no-tools suffix', async () => {
+  for (const pin of ['own', 'inherited'] as const) {
+    const calls = await run('readingFallback', pin, custom, {}, Probe, 2, ['refusal', 'tool_use']);
+    const source = `CUSTOM ${pin === 'inherited' ? 'W' : ''}MERGE 1 2 2000`;
+    assert.deepEqual(calls.map(instruction), ['CUSTOM RMERGE 0 2 2560 2000', source,
+      source + '\n\nWrite the memory as plain text directly in your response — do not call any tools for this.']);
+  }
+});
+
 it('empty chunk retries retain custom text and request plain prose', async () => {
   const calls = await run('chunk', 'own', custom, {}, Probe, 2, 'empty');
   assert.equal(instruction(calls[0]!), 'CUSTOM CHUNK 2000');
@@ -329,7 +352,7 @@ it('validates cloneable invalid text returned only at clone time', () => {
   let reads = 0;
   const config = { templates: { get opening() { return ++reads < 3 ? 'valid' : '{unknown}'; } } };
   assert.throws(() => new Probe({ compressionInstructions: config }), {
-    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder',
+    name: 'TypeError', message: 'Invalid compressionInstructions configuration: templates.opening: unsupported placeholder "unknown"; supported: {participant}',
   });
   assert.equal(reads, 3);
 });
@@ -363,7 +386,7 @@ it('delegating legacy hooks infer the declared child level for custom templates'
 it('L4 merges of legacy L3 sources that skip a level show their L1 children', async () => {
   for (const mode of ['merge', 'readingMerge'] as const) {
     const calls = await run(mode, 'own', custom, {}, Probe, 4);
-    assert.match(instruction(calls[0]!), mode === 'merge' ? /^CUSTOM MERGE 1 4 / : /^CUSTOM RMERGE 1 4 /);
+    assert.equal(instruction(calls[0]!), mode === 'merge' ? 'CUSTOM MERGE 1 4 2000' : 'CUSTOM RMERGE 1 4 2560 2000');
     assert.ok(texts(calls[0]!).some(text => text === '[CM] Recall memory L1-100.'));
   }
 });
@@ -471,7 +494,13 @@ it('skipped-level L4 telemetry retains the legacy shown level across defaults an
         for (const mode of ['merge', 'readingMerge', 'fallback', 'readingFallback'] as const) {
           const calls = await run(mode, 'own', config, {}, Probe, 4, undefined, childLevel);
           expected.push(...calls.map(() => childLevel === 0 ? 0 : 2));
-          if (config === custom) assert.match(instruction(calls[0]!), new RegExp(`^CUSTOM R?MERGE ${childLevel} 4 `));
+          if (config === custom) {
+            assert.deepEqual(calls.map(instruction), calls.map((_call, index) => {
+              const reading = mode.startsWith('reading') && index === 0;
+              const shown = index === 0 ? childLevel : 3;
+              return reading ? `CUSTOM RMERGE ${shown} 4 2560 2000` : `CUSTOM MERGE ${shown} 4 2000`;
+            }));
+          }
         }
       }
     }

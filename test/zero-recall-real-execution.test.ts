@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 
-for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty']) {
+for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty', 'mismatch']) {
   test(`surgery CLI with real manager and public strategy tick: ${scenario}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zr-'));
     try {
@@ -59,10 +59,23 @@ for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rat
       assert.equal(receipt.clearedQuarantineKey, 'fixture', result.stdout + result.stderr);
       if (scenario === 'carrier' || scenario === 'rejection') {
         assert.equal(state.pause, undefined, 'unsent call-cap withdrawal never pauses the lane');
+        assert.equal(receipt.error?.name, 'CompressionWithdrawn');
+        assert.match(receipt.error?.message ?? '', /ONE_CALL_CAP/, 'a second admission actually reached the cap');
       }
-      if (scenario !== 'merge-empty') assert.ok(existsSync(join(dir,'sent')), result.stdout + result.stderr);
-      assert.equal(existsSync(join(dir,'sent')) ? readFileSync(join(dir,'sent'),'utf8').trim().split('\n').length : 0, scenario === 'merge-empty' ? 0 : 1, 'exactly one provider call');
-      if (scenario === 'merge-empty') {
+      if (scenario !== 'merge-empty' && scenario !== 'mismatch') assert.ok(existsSync(join(dir,'sent')), result.stdout + result.stderr);
+      assert.equal(existsSync(join(dir,'sent')) ? readFileSync(join(dir,'sent'),'utf8').trim().split('\n').length : 0, scenario === 'merge-empty' || scenario === 'mismatch' ? 0 : 1, 'at most one provider call');
+      if (scenario === 'mismatch') {
+        assert.equal(result.status, 1);
+        assert.equal(receipt.status, 'failed');
+        assert.equal(receipt.error.name, 'CompressionWithdrawn');
+        assert.match(receipt.error.message, /differs from trusted/);
+        assert.equal(receipt.call, null);
+        assert.equal(state.pause, undefined);
+        assert.equal(state.progress, null, 'local mismatch records no ladder outcome');
+        assert.equal(state.l1Failures.length, 0);
+        assert.equal(state.l1Runs.length, 0);
+        assert.equal(receipt.after.quarantine.count, 0, 'only the explicitly cleared operator hold changed');
+      } else if (scenario === 'merge-empty') {
         assert.equal(result.status,1);
         assert.equal(receipt.status,'failed');
         assert.equal(state.mergeFailures.length,0);

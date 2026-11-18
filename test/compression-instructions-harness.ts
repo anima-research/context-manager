@@ -34,12 +34,11 @@ export class Probe extends AutobiographicalStrategy {
   pin(value: number) { this.config.witnessedBeforeSequence = value; }
   compress(chunk: Chunk, ctx: StrategyContext) { return this.compressChunkHierarchical(chunk, ctx); }
   seed(s: SummaryEntry) { this.pushSummary(s); }
-  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2) {
+  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2, ticks = 2) {
     if (!fallback) return this.executeMerge(targetLevel, ids, ctx);
     this.compressionQueue = []; // Isolate the seeded merge from unrelated shard work.
     this.enqueueMerge({ level: targetLevel, sourceIds: ids });
-    await this.tick(ctx);
-    await this.tick(ctx);
+    for (let i = 0; i < ticks; i++) await this.tick(ctx);
     return this.summaries.some(s => s.level === targetLevel);
   }
   summariesNow() { return this.summaries; }
@@ -49,19 +48,18 @@ export class KnowledgeProbe extends KnowledgeStrategy {
   pin(value: number) { this.config.witnessedBeforeSequence = value; }
   compress(chunk: Chunk, ctx: StrategyContext) { return this.compressChunkHierarchical(chunk, ctx); }
   seed(s: SummaryEntry) { this.pushSummary(s); }
-  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2) {
+  async merge(ids: string[], ctx: StrategyContext, fallback = false, targetLevel: 2 | 3 | 4 = 2, ticks = 2) {
     if (!fallback) return this.executeMerge(targetLevel, ids, ctx);
     this.compressionQueue = []; // Isolate the seeded merge from unrelated shard work.
     this.enqueueMerge({ level: targetLevel, sourceIds: ids });
-    await this.tick(ctx);
-    await this.tick(ctx);
+    for (let i = 0; i < ticks; i++) await this.tick(ctx);
     return this.summaries.some(s => s.level === targetLevel);
   }
   summariesNow() { return this.summaries; }
 }
 export type Mode = 'chunk' | 'reading' | 'split' | 'readingSplit' | 'merge' | 'readingMerge' | 'fallback' | 'readingFallback' | 'transition';
 export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config?: CompressionInstructions,
-  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 | 4 = 2, firstResponse?: 'tool_use' | 'empty', childLevel: 0 | 1 = 1) {
+  extra: AutobiographicalOptions = {}, Strategy: typeof Probe | typeof KnowledgeProbe = Probe, targetLevel: 2 | 3 | 4 = 2, firstResponse?: 'tool_use' | 'empty' | Array<'refusal' | 'tool_use' | 'empty'>, childLevel: 0 | 1 = 1) {
   const path = mkdtempSync(join(tmpdir(), 'test-instructions-'));
   const calls: NormalizedRequest[] = [];
   let manager: ContextManager | undefined;
@@ -75,9 +73,10 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       calls.push(structuredClone(request));
       // Canonical/source-only requests have four raw records. Recursive pieces
       // have two, then one; only single-record pieces are accepted below.
-      if (firstResponse && calls.length === 1) return {
-        content: firstResponse === 'empty' ? [] : [text('A nonempty tool-use preamble.'),
-          { type: 'tool_use', id: 'mock-call', name: 'mock', input: {} }], stopReason: firstResponse === 'empty' ? 'end_turn' : 'tool_use',
+      const scripted = Array.isArray(firstResponse) ? firstResponse[calls.length - 1] : calls.length === 1 ? firstResponse : undefined;
+      if (scripted) return {
+        content: scripted !== 'tool_use' ? [] : [text('A nonempty tool-use preamble.'),
+          { type: 'tool_use', id: 'mock-call', name: 'mock', input: {} }], stopReason: scripted === 'empty' ? 'end_turn' : scripted,
         usage: { inputTokens: 100, outputTokens: 0 },
       };
       const rawCount = texts(request).filter(s => s.startsWith('raw-')).length;
@@ -118,7 +117,7 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
           sourceLevel: childLevel, sourceIds: childLevel === 0 ? s.sourceIds : [s.id] }));
         for (const s of sources) strategy.seed(s);
       }
-      assert.equal(await strategy.merge(sources.map(s => s.id), ctx, mode.toLowerCase().includes('fallback'), targetLevel), true);
+      assert.equal(await strategy.merge(sources.map(s => s.id), ctx, mode.toLowerCase().includes('fallback'), targetLevel, Array.isArray(firstResponse) ? firstResponse.length + 1 : 2), true);
       const merged = strategy.summariesNow().find(s => s.level === targetLevel)!;
       assert.ok(merged, 'merge was actually installed');
       assert.equal(!!merged.witnessed, pin === 'inherited');
@@ -131,7 +130,7 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       assert.doesNotMatch(JSON.stringify(summary.responseContent) ?? '', /CUSTOM /,
         'custom instructions are not persisted into summary carriers');
     }
-    assert.equal(calls.length, split ? 8 : firstResponse ? 2 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
+    assert.equal(calls.length, split ? 8 : Array.isArray(firstResponse) ? firstResponse.length + 1 : firstResponse ? 2 : mode.toLowerCase().includes('fallback') ? 2 : 1, 'only the expected mock calls');
     return calls;
   } finally {
     try { await manager?.close(); }

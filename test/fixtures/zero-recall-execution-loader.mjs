@@ -3,7 +3,7 @@
 // Ladder integration is covered separately in zero-recall-construction.test.ts.
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
-    if (specifier === 'node:fs' && process.env.SURGERY_CASE === 'receipt-sync-error') return { url: 'stub:fs', shortCircuit: true };
+    if (specifier === 'node:fs' && ['receipt-sync-error', 'initial-sync-error', 'initial-sync-persistent', 'pre-call-sync-error'].includes(process.env.SURGERY_CASE)) return { url: 'stub:fs', shortCircuit: true };
     if (specifier === '../src/context-manager.js') return { url: 'stub:manager', shortCircuit: true };
     if (specifier === '@animalabs/membrane') return { url: 'stub:membrane', shortCircuit: true };
   }
@@ -12,15 +12,23 @@ export async function resolve(specifier, context, nextResolve) {
 export async function load(url, context, nextLoad) {
   if (url === 'stub:fs') return { format: 'module', shortCircuit: true, source: `
     export * from 'node:fs';
-    import { fsyncSync as realSync, readFileSync, existsSync } from 'node:fs';
+    import { fsyncSync as realSync, closeSync as realClose, appendFileSync, readFileSync, existsSync } from 'node:fs';
+    let syncs = 0;
+    export function closeSync(fd) {
+      realClose(fd);
+      appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({receiptClosed:true}) + '\\n');
+    }
     export function fsyncSync(fd) {
+      syncs++;
+      if (process.env.SURGERY_CASE === 'initial-sync-persistent' || (process.env.SURGERY_CASE === 'initial-sync-error' && syncs === 1)) throw new Error('initial receipt sync failed');
+      if (process.env.SURGERY_CASE === 'pre-call-sync-error' && syncs === 3) throw new Error('pre-call receipt sync failed');
       if (existsSync(process.env.SURGERY_TRACE) && readFileSync(process.env.SURGERY_TRACE, 'utf8').includes('"closed":true')) throw new Error('final receipt sync failed');
       return realSync(fd);
     }
   ` };
   if (url === 'stub:membrane') return { format: 'module', shortCircuit: true, source: `
     import { appendFileSync, readFileSync } from 'node:fs';
-    export class AnthropicAdapter { client = { fetch: async () => { throw new Error('offline only'); }, maxRetries: 2, withOptions(options) { return { ...this, ...options }; } }; }
+    export class AnthropicAdapter { constructor() { if (process.env.SURGERY_CASE === 'transport-setup-error') this.client = {}; } client = { fetch: async () => { throw new Error('offline only'); }, maxRetries: 2, withOptions(options) { return { ...this, ...options }; } }; }
     export class NativeFormatter {}
     export class Membrane {
       bound = true;

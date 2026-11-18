@@ -596,6 +596,45 @@ describe('split-stitch L1 fallback', () => {
     }
   });
 
+  for (const ending of ['refusal', 'error', 'window'] as const) {
+    it(`last dispatched split-piece scope survives ${ending}`, async () => {
+      const log = `${freshPath()}-scope.jsonl`;
+      paths.push(log);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+      try {
+        const inner = cumulativeMembrane({ refuseAt: ending === 'refusal' ? 1 : 2,
+          ...(ending === 'error' ? { rejectOn: 'raw-0' } : {}) });
+        let fx: Awaited<ReturnType<typeof build>>;
+        let injected = false;
+        const membrane = { complete: async (request: NormalizedRequest) => {
+          const result = await (inner.membrane as unknown as { complete(r: NormalizedRequest): Promise<unknown> }).complete(request);
+          const targets = texts(request).filter(t => /^raw-\d+ /.test(t));
+          if (ending === 'window' && targets.length < 4 && !injected) {
+            injected = true;
+            // Another operation occupies the shared window after our first piece.
+            (fx.strategy as unknown as { splitCallTimes: number[] }).splitCallTimes = Array(80).fill(Date.now());
+          }
+          return result;
+        } };
+        fx = await build(membrane, { split: true });
+        if (ending === 'window') await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /split-stitch waits for its call window/);
+        else await fx.strategy.run(fx.target, managerContext(fx.manager));
+        const last = inner.calls.at(-1)!;
+        assert.ok(texts(last).filter(t => /^raw-\d+ /.test(t)).length < 4, 'last dispatch was a piece, not the whole chunk');
+        const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+          .find(entry => entry.operation === 'compress_l1' && !entry.event);
+        assert.equal(receipt.metadata.request_scope, 'last-split-piece');
+        assert.equal(fx.strategy.entries().length, 0);
+        if (ending === 'window') assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'waiting is not exhaustion');
+        fx.manager.close();
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+  }
+
   it('model identity is recorded only when every successful leaf reported the same one', async () => {
     const some = await build(cumulativeMembrane({ refuseAt: 2, leafDetails: 'first-only' }).membrane, { split: true });
     await some.strategy.run(some.target, managerContext(some.manager));

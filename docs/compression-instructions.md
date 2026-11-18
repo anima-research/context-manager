@@ -34,6 +34,24 @@ paid calls (until the per-chunk quarantine cap is reached). Ordinary L1
 and counts recalls by construction identity, including pair/envelope overhead.
 Default instruction wording is unchanged; full request bytes and provenance hashes are not.
 
+Family/rung/outcome identity is computed from the prepared plan, before subclass
+L1 authoring and carrier stripping. A subclass that changes authoring must version
+its `compressionOutcomeNamespace()` result; retaining a stable namespace can reuse
+a refusal for different would-be sent bytes. Mint provenance, in contrast, binds
+the accepted authored request. This does not provide automatic authored-family
+identity.
+
+L1 recall totals in logs are estimates, not provider token measurements.
+`prior_summary_token_estimate` is `stored-summary-estimate` normally (stored output
+counts can include reasoning), `text-content-estimate` after carrier stripping
+(text plus pair/envelope overhead), or `unavailable`. Failed recall projection reads
+leave both totals `null` and issue one bounded warning without blocking dispatch.
+Empty recall IDs skip the telemetry projection; nonempty retries reuse a lookup
+for that compression operation. The remaining full-history lookup is not bounded
+or benchmarked here. A branded host withdrawal is not evidence of dispatch, so it
+leaves the preceding sent snapshot intact (or emits no request receipt if none
+was sent). Cancellation of an already-out call retains that call's snapshot.
+
 ## Slots and placeholders
 
 | Slot | Where it is used | Available placeholders |
@@ -88,9 +106,11 @@ unsupported placeholders, non-enumerable or Symbol keys, and absent required
 participant/context are errors.
 A chunk containing 60% of a sharded body uses `chunk`/`witnessedChunk`, not `readingChunk`.
 An empty `templates: {}` is an error; omit it instead. Validator errors are `TypeError`s
-with allowlisted paths and reason categories after the existing value-free
-`Invalid compressionInstructions configuration` prefix; values and unknown keys
-are never echoed. The separate witnessed-instruction conflict instead throws a
+with allowlisted paths and reason categories after the existing
+`Invalid compressionInstructions configuration` prefix. Unknown keys, preset names
+and placeholder names are bounded, JSON-escaped and accompanied by supported
+alternatives; template bodies and participant values are never echoed. Malformed
+braces have a separate diagnostic. The separate witnessed-instruction conflict instead throws a
 `TypeError` beginning `Conflicting witnessedInstruction`. Template settings are copied at construction;
 mutating the caller's object afterward does not update a strategy. They are
 not hot-tunable. Inherited outer strategy options are ignored. Settings and

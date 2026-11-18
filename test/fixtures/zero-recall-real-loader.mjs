@@ -1,6 +1,7 @@
 // The CLI, manager, store, quarantine binding/clearing and L1 ladder are real.
 // Provider I/O is stubbed; merge scenarios also force scheduling/queue state,
-// and carrier injects a synthetic authored thinking block to reach fallback.
+// carrier injects authored thinking, and rejection reuses authored bytes on its
+// otherwise empty-recall retry, specifically to reach second proxy admission.
 let membraneUrl;
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
@@ -42,6 +43,24 @@ export async function load(url, context, nextLoad) {
               strategy.mergeTakesTurnBefore = () => true;
             }
           }
+          if (scenario === 'rejection') {
+            // A real source-only surgery retry refuses empty recalls during
+            // authoring, before proxy admission. Reuse the last trusted authored
+            // bytes here specifically to test the proxy cap after a rejection.
+            const author = strategy.authorL1CompressionRequest.bind(strategy);
+            let prior;
+            strategy.authorL1CompressionRequest = (request, ids) => {
+              if (ids.length === 0 && prior) return prior;
+              return prior = author(request, ids);
+            };
+          }
+          if (scenario === 'mismatch') {
+            const author = strategy.authorL1CompressionRequest.bind(strategy);
+            strategy.authorL1CompressionRequest = (request, ids) => {
+              const result = author(request, ids);
+              return { ...result, config: { ...result.config, model: 'tampered' } };
+            };
+          }
           if (scenario === 'carrier') {
             // Exercise the transport's carrier-rejection path with a carrier
             // outside the deleted recalls (ordinary raw thinking is stripped).
@@ -61,6 +80,8 @@ export async function load(url, context, nextLoad) {
             progress: manager.getStore().getStateJson(strategy.compressionFamilyProgressStateId),
             pause: strategy.compressionPause?.latest,
             mergeQueue: strategy.mergeQueue,
+            l1Failures: [...strategy.compressionFailureOrder],
+            l1Runs: [...strategy.compressionFailureRuns],
             mergeFailures: [...strategy.mergeFailureOrder],
             mergeRuns: [...strategy.mergeFailureRuns],
           }));

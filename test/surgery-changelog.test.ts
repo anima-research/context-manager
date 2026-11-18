@@ -16,8 +16,7 @@ function breakingText(root = '.'): string {
   }).join('\n');
 }
 function assertMigration(text: string) {
-  assert.match(text, /provenanceMode.*authored-request/);
-  assert.match(text, /external-receipt-only/);
+  assert.match(text, /`provenanceMode` is (?:now )?`authored-request`, not\s+`external-receipt-only`/);
 }
 test('receipt provenanceMode migration remains in Breaking after release', () => {
   assertMigration(breakingText());
@@ -33,6 +32,12 @@ test('changelog check handles consumed fragments and rejects a non-breaking migr
     rmSync(fragment);
     writeFileSync(join(root, 'CHANGELOG.md'), `# Changelog\n## 1.0.0\n### Breaking (subclass authors)\n${migration}\n### Fixed\n- Other fix.`);
     assertMigration(breakingText(root));
+    const reversed = '- `provenanceMode` is `external-receipt-only`, not `authored-request`.';
+    writeFileSync(fragment, reversed);
+    assert.throws(() => assertMigration(breakingText(root)), 'reversed fragment fails');
+    rmSync(fragment);
+    writeFileSync(join(root, 'CHANGELOG.md'), `# Changelog\n## 1.0.0\n### Breaking\n${reversed}`);
+    assert.throws(() => assertMigration(breakingText(root)), 'reversed folded Breaking fails');
     writeFileSync(join(root, 'CHANGELOG.md'), `# Changelog\n## 1.0.0\n### Breaking\n- Other migration.\n### Fixed\n${migration}`);
     assert.throws(() => assertMigration(breakingText(root)));
   } finally { rmSync(root, {recursive:true, force:true}); }

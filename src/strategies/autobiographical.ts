@@ -12029,30 +12029,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  degraded path), whose count is the copy's, not the planned request's. */
     const countedStripped = new WeakSet<object>();
     const strippedErrors = new WeakSet<object>();
+    type RequestScope = 'last-dispatched-attempt' | 'last-split-piece';
     let loggedRequest: NormalizedRequest | undefined;
-    let loggedRecallCount = 0;
-    let loggedRecallTokens = 0;
-    const logDispatch = async (request: NormalizedRequest): Promise<unknown> => {
-      // Capture small scalar totals before yielding; the projection may change
-      // while the provider is in flight. Admission deferrals never replace the
-      // previous actual dispatch.
-      let count = 0;
-      let tokens = 0;
+    let loggedScope: RequestScope = 'last-dispatched-attempt';
+    let loggedRecallCount: number | null = 0;
+    let loggedRecallTokens: number | null = 0;
+    let loggedRecallPricing = 'stored-summary-estimate';
+    let telemetrySummaries: Map<string, SummaryEntry> | undefined;
+    let telemetryUnavailable = false;
+    let lastAttemptRequest: NormalizedRequest | undefined;
+    const logDispatch = async (request: NormalizedRequest, scope: RequestScope, stripped: boolean): Promise<unknown> => {
+      // Capture totals before yielding. Never scan the persisted projection for
+      // an empty recall set; reuse the operation's lookup across retry rungs.
+      lastAttemptRequest = request;
+      let count: number | null = 0;
+      let tokens: number | null = 0;
+      const pricing = stripped ? 'text-content-estimate' : 'stored-summary-estimate';
       if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
-        try {
-          const ids = new Set(request.messages.flatMap(sentRecallHeaderIds));
-          const recalls = [...this.persistedCanonicalSummariesById().values()].filter(s => ids.has(s.id));
-          count = recalls.length;
-          tokens = this.capRecallPairs(recalls, Infinity).keptTokens;
-        } catch { /* Best-effort telemetry must not prevent dispatch. */ }
+        const ids = new Set(request.messages.flatMap(sentRecallHeaderIds));
+        if (ids.size) {
+          try {
+            if (telemetryUnavailable) throw new Error('Recall totals unavailable');
+            telemetrySummaries ??= this.persistedCanonicalSummariesById();
+            const recalls = [...ids].map(id => telemetrySummaries!.get(id));
+            if (recalls.some(summary => !summary)) throw new Error('Recall totals unavailable');
+            count = recalls.length;
+            tokens = this.capRecallPairs((recalls as SummaryEntry[]).map(summary => stripped
+              ? { ...summary, tokens: this.estimateTokens([{ type: 'text', text: summary.content }]) }
+              : summary), Infinity).keptTokens;
+          } catch {
+            // Keep dispatch best effort without representing a failed read as
+            // a genuine zero. Warn only once, without leaking store/error data.
+            count = null;
+            tokens = null;
+            if (!telemetryUnavailable) {
+              try { this.diag.warn('autobio: compression recall telemetry unavailable; dispatch continues'); } catch { /* Best effort. */ }
+            }
+            telemetryUnavailable = true;
+          }
+        }
       }
-      const commit = () => { loggedRequest = request; loggedRecallCount = count; loggedRecallTokens = tokens; };
+      const commit = () => {
+        loggedRequest = request;
+        loggedScope = scope;
+        loggedRecallCount = count;
+        loggedRecallTokens = tokens;
+        loggedRecallPricing = tokens === null ? 'unavailable' : pricing;
+      };
       try {
         const response = await this.callProvider(ctx.membrane!, request);
         commit();
         return response;
       } catch (error) {
-        if (!isAdmissionDeferral(error)) commit();
+        // A branded host withdrawal can be pre-send. Unlike a cancellation of
+        // an already-out request, it supplies no evidence of dispatch.
+        if (!isAdmissionDeferral(error) && !isCompressionWithdrawn(error)) commit();
         throw error;
       }
     };
@@ -12070,7 +12101,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         leafCoverageHash: string,
         expandedParentId?: string,
         expandedChildIds?: string[],
+        requestScope: RequestScope = 'last-dispatched-attempt',
       ): Promise<unknown> => {
+        lastAttemptRequest = undefined;
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         // Each attempt, a ladder's next rung included, checks before it calls
         // the provider: a strategy let go of between two attempts starts no
@@ -12118,7 +12151,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          response = await logDispatch(attemptRequest);
+          response = await logDispatch(attemptRequest, requestScope, false);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
@@ -12165,7 +12198,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = this.authorL1CompressionRequest(stripReasoningFromRequest(preparedRequest), recallIds);
           try {
-            response = await logDispatch(acceptedRequest);
+            response = await logDispatch(acceptedRequest, requestScope, true);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
@@ -12185,22 +12218,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
         }
         const stopReason = this.compressionResponseStopReason(response);
-        const sentRecallSet = new Set(acceptedRequest.messages.flatMap(sentRecallHeaderIds));
-        const sentRecallIds = recallIds.filter(id => sentRecallSet.has(id));
-        const sentLeafIds = sentRecallIds.length === recallIds.length ? [] : sentRecallIds.flatMap(id => {
-          const summary = summariesById.get(id);
-          return summary ? this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [] : [];
-        }).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
         const trace: CompressionAttemptTrace = {
           curveLabel,
-          recallIds: sentRecallIds,
-          recallLevels: recallLevels.filter((_level, i) => sentRecallSet.has(recallIds[i]!)),
+          ...sentAttemptIdentity(acceptedRequest, recallIds, recallLevels, leafCoverageHash),
           ...(expandedParentId ? { expandedParentId } : {}),
           ...(expandedChildIds ? { expandedChildIds } : {}),
-          leafCoverageHash: sentRecallIds.length === recallIds.length ? leafCoverageHash : sha256Json(sentLeafIds),
-          requestHash: sha256Json(acceptedRequest),
-          messageCount: acceptedRequest.messages.length,
-          estimatedTokens: this.estimateCompressionRequestTokens(acceptedRequest),
           renderedTokens: this.compressionResponseInputTokens(response),
           stopReason,
           refusalCategory: response && typeof response === 'object'
@@ -12212,6 +12234,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         attemptTraces.push(trace);
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
+      };
+
+      const sentAttemptIdentity = (
+        sent: NormalizedRequest, recallIds: string[], recallLevels: number[], leafCoverageHash: string,
+      ) => {
+        const sentRecallSet = new Set(sent.messages.flatMap(sentRecallHeaderIds));
+        const sentRecallIds = recallIds.filter(id => sentRecallSet.has(id));
+        const sentLeafIds = sentRecallIds.length === recallIds.length ? [] : sentRecallIds.flatMap(id => {
+          const summary = summariesById.get(id);
+          return summary ? this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [] : [];
+        }).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
+        return {
+          recallIds: sentRecallIds,
+          recallLevels: recallLevels.filter((_level, i) => sentRecallSet.has(recallIds[i]!)),
+          leafCoverageHash: sentRecallIds.length === recallIds.length ? leafCoverageHash : sha256Json(sentLeafIds),
+          requestHash: sha256Json(sent), messageCount: sent.messages.length,
+          estimatedTokens: this.estimateCompressionRequestTokens(sent),
+        };
       };
 
       // The provider's count of a request the ladder rewrites, its base, only
@@ -12798,14 +12838,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (!result.reused) {
               const trace: CompressionAttemptTrace = {
                 curveLabel,
-                recallIds: variantFrontier.map((summary) => summary.id),
-                recallLevels: variantFrontier.map((summary) => summary.level),
+                ...sentAttemptIdentity(lastAttemptRequest ?? variant.request,
+                  variantFrontier.map(summary => summary.id), variantFrontier.map(summary => summary.level),
+                  variant.leafCoverageHash),
                 expandedParentId: variant.parent.id,
                 expandedChildIds: variant.children.map((child) => child.id),
-                leafCoverageHash: variant.leafCoverageHash,
-                requestHash: variant.requestHash,
-                messageCount: variant.request.messages.length,
-                estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
                 latencyMs: 0,
                 persisted: false,
                 outcome: 'provider_error',
@@ -13035,7 +13072,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.splitCallTimes.push(slot);
             let res: unknown;
             try {
-              res = await runAttempt(sub, label, [], [], leafHash);
+              res = await runAttempt(sub, label, [], [], leafHash, undefined, undefined, 'last-split-piece');
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
@@ -13601,10 +13638,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               chunk_message_ids: chunk.messages.map((m) => m.id),
               chunk_size: chunk.messages.length,
               prior_summary_count: priorSummaries.length,
-              request_scope: stitchedFoldRequestHashes ? 'last-split-piece' : 'last-dispatched-attempt',
+              request_scope: loggedScope,
               response_scope: 'whole-chunk',
               prior_summary_count_kept: loggedRecallCount,
               prior_summary_tokens: loggedRecallTokens,
+              prior_summary_token_estimate: loggedRecallPricing,
               has_doc_context: docContext !== null,
               doc_context: docContext,
               target_tokens: targetTokens,
