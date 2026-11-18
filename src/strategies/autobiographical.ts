@@ -1,4 +1,4 @@
-import { recallHeaderId } from '../recall-header.js';
+import { recallHeaderId, sentRecallHeaderIds } from '../recall-header.js';
 import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
@@ -2618,6 +2618,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // AutobiographicalConfig that the caller did not itself override, which is
     // what makes this narrowing as sound as the spread it replaces.
     this.config = resolved.effective as unknown as AutobiographicalConfig;
+    // Absent settings must not be supplied by Object.prototype. Keep these
+    // shadows non-enumerable so effective-config keys/provenance stay unchanged.
+    for (const key of ['compressionInstructions', 'witnessedInstruction'] as const) {
+      if (!Object.hasOwn(this.config, key)) Object.defineProperty(this.config, key, {
+        value: undefined, enumerable: false, writable: true, configurable: true,
+      });
+    }
     // Snapshot JSON settings so caller mutation cannot invalidate a checked template.
     if (this.config.compressionInstructions !== undefined) {
       validateCompressionInstructions(this.config.compressionInstructions);
@@ -5422,6 +5429,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getCompressionQuarantineStatus(now: number = Date.now()): CompressionQuarantineStatus {
     return this.readCompressionQuarantineStatus(now).status;
+  }
+
+  /** Fail closed: an operator key must identify exactly the selected raw chunk. */
+  assertCompressionQuarantineChunk(key: string, chunkIndex: number): void {
+    const active = this.readCompressionQuarantineProjection().get(key);
+    if (!active) throw new Error('Expected quarantine key absent');
+    const chunk = this.chunks.find(chunk => chunk.index === chunkIndex);
+    if (!chunk || active.record.chunkSourceHash !== sha256Json(chunk.messages.map(message => message.id))) {
+      throw new Error('Quarantine key does not belong to selected chunk');
+    }
   }
 
   /**
@@ -12128,9 +12145,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
         }
         const stopReason = this.compressionResponseStopReason(response);
-        const sentRecallSet = new Set(acceptedRequest.messages.map(recallHeaderId).filter(id => id !== undefined));
+        const sentRecallSet = new Set(acceptedRequest.messages.flatMap(sentRecallHeaderIds));
         const sentRecallIds = recallIds.filter(id => sentRecallSet.has(id));
-        const sentLeafIds = sentRecallIds.flatMap(id => {
+        const sentLeafIds = sentRecallIds.length === recallIds.length ? [] : sentRecallIds.flatMap(id => {
           const summary = summariesById.get(id);
           return summary ? this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [] : [];
         }).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
@@ -13532,31 +13549,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           },
         }, this.ns);
       }
-      logCompressionCall({
-        operation: 'compress_l1',
-        // Summarize the last request actually dispatched, including opt-in
-        // authoring and carrier fallback, not the prepared recall-bearing plan.
-        system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
-        messages: summarizeTelemetryMessages(loggedRequest.messages),
-        metadata: {
-          chunk_message_ids: chunk.messages.map((m) => m.id),
-          chunk_size: chunk.messages.length,
-          prior_summary_count: priorSummaries.length,
-          prior_summary_count_kept: keptSummaries.filter(summary => loggedRequest.messages.some(m => recallHeaderId(m) === summary.id)).length,
-          prior_summary_tokens: loggedRequest === request ? recallTokens : keptSummaries
-            .filter(summary => loggedRequest.messages.some(m => recallHeaderId(m) === summary.id))
-            .reduce((total, summary) => total + summary.tokens, 0),
-          has_doc_context: docContext !== null,
-          doc_context: docContext,
-          target_tokens: targetTokens,
-          model,
-          latency_ms: Date.now() - callStart,
-          summary_id: logSummaryId,
-          ...(logWithdrawn ? { withdrawn: true } : {}),
-        },
-        response: summarizeTelemetryText(logResponse),
-        error: logError,
-      }, this.ns);
+      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
+        const loggedRecallIds = new Set(loggedRequest.messages.flatMap(sentRecallHeaderIds));
+        const loggedRecalls = [...this.persistedCanonicalSummariesById().values()]
+          .filter(summary => loggedRecallIds.has(summary.id));
+        const loggedRecallTokens = this.capRecallPairs(loggedRecalls, Infinity).keptTokens;
+        logCompressionCall({
+          operation: 'compress_l1',
+          // Summarize the last request actually dispatched, including opt-in
+          // authoring and carrier fallback, not the prepared recall-bearing plan.
+          system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
+          messages: summarizeTelemetryMessages(loggedRequest.messages),
+          metadata: {
+            chunk_message_ids: chunk.messages.map((m) => m.id),
+            chunk_size: chunk.messages.length,
+            prior_summary_count: priorSummaries.length,
+            prior_summary_count_kept: loggedRecalls.length,
+            prior_summary_tokens: loggedRecallTokens,
+            has_doc_context: docContext !== null,
+            doc_context: docContext,
+            target_tokens: targetTokens,
+            model,
+            latency_ms: Date.now() - callStart,
+            summary_id: logSummaryId,
+            ...(logWithdrawn ? { withdrawn: true } : {}),
+          },
+          response: summarizeTelemetryText(logResponse),
+          error: logError,
+        }, this.ns);
+      }
     }
   }
 

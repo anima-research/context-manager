@@ -137,12 +137,17 @@ export function transformZeroRecallCompression(
 
 
   // Never leave a raw result whose matching use was deleted with a memory.
-  const keptUses = new Set(kept.flatMap(m => m.content.flatMap(b => b.type === 'tool_use' ? [b.id] : [])));
-  const removedUses = new Set(messages.filter(m => !kept.includes(m))
-    .flatMap(m => m.content.flatMap(b => b.type === 'tool_use' ? [b.id] : [])));
-  if (kept.some(m => m.content.some(b => b.type === 'tool_result'
-    && removedUses.has(b.toolUseId) && !keptUses.has(b.toolUseId)))) {
-    throw new Error('Tool pair crosses recall deletion boundary; refusing zero-recall surgery');
+  // Match each result to its most recent preceding use, not an unrelated
+  // earlier use with the same id. Reused ids must not mask deleted calls.
+  const retainedUses = new Map<string, boolean>();
+  for (const message of messages) {
+    const retained = kept.includes(message);
+    for (const block of message.content) {
+      if (block.type === 'tool_use') retainedUses.set(block.id, retained);
+      if (retained && block.type === 'tool_result' && retainedUses.get(block.toolUseId) === false) {
+        throw new Error('Tool pair crosses recall deletion boundary; refusing zero-recall surgery');
+      }
+    }
   }
 
   const originalJson = JSON.stringify(messages);

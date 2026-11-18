@@ -296,6 +296,10 @@ for (const surgeryFirst of [true, false]) {
         }));
         this.store!.setStateJson(id, crowded);
         internal.checkpointCompressionQuarantineIfNeeded(internal.captureCompressionBranch());
+        const retained = (this.store!.getStateJson(id) as Array<{ kind: string; active?: Array<{ record: { normalizedConfig: { outcomeNamespace?: string } } }> }>).find(e => e.kind === 'checkpoint')!.active!;
+        for (const namespace of [undefined, 'zero-recall-surgery-v1']) {
+          assert.equal(retained.filter(item => item.record.normalizedConfig.outcomeNamespace === namespace).length, 1024);
+        }
         assert.equal(this.getCompressionQuarantineStatus().count, 2048,
           'checkpoint retains up to 1024 records independently in each namespace');
       }
@@ -351,3 +355,67 @@ for (const surgeryFirst of [true, false]) {
     } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test('ordinary telemetry retains collapsed headers and recall budget overhead on prose retry', async () => {
+  class OrdinaryProbe extends Probe {
+    protected override authorL1CompressionRequest(request: NormalizedRequest) {
+      // Reproduce the multi-block CM turn produced by adjacent-turn collapse.
+      return { ...request, messages: request.messages.map(message =>
+        message.participant === 'Context Manager' && message.content.some(block =>
+          block.type === 'text' && block.text === '[CM] Recall memory L1-100.')
+          ? { ...message, content: [text('adjacent raw CM turn'), ...message.content] } : message) };
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'zt-'));
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = join(dir, 'log');
+  const strategy = new OrdinaryProbe({ compressionModel: 'mock', headWindowTokens: 0,
+    recentWindowTokens: 0, minChunkCharsForLLM: 0, mergeThreshold: 99, autoTickOnNewMessage: false,
+    quarantineAlarmIntervalMs: 0, compressionRefusalCurveFallbacks: 0 });
+  let calls = 0;
+  const manager = await ContextManager.open({ path: dir, strategy, membrane: { complete: async () => {
+    calls++;
+    return { content: calls === 1 ? [] : [text('summary')], stopReason: 'end_turn' };
+  } } as never });
+  try {
+    const first = manager.addMessage('user', [text('covered')]);
+    manager.addMessage('Claude', [text('raw middle')]);
+    const source = manager.addMessage('user', [text('source turn '.repeat(50))]);
+    strategy.seed({ id: 'L1-100', level: 1, content: 'stored summary', tokens: 20,
+      sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 0 });
+    const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
+    await strategy.compress({ index: 1, startIndex: 2, endIndex: 3,
+      messages: ctx.messageStore.getAll().filter(m => m.id === source), tokens: 100, compressed: false }, ctx);
+    assert.equal(calls, 2, 'empty response exercises the prose retry');
+    const entries = readFileSync(join(dir, 'log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const traces = entries.filter(entry => entry.event === 'compression:attempt');
+    assert.equal(traces.length, 2);
+    for (const { metadata } of traces) {
+      assert.deepEqual(metadata.recallIds, ['L1-100']);
+      assert.deepEqual(metadata.recallLevels, [1]);
+      assert.equal(metadata.leafCoverageHash, createHash('sha256').update(JSON.stringify([first])).digest('hex'));
+    }
+    const log = entries.find(entry => entry.operation === 'compress_l1' && entry.messages);
+    assert.equal(log.metadata.prior_summary_count_kept, 1);
+    assert.ok(log.metadata.prior_summary_tokens >= 70, 'includes pair and envelope overhead, not just 20 body tokens');
+  } finally {
+    manager.close(); rmSync(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+  }
+});
+
+test('an earlier reused call id cannot hide a deleted raw-result predecessor', () => {
+  const use: ContentBlock = { type: 'tool_use', id: 'X', name: 'mock', input: {} };
+  const result: ContentBlock = { type: 'tool_result', toolUseId: 'X', content: [text('result')] };
+  const request = { config: {}, messages: [
+    { participant: 'Claude', content: [use] },
+    { participant: 'user', content: [result] },
+    { participant: 'Context Manager', content: [text('[CM] Recall memory L1-1.')] },
+    { participant: 'Claude', content: [text('summary'), use] },
+    { participant: 'user', content: [result] },
+    { participant: 'Context Manager', content: [text('OPEN')] },
+  ] } as NormalizedRequest;
+  const construction = captureZeroRecallConstruction(request, ['L1-1']);
+  assert.throws(() => transformConstructedZeroRecallCompression(request, 'OPEN', construction), /Tool pair crosses/);
+});

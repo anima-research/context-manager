@@ -31,3 +31,14 @@
 - **Surgery receipt consumers:** `provenanceMode` is now `authored-request`, not
   `external-receipt-only`; update parsers to accept the new value. The restored
   message-digest compatibility aliases remain unchanged.
+
+- One-shot execution now validates the quarantine key's chunk-source identity on
+  both parent and fork. It reserves and syncs an external preflight receipt
+  before opening the store, and syncs the attempted-call metadata before dispatch.
+  Early failures retain recovery guidance; dangling receipt symlinks refuse before
+  mutation. Provider error messages are omitted to avoid echoing source content.
+- **Ordinary compression telemetry also changes:** L1 attempt traces and logs
+  report sent recalls, including headers in collapsed CM turns and child summaries
+  on recall-curve retries. Recall token totals include pair/envelope overhead on
+  prose and no-tools retries, rather than only bare summary-body tokens.
+- Inherited instruction settings cannot supply templates or create witnessed conflicts.

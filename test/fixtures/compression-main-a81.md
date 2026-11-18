@@ -55,6 +55,8 @@ git -c core.autocrlf=false -c core.eol=lf worktree add --detach "$SOURCE_ROOT" "
 ln -s "$PWD/node_modules" "$SOURCE_ROOT/node_modules"
 ```
 
+Tracked symlinks require real symlink support (on Windows, enable Developer Mode or the required privilege) and a fresh checkout with `core.symlinks=true`. A `core.symlinks=false` regular-file checkout cannot reproduce symlink provenance.
+
 Reuse the same locked compiler/dependencies, installed with scripts disabled.
 **Modern source already containing the option and harness needs no port.**
 Copy the synthetic harness whenever the selected source lacks it (including

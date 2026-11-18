@@ -9,3 +9,11 @@ export function recallHeaderId(message: { participant: string; content: ContentB
   return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
 }
 
+
+/** Telemetry only: collapse retains recall headers as individual text blocks.
+ * Do not use this looser recognition to authorize surgery deletion. */
+export function sentRecallHeaderIds(message: { participant: string; content: ContentBlock[] }): string[] {
+  if (message.participant !== 'Context Manager') return [];
+  return message.content.flatMap(block => block.type === 'text'
+    ? [...block.text.matchAll(/^\[CM\] Recall memory (.+)\.$/gm)].map(match => match[1]!) : []);
+}

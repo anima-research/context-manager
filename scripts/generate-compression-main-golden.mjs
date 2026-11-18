@@ -48,7 +48,7 @@ const statusPaths = [...git('diff', '--name-only', '-z', 'HEAD').split('\0'),
   ...git('diff', '--cached', '--name-only', '-z', 'HEAD').split('\0')].filter(Boolean);
 const changedPaths = [...new Set([...sourceFilesChanged(), ...untrackedSource(), ...statusPaths])];
 if (git('status', '--porcelain', '--untracked-files=no') || changedPaths.length) {
-  throw new Error(`Refusing dirty source worktree ${JSON.stringify(root)}; restore/remove unintended files, clear index flags, or commit intentional changes. Raw-byte provenance requires a byte-matching checkout: disable line-ending conversion/filters and check out again if Git reports clean. Paths: ${JSON.stringify(changedPaths)}`);
+  throw new Error(`Refusing dirty source worktree ${JSON.stringify(root)}; restore/remove unintended files, clear index flags, or commit intentional changes. Raw-byte provenance requires a byte-matching checkout: disable line-ending conversion/filters and check out again if Git reports clean. Tracked symlinks require real symlink support and core.symlinks=true; a core.symlinks=false regular-file checkout is not byte-equivalent. Paths: ${JSON.stringify(changedPaths)}`);
 }
 const producerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');

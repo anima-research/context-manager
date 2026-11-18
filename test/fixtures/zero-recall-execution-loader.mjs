@@ -10,7 +10,7 @@ export async function resolve(specifier, context, nextResolve) {
 }
 export async function load(url, context, nextLoad) {
   if (url === 'stub:membrane') return { format: 'module', shortCircuit: true, source: `
-    import { appendFileSync } from 'node:fs';
+    import { appendFileSync, readFileSync } from 'node:fs';
     export class AnthropicAdapter {}
     export class NativeFormatter {}
     export class Membrane {
@@ -18,6 +18,8 @@ export async function load(url, context, nextLoad) {
       async complete(request, options) {
         if (!this.bound) throw new Error('lost provider receiver');
         if (!options?.formatter?.offline || !(options.signal instanceof AbortSignal)) throw new Error('lost complete options');
+        const receipt = JSON.parse(readFileSync(process.env.SURGERY_RECEIPT, 'utf8'));
+        if (receipt.status !== 'calling' || receipt.call.status !== 'started') throw new Error('missing pre-call receipt');
         appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({ sent: request }) + '\\n');
         if (process.env.SURGERY_CASE === 'provider-error') throw new Error('stub provider failure');
         return { content: [{ type: 'text', text: 'summary' }], stopReason: 'end_turn' };
@@ -25,17 +27,24 @@ export async function load(url, context, nextLoad) {
     }
   ` };
   if (url === 'stub:manager') return { format: 'module', shortCircuit: true, source: `
-    import { appendFileSync } from 'node:fs';
+    import { appendFileSync, readFileSync } from 'node:fs';
+    import { createHash } from 'node:crypto';
     const text = text => ({ type: 'text', text });
     const message = (participant, value) => ({ participant, content: [text(value)] });
     const trace = value => appendFileSync(process.env.SURGERY_TRACE, JSON.stringify(value) + '\\n');
     export class ContextManager {
       static async open({ strategy, membrane }) {
+        trace({ opened: true });
         strategy.chunks = [{ index: 0, messages: [{ id: 'first' }, { id: 'last' }] }];
         strategy.summaries = [];
         strategy.compressionQueue = [];
         strategy.getCompressionQuarantineStatus = () => ({ keys: ['quarantined'] });
-        strategy.clearCompressionRefusalQuarantine = async key => trace({ cleared: key });
+        strategy.readCompressionQuarantineProjection = () => {
+          if (process.env.SURGERY_CASE === 'unreadable') throw new Error('quarantine ledger unreadable');
+          return new Map([['quarantined', { record: { chunkSourceHash: createHash('sha256').update(JSON.stringify(
+            process.env.SURGERY_CASE === 'wrong-chunk' ? ['other'] : ['first', 'last'])).digest('hex') } }]]);
+        };
+        strategy.clearCompressionRefusalQuarantine = async key => { if (process.env.SURGERY_CASE === 'clear-error') throw new Error('clear failed'); trace({ cleared: key }); };
         let branch = { name: 'main' };
         return {
           getStrategy: () => strategy,
@@ -44,7 +53,7 @@ export async function load(url, context, nextLoad) {
             ? [message('Context Manager', '[CM] Recall memory raw.')]
             : process.env.SURGERY_CASE === 'opening-collision' ? [message('Context Manager', strategy.opening())] : [] }),
           currentBranch: () => branch,
-          fork: async name => { trace({ fork: name }); return branch = { name }; },
+          fork: async name => { trace({ fork: name }); branch = { name }; return name; },
           tick: async () => {
             let request = { messages: [message('Context Manager', '[CM] Recall memory memory.'),
               message('Claude', 'stored answer'), message('Context Manager', strategy.opening()),

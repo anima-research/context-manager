@@ -318,8 +318,8 @@ it('rejects own symbols and non-enumerable settings rather than dropping them at
   for (const [key, enumerable] of [['chunk', false], [Symbol('private'), false], [Symbol('private'), true]] as const) {
     const templates = Object.defineProperty({ opening: 'valid' }, key, { value: 'hidden', enumerable });
     for (const value of [{ templates }, Object.defineProperty({}, key, { value: 'hidden', enumerable })]) {
-      assert.throws(() => validateCompressionInstructions(value), /expected enumerable string keys/);
-      assert.throws(() => new Probe({ compressionInstructions: value }), /expected enumerable string keys/);
+      assert.throws(() => validateCompressionInstructions(value), (error: unknown) => error instanceof TypeError && /expected enumerable string keys/.test(error.message) && !/hidden|private/.test(error.message));
+      assert.throws(() => new Probe({ compressionInstructions: value }), (error: unknown) => error instanceof TypeError && /expected enumerable string keys/.test(error.message) && !/hidden|private/.test(error.message));
     }
   }
 });
@@ -539,7 +539,7 @@ it('clone failures identify cloneability and hidden-only template keys identify 
   validateCompressionInstructions(proxy); // Structural validation does not promise cloneability.
   assert.throws(() => new Probe({ compressionInstructions: proxy }), /settings must be cloneable/);
   for (const key of ['chunk', Symbol('hidden')]) {
-    assert.throws(() => validateCompressionInstructions({ templates: Object.defineProperty({}, key, { value: 'hidden' }) }), /expected enumerable string keys/);
+    assert.throws(() => validateCompressionInstructions({ templates: Object.defineProperty({}, key, { value: 'hidden' }) }), (error: unknown) => error instanceof TypeError && /expected enumerable string keys/.test(error.message) && !/hidden|private/.test(error.message));
   }
 });
 
@@ -654,5 +654,23 @@ it('unrelated symbol descriptors are not inspected and primitive JS options reta
   for (const value of [false, 1]) {
     assert.doesNotThrow(() => new Probe(value as never));
     assert.doesNotThrow(() => new KnowledgeProbe(value as never));
+  }
+});
+
+it('inherited instruction options cannot supply templates or create conflicts', () => {
+  const keys = ['compressionInstructions', 'witnessedInstruction'] as const;
+  const descriptors = keys.map(key => Object.getOwnPropertyDescriptor(Object.prototype, key));
+  try {
+    Object.defineProperty(Object.prototype, 'compressionInstructions', { configurable: true,
+      value: { templates: { opening: 'polluted' } } });
+    Object.defineProperty(Object.prototype, 'witnessedInstruction', { configurable: true, value: 'polluted' });
+    new Probe({ compressionInstructions: { templates: { witnessedChunk: 'explicit' } } });
+    class OpeningProbe extends Probe { opening() { return this.getCompressionOpening(); } }
+    assert.notEqual(new OpeningProbe().opening(), 'polluted');
+  } finally {
+    keys.forEach((key, index) => {
+      if (descriptors[index]) Object.defineProperty(Object.prototype, key, descriptors[index]!);
+      else Reflect.deleteProperty(Object.prototype, key);
+    });
   }
 });

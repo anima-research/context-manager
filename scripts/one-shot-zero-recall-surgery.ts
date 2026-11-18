@@ -10,7 +10,7 @@
  * do not just update the expected hash or reuse the treatment branch.
  */
 import { createHash } from 'node:crypto';
-import { createReadStream, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
+import { createReadStream, readFileSync, realpathSync, openSync, closeSync, fsyncSync, ftruncateSync, writeSync } from 'node:fs';
 import { resolve, dirname, basename, relative, isAbsolute, sep } from 'node:path';
 import { ContextManager } from '../src/context-manager.js';
 import { ZeroRecallSurgeryStrategy as SurgeryStrategy } from '../src/surgery/zero-recall-strategy.js';
@@ -57,18 +57,41 @@ const fromStore = relative(realpathSync(config.storePath), receiptDestination);
 if (!fromStore || (!fromStore.startsWith('..' + sep) && fromStore !== '..' && !isAbsolute(fromStore))) {
   throw new Error('Receipt must be outside the disposable store');
 }
-if (existsSync(config.receiptPath)) throw new Error('Receipt destination already exists');
+// Exclusive creation rejects existing files AND dangling symlinks before opening
+// the store. Retain the descriptor; later writes never follow a replaced path.
+const receiptFd = openSync(receiptDestination, 'wx');
+const recovery = 'Execution may have changed the disposable copy. Preserve this receipt and config, discard the copy, and restore a fresh copy of the original stopped backup before retrying.';
+let receipt: Record<string, unknown> = { ...preview, status: 'preflight', recovery };
+function saveReceipt() {
+  const bytes = Buffer.from(JSON.stringify(receipt, null, 2));
+  let offset = 0;
+  while (offset < bytes.length) offset += writeSync(receiptFd, bytes, offset, bytes.length - offset, offset);
+  ftruncateSync(receiptFd, bytes.length);
+  fsyncSync(receiptFd);
+}
+saveReceipt();
 console.error('Execution may change the disposable copy. On failure preserve output/config and any receipt, discard the copy, and restore a fresh copy of the original stopped backup before retrying.');
 
 const actual=new Membrane(new AnthropicAdapter({apiKey:process.env.ANTHROPIC_API_KEY}),{formatter:new NativeFormatter()});
 let call: Record<string,unknown>|null=null;
-const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw new Error('ONE_CALL_CAP');const active=manager.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw new Error('No trusted L1 authoring');assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};try{const response=await target.complete(sent,options);const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:(e as Error).name,message:(e as Error).message}};throw e;}};}});
-const manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace});
+const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw new Error('ONE_CALL_CAP');const active=manager!.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw new Error('No trusted L1 authoring');assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};receipt={...receipt,status:'calling',call};saveReceipt();try{const response=await target.complete(sent,options);const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:(e as Error).name,message:'Provider call failed; message omitted to protect source content'}};throw e;}};}});
+let manager: ContextManager | undefined;
+try {
+manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace});
 manager.setToolDefinitions(tools);
 const cmSource=manager.queryMessages({ participant: 'Context Manager' }).messages;
 assertZeroRecallSourceSafe(cmSource, strategy.opening());
 const parent=manager.currentBranch(); if(parent.name!==config.expectedParentBranch)throw new Error(`parent branch mismatch ${parent.name}`);
-const chunks=(strategy as unknown as {chunks:Array<{index:number,messages:Array<{id:string}>}>}).chunks;const chunk=chunks.find(c=>c.index===config.targetChunkIndex);if(!chunk)throw new Error(`chunk ${config.targetChunkIndex} absent`);const range:[string,string]=[String(chunk.messages[0]?.id),String(chunk.messages.at(-1)?.id)];if(JSON.stringify(range)!==JSON.stringify(config.expectedSourceRange))throw new Error(`source range mismatch ${range}`);const parentQuarantine=strategy.getCompressionQuarantineStatus();if(!parentQuarantine.keys.includes(config.expectedQuarantineKey))throw new Error(`expected quarantine key absent on parent ${config.expectedQuarantineKey}`);
-const branch=await manager.fork(config.branchName);const activeStrategy=manager.getStrategy() as AutobiographicalStrategy;const qBefore=activeStrategy.getCompressionQuarantineStatus();if(!qBefore.keys.includes(config.expectedQuarantineKey))throw new Error(`expected quarantine key absent after fork ${config.expectedQuarantineKey}`);await activeStrategy.clearCompressionRefusalQuarantine(config.expectedQuarantineKey);(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue=[config.targetChunkIndex];const beforeSummaryIds=new Set((activeStrategy as unknown as {summaries:Array<{id:string}>}).summaries.map(s=>s.id));let error:null|{name?:string;message?:string}=null;try{await manager.tick();}catch(e){error={name:(e as Error).name,message:(e as Error).message};}
-const newSummaries=(activeStrategy as unknown as {summaries:Array<{id:string,sourceRange?:unknown,content?:unknown}>}).summaries.filter(s=>!beforeSummaryIds.has(s.id)).map(s=>({id:s.id,sourceRange:s.sourceRange}));const after={branch:manager.currentBranch(),queue:[...(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue],quarantine:activeStrategy.getCompressionQuarantineStatus(),newSummaries};manager.close();
-const receipt={...preview,parentBranch:parent,branch,targetChunkIndex:config.targetChunkIndex,sourceRange:range,provenanceMode:'authored-request',clearedQuarantineKey:config.expectedQuarantineKey,call,error,after,recovery:error||newSummaries.length!==1||!call?'Execution failed or did not produce exactly one summary. Execution may have forked and changed quarantine/queue/ladder state. Preserve this receipt, discard the disposable store copy, and restore a fresh copy of the original stopped backup before retrying; do not merely update the expected hash.':undefined};writeFileSync(config.receiptPath,JSON.stringify(receipt,null,2),{flag:'wx'});console.log(JSON.stringify(receipt,null,2));console.log('RECEIPT_SHA256',await hashFile(config.receiptPath));if(error||newSummaries.length!==1||!call)process.exitCode=1;
+const chunks=(strategy as unknown as {chunks:Array<{index:number,messages:Array<{id:string}>}>}).chunks;const chunk=chunks.find(c=>c.index===config.targetChunkIndex);if(!chunk)throw new Error(`chunk ${config.targetChunkIndex} absent`);const range:[string,string]=[String(chunk.messages[0]?.id),String(chunk.messages.at(-1)?.id)];if(JSON.stringify(range)!==JSON.stringify(config.expectedSourceRange))throw new Error(`source range mismatch ${range}`);strategy.assertCompressionQuarantineChunk(config.expectedQuarantineKey, config.targetChunkIndex);
+receipt={...receipt,parentBranch:parent,targetChunkIndex:config.targetChunkIndex,sourceRange:range,status:'forking'};saveReceipt();
+const branch=await manager.fork(config.branchName);const activeStrategy=manager.getStrategy() as AutobiographicalStrategy;activeStrategy.assertCompressionQuarantineChunk(config.expectedQuarantineKey, config.targetChunkIndex);await activeStrategy.clearCompressionRefusalQuarantine(config.expectedQuarantineKey);(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue=[config.targetChunkIndex];const beforeSummaryIds=new Set((activeStrategy as unknown as {summaries:Array<{id:string}>}).summaries.map(s=>s.id));let error:null|{name?:string;message?:string}=null;try{await manager.tick();}catch(e){error={name:(e as Error).name,message:(call as Record<string,unknown>|null)?.status === 'error' ? 'Provider call failed; message omitted to protect source content' : (e as Error).message};}
+const newSummaries=(activeStrategy as unknown as {summaries:Array<{id:string,sourceRange?:unknown,content?:unknown}>}).summaries.filter(s=>!beforeSummaryIds.has(s.id)).map(s=>({id:s.id,sourceRange:s.sourceRange}));const after={branch:manager.currentBranch(),queue:[...(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue],quarantine:activeStrategy.getCompressionQuarantineStatus(),newSummaries};
+receipt={...preview,status:'finished',parentBranch:parent,branch,targetChunkIndex:config.targetChunkIndex,sourceRange:range,provenanceMode:'authored-request',clearedQuarantineKey:config.expectedQuarantineKey,call,error,after,recovery:error||newSummaries.length!==1||!call?'Execution failed or did not produce exactly one summary. Execution may have forked and changed quarantine/queue/ladder state. Preserve this receipt, discard the disposable store copy, and restore a fresh copy of the original stopped backup before retrying; do not merely update the expected hash.':undefined};saveReceipt();console.log(JSON.stringify(receipt,null,2));console.log('RECEIPT_SHA256',await hashFile(config.receiptPath));if(error||newSummaries.length!==1||!call)process.exitCode=1;
+} catch (error) {
+  receipt = { ...receipt, status: 'failed', call, error: { name: (error as Error).name, message: (error as Error).message }, recovery };
+  saveReceipt();
+  console.log(JSON.stringify(receipt, null, 2));
+  process.exitCode = 1;
+} finally {
+  try { manager?.close(); } finally { closeSync(receiptFd); }
+}
