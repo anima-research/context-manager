@@ -8,6 +8,7 @@ import { Membrane, TimeoutAbortError, abortError } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore, CompressionWithdrawn } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
+import { constructedRecallHeader } from '../src/recall-header.js';
 import type { StoredMessage, StrategyContext, SummaryEntry } from '../src/types/index.js';
 
 const BASE = './test-compression-recall-curve';
@@ -2647,7 +2648,7 @@ describe('compression refusal recall curves', () => {
       }) }, { stop: 'end_turn', text: 'summary' }]);
       const fx = await fixture(mock.membrane);
       for (const entry of fx.strategy.summariesView()) {
-        entry.responseContent = carrierBlocks(entry.id, entry.content);
+        entry.responseContent = carrierBlocks(entry.id, '<thinking>' + 'literal preamble '.repeat(200) + '</thinking>' + entry.content);
         entry.tokens = 10_000;
       }
       fx.strategy.flushSummaries();
@@ -2657,7 +2658,7 @@ describe('compression refusal recall curves', () => {
         .find(entry => entry.operation === 'compress_l1' && !entry.event);
       assert.equal(receipt.metadata.prior_summary_count_kept, 2);
       assert.equal(receipt.metadata.prior_summary_token_estimate, 'text-content-estimate');
-      assert.ok(receipt.metadata.prior_summary_tokens >= 100 && receipt.metadata.prior_summary_tokens < 1000, 'text plus pair/envelope overhead, not 20000 stored tokens');
+      assert.ok(receipt.metadata.prior_summary_tokens > 1000 && receipt.metadata.prior_summary_tokens < 10000, 'replayed text includes the literal preamble plus pair/envelope overhead, not 20000 stored tokens');
       assert.equal(quarantineEvents(fx.manager).length, 0);
       fx.manager.close();
     } finally {
@@ -2679,17 +2680,21 @@ describe('compression refusal recall curves', () => {
         const original = internals.persistedCanonicalSummariesById.bind(fx.strategy);
         let reads = 0;
         let telemetryReads = 0;
+        let authoring = false;
+        const hooks = fx.strategy as unknown as { authorL1CompressionRequest(request: NormalizedRequest, ids: string[]): NormalizedRequest };
+        const author = hooks.authorL1CompressionRequest.bind(fx.strategy);
+        hooks.authorL1CompressionRequest = (request, ids) => { authoring = true; return author(request, ids); };
         internals.persistedCanonicalSummariesById = () => {
           reads++;
           // Only the log preparation read fails; planning reads stay real.
-          if (new Error().stack?.includes('logDispatch')) { telemetryReads++; throw new Error('private store error'); }
+          if (authoring) { telemetryReads++; throw new Error('private store error'); }
           return original();
         };
         const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
         assert.equal(result.status, 'fulfilled');
-        assert.equal(mock.calls.length, 2, 'empty response retries without repeated telemetry reads');
+        assert.equal(mock.calls.length, 2, 'empty response retries despite telemetry failures');
         assert.ok(reads > 0, 'planning still uses its projection');
-        assert.equal(telemetryReads, empty ? 0 : 1);
+        assert.equal(telemetryReads, empty ? 0 : 2);
         const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
           .find(entry => entry.operation === 'compress_l1' && !entry.event);
         assert.equal(receipt.metadata.prior_summary_count_kept, empty ? 0 : null);
@@ -5187,3 +5192,138 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     fx.manager.close();
   });
 });
+
+
+describe('L1 no-dispatch outcome receipts', () => {
+  for (const logging of [false, true]) {
+    for (const reason of ['deferral', 'withdrawal', 'error'] as const) {
+      it(`records ${reason} without claiming a send (logging=${logging})`, async () => {
+        const log = `${freshPath()}-no-dispatch.jsonl`;
+        paths.push(log);
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        let fx: Fixture | undefined;
+        try {
+          const error = reason === 'withdrawal' ? new CompressionWithdrawn('host stopped before send')
+            : Object.assign(new Error(`${reason} before send`), reason === 'deferral' ? { providerAdmission: 'deferred' } : {});
+          const mock = flexibleMembrane([{ error }]);
+          fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+          if (reason === 'error') {
+            // A local authoring failure happens before callProvider, unlike a
+            // provider error, which is evidence of an attempted dispatch.
+            (fx.strategy as unknown as { authorL1CompressionRequest(): never }).authorL1CompressionRequest = () => { throw error; };
+          }
+          const { result } = await quiet(() => fx!.strategy.run(fx!.target, managerContext(fx!.manager)));
+          assert.equal(result.status, 'rejected');
+          assert.equal((result as PromiseRejectedResult).reason, error);
+          assert.equal(mock.calls.length, reason === 'error' ? 0 : 1, 'admission/withdrawal intercept the call before transport');
+          assert.equal(fx.target.compressed, false);
+          const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+          assert.equal(entries.filter(entry => entry.operation === 'compress_l1' && !entry.event).length, 0);
+          const outcomes = entries.filter(entry => entry.event === 'compression:no-dispatch');
+          assert.equal(outcomes.length, logging ? 1 : 0);
+          if (!logging) { assert.equal(existsSync(log), false); return; }
+          const outcome = outcomes[0];
+          assert.equal(outcome.operation, 'compress_l1');
+          assert.equal(outcome.metadata.dispatched, false);
+          assert.equal(outcome.metadata.reason, reason);
+          assert.equal(outcome.metadata.detail, error.message);
+          assert.deepEqual(outcome.metadata.chunk_message_ids, fx.target.messages.map(message => message.id));
+          for (const key of ['system', 'messages', 'request', 'response']) assert.equal(key in outcome, false);
+          assert.equal(outcome.metadata.request_scope, undefined);
+          assert.deepEqual(quarantineEvents(fx.manager), [], 'no unsent attempt exhausts a family');
+        } finally {
+          fx?.manager.close();
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        }
+      });
+    }
+  }
+});
+
+
+it('recall curves preserve collapsed raw blocks and identical untagged pairs', async () => {
+  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'summary' }]);
+  const fx = await fixture(mock.membrane);
+  try {
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const canonical = mock.calls[0]!.originalRequest!;
+    const pairIndex = canonical.messages.findIndex(message => message.content.some(block => block.type === 'text' && block.text === '[CM] Recall memory L2-201.'));
+    assert.ok(pairIndex >= 0);
+    const rawPair = structuredClone(canonical.messages.slice(pairIndex, pairIndex + 2));
+    const rawPrefix = text('raw Context Manager history before the constructed header');
+    const messages = [...rawPair, ...canonical.messages];
+    const headerIndex = pairIndex + rawPair.length;
+    messages[headerIndex] = { ...messages[headerIndex]!, content: [rawPrefix, ...messages[headerIndex]!.content] };
+    const build = fx.strategy as unknown as { buildRecallCurveVariants(request: NormalizedRequest, kept: SummaryEntry[], all: StoredMessage[]): Array<{ parent: SummaryEntry; request: NormalizedRequest }> };
+    const variants = build.buildRecallCurveVariants({ ...canonical, messages }, fx.parents, managerContext(fx.manager).messageStore.getAll());
+    const variant = variants.find(item => item.parent.id === 'L2-201');
+    assert.ok(variant, 'collapsed constructed header still expands in the presence of identical raw bytes');
+    assert.deepEqual(variant.request.messages.slice(0, 2), rawPair, 'raw duplicate is neither ambiguous nor replaced');
+    assert.equal(variant.request.messages[headerIndex]!.content[0], rawPrefix, 'raw prefix keeps its block identity');
+    assert.deepEqual(variant.request.messages[headerIndex]!.content, [rawPrefix, text('[CM] Recall memory L1-102.')]);
+    assert.deepEqual(variant.request.messages[headerIndex + 1]!.content, [text(fx.children[2]!.content)]);
+  } finally { fx.manager.close(); }
+});
+
+it('a later dispatch recovers recall totals after an unknown authored recall', async () => {
+  const log = `${freshPath()}-recovered-totals.jsonl`;
+  paths.push(log);
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+  const mock = flexibleMembrane([{ raw: { content: [], stopReason: 'end_turn' } }, { stop: 'end_turn', text: 'summary' }]);
+  const fx = await fixture(mock.membrane);
+  try {
+    const hooks = fx.strategy as unknown as { authorL1CompressionRequest(request: NormalizedRequest, ids: string[]): NormalizedRequest };
+    const author = hooks.authorL1CompressionRequest.bind(fx.strategy);
+    let calls = 0;
+    hooks.authorL1CompressionRequest = (request, ids) => {
+      const result = author(request, ids);
+      return calls++ ? result : { ...result, messages: [
+        { participant: 'Context Manager', content: [constructedRecallHeader('L1-unknown')] },
+        { participant: 'Claude', content: [text('unknown recall')] }, ...result.messages,
+      ] };
+    };
+    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(result.status, 'fulfilled');
+    assert.equal(mock.calls.length, 2);
+    assert.equal(logs.filter(line => line.includes('recall telemetry unavailable')).length, 1);
+    const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(entry => entry.operation === 'compress_l1' && !entry.event);
+    assert.equal(receipt.metadata.prior_summary_count_kept, 2);
+    assert.ok(receipt.metadata.prior_summary_tokens > 0);
+    assert.equal(receipt.metadata.prior_summary_token_estimate, 'stored-summary-estimate');
+  } finally {
+    fx.manager.close();
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+  }
+});
+
+it('warns without replacing a successful compression when receipt preparation throws', async () => {
+  const log = `${freshPath()}-receipt-warning.jsonl`;
+  paths.push(log);
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'summary' }]);
+  const fx = await fixture(mock.membrane);
+  try {
+    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold = () => {
+      // Mint persistence has finished; only telemetry now needs this message.
+      Object.defineProperty(mock.calls[0]!.originalRequest!.messages[0], 'participant', { get() { throw new Error('private payload'); } });
+    };
+    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(result.status, 'fulfilled');
+    assert.equal(fx.target.compressed, true);
+    assert.equal(logs.filter(line => line.includes('receipt preparation failed')).length, 1);
+    assert.ok(!logs.join('').includes('private payload'));
+  } finally {
+    fx.manager.close();
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+  }
+});
+
+// Root-level regressions also own temporary stores/logs outside the suites above.
+after(cleanup);

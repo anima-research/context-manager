@@ -334,8 +334,7 @@ it('refusal then tool-use reading merge retries retain the source hook and full 
 it('empty chunk retries retain custom text and request plain prose', async () => {
   const calls = await run('chunk', 'own', custom, {}, Probe, 2, 'empty');
   assert.equal(instruction(calls[0]!), 'CUSTOM CHUNK 2000');
-  assert.ok(instruction(calls[1]!).startsWith(instruction(calls[0]!)));
-  assert.match(instruction(calls[1]!), /plain prose/);
+  assert.equal(instruction(calls[1]!), instruction(calls[0]!) + '\n\nWrite the memory directly as plain prose — do not wrap it in <thinking> or any other tags; begin immediately with the memory text itself.');
 });
 
 it('rejects own symbols and non-enumerable settings rather than dropping them at clone time', () => {

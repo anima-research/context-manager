@@ -15,14 +15,14 @@ export function sanitizeSurgeryProviderError(thrown: unknown): Error & {
     : 'Provider call failed; message omitted to protect source content';
   const safe = new Error(message);
   if (thrown instanceof Error) Object.setPrototypeOf(safe, Object.getPrototypeOf(thrown));
-  if (typeof source?.name === 'string') safe.name = source.name;
+  if (typeof source?.name === 'string') Object.defineProperty(safe, 'name', { value: source.name, configurable: true, writable: true });
   const classified = safe as ReturnType<typeof sanitizeSurgeryProviderError>;
-  if (typeof source?.type === 'string') classified.type = source.type;
-  if (typeof source?.httpStatus === 'number') classified.httpStatus = source.httpStatus;
-  if (typeof source?.retryable === 'boolean') classified.retryable = source.retryable;
+  if (typeof source?.type === 'string') Object.defineProperty(safe, 'type', { value: source.type, enumerable: true, configurable: true, writable: true });
+  if (typeof source?.httpStatus === 'number') Object.defineProperty(safe, 'httpStatus', { value: source.httpStatus, enumerable: true, configurable: true, writable: true });
+  if (typeof source?.retryable === 'boolean') Object.defineProperty(safe, 'retryable', { value: source.retryable, enumerable: true, configurable: true, writable: true });
   if (isCompressionWithdrawn(thrown)) Object.defineProperty(safe, Symbol.for('@animalabs/context-manager:compression-withdrawn'), { value: true });
-  if (source?.providerAdmission === 'deferred') classified.providerAdmission = 'deferred';
-  if (typeof source?.retryAfterMs === 'number') classified.retryAfterMs = source.retryAfterMs;
-  if (typeof source?.providerErrorCode === 'string') classified.providerErrorCode = source.providerErrorCode;
+  if (source?.providerAdmission === 'deferred') Object.defineProperty(safe, 'providerAdmission', { value: 'deferred', enumerable: true, configurable: true, writable: true });
+  if (typeof source?.retryAfterMs === 'number') Object.defineProperty(safe, 'retryAfterMs', { value: source.retryAfterMs, enumerable: true, configurable: true, writable: true });
+  if (typeof source?.providerErrorCode === 'string') Object.defineProperty(safe, 'providerErrorCode', { value: source.providerErrorCode, enumerable: true, configurable: true, writable: true });
   return classified;
 }

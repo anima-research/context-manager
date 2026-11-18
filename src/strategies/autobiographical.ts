@@ -4970,9 +4970,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const body = canonicalRequest.messages[i + 1]!;
         if (
           header.participant === 'Context Manager' &&
-          header.content.length === 1 &&
-          header.content[0]?.type === 'text' &&
-          sentRecallHeaderIds(header)[0] === parent.id &&
+          sentRecallHeaderIds(header).length === 1 &&
+          sentRecallHeaderIds({ participant: header.participant, content: header.content.slice(-1) })[0] === parent.id &&
           JSON.stringify(body.content) === expectedBody
         ) pairIndexes.push(i);
       }
@@ -4989,6 +4988,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
       ]);
       const pairIndex = pairIndexes[0]!;
+      // Collapse may have joined preceding raw CM blocks to this header.
+      // Preserve them ahead of the first child header, never replace raw text.
+      replacement[0]!.content.unshift(...canonicalRequest.messages[pairIndex]!.content.slice(0, -1));
       const request: NormalizedRequest = {
         ...canonicalRequest,
         messages: [
@@ -12009,6 +12011,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logWithdrawn = false;
+    let noDispatchOutcome: { reason: 'deferral' | 'withdrawal' | 'error'; detail: string } | undefined;
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
@@ -12049,13 +12052,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const ids = new Set(request.messages.flatMap(sentRecallHeaderIds));
         if (ids.size) {
           try {
-            if (telemetryUnavailable) throw new Error('Recall totals unavailable');
             telemetrySummaries ??= this.persistedCanonicalSummariesById();
             const recalls = [...ids].map(id => telemetrySummaries!.get(id));
             if (recalls.some(summary => !summary)) throw new Error('Recall totals unavailable');
             count = recalls.length;
             tokens = this.capRecallPairs((recalls as SummaryEntry[]).map(summary => stripped
-              ? { ...summary, tokens: this.estimateTokens([{ type: 'text', text: summary.content }]) }
+              ? { ...summary, tokens: this.estimateTokens(this.summaryAnswerProse(summary).filter(block => block.type === 'text')) }
               : summary), Infinity).keptTokens;
           } catch {
             // Keep dispatch best effort without representing a failed read as
@@ -13565,6 +13567,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
+      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && !loggedRequest) {
+        let detail = 'Compression stopped before dispatch';
+        try { detail = boundFailureLogText(error instanceof Error ? error.message : String(error)); } catch { /* Telemetry cannot replace the error. */ }
+        noDispatchOutcome = {
+          reason: isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait ? 'deferral'
+            : isCompressionWithdrawn(error) || compressionFailureKind(error) === 'abort' ? 'withdrawal' : 'error',
+          detail,
+        };
+      }
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
       // A host's withdrawal isn't a failure: the host asked for it, so its
       // receipts say withdrawn rather than carrying an error, a moved
@@ -13627,6 +13638,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             },
           }, this.ns);
         }
+        if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && !loggedRequest && noDispatchOutcome) {
+          logCompressionCall({
+            event: 'compression:no-dispatch',
+            operation: 'compress_l1',
+            metadata: {
+              chunk_message_ids: chunk.messages.map(message => message.id),
+              model,
+              dispatched: false,
+              ...noDispatchOutcome,
+              latency_ms: Date.now() - callStart,
+            },
+          }, this.ns);
+        }
         if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && loggedRequest) {
           logCompressionCall({
             operation: 'compress_l1',
@@ -13656,8 +13680,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns);
         }
       } catch {
-        // Best-effort telemetry must never replace a result, discard or error,
-        // including when the store was closed while the provider was pending.
+        // Never replace a compression result/error, or expose failed payloads.
+        try { this.diag.warn('autobio: compression receipt preparation failed; receipt may be missing'); } catch { /* Best effort. */ }
       }
     }
   }

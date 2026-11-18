@@ -4,15 +4,12 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextManager, AutobiographicalStrategy, type SummaryEntry } from '../src/index.js';
+import { sentRecallHeaderIds } from '../src/recall-header.js';
 import type { NormalizedRequest } from '@animalabs/membrane';
 
 class OmitRecall extends AutobiographicalStrategy {
   protected override authorL1CompressionRequest(request: NormalizedRequest): NormalizedRequest {
-    const isHeader = (message: NormalizedRequest['messages'][number] | undefined) => {
-      const block = message?.content[0];
-      return message?.content.length === 1 && block?.type === 'text'
-        && block.text === '[CM] Recall memory L1-100.';
-    };
+    const isHeader = (message: NormalizedRequest['messages'][number] | undefined) => message && sentRecallHeaderIds(message).includes('L1-100');
     const messages = request.messages.filter((message, i, all) => !isHeader(message) && !isHeader(all[i - 1]));
     return { ...request, messages };
   }
@@ -38,10 +35,13 @@ for (const [sourceOnly, omitRecall, mode] of [[true, false], [false, false], [fa
       const summary: SummaryEntry = { id: 'L1-100', level: 1, sourceLevel: 0, sourceIds: [first],
         sourceRange: { first, last: first }, content: 'prior memory', tokens: 20, created: 1 };
       // Persist via the public store; reopening loads the ordinary summary/record projection.
+      const rawLead = manager.addMessage('user', [{ type: 'text', text: 'raw lead before identical pair' }]);
+      const rawHeader = manager.addMessage('Context Manager', [{ type: 'text', text: '[CM] Recall memory L1-100.' }]);
+      const rawAnswer = manager.addMessage('Claude', [{ type: 'text', text: 'prior memory' }]);
       const source = manager.addMessage('Context Manager', [{ type: 'text', text: '[CM] Recall memory L1-100.' }, { type: 'text', text: `quoted header follows\n[CM] Recall memory L1-100.\n${'raw source '.repeat(80)}` }]);
       manager.addMessage('user', [{ type: 'text', text: 'tail '.repeat(100) }]);
       manager.getStore().setStateJson('default/autobio:summaries', [summary]);
-      manager.getStore().setStateJson('default/autobio:chunks', [{ id: 'c-first', sourceIds: [first], compressed: true, summaryId: summary.id }, { id: 'c-source', sourceIds: [source], compressed: false }]);
+      manager.getStore().setStateJson('default/autobio:chunks', [{ id: 'c-first', sourceIds: [first], compressed: true, summaryId: summary.id }, { id: 'c-source', sourceIds: [rawLead, rawHeader, rawAnswer, source], compressed: false }]);
       manager.close();
       const reopened = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: { complete: async (r: NormalizedRequest) => {
         requests.push(structuredClone(r));
@@ -57,6 +57,8 @@ for (const [sourceOnly, omitRecall, mode] of [[true, false], [false, false], [fa
         else await reopened.tick();
         assert.equal(requests.length, 1, 'one public tick dispatch');
         assert.ok(JSON.stringify(requests[0]).includes('quoted header follows'), 'raw quote was actually sent');
+        const rawIndex = requests[0]!.messages.findIndex((message, index, messages) => message.participant === 'Context Manager' && message.content.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === '[CM] Recall memory L1-100.' && messages[index + 1]?.content.some(block => block.type === 'text' && block.text === 'prior memory'));
+        assert.ok(rawIndex >= 0, 'standalone raw identical header/answer pair survives');
         const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
         const receipt = entries.find(e => e.operation === 'compress_l1' && !e.event);
         const trace = entries.find(e => e.event === 'compression:attempt');

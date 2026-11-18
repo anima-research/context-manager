@@ -5,10 +5,10 @@
   the L1 opening and throughout L2 raw sources as well. Cache seams and
   recall-curve replacement also use constructed identity, not matching raw text.
 
-- Changed default request bytes also change refusal-family identities. Persisted
-  quarantine/ladder outcomes under the old family are not reused; until the
+- Where default request bytes change, refusal-family identities change too. Persisted
+  quarantine/ladder outcomes under those old families are not reused; until the
   per-chunk quarantine cap is reached, previously attempted work may incur new paid calls.
 
 - Default instruction wording is unchanged; full request bytes and provenance
-  hashes are not. Ordinary `compress_l1`
+  hashes may change. Unaffected requests retain their identities and may reuse matching outcomes. Ordinary `compress_l1`
   telemetry changes too (last dispatched request and constructed recall totals).

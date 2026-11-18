@@ -94,6 +94,10 @@ for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rat
         const sends = readFileSync(join(dir,'sent'),'utf8').trim().split('\n').map(line => JSON.parse(line));
         assert.deepEqual(sends, [{sdkRetries:0, redirect:'error'}], 'real CLI installed one-send SDK policy');
         assert.equal(receipt.call.providerError.httpStatus, scenario === 'sdk-rate' ? 429 : 500);
+        assert.equal(receipt.call.providerError.name, 'MembraneError');
+        assert.equal(receipt.call.providerError.type, scenario === 'sdk-rate' ? 'rate_limit' : 'server');
+        assert.equal(receipt.call.providerError.retryable, true);
+        assert.match(JSON.stringify(state.pause), new RegExp(`${scenario === 'sdk-rate' ? 'rate_limit' : 'server'}:${scenario === 'sdk-rate' ? 429 : 500}`));
       } else {
         assert.equal(result.status,1);
         assert.equal(receipt.status,'failed');

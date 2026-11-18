@@ -161,3 +161,12 @@ test('surgery refuses a tool pair crossing the recall deletion boundary', () => 
     text('Context Manager', 'OPEN'), raw,
   ], 'OPEN', [{ id: 'L1-1', answer }]), /Tool pair crosses recall deletion boundary/);
 });
+
+
+test('source safety rejects recall markers split across text blocks', () => {
+  const content: NormalizedMessage['content'] = [
+    { type: 'text', text: '[CM] Recall ' }, { type: 'text', text: 'memory L1-1.' },
+  ];
+  assert.throws(() => assertZeroRecallSourceSafe([{ participant: 'Context Manager', content }]), /Raw recall-shaped/);
+  assert.doesNotThrow(() => assertZeroRecallSourceSafe([{ participant: 'user', content }]));
+});

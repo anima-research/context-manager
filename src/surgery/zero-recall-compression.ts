@@ -61,7 +61,7 @@ export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMes
     throw new Error('Raw history collides with compression opening; refusing zero-recall surgery');
   }
   if (messages.some(message => message.participant === 'Context Manager'
-    && message.content.some(block => block.type === 'text' && block.text.includes('[CM] Recall memory ')))) {
+    && message.content.filter(block => block.type === 'text').map(block => block.text).join('').includes('[CM] Recall memory '))) {
     throw new Error('Raw recall-shaped Context Manager history; refusing zero-recall surgery');
   }
 }

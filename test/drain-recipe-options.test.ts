@@ -88,3 +88,10 @@ it('drain executable dispatches a valid custom recipe through the real manager a
     assert.match(result.stdout, /"stopped":"drained"/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+it('drain ignores inherited and non-enumerable instruction settings like the constructor', () => {
+  const instructions = { templates: { opening: 'NOT OWN' } };
+  assert.deepEqual(drainRecipeOptions(Object.create({ compressionInstructions: instructions })), {});
+  assert.deepEqual(drainRecipeOptions(Object.defineProperty({}, 'compressionInstructions', { value: instructions })), {});
+});

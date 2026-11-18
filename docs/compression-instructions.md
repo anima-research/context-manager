@@ -32,7 +32,8 @@ family outcomes may not be reused, so previously attempted work may incur new
 paid calls (until the per-chunk quarantine cap is reached). Ordinary L1
 `compress_l1` telemetry also changes: it describes the last dispatched attempt
 and counts recalls by construction identity, including pair/envelope overhead.
-Default instruction wording is unchanged; full request bytes and provenance hashes are not.
+Default instruction wording is unchanged; affected request bytes and provenance hashes
+change. Unaffected requests can retain their identities and reuse matching outcomes.
 
 Family/rung/outcome identity is computed from the prepared plan, before subclass
 L1 authoring and carrier stripping. A subclass that changes authoring must version
@@ -50,7 +51,11 @@ Empty recall IDs skip the telemetry projection; nonempty retries reuse a lookup
 for that compression operation. The remaining full-history lookup is not bounded
 or benchmarked here. A branded host withdrawal is not evidence of dispatch, so it
 leaves the preceding sent snapshot intact (or emits no request receipt if none
-was sent). Cancellation of an already-out call retains that call's snapshot.
+was sent). With logging enabled, a deferral, withdrawal, or error ending an operation
+before any dispatch instead emits `compression:no-dispatch` for `compress_l1`, with `dispatched: false`, a
+`reason` of `deferral`, `withdrawal`, or `error`, and a bounded `detail`. It has
+no request, message, system, or response payload and does not claim a send.
+Cancellation of an already-out call retains that call's snapshot.
 
 ## Slots and placeholders
 

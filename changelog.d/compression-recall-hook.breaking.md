@@ -8,7 +8,10 @@
   message-digest compatibility aliases remain unchanged.
 
 - **Subclass name collisions:** new protected hooks `compressionOutcomeNamespace`,
-  `authorL1CompressionRequest`, and `getCompressionOpening`, and public method
+  `authorL1CompressionRequest`, `observeL1CompressionRequest`,
+  `getSourceMergeInstruction`, `allowsMergeScheduling`, and `getCompressionOpening`, and public method
   `assertCompressionQuarantineChunk` reserve these names. Rename pre-existing
   private helpers or adapt compatible overrides before upgrading; otherwise
   compilation can fail or an existing method can become an unintended override.
+  `allowsMergeScheduling(): boolean` defaults to true; return false only to
+  deliberately opt out of merge scheduling, or rename an unrelated helper.

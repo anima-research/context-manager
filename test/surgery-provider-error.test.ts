@@ -42,3 +42,27 @@ test('local transport cap keeps its trusted diagnostic', () => {
   assert.match(sanitizeSurgeryProviderError(new SurgeryTransportCapError()).message, /ONE_PROVIDER_REQUEST_CAP/);
   assert.doesNotMatch(sanitizeSurgeryProviderError(new Error('ONE_PROVIDER_REQUEST_CAP private')).message, /ONE_PROVIDER_REQUEST_CAP/);
 });
+
+
+test('DOMException cancellation survives getter-only prototype fields', () => {
+  const original = new DOMException('private source', 'AbortError');
+  const safe = sanitizeSurgeryProviderError(original);
+  assert.ok(safe instanceof DOMException);
+  assert.ok(safe instanceof Error);
+  assert.equal(safe.name, 'AbortError');
+  assert.match(safe.message, /message omitted/);
+  assert.ok(!String(safe.stack).includes('private source'));
+});
+
+test('read-only inherited classification fields do not prevent a safe projection', () => {
+  class ProviderError extends Error {
+    get type() { return 'rate_limit'; }
+    get httpStatus() { return 429; }
+    get retryable() { return true; }
+  }
+  const safe = sanitizeSurgeryProviderError(new ProviderError('private source'));
+  assert.ok(safe instanceof ProviderError);
+  assert.equal(safe.type, 'rate_limit');
+  assert.equal(safe.httpStatus, 429);
+  assert.equal(safe.retryable, true);
+});
