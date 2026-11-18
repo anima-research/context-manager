@@ -4751,7 +4751,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never persisted, however plausible its text looks.
    */
   private assessFallbackCompressionResponse(response: unknown):
-    | { outcome: 'valid'; response: NormalizedResponse; text: string }
+    | { outcome: 'valid'; response: NormalizedResponse; text: string; onlyTextBlocks: boolean }
     | { outcome: 'refusal'; stopReason: 'refusal' }
     | { outcome: 'incomplete'; stopReason?: string }
     | { outcome: 'unusable_empty'; stopReason?: string }
@@ -4768,10 +4768,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return { outcome: 'provider_error', stopReason, errorType: 'malformed_content' };
     }
     const textParts: string[] = [];
+    let onlyTextBlocks = true;
     for (const block of content) {
       const errorType = this.fallbackContentBlockError(block);
       if (errorType) return { outcome: 'provider_error', stopReason, errorType };
       const type = (block as { type: string }).type;
+      if (type !== 'text') onlyTextBlocks = false;
       if (type === 'text') {
         textParts.push((block as { text: string }).text);
       }
@@ -4785,7 +4787,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // unknown finish reasons to 'end_turn', so this cannot reject a
     // healthy provider leg.
     if (stopReason !== 'end_turn') return { outcome: 'incomplete', stopReason };
-    return { outcome: 'valid', response: response as NormalizedResponse, text };
+    return { outcome: 'valid', response: response as NormalizedResponse, text, onlyTextBlocks };
   }
 
   /**
@@ -12074,15 +12076,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const carrierLabel = `${curveLabel}:carrier-rejected`;
         const carrierKnownRejected = knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
           requestCarriesReasoning(attemptRequest);
+        let providerAnswered = false;
         try {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
           response = await this.callProvider(ctx.membrane!, attemptRequest);
+          providerAnswered = true;
+          // Keep main's local resume boundary, including carrier retry and
+          // error-model attribution, without tracing it as a provider failure.
+          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
-            noteFailedAttempt(attemptRequest);
+            if (!providerAnswered) noteFailedAttempt(attemptRequest);
             noteDispatchedModel(error, attemptRequest);
           }
           discardIfStale(error);
@@ -12137,11 +12144,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             throw retryError;
           }
           if (response && typeof response === 'object') countedStripped.add(response);
+          this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         }
         failedAttempt = undefined;
         // As on main, a local resume failure precedes the shared run reset.
         // Split parts end only their own key, not the enclosing stitch rung.
-        this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
@@ -12454,6 +12461,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       };
 
+      // Classification uses the assessment's existing text snapshot, never
+      // another read of a live response. Disabled logging does no extra work.
+      const classifyFallbackTrace = (
+        assessment: { text: string; onlyTextBlocks: boolean }, trace: CompressionAttemptTrace,
+      ): void => {
+        withCompressionLog(() => {
+          const extracted = extractCompressionSummaryText(assessment.text,
+            this.config.recoverLiteralThinkingWrappedCompression === true && assessment.onlyTextBlocks);
+          trace.outcome = extracted.text.trim() ? 'success' : 'unusable_empty';
+        }, this.ns, `compression outcome diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+      };
+
       const extractSummaryText = (r: NormalizedResponse, trace?: CompressionAttemptTrace): { text: string; recoveredWholeWrapper: boolean } => {
         try {
           const rawText = r.content
@@ -12743,7 +12762,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
-            trace.outcome = extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty';
+            classifyFallbackTrace(assessment, trace);
             fallbackResponse = assessment.response;
             response = assessment.response;
             successfulTrace = trace;
@@ -12868,9 +12887,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
           const assessment = this.assessFallbackCompressionResponse(variantResponse);
-          trace.outcome = assessment.outcome === 'valid'
-            ? (extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty')
-            : assessment.outcome;
+          if (assessment.outcome === 'valid') classifyFallbackTrace(assessment, trace);
+          else trace.outcome = assessment.outcome;
           if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
           logCompressionCall({
             event: 'compression:curve-attempt',
@@ -12937,7 +12955,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const assessment = this.assessFallbackCompressionResponse(result.response);
             progressSourceOnlyInputTokens = baseInputTokens(result.response);
             if (assessment.outcome === 'valid') {
-              trace.outcome = extractSummaryText(assessment.response).text.trim() ? 'success' : 'unusable_empty';
+              classifyFallbackTrace(assessment, trace);
               fallbackResponse = assessment.response;
               response = assessment.response;
               successfulTrace = trace;
@@ -13629,7 +13647,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
-      for (const trace of attemptTraces) {
+      for (const trace of attemptTraces) withCompressionLog(() => {
         logCompressionCall({
           event: 'compression:attempt',
           operation: 'compress_l1',
@@ -13640,7 +13658,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             ...trace,
           },
         }, this.ns, quarantineRecord.chunkSourceHash);
-      }
+      }, this.ns, `compression attempt receipt diagnostic failed: chunk=${quarantineRecord.chunkSourceHash}`);
       withCompressionLog(() => logCompressionCall({
         operation: 'compress_l1',
         // The DISPATCHED bytes, read off the request object — deliberately

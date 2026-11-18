@@ -4889,6 +4889,44 @@ describe('tool-prose hoist admission', () => {
       });
     }
 
+    for (const logging of [false, true]) {
+      it(`recall outcome tracing does not re-read text: logging=${logging}`, async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'assessed memory' }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        const seam = fx.strategy as unknown as {
+          assessFallbackCompressionResponse(response: unknown): { outcome: string; response?: { content: Array<{ text: string }> } };
+        };
+        const assess = seam.assessFallbackCompressionResponse;
+        let reads = 0;
+        seam.assessFallbackCompressionResponse = function (response) {
+          const result = assess.call(this, response);
+          if (result.outcome === 'valid') Object.defineProperty(result.response!.content[0]!, 'text', {
+            get() {
+              reads++;
+              if (reads > 1) throw new Error('extra extraction consumed the answer');
+              return 'persisted recall memory';
+            },
+          });
+          return result;
+        };
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const run = () => fx.strategy.run(fx.target, managerContext(fx.manager));
+          if (logging) await capture(fx, run);
+          else await run();
+          assert.equal(mock.calls.length, 2, 'canonical refusal, then recall expansion');
+          assert.equal(reads, 1, 'only summary extraction reads the live text');
+          assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted recall memory'));
+        } finally {
+          seam.assessFallbackCompressionResponse = assess;
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
     it('a thinking-only recall expansion logs unusable_empty before the plain-prose retry', async () => {
       const mock = flexibleMembrane([
         { stop: 'refusal' }, { stop: 'end_turn', text: '<thinking>hidden memory</thinking>' },

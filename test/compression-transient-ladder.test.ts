@@ -1025,6 +1025,74 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  for (const logging of [false, true]) for (const hoist of [false, true]) {
+    it(`fallback outcome tracing does not re-read text: logging=${logging}, hoist=${hoist}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const mock = scripted([REFUSAL as never, OK('assessed memory')]);
+      const fx = await build(mock.membrane, { hoist, sourceOnlyFallback: true });
+      const seam = fx.strategy as unknown as {
+        assessFallbackCompressionResponse(response: unknown): { outcome: string; response?: { content: Array<{ text: string }> } };
+      };
+      const assess = seam.assessFallbackCompressionResponse;
+      let reads = 0;
+      seam.assessFallbackCompressionResponse = function (response) {
+        const result = assess.call(this, response);
+        if (result.outcome === 'valid') Object.defineProperty(result.response!.content[0]!, 'text', {
+          get() {
+            reads++;
+            if (reads > 1) throw new Error('extra extraction consumed the answer');
+            return 'persisted memory';
+          },
+        });
+        return result;
+      };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        await fx.strategy.run(fx.target(), managerContext(fx.manager));
+        assert.equal(mock.calls.length, 2, 'canonical refusal, then the selected fallback');
+        assert.equal(reads, 1, 'only the required summary extraction reads the live text');
+        assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted memory'));
+      } finally {
+        seam.assessFallbackCompressionResponse = assess;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
+  for (const logging of [false, true]) {
+    it(`attempt receipt id getters cannot replace a provider failure: logging=${logging}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const original = failure('server');
+      const mock = scripted([{ throw: failure('invalid_request') }, { throw: original }]);
+      const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+      const chunk = fx.target();
+      const seam = fx.strategy as unknown as { diag: { error(...args: unknown[]): void } };
+      const error = seam.diag.error;
+      let reads = 0;
+      seam.diag.error = (...args) => {
+        if (String(args[0]).startsWith('Failed to compress chunk')) Object.defineProperty(chunk.messages[1]!, 'id', {
+          get() { reads++; throw new Error('attempt receipt id getter failed'); },
+        });
+        error.apply(seam.diag, args);
+      };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        await assert.rejects(fx.strategy.run(chunk, managerContext(fx.manager)), err => err === original);
+        assert.equal(mock.calls.length, 2, 'the rejected canonical has a failed-attempt trace before source-only interrupts');
+        assert.equal(reads, logging ? 2 : 0, 'attempt and final receipts exercise their guarded getters only with logging');
+      } finally {
+        seam.diag.error = error;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
   for (const logging of [false, true]) for (const success of [false, true]) {
     it(`receipt getters cannot replace compression result: logging=${logging}, success=${success}`, async () => {
       const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
@@ -1057,6 +1125,49 @@ describe('every rung keeps its own identity across a resume', () => {
       }
     });
   }
+
+  it('a carrier-shaped unstripped resume warning still takes the stripping retry', async () => {
+    const mock = scripted([OK('unstripped memory'), OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    const local = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    let resumedWarnings = 0;
+    try {
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after') && ++resumedWarnings === 1) throw local;
+        warn.apply(seam.diag, args);
+      };
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(mock.calls.length, 2, 'main retries the carrier-shaped local error once');
+      assert.ok(carriesThinking(mock.calls[0]!) && !carriesThinking(mock.calls[1]!));
+      assert.ok(fx.strategy.summariesView().some(s => s.content === 'stripped memory'));
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
+
+  it('a reused resume-warning error is attributed to the current dispatched model', async () => {
+    const original = failure('server');
+    const mock = scripted([{ throw: original }, OK('memory')]);
+    const fx = await build(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), err => err === original);
+      assert.equal(fx.strategy.pause()?.model, 'same-model', 'premise: this error has an earlier attribution');
+      fx.strategy.setCompressionModel('model-B');
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after')) throw original;
+        warn.apply(seam.diag, args);
+      };
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), err => err === original);
+      assert.equal(mock.calls[1]!.config?.model, 'model-B');
+      assert.equal(fx.strategy.pause()?.model, 'model-B', 'the local catch refreshes attribution as on main');
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
 
   it('main reset-order regression: repeated successful unstripped answers with failing resume warnings', async () => {
     const mock = scripted([OK('memory')]);
