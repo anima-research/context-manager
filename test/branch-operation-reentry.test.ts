@@ -17,14 +17,19 @@ type Point = { label: string; occurrence: number; calls: number };
 const clone = <T>(value: T): T => structuredClone(value);
 // Pin the complete successful occurrence trace, not only its dynamic replay.
 // Removing a hook/read (or reducing its occurrences) MUST fail reachability.
-// Initialization includes the new scheduleLoadRepairs getter/return pair.
+// Initialization includes scheduleLoadRepairs. Local pricing/chunk helpers now
+// resolve each method getter once per pass (nine fewer duplicate getter seams);
+// every remaining occurrence is still replayed across all four rebind modes.
+// Queue partition construction reuses each chunk key within ordering (one
+// fewer key return) and checks persistence once; initializer trace lengths
+// stay unchanged, but these two occurrences change their labels/positions.
 const expectedTrace: Record<Operation, [number, string]> = {
   'counter-push': [38, 'c7bed58b97d18b600f475cb0009a2c786cd4ed106d7503299a4dd7ff32cf28aa'],
   'async-counter-push': [45, '8797cd678f9ad82d94caeb0cfc01bfc2f285ca6ac08da590fe5a75a0ea94ac85'],
   compress: [365, 'c6815973fb3204ecd4f7a8c099666c2d154edd2057cbe18da3207e1369dab68a'],
-  initialize: [387, 'f0f145bae4b4864e5f1de4677386f87335c9c241e9e8dc59f118e9d114e397d4'],
+  initialize: [378, '6e45bcafe3a8fb788a155e40dad8bd246e04d1124c294094f9f127a77d579b09'],
   'counter-push-override': [46, '8cc84189bae14beab6601df2b64348af7b57202f648cec125b5a665a7a5339ae'],
-  'initialize-override': [415, '6352f5b992b3d3fa0bc8607f4e0a9bc51f92dafc71a0774b2572d2aa118391c4'],
+  'initialize-override': [406, '71b798c9206d52693abf271d2ac1bb965caa539a9f413e6ffbdc68f004a3fb68'],
   'detach-override': [6, '1da3b2e603db9a077b0f109e9ebf8453a632d4cb10ab882a0d844a4af66aeb2c'],
 };
 const config = {

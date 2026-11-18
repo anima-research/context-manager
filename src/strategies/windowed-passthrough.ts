@@ -1,3 +1,4 @@
+import { registerUnfencedStrategy } from '../branch-operation-scope.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { describeThrown } from '../describe-thrown.js';
 import type {
@@ -289,6 +290,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private keptSlotReported = false;
 
   constructor(options: WindowedPassthroughOptions = {}) {
+    if (new.target === WindowedPassthroughStrategy) registerUnfencedStrategy(this);
     const fraction = options.reAnchorFraction ?? 0.5;
     if (!(fraction > 0 && fraction <= 1)) {
       throw new Error(`reAnchorFraction must be in (0, 1], got ${fraction}`);

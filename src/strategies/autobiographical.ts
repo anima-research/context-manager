@@ -2586,6 +2586,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private compressionFailureOrder = new Map<string, number>();
   private mergeFailureOrder = new Map<string, number>();
+  /** Index-order partition for the next rebuild. Record-backed chunks retain
+   * their indices on append, so the existing queue-building pass can visit
+   * fresh work, new frontier work, then failed work without sorting again.
+   * Invalidated by source/decision changes, never by an ordinary append. */
+  private compressionQueuePartition: {
+    records: ChunkRecord[];
+    count: number;
+    fresh: number[];
+    failed: number[];
+    failureSequence: number;
+    failureCount: number;
+    merges: AutobiographicalStrategy['mergeQueue'];
+    mergeCount: number;
+  } | null = null;
+
   /** The failure mark of the head merge the relief rule last gave way for,
    *  and `l1Attempts` then (mergeTakesTurnByRelief): that merge competes by
    *  relief again once an L1 has run since. Branch-local, like the queues. */
@@ -3670,6 +3685,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Drop every branch-derived mirror without touching durable state. */
   private clearBranchMirrors(): void {
+    this.compressionQueuePartition = null;
     this._previewInFlight = false;
     this.previewPins = null;
     this._lastPreview = undefined;
@@ -3812,6 +3828,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected markChunkRecordCompressed(recordId: string | undefined, summaryId: string): void {
     if (!this.chunkPersistenceEnabled || !recordId) return;
     this.requireBranchMutation('markChunkRecordCompressed');
+    this.compressionQueuePartition = null;
     const rec = this.chunkRecords.find(r => r.id === recordId);
     if (!rec) return;
     rec.compressed = true;
@@ -3955,6 +3972,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * memory, rather than clearing them (#166).
    */
   protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
+    this.compressionQueuePartition = null;
     // The summaries a load takes up can end an overlap the guard refused, so
     // the next queue build tests those chunks again. The orphaned-records
     // halt and its warning stay as they are: rebuildChunks recomputes the
@@ -7102,8 +7120,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * and so is one whose merge is no longer queued.
    */
   private orderCompressionQueue(): void {
-    const pending = new Set(this.chunks.filter((chunk) => !chunk.compressed).map((chunk) => this.chunkKey(chunk)));
-    for (const key of this.compressionFailureOrder.keys()) if (!pending.has(key)) this.compressionFailureOrder.delete(key);
+    const chunks = this.chunks;
+    const failureOrder = this.compressionFailureOrder;
+    const chunkKey = this.branchOperations.local(this, this.chunkKey);
+    const keys = chunks.map((chunk) => chunk.compressed ? undefined : chunkKey(chunk));
+    const pending = new Set(keys.filter((key): key is string => key !== undefined));
+    for (const key of failureOrder.keys()) if (!pending.has(key)) failureOrder.delete(key);
     for (const key of this.compressionNotBefore.keys()) if (!pending.has(key)) this.compressionNotBefore.delete(key);
     for (const [subject, entry] of this.compressionFailureRuns) if (!pending.has(entry.chunkKey)) this.compressionFailureRuns.delete(subject);
     const queuedMerges = new Set(this.mergeQueue.map((merge) => mergeFailureKey(merge)));
@@ -7113,8 +7135,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // its message ids, so the sort mustn't recompute it per comparison.
     const failedAt = new Map<number, number>();
     for (const index of this.compressionQueue) {
-      const chunk = this.chunks[index];
-      const order = chunk ? this.compressionFailureOrder.get(this.chunkKey(chunk)) : undefined;
+      const chunk = chunks[index];
+      const order = chunk ? failureOrder.get(keys[index]!) : undefined;
       if (order !== undefined) failedAt.set(index, order);
     }
     const fresh = this.compressionQueue.filter((index) => !failedAt.has(index));
@@ -7122,6 +7144,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter((index) => failedAt.has(index))
       .sort((a, b) => failedAt.get(a)! - failedAt.get(b)!);
     this.compressionQueue = [...fresh, ...failed];
+    const freshIndices: number[] = [], failedIndices: number[] = [];
+    for (let index = 0; index < chunks.length; index++) {
+      (failureOrder.has(keys[index]!) ? failedIndices : freshIndices).push(index);
+    }
+    failedIndices.sort((a, b) => failureOrder.get(keys[a]!)! - failureOrder.get(keys[b]!)!);
+    this.compressionQueuePartition = this.chunkPersistenceEnabled && !this._dryRunSelect &&
+      chunks.length === this.chunkRecords.length ? {
+        records: this.chunkRecords, count: chunks.length, fresh: freshIndices, failed: failedIndices,
+        failureSequence: this.compressionFailureSequence, failureCount: failureOrder.size,
+        merges: this.mergeQueue, mergeCount: this.mergeQueue.length,
+      } : null;
   }
 
   /**
@@ -7619,6 +7652,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.persistMergeQuarantine();
       this.diag.warn(`[merge-quarantine] cleared topology record key=${key.slice(0, 12)}: its group is a valid merge again`);
     }
+    this.compressionQueuePartition = null;
     this.mergeQueue.push(merge);
     this.branchMutation(this.store, 'setStateJson', this.mergeQueueStateId, this.mergeQueue);
   }
@@ -7669,6 +7703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected dequeueMerge(): { level: SummaryLevel; sourceIds: string[]; attempts?: number } | undefined {
     this.requireBranchMutation('dequeueMerge');
+    this.compressionQueuePartition = null;
     const merge = this.mergeQueue.shift();
     if (merge && this.landsAsPlanned()) this.mergePicksDeferred = true;
     this.branchMutation(this.store, 'setStateJson', this.mergeQueueStateId, this.mergeQueue);
@@ -9845,6 +9880,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.mergeFailureOrder.set(mergeFailureKey(merge), ++this.compressionFailureSequence);
             if (this.mergeQueue[0] === merge && this.mergeQueue.length > 1) {
               this.mergeQueue.shift();
+              this.compressionQueuePartition = null;
               this.mergeQueue.push(merge);
             }
           }
@@ -20244,10 +20280,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const prev = memo!.listing;
       for (let i = 0; i < prev.length; i++) if (listing[i] !== prev[i]) { reusable = false; break; }
     }
+    // Keep A's collection shells through reentry; initialization isolates B's.
+    // Subsequent guarded assignments/writers still refuse the obsolete origin.
+    const records = this.chunkRecords;
+    const chunks = this.chunks;
+    const queue = this.compressionQueue;
+    const overlapBlocked = this._overlapBlocked;
+    const chunkHasHeldMessage = this.branchOperations.local(this, this.chunkHasHeldMessage);
     const entries: NonNullable<typeof memo>['entries'] = [];
+    let partition = this.compressionQueuePartition;
+    if (!reusable || this._dryRunSelect || partition?.records !== records || records.length !== partition.count ||
+      partition.failureSequence !== this.compressionFailureSequence || partition.failureCount !== this.compressionFailureOrder.size ||
+      partition.merges !== this.mergeQueue || partition.mergeCount !== this.mergeQueue.length) partition = null;
+    const finishQueue = (): void => {
+      // A host hook can change the lane during this synchronous rebuild.
+      // In that case restore rebuild's index order before applying the new
+      // failure decision; never publish a partition captured before reentry.
+      if (partition && (this.compressionQueuePartition !== partition ||
+        partition.count !== this.chunkRecords.length ||
+        partition.failureSequence !== this.compressionFailureSequence ||
+        partition.failureCount !== this.compressionFailureOrder.size ||
+        partition.merges !== this.mergeQueue || partition.mergeCount !== this.mergeQueue.length)) {
+        this.compressionQueue.sort((a, b) => a - b);
+        partition = null;
+      }
+      if (!partition) this.orderCompressionQueue();
+    };
     let orphaned = 0;
-    for (let r = 0; r < this.chunkRecords.length; r++) {
-      const rec = this.chunkRecords[r];
+    for (let r = 0; r < records.length; r++) {
+      const rec = records[r];
       const kept = reusable && r < memo!.entries.length ? memo!.entries[r] : null;
       let msgs: StoredMessage[], tokens: number, positions: number[];
       if (kept && kept.record === rec && kept.messages.length === rec.sourceIds.length) {
@@ -20267,10 +20328,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? this.estimateTextOnlyTokens(m)
           : store.estimateTokens(m)), 0);
         entries.push({ record: rec, messages: msgs, tokens, positions });
+        if (msgs.length !== rec.sourceIds.length) partition = null;
       }
-      if (msgs.length === 0) { orphaned++; continue; }
+      if (msgs.length === 0) { orphaned++; partition = null; continue; }
       const chunk: Chunk = {
-        index: this.chunks.length,
+        index: chunks.length,
         startIndex: -1, // record-derived; filtered-array indices are not meaningful
         endIndex: -1,
         messages: msgs,
@@ -20281,7 +20343,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         recordId: rec.id,
       };
       for (const at of positions) byPosition[at] = chunk;
-      this.chunks.push(chunk);
+      chunks.push(chunk);
     }
     this._recordChunks = { listing, records: this.chunkRecords, calibration, ignoreSize, entries };
 
@@ -20290,14 +20352,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // has been rebuilt/renumbered underneath us. Chunking "fresh" ground now
     // would re-compress already-lived history into duplicate memories.
     // Halt ALL compression until an operator reconciles the store.
-    if (this.chunkPersistenceEnabled && this.chunkRecords.length >= 3 &&
-        orphaned / this.chunkRecords.length > 0.5) {
+    if (this.chunkPersistenceEnabled && records.length >= 3 &&
+        orphaned / records.length > 0.5) {
       this.chunkRecordsOrphaned = true;
       this.compressionQueue = [];
       if (!this._orphanWarned) {
         this._orphanWarned = true;
         this.diag.error(
-          `[autobiographical] FAIL-CLOSED: ${orphaned}/${this.chunkRecords.length} chunk ` +
+          `[autobiographical] FAIL-CLOSED: ${orphaned}/${records.length} chunk ` +
           `records resolve to zero live messages (messages chain break / store ` +
           `reconciliation signature). Compression halted to prevent duplicate ` +
           `memory formation — reconcile the store before resuming.`,
@@ -20307,16 +20369,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     this.chunkRecordsOrphaned = false;
 
-    // Queue uncompressed record-backed chunks (crash-recovery: record was
-    // appended but the process died before its L1 landed).
+    // Queue construction already visits every record on main. Reuse the
+    // partition in THAT pass: no pending-key/map/merge scan or failure sort
+    // is added to an append. Newly closed chunks go before the failed pass.
     const holdBlocked = this.holdBlockedIds(store);
-    for (const chunk of this.chunks) {
+    for (const index of partition ? partition.fresh : chunks.keys()) {
+      const chunk = chunks[index]!;
       if (
         !chunk.compressed &&
-        !(chunk.recordId && this._overlapBlocked.has(chunk.recordId)) &&
-        !this.chunkHasHeldMessage(chunk, holdBlocked)
+        !(chunk.recordId && overlapBlocked.has(chunk.recordId)) &&
+        !chunkHasHeldMessage(chunk, holdBlocked)
       ) {
-        this.compressionQueue.push(chunk.index);
+        queue.push(chunk.index);
       }
     }
 
@@ -20325,7 +20389,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // are not the resident's, and a record written here would be compressed
     // by the resident at its next boot.
     if (this.config.auditOnly) {
-      this.orderCompressionQueue();
+      if (partition) {
+        for (const index of partition.failed) {
+          const chunk = chunks[index]!;
+          if (!chunk.compressed && !(chunk.recordId && overlapBlocked.has(chunk.recordId)) &&
+            !chunkHasHeldMessage(chunk, holdBlocked)) queue.push(index);
+        }
+      }
+      finishQueue();
       return;
     }
     const messagesToChunk = this.getCompressibleMessages(store, consumed);
@@ -20365,7 +20436,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (at !== undefined) byPosition[at] = chunk;
       }
       this.chunks.push(chunk);
-      this.compressionQueue.push(chunk.index);
+      queue.push(chunk.index);
+      if (partition) {
+        partition.fresh.push(chunk.index);
+        partition.count++;
+      }
 
       currentChunk = [];
       currentTokens = 0;
@@ -20437,6 +20512,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // NOTE: no trailing-partial chunk. An unclosed chunk is not a chunk —
     // it compresses only after the running sum closes it.
 
+    if (partition) {
+      for (const index of partition.failed) {
+        const chunk = chunks[index]!;
+        if (!chunk.compressed && !(chunk.recordId && overlapBlocked.has(chunk.recordId)) &&
+          !chunkHasHeldMessage(chunk, holdBlocked)) queue.push(index);
+      }
+    }
+
     // ---- 4. L1 holdback: keep the newest X closed chunks out of the
     // speculative queue (default 1). The chunk at the live edge is the one
     // most likely to still be in motion (edits, tool-result landings, the
@@ -20455,16 +20538,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return lastId !== undefined && this._demandedL1Chunks.has(lastId);
       });
     }
-    this.orderCompressionQueue();
+    finishQueue();
   }
 
   protected heldBackChunks(holdback: number): Set<number> {
     if (!(holdback > 0)) return new Set();
+    const chunks = this.chunks;
     const order = this._storeOrder;
     const listed = order.size > 0;
     const edge: Array<{ index: number; at: number }> = [];
-    for (let pos = 0; pos < this.chunks.length; pos++) {
-      const messages = this.chunks[pos]!.messages;
+    for (let pos = 0; pos < chunks.length; pos++) {
+      const messages = chunks[pos]!.messages;
       let at = pos;
       if (listed) {
         at = -1;
@@ -21030,17 +21114,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // crosses the depth is beyond it, and the strip replaces its images.
     // (`raw` and `rawDepth` are pre-strip, not uncalibrated.)
     let rawDepth = 0;
+    const forms = {
+      prune: this.branchOperations.local(this, this.prunedForSend),
+      truncate: this.branchOperations.local(this, this.truncateContent),
+      estimate: this.branchOperations.local(this, this.estimateTextOnlyTokens),
+      pruning,
+      cache: this._prunedForSend,
+    };
+    const capped = this.branchOperations.local(this, this.cappedForSend);
     for (let i = messages.length - 1; i >= 0; i--) {
       const raw = store.estimateTokens(messages[i]);
       rawDepth += raw;
-      const sent = this.prunedForSend(store, messages[i]!);
+      const sent = forms.prune(store, messages[i]!, forms);
       let est = sent === messages[i] ? raw : store.estimateTokens(sent);
       if (stripActive) {
         // The images the cut sends (cappedForSend), whose verdicts the strip
         // applies, so a cut that leaves one out takes it off at its full
         // price, through the cut's extra, rather than here.
         // Block by block, which walks the cut's images in imagesIn's order.
-        const cut = this.cappedForSend(store, messages[i]!, msgCap).content;
+        const cut = capped(store, messages[i]!, msgCap, forms).content;
         const groups = new Map<unknown, ImageVerdict[]>();
         let ruleLeft = replay !== undefined ? replay.get(messages[i]!.id) ?? 0 : undefined;
         for (const block of cut) {
@@ -22601,11 +22693,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * form for one message and decision: postStripEstimates keeps its prices
    * per listing and decision.
    */
-  protected prunedForSend(store: MessageStoreView, msg: StoredMessage): StoredMessage {
-    const pruning = this._toolPruningInUse?.store === store ? this._toolPruningInUse.pruning : this.toolPruning(store);
+  protected prunedForSend(store: MessageStoreView, msg: StoredMessage, forms: SendForms | undefined = undefined): StoredMessage {
+    const held = forms ? undefined : this._toolPruningInUse;
+    const pruning = forms?.pruning ?? (held?.store === store ? held.pruning : this.toolPruning(store));
     const results = pruning.replaced.get(msg.id);
     if (!results && !(pruning.inputCap > 0)) return msg;
-    const kept = this._prunedForSend.get(msg);
+    const cache = forms?.cache ?? this._prunedForSend;
+    const kept = cache.get(msg);
     if (kept && kept.inputCap === pruning.inputCap && sameMarkers(kept.results, results)) return kept.sent;
     let content: ContentBlock[] | null = null;
     let inputs = false;
@@ -22624,7 +22718,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sent = content ? { ...msg, content: releaseEditedRawForms(msg.content, content) } : msg;
     // A message with no tool call to measure and nothing replaced costs a
     // scan, so only the others are kept.
-    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, results, sent });
+    if (content || inputs) cache.set(msg, { inputCap: pruning.inputCap, results, sent });
     return sent;
   }
 
@@ -23261,6 +23355,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     store: MessageStoreView,
     msg: StoredMessage,
     msgCap: number,
+    forms: SendForms | undefined = undefined,
   ): { content: ContentBlock[]; extra: number } {
     // The default cut, capContent, reads a cap that isn't a positive number
     // as no cap, such as a caller's explicit `maxMessageTokens: undefined`,
@@ -23268,9 +23363,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // extra is 0. The estimate is the message's cached one for its own
     // content, and otherwise of the content it's given, such as an
     // override's rewrite passed on to this class's cut.
-    const sent = this.prunedForSend(store, msg);
-    const content = this.truncateContent(sent.content, msgCap, (blocks) =>
-      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+    const sent = forms ? forms.prune(store, msg, forms) : this.prunedForSend(store, msg);
+    const content = forms
+      ? forms.truncate(sent.content, msgCap, (blocks) =>
+        forms.estimate(blocks === sent.content ? sent : { content: blocks } as StoredMessage))
+      : this.truncateContent(sent.content, msgCap, (blocks) =>
+        blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
     return { content, extra: cappedPriceExtra(store, sent, content) };
   }
 
@@ -23285,6 +23383,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
+      compressionQueuePartition: this.compressionQueuePartition,
       // The dry rebuild orders its queue (orderCompressionQueue), which prunes
       // the failure orders, runs and window waits of chunks its own cut
       // doesn't have, and the failure orders and runs of merges not queued
@@ -23322,6 +23421,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
+      this.compressionQueuePartition = saved.compressionQueuePartition;
       this.compressionFailureOrder = saved.compressionFailureOrder;
       this.compressionNotBefore = saved.compressionNotBefore;
       this.toolsDeferredChunks = saved.toolsDeferredChunks;
@@ -23533,4 +23633,13 @@ function windowRuns(ids: readonly MessageId[], position: ReadonlyMap<MessageId, 
     else runs.push([id]);
   }
   return runs;
+}
+
+/** Captured only for a single scoped pricing pass; never retained across operations. */
+interface SendForms {
+  prune: (store: MessageStoreView, msg: StoredMessage, forms?: SendForms) => StoredMessage;
+  truncate: (content: ContentBlock[], maxTokens: number, estimate?: (content: ContentBlock[]) => number) => ContentBlock[];
+  estimate: (msg: StoredMessage) => number;
+  pruning: ToolPruningDecision;
+  cache: WeakMap<StoredMessage, { inputCap: number; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }>;
 }

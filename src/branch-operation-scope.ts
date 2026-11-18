@@ -24,9 +24,17 @@ interface BoundaryResolution {
   origin?: { owner: object; context: object; displaced: object | undefined };
 }
 const boundaryResolution = new AsyncLocalStorage<BoundaryResolution>();
+const unfencedStrategies = new WeakSet<object>();
+
+/** Internal opt-out for exact built-in strategies with no origin fence.
+ * Proxies and subclasses are not registered implicitly; their symbol traps may
+ * forward a fence. Installing a fence revokes the opt-out.
+ */
+export function registerUnfencedStrategy(strategy: object): void { unfencedStrategies.add(strategy); }
 
 /** Resolve ALL strategy member checks, methods and arguments in this boundary. */
 export function callStrategy<S extends object, T>(strategy: S, key: PropertyKey, work: (strategy: S) => T): T {
+  if (unfencedStrategies.has(strategy)) return work(strategy);
   let parent = boundaryResolution.getStore();
   while (parent && !parent.resolving) parent = parent.parent;
   return boundaryResolution.run({ resolving: true, failed: false, invalidated: new Set(), parent }, () => {
@@ -53,6 +61,7 @@ export class BranchOperationScope<Identity extends object> {
   // Entry itself supersedes earlier work, even if an override awaits before
   // super and has not advanced the strategy's load generation yet.
   private lifecycleEpoch = 0;
+  private readonly localMethods = new WeakMap<Function, Function>();
   private readonly storage = new AsyncLocalStorage<Readonly<{
     // Only the synchronous lifecycle setup may replace this binding. Keeping
     // the holder lets an override's post-super continuation retain that load,
@@ -175,6 +184,17 @@ export class BranchOperationScope<Identity extends object> {
       this.isBindingCurrent();
   }
 
+  /** Reuse a helper inside an ALREADY scoped operation, without another origin lookup.
+   * Keep the result local to that operation: it inherits the caller's ALS origin,
+   * including through awaits. Mirror accessors and writer guards remain installed;
+   * a reentrant lifecycle still invalidates them. Never unwrap lifecycle entries.
+   */
+  local<T extends (...args: any[]) => any>(target: object, method: T): T {
+    if (!this.context()) throw new Error('Local helper requires an operation scope');
+    this.assertCurrent();
+    return (this.localMethods.get(method) ?? method).bind(target) as T;
+  }
+
   /** Detach collection shells before initialization clears/reloads them. */
   isolateMirrors(): void {
     this.assertCurrent();
@@ -184,6 +204,7 @@ export class BranchOperationScope<Identity extends object> {
   install(target: object, sharedFields: ReadonlySet<string>, objectMirrors: ReadonlySet<string>,
     discardedMirrors: ReadonlySet<string> = new Set()): void {
     const scope = this;
+    unfencedStrategies.delete(target);
     Object.defineProperty(target, strategyOperationBoundary, {
       // Forwarders may bind functions returned by their get trap. A frozen
       // data slot would require the trap to return this exact function.
@@ -222,6 +243,7 @@ export class BranchOperationScope<Identity extends object> {
           const identity = scope.capture();
           return scope.run(identity ? Object.freeze({ ...identity }) : null, work);
         };
+        if (key !== 'initialize' && key !== 'detach') this.localMethods.set(wrapped, method);
         Object.defineProperties(wrapped, {
           name: { value: method.name, configurable: true },
           length: { value: method.length, configurable: true },
