@@ -9,6 +9,8 @@
  * precede receipt creation), discard that copy and restore a fresh copy of the original backup;
  * do not just update the expected hash or reuse the treatment branch.
  */
+import { CompressionWithdrawn } from '../src/compression-withdrawn.js';
+import { limitSurgeryTransport } from '../src/surgery/one-request-transport.js';
 import { sanitizeSurgeryProviderError } from '../src/surgery/provider-error.js';
 import { createHash } from 'node:crypto';
 import { createReadStream, readFileSync, realpathSync, openSync, closeSync, fsyncSync, ftruncateSync, writeSync } from 'node:fs';
@@ -61,7 +63,7 @@ if (!fromStore || (!fromStore.startsWith('..' + sep) && fromStore !== '..' && !i
 // Exclusive creation rejects existing files AND dangling symlinks before opening
 // the store. Retain the descriptor; later writes never follow a replaced path.
 const receiptFd = openSync(receiptDestination, 'wx');
-const recovery = 'Execution may have changed the disposable copy. Preserve this receipt and config, discard the copy, and restore a fresh copy of the original stopped backup before retrying.';
+const recovery = 'Execution may have changed the disposable copy. Preserve this receipt and config, discard the copy, and restore a fresh copy of the original stopped backup before retrying with a new, unused receiptPath.';
 let receipt: Record<string, unknown> = { ...preview, status: 'preflight', recovery };
 function saveReceipt() {
   const bytes = Buffer.from(JSON.stringify(receipt, null, 2));
@@ -72,11 +74,13 @@ function saveReceipt() {
   return createHash('sha256').update(bytes).digest('hex');
 }
 saveReceipt();
-console.error('Execution may change the disposable copy. On failure preserve output/config and any receipt, discard the copy, and restore a fresh copy of the original stopped backup before retrying.');
+console.error('Execution may change the disposable copy. On failure preserve output/config and any receipt, discard the copy, and restore a fresh copy of the original stopped backup before retrying with a new, unused receiptPath.');
 
-const actual=new Membrane(new AnthropicAdapter({apiKey:process.env.ANTHROPIC_API_KEY}),{formatter:new NativeFormatter()});
+const adapter = new AnthropicAdapter({apiKey:process.env.ANTHROPIC_API_KEY, cacheKeepalive:{enabled:false}});
+limitSurgeryTransport(adapter);
+const actual=new Membrane(adapter,{formatter:new NativeFormatter()});
 let call: Record<string,unknown>|null=null;
-const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw new Error('ONE_CALL_CAP');const active=manager!.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw new Error('No trusted L1 authoring');assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};receipt={...receipt,status:'calling',call};saveReceipt();try{const response=await target.complete(sent,options);const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){const safe=sanitizeSurgeryProviderError(e);call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:safe.name,message:safe.message,type:safe.type,httpStatus:safe.httpStatus,retryable:safe.retryable}};throw safe;}};}});
+const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw Object.assign(new CompressionWithdrawn('ONE_CALL_CAP'),{providerAdmission:'deferred'});const active=manager!.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw Object.assign(new CompressionWithdrawn('No trusted L1 authoring'),{providerAdmission:'deferred'});assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};receipt={...receipt,status:'calling',call};saveReceipt();try{const response=await target.complete(sent,{...options,retry:false});const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){const safe=sanitizeSurgeryProviderError(e);call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:safe.name,message:safe.message,type:safe.type,httpStatus:safe.httpStatus,retryable:safe.retryable}};throw safe;}};}});
 let manager: ContextManager | undefined;
 try {
 manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace});
@@ -86,11 +90,11 @@ assertZeroRecallSourceSafe(cmSource, strategy.opening());
 const parent=manager.currentBranch(); if(parent.name!==config.expectedParentBranch)throw new Error(`parent branch mismatch ${parent.name}`);
 const chunks=(strategy as unknown as {chunks:Array<{index:number,messages:Array<{id:string}>}>}).chunks;const chunk=chunks.find(c=>c.index===config.targetChunkIndex);if(!chunk)throw new Error(`chunk ${config.targetChunkIndex} absent`);const range:[string,string]=[String(chunk.messages[0]?.id),String(chunk.messages.at(-1)?.id)];if(JSON.stringify(range)!==JSON.stringify(config.expectedSourceRange))throw new Error(`source range mismatch ${range}`);strategy.assertCompressionQuarantineChunk(config.expectedQuarantineKey, config.targetChunkIndex);
 receipt={...receipt,parentBranch:parent,targetChunkIndex:config.targetChunkIndex,sourceRange:range,status:'forking'};saveReceipt();
-const branch=await manager.fork(config.branchName);const activeStrategy=manager.getStrategy() as AutobiographicalStrategy;activeStrategy.assertCompressionQuarantineChunk(config.expectedQuarantineKey, config.targetChunkIndex);await activeStrategy.clearCompressionRefusalQuarantine(config.expectedQuarantineKey);(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue=[config.targetChunkIndex];const beforeSummaryIds=new Set((activeStrategy as unknown as {summaries:Array<{id:string}>}).summaries.map(s=>s.id));let error:null|{name?:string;message?:string}=null;try{await manager.tick();}catch(e){error={name:(e as Error).name,message:(call as Record<string,unknown>|null)?.status === 'error' ? 'Provider call failed; message omitted to protect source content' : (e as Error).message};}
+const branch=await manager.fork(config.branchName);const activeStrategy=manager.getStrategy() as AutobiographicalStrategy;activeStrategy.assertCompressionQuarantineChunk(config.expectedQuarantineKey, config.targetChunkIndex);await activeStrategy.clearCompressionRefusalQuarantine(config.expectedQuarantineKey);(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue=[config.targetChunkIndex];const beforeSummaryIds=new Set((activeStrategy as unknown as {summaries:Array<{id:string}>}).summaries.map(s=>s.id));let error:null|{name?:string;message?:string}=null;try{await manager.tick();}catch(e){error={name:(e as Error).name,message:(e as Error).message};}
 const newSummaries=(activeStrategy as unknown as {summaries:Array<{id:string,sourceRange?:unknown,content?:unknown}>}).summaries.filter(s=>!beforeSummaryIds.has(s.id)).map(s=>({id:s.id,sourceRange:s.sourceRange}));const after={branch:manager.currentBranch(),queue:[...(activeStrategy as unknown as {compressionQueue:number[]}).compressionQueue],quarantine:activeStrategy.getCompressionQuarantineStatus(),newSummaries};
 const succeeded = !error && newSummaries.length === 1 && !!call && (call as Record<string, unknown>).status === 'completed'
   && JSON.stringify(newSummaries[0].sourceRange) === JSON.stringify({ first: range[0], last: range[1] });
-receipt={...preview,status:succeeded?'closing':'failed',parentBranch:parent,branch,targetChunkIndex:config.targetChunkIndex,sourceRange:range,provenanceMode:'authored-request',clearedQuarantineKey:config.expectedQuarantineKey,call,error,after,recovery:!succeeded?'Execution failed or did not produce exactly one summary. Execution may have forked and changed quarantine/queue/ladder state. Preserve this receipt, discard the disposable store copy, and restore a fresh copy of the original stopped backup before retrying; do not merely update the expected hash.':undefined};if(!succeeded)process.exitCode=1;
+receipt={...preview,status:succeeded?'closing':'failed',parentBranch:parent,branch,targetChunkIndex:config.targetChunkIndex,sourceRange:range,provenanceMode:'authored-request',clearedQuarantineKey:config.expectedQuarantineKey,call,error,after,recovery:!succeeded?'Execution failed or did not produce exactly one summary. Execution may have forked and changed quarantine/queue/ladder state. Preserve this receipt, discard the disposable store copy, and restore a fresh copy of the original stopped backup before retrying with a new, unused receiptPath; do not merely update the expected hash.':undefined};if(!succeeded)process.exitCode=1;
 } catch (error) {
   receipt = { ...receipt, status: 'failed', call, error: { name: (error as Error).name, message: (error as Error).message }, recovery };
   process.exitCode = 1;
@@ -98,8 +102,8 @@ receipt={...preview,status:succeeded?'closing':'failed',parentBranch:parent,bran
   try {
     manager?.close();
     if (receipt.status === 'closing') receipt.status = 'finished';
-  } catch {
-    receipt = { ...receipt, status: 'uncertain', closeError: 'Store close failed; final durability is uncertain', recovery };
+  } catch (error) {
+    receipt = { ...receipt, status: 'uncertain', closeError: 'Store close failed; final durability is uncertain', closeCause: { name: (error as Error).name, message: (error as Error).message }, recovery };
     process.exitCode = 1;
   }
 }
@@ -109,6 +113,12 @@ try {
   const digest = saveReceipt();
   console.log(JSON.stringify(receipt, null, 2));
   console.log('RECEIPT_SHA256', digest);
+} catch (error) {
+  receipt = { ...receipt, status: 'uncertain', receiptError: { name: (error as Error).name, message: (error as Error).message }, recovery };
+  process.exitCode = 1;
+  // The file may be partial or stale: stdout is the fallback, NOT a saved-file digest.
+  console.log(JSON.stringify(receipt, null, 2));
+  console.error('Final receipt save failed; preserve stdout. No saved receipt digest is available.');
 } finally {
   closeSync(receiptFd);
 }

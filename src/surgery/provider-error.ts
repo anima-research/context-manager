@@ -1,3 +1,4 @@
+import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { isCarrierTransportRejection } from '../strategies/autobiographical.js';
 
 /** Keep classification, not the provider's payload, cause or original stack.
@@ -5,8 +6,9 @@ import { isCarrierTransportRejection } from '../strategies/autobiographical.js';
  */
 export function sanitizeSurgeryProviderError(thrown: unknown): Error & {
   type?: string; httpStatus?: number; retryable?: boolean;
+  providerAdmission?: 'deferred'; retryAfterMs?: number; providerErrorCode?: string;
 } {
-  const source = thrown as { name?: unknown; type?: unknown; httpStatus?: unknown; retryable?: unknown } | null;
+  const source = thrown as { name?: unknown; type?: unknown; httpStatus?: unknown; retryable?: unknown; providerAdmission?: unknown; retryAfterMs?: unknown; providerErrorCode?: unknown } | null;
   const message = isCarrierTransportRejection(thrown)
     ? 'Provider call failed (invalid_request: thinking carriers rejected); message omitted to protect source content'
     : 'Provider call failed; message omitted to protect source content';
@@ -17,5 +19,9 @@ export function sanitizeSurgeryProviderError(thrown: unknown): Error & {
   if (typeof source?.type === 'string') classified.type = source.type;
   if (typeof source?.httpStatus === 'number') classified.httpStatus = source.httpStatus;
   if (typeof source?.retryable === 'boolean') classified.retryable = source.retryable;
+  if (isCompressionWithdrawn(thrown)) Object.defineProperty(safe, Symbol.for('@animalabs/context-manager:compression-withdrawn'), { value: true });
+  if (source?.providerAdmission === 'deferred') classified.providerAdmission = 'deferred';
+  if (typeof source?.retryAfterMs === 'number') classified.retryAfterMs = source.retryAfterMs;
+  if (typeof source?.providerErrorCode === 'string') classified.providerErrorCode = source.providerErrorCode;
   return classified;
 }

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { CompressionWithdrawn, isCompressionWithdrawn } from '../src/compression-withdrawn.js';
 import assert from 'node:assert/strict';
 import { sanitizeSurgeryProviderError } from '../src/surgery/provider-error.js';
 test('sanitization retains the provider class and classification, never payload or original stack', () => {
@@ -17,4 +18,16 @@ test('sanitization retains the provider class and classification, never payload 
   assert.ok(!('payload' in safe));
   assert.equal(safe.cause,undefined);
   assert.match(original.message,/private source/, 'the provider exception is not mutated');
+});
+
+test('sanitization preserves own withdrawal and admission classification', () => {
+  const error = Object.assign(new CompressionWithdrawn('private source'), {
+    providerAdmission: 'deferred', retryAfterMs: 1234, providerErrorCode: 'offline_code',
+  });
+  const safe = sanitizeSurgeryProviderError(error);
+  assert.equal(isCompressionWithdrawn(safe), true);
+  assert.equal(safe.providerAdmission, 'deferred');
+  assert.equal(safe.retryAfterMs, 1234);
+  assert.equal(safe.providerErrorCode, 'offline_code');
+  assert.ok(!JSON.stringify(safe).includes('private source'));
 });

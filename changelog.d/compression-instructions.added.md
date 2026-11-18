@@ -34,3 +34,6 @@
   `observeL1CompressionRequest` to preserve observation; rewriting strategies
   must override `compressionOutcomeNamespace` to isolate durable outcomes from
   ordinary request families.
+- Subclasses may override protected `allowsMergeScheduling(): boolean` to opt
+  out of merge scheduling (the default returns true). Existing subclasses with
+  a same-named member must check its visibility and signature for compatibility.

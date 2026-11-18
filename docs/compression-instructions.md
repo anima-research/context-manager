@@ -23,11 +23,16 @@ keeps today's instruction text byte-for-byte. `default` is the only accepted
 preset; all other names are rejected. A partial `templates` object
 replaces only its named slots; every unspecified slot inherits the current
 built-in text. No migration of existing summaries is performed. This instruction-text guarantee
-is not a guarantee of identical full requests: L1 now ignores recall-shaped raw
-Context Manager headers at or after the opening when separating recall answers.
+is not a guarantee of identical full requests: L1 and L2 now distinguish constructed recall headers from recall-shaped raw
+Context Manager history when separating recall answers.
 Consecutive source turns can therefore collapse without the former synthetic
-resume turn, even with default settings. Header-shaped raw history before the
-opening is still detected heuristically.
+resume turn, even with default settings. This also applies before the L1 opening and throughout L2 raw sources.
+Changed request bytes change request hashes and refusal-family identities: old
+family outcomes may not be reused, so previously attempted work may incur new
+paid calls (unless a per-chunk quarantine cap prevents them). Ordinary L1
+`compress_l1` telemetry also changes: it describes the last dispatched attempt
+and counts recalls by construction identity, including pair/envelope overhead.
+Our earlier answer claiming unchanged defaults and provenance was incomplete.
 
 ## Slots and placeholders
 
@@ -135,7 +140,9 @@ still owns the whole operation.
 `summarySystemPrompt` and `summaryUserPrompt` exist in the public config but
 are not read by these current request-building paths. They are not aliases
 for this option. The host-supplied live system prompt, tools, native content,
-recall carriers, provenance, and transition system prompt are unchanged.
+recall carrier content, and transition system prompt are not customized by this
+option. This does not imply unchanged request bytes or provenance hashes; see
+the compatibility caveat above.
 
 ## Scope and limits
 

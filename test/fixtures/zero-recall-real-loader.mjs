@@ -1,5 +1,5 @@
-// The CLI, manager, store and L1 ladder are real. Only provider I/O and the
-// operator quarantine binding are replaced; queued merges are fixture state.
+// The CLI, manager, store, quarantine binding/clearing and L1 ladder are real.
+// Only provider I/O is stubbed; queued merges are fixture state.
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
     if (specifier === '../src/context-manager.js') return { url: 'real-fixture:manager', shortCircuit: true };
@@ -15,8 +15,11 @@ export async function load(url, context, nextLoad) {
       static async open(options) {
         const manager = await Real.open(options);
         const strategy = options.strategy;
-        strategy.assertCompressionQuarantineChunk = () => {};
-        strategy.clearCompressionRefusalQuarantine = async () => {};
+        const clear = strategy.clearCompressionRefusalQuarantine.bind(strategy);
+        strategy.clearCompressionRefusalQuarantine = async key => {
+          await clear(key);
+          if (strategy.getCompressionQuarantineStatus().keys.includes(key)) throw new Error('real quarantine clear did not retire the fixture');
+        };
         const fork = manager.fork.bind(manager);
         const tick = manager.tick.bind(manager);
         manager.tick = async () => {
@@ -64,7 +67,7 @@ export async function load(url, context, nextLoad) {
   ` };
   if (url === 'real-fixture:membrane') return { format: 'module', shortCircuit: true, source: `
     import { appendFileSync } from 'node:fs';
-    export class AnthropicAdapter {}
+    export class AnthropicAdapter { client = { fetch: async () => { throw new Error('offline only'); }, maxRetries: 2, withOptions(options) { return { ...this, ...options }; } }; }
     export class NativeFormatter {}
     class ProviderError extends Error {}
     export class Membrane {

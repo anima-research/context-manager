@@ -21,7 +21,7 @@ export function constructedRecallHeader(id: string): ContentBlock {
   return block;
 }
 
-/** Telemetry only: count constructed headers that survive request authoring,
+/** Identify constructed headers that survive request authoring,
  * not header-shaped text in raw history. Never used to authorize deletion. */
 export function sentRecallHeaderIds(message: { participant: string; content: ContentBlock[] }): string[] {
   if (message.participant !== 'Context Manager') return [];

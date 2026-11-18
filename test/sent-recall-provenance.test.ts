@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextManager, AutobiographicalStrategy, type SummaryEntry } from '../src/index.js';
@@ -18,8 +18,8 @@ class OmitRecall extends AutobiographicalStrategy {
   }
 }
 
-for (const [sourceOnly, omitRecall] of [[true, false], [false, false], [false, true]]) {
-  test(`public tick counts constructed recalls, not raw CM quotes (sourceOnly=${sourceOnly}, omitRecall=${omitRecall})`, async () => {
+for (const [sourceOnly, omitRecall, mode] of [[true, false], [false, false], [false, true], [false, false, 'removed'], [false, false, 'deferred']] as Array<[boolean, boolean, string?]>) {
+  test(`public tick counts constructed recalls, not raw CM quotes (sourceOnly=${sourceOnly}, omitRecall=${omitRecall}, mode=${mode})`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sr-'));
     const oldLog = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
     const log = join(dir, 'calls.jsonl');
@@ -45,15 +45,22 @@ for (const [sourceOnly, omitRecall] of [[true, false], [false, false], [false, t
       manager.close();
       const reopened = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: { complete: async (r: NormalizedRequest) => {
         requests.push(structuredClone(r));
+        if (mode === 'deferred') throw Object.assign(new Error('offline admission'), { providerAdmission: 'deferred', type: 'rate_limit', retryable: true });
+        if (mode === 'removed') {
+          reopened.getStore().setStateJson('default/autobio:summaries', []);
+          (strategy as unknown as { summaries: SummaryEntry[] }).summaries = [];
+        }
         return { content: [{ type: 'text', text: 'new memory' }], stopReason: 'end_turn' };
       } } as never });
       try {
-        await reopened.tick();
+        if (mode === 'deferred') await assert.rejects(reopened.tick(), /offline admission/);
+        else await reopened.tick();
         assert.equal(requests.length, 1, 'one public tick dispatch');
         assert.ok(JSON.stringify(requests[0]).includes('quoted header follows'), 'raw quote was actually sent');
-        const entries = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
         const receipt = entries.find(e => e.operation === 'compress_l1' && !e.event);
         const trace = entries.find(e => e.event === 'compression:attempt');
+        if (mode === 'deferred') { assert.equal(receipt, undefined, 'caller-side deferral logs no dispatched request'); return; }
         assert.ok(receipt && trace, 'receipt and attempt emitted');
         assert.equal(receipt.metadata.prior_summary_count_kept, sourceOnly || omitRecall ? 0 : 1);
         assert.equal(receipt.metadata.prior_summary_tokens === 0, sourceOnly || omitRecall);

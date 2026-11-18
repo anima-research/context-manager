@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch']) {
+for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch', 'wrong-range', 'summary-without-call', 'error-then-cap', 'receipt-sync-error']) {
   test(`executing surgery CLI offline: ${scenario}`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -47,7 +47,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const sent = trace.filter(event => event.sent).map(event => event.sent);
       assert.equal(result.status, scenario === 'success' ? 0 : 1, result.stderr);
-      assert.equal(sent.length, ['success', 'repeat', 'provider-error', 'close-error', 'refusal'].includes(scenario) ? 1 : 0);
+      assert.equal(sent.length, ['success', 'repeat', 'provider-error', 'close-error', 'refusal', 'wrong-range', 'error-then-cap', 'receipt-sync-error'].includes(scenario) ? 1 : 0);
       if (scenario === 'unsafe' || scenario === 'opening-collision') {
         assert.match(result.stdout, scenario === 'unsafe' ? /Raw recall-shaped/ : /collides with compression opening/);
         assert.ok(!trace.some(event => event.fork || event.cleared), 'source safety precedes mutation');
@@ -63,6 +63,13 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         assert.match(result.stdout, scenario === 'wrong-chunk' ? /does not belong/ : /ledger unreadable/);
       }
       const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+      if (scenario === 'receipt-sync-error') {
+        assert.match(result.stdout, /"status": "uncertain"/);
+        assert.match(result.stdout, /final receipt sync failed/);
+        assert.match(result.stdout, /"status": "completed"/);
+        assert.ok(!result.stdout.includes('RECEIPT_SHA256'));
+        return;
+      }
       if (sent.length) {
         assert.deepEqual(sent[0].messages.map((m: { content: unknown }) => m.content), [
           [{ type: 'text', text: 'offline opening' }],
@@ -93,6 +100,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       if (scenario === 'close-error') {
         assert.equal(receipt.status, 'uncertain');
         assert.match(receipt.closeError, /durability is uncertain/);
+        assert.equal(receipt.closeCause.message, "sync failed");
         assert.ok(!result.stdout.includes('"status": "finished"'));
       }
       if (scenario === 'success') {
@@ -105,6 +113,9 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         assert.match(receipt.error.message, /clear failed/);
       }
       if (scenario === 'provider-error') assert.ok(!(result.stdout + result.stderr).includes('private source echoed'));
+      if (scenario === 'wrong-range') { assert.equal(receipt.call.status, 'completed'); assert.equal(receipt.after.newSummaries.length, 1); }
+      if (scenario === 'summary-without-call') { assert.equal(receipt.call, null); assert.equal(receipt.after.newSummaries.length, 1); }
+      if (scenario === 'error-then-cap') assert.match(receipt.error.message, /ONE_CALL_CAP/);
       if (scenario === 'repeat') assert.match(receipt.error.message, /ONE_CALL_CAP/);
       if (scenario === 'mismatch') assert.match(receipt.error.message, /differs from trusted/);
       if (scenario === 'provider-error') assert.equal(receipt.call.status, 'error');

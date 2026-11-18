@@ -44,7 +44,8 @@
 - Inherited instruction settings cannot supply templates or create witnessed conflicts.
 
 - One-shot receipts report `finished` only after store close succeeds. A failed
-  final sync reports `uncertain` with backup-restoration guidance. Receipt
+  store close or final receipt sync reports `uncertain` with backup-restoration guidance; if receipt persistence fails,
+  stdout carries the final outcome without claiming a saved-file digest. Receipt
   digests hash the saved bytes rather than rereading a mutable destination path.
 - Surgery uses ordinary quarantine for head and raw-history selection; only its
   own outcome records and queued-outcome accounting use the surgery namespace.
@@ -70,3 +71,14 @@
   one-call cap.
 - The standalone transform rejects crossing tool pairs in either direction,
   including a retained raw use whose result would be deleted with a recall.
+
+- One-shot surgery disables SDK and Membrane retries and cache keepalive, and
+  guards the SDK fetch transport against a second request (including redirects).
+  Unknown SDK transport shapes fail closed. Local call-cap refusals withdraw
+  compression rather than adding provider-failure streaks or lane pauses.
+- Recovery requires a fresh, unused receiptPath in addition to a restored copy.
+- Operational limits remain: combined quarantine diagnostics can count
+  surgery-only outcomes as ordinary holds. Older package versions can interpret
+  those outcomes as ordinary quarantine. Do not resume service or downgrade on
+  the disposable treatment copy; rollback means restoring the untouched original
+  backup, not reopening the treatment branch with older code.

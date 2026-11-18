@@ -1,4 +1,4 @@
-import { constructedRecallHeader, recallHeaderId, sentRecallHeaderIds } from '../recall-header.js';
+import { constructedRecallHeader, sentRecallHeaderIds } from '../recall-header.js';
 import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
@@ -4548,7 +4548,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let deepEnd = -1;
     let frontierEnd = -1;
     for (let i = 0; i < messages.length - 1; i++) {
-      const id = recallHeaderId(messages[i]!);
+      const id = sentRecallHeaderIds(messages[i]!)[0];
       if (id === undefined) continue;
       const level = levelById.get(id);
       if (level === undefined) continue;
@@ -4959,7 +4959,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         childLeaves[childLeaves.length - 1] !== parent.sourceRange.last
       ) continue;
 
-      const parentHeader = `[CM] Recall memory ${parent.id}.`;
       // The canonical pair body is whatever summaryAnswerContent produced —
       // a single text block for legacy entries, or verbatim reasoning
       // carriers + text for entries with responseContent. Match by exact
@@ -4973,7 +4972,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           header.participant === 'Context Manager' &&
           header.content.length === 1 &&
           header.content[0]?.type === 'text' &&
-          header.content[0].text === parentHeader &&
+          sentRecallHeaderIds(header)[0] === parent.id &&
           JSON.stringify(body.content) === expectedBody
         ) pairIndexes.push(i);
       }
@@ -12031,6 +12030,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const countedStripped = new WeakSet<object>();
     const strippedErrors = new WeakSet<object>();
     let loggedRequest: NormalizedRequest | undefined;
+    let loggedRecallCount = 0;
+    let loggedRecallTokens = 0;
+    const logDispatch = async (request: NormalizedRequest): Promise<unknown> => {
+      // Capture small scalar totals before yielding; the projection may change
+      // while the provider is in flight. Admission deferrals never replace the
+      // previous actual dispatch.
+      let count = 0;
+      let tokens = 0;
+      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
+        try {
+          const ids = new Set(request.messages.flatMap(sentRecallHeaderIds));
+          const recalls = [...this.persistedCanonicalSummariesById().values()].filter(s => ids.has(s.id));
+          count = recalls.length;
+          tokens = this.capRecallPairs(recalls, Infinity).keptTokens;
+        } catch { /* Best-effort telemetry must not prevent dispatch. */ }
+      }
+      const commit = () => { loggedRequest = request; loggedRecallCount = count; loggedRecallTokens = tokens; };
+      try {
+        const response = await this.callProvider(ctx.membrane!, request);
+        commit();
+        return response;
+      } catch (error) {
+        if (!isAdmissionDeferral(error)) commit();
+        throw error;
+      }
+    };
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
@@ -12093,8 +12118,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          loggedRequest = attemptRequest;
-          response = await this.callProvider(ctx.membrane!, attemptRequest);
+          response = await logDispatch(attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
@@ -12141,8 +12165,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = this.authorL1CompressionRequest(stripReasoningFromRequest(preparedRequest), recallIds);
           try {
-            loggedRequest = acceptedRequest;
-            response = await this.callProvider(ctx.membrane!, acceptedRequest);
+            response = await logDispatch(acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
@@ -13568,10 +13591,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns);
         }
         if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && loggedRequest) {
-          const loggedRecallIds = new Set(loggedRequest.messages.flatMap(sentRecallHeaderIds));
-          const loggedRecalls = [...this.persistedCanonicalSummariesById().values()]
-            .filter(summary => loggedRecallIds.has(summary.id));
-          const loggedRecallTokens = this.capRecallPairs(loggedRecalls, Infinity).keptTokens;
           logCompressionCall({
             operation: 'compress_l1',
             // Summarize the last request actually dispatched, including opt-in
@@ -13582,7 +13601,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               chunk_message_ids: chunk.messages.map((m) => m.id),
               chunk_size: chunk.messages.length,
               prior_summary_count: priorSummaries.length,
-              prior_summary_count_kept: loggedRecalls.length,
+              prior_summary_count_kept: loggedRecallCount,
               prior_summary_tokens: loggedRecallTokens,
               has_doc_context: docContext !== null,
               doc_context: docContext,
@@ -22257,7 +22276,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prompt, an opened chunk or the raw middle that starts with the agent's
    * turn; in a merge prompt, an L2 target or the raw middle that does. A
    * recall answer is the message after a `[CM] Recall memory <id>.` header
-   * (recallHeaderId) before recallHeadersEnd (default: the entire array).
+   * (by construction identity) before recallHeadersEnd (default: the entire array).
    * The L1 caller excludes its opening and source, not raw prefix history.
    * The answer is the agent's, so a next message of the
    * answer's participant is what the collapse below joins to it, and the
@@ -22279,7 +22298,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
     messages.forEach((message, i) => {
       separated.push(message);
-      if (i === 0 || i - 1 >= recallHeadersEnd || recallHeaderId(messages[i - 1]!) === undefined) return;
+      if (i === 0 || i - 1 >= recallHeadersEnd || sentRecallHeaderIds(messages[i - 1]!).length === 0) return;
       let withContent = i + 1;
       while (withContent < messages.length && !hasContent(withContent)) withContent++;
       if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {

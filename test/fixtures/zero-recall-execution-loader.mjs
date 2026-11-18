@@ -3,15 +3,24 @@
 // Ladder integration is covered separately in zero-recall-construction.test.ts.
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
+    if (specifier === 'node:fs' && process.env.SURGERY_CASE === 'receipt-sync-error') return { url: 'stub:fs', shortCircuit: true };
     if (specifier === '../src/context-manager.js') return { url: 'stub:manager', shortCircuit: true };
     if (specifier === '@animalabs/membrane') return { url: 'stub:membrane', shortCircuit: true };
   }
   return nextResolve(specifier, context);
 }
 export async function load(url, context, nextLoad) {
+  if (url === 'stub:fs') return { format: 'module', shortCircuit: true, source: `
+    export * from 'node:fs';
+    import { fsyncSync as realSync, readFileSync, existsSync } from 'node:fs';
+    export function fsyncSync(fd) {
+      if (existsSync(process.env.SURGERY_TRACE) && readFileSync(process.env.SURGERY_TRACE, 'utf8').includes('"closed":true')) throw new Error('final receipt sync failed');
+      return realSync(fd);
+    }
+  ` };
   if (url === 'stub:membrane') return { format: 'module', shortCircuit: true, source: `
     import { appendFileSync, readFileSync } from 'node:fs';
-    export class AnthropicAdapter {}
+    export class AnthropicAdapter { client = { fetch: async () => { throw new Error('offline only'); }, maxRetries: 2, withOptions(options) { return { ...this, ...options }; } }; }
     export class NativeFormatter {}
     export class Membrane {
       bound = true;
@@ -21,7 +30,7 @@ export async function load(url, context, nextLoad) {
         const receipt = JSON.parse(readFileSync(process.env.SURGERY_RECEIPT, 'utf8'));
         if (receipt.status !== 'calling' || receipt.call.status !== 'started') throw new Error('missing pre-call receipt');
         appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({ sent: request }) + '\\n');
-        if (process.env.SURGERY_CASE === 'provider-error') throw new Error('private source echoed by provider');
+        if (['provider-error', 'error-then-cap'].includes(process.env.SURGERY_CASE)) throw new Error('private source echoed by provider');
         return { content: [{ type: 'text', text: 'summary' }], stopReason: 'end_turn' };
       }
     }
@@ -56,16 +65,17 @@ export async function load(url, context, nextLoad) {
           fork: async name => { trace({ fork: name }); branch = { name }; return name; },
           tick: async () => {
             if (process.env.SURGERY_CASE === 'no-summary') return;
+            if (process.env.SURGERY_CASE === 'summary-without-call') { strategy.summaries.push({ id: 'new', sourceRange: { first: 'first', last: 'last' } }); return; }
             let request = { messages: [message('Context Manager', '[CM] Recall memory memory.'),
               message('Claude', 'stored answer'), message('Context Manager', strategy.opening()),
               message('user', 'raw source must survive')], config: { model: 'offline' } };
             trace({ original: request });
             request = strategy.authorL1CompressionRequest(request, ['memory']);
             if (process.env.SURGERY_CASE === 'mismatch') request.config.model = 'tampered';
-            await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
+            try { await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal }); } catch (error) { if (process.env.SURGERY_CASE !== 'error-then-cap') throw error; await membrane.complete(request); }
             if (process.env.SURGERY_CASE === 'repeat') await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
             if (process.env.SURGERY_CASE === 'refusal') return;
-            strategy.summaries.push({ id: 'new', sourceRange: { first: 'first', last: 'last' } });
+            strategy.summaries.push({ id: 'new', sourceRange: { first: process.env.SURGERY_CASE === 'wrong-range' ? 'other' : 'first', last: 'last' } });
           },
           close: () => {
             const receipt = JSON.parse(readFileSync(process.env.SURGERY_RECEIPT, 'utf8'));

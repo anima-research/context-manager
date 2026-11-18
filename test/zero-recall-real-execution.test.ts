@@ -30,6 +30,12 @@ for (const scenario of ['carrier', 'rejection', 'rate', 'overload', 'merge-cap',
         {id:'c-first',sourceIds:[first],compressed:true,summaryId:'L1-100'},
         {id:'c-second',sourceIds:[second],compressed:true,summaryId:'L1-101'},
         {id:'c-source',sourceIds:[source],compressed:false}]);
+      manager.getStore().registerState({ id: 'default/autobio:compression-refusal-quarantine', strategy: 'snapshot' });
+      manager.getStore().setStateJson('default/autobio:compression-refusal-quarantine', [{
+        key: 'fixture', familyKey: 'fixture-family', model: 'mock', sourceIds: [source],
+        chunkSourceHash: createHash('sha256').update(JSON.stringify([source])).digest('hex'),
+        normalizedConfig: { accountingVersion: 2 }, created: 1,
+      }]);
       manager.close();
       const hash = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');
       const receiptPath = join(dir,'receipt.json');
@@ -49,6 +55,10 @@ for (const scenario of ['carrier', 'rejection', 'rate', 'overload', 'merge-cap',
       const state = JSON.parse(readFileSync(join(dir,'state'),'utf8'));
       const logs = existsSync(log) ? readFileSync(log,'utf8') : '';
       assert.ok(!(result.stdout + result.stderr + logs + JSON.stringify(state)).includes('private source echoed'));
+      assert.equal(receipt.clearedQuarantineKey, 'fixture', result.stdout + result.stderr);
+      if (scenario === 'carrier' || scenario === 'rejection') {
+        assert.equal(state.pause, undefined, 'unsent call-cap withdrawal never pauses the lane');
+      }
       if (scenario !== 'merge-empty') assert.ok(existsSync(join(dir,'sent')), result.stdout + result.stderr);
       assert.equal(existsSync(join(dir,'sent')) ? readFileSync(join(dir,'sent'),'utf8').trim().split('\n').length : 0, scenario === 'merge-empty' ? 0 : 1, 'exactly one provider call');
       if (scenario === 'merge-empty') {

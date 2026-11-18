@@ -1,3 +1,4 @@
+import { CompressionWithdrawn } from '../compression-withdrawn.js';
 import { AutobiographicalStrategy } from '../strategies/autobiographical.js';
 import type { NormalizedRequest } from '@animalabs/membrane';
 import { captureZeroRecallConstruction, transformConstructedZeroRecallCompression } from './zero-recall-compression.js';
@@ -12,12 +13,17 @@ export class ZeroRecallSurgeryStrategy extends AutobiographicalStrategy {
   authoredRequest?: NormalizedRequest;
   transformation?: ReturnType<typeof transformConstructedZeroRecallCompression>;
   protected override authorL1CompressionRequest(request: NormalizedRequest, recallIds: readonly string[]): NormalizedRequest {
-    this.observeL1CompressionRequest(request, recallIds);
-    const transformed = transformConstructedZeroRecallCompression(request, this.opening(), this.construction!);
-    const authored = { ...request, messages: transformed.messages };
-    this.transformation = transformed;
-    this.authoredRequest = structuredClone(authored);
-    return authored;
+    try {
+      this.observeL1CompressionRequest(request, recallIds);
+      const transformed = transformConstructedZeroRecallCompression(request, this.opening(), this.construction!);
+      const authored = { ...request, messages: transformed.messages };
+      this.transformation = transformed;
+      this.authoredRequest = structuredClone(authored);
+      return authored;
+    } catch (error) {
+      // Local authoring refusals sent nothing and are not provider outcomes.
+      throw new CompressionWithdrawn((error as Error).message);
+    }
   }
   construction?: ReturnType<typeof captureZeroRecallConstruction>;
   opening() {
