@@ -659,10 +659,13 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const strategy = newStrategy(true);
     let manager: ContextManager | undefined;
     let swappedBack: Promise<unknown> | undefined;
+    const counts = countDrives(strategy);
+    let drivesAtSwap: number | undefined;
     // As the drain re-arms after its first tick, swap the strategy out and
     // back in; the timer runs once the same instance is set again.
     const timers = watchDrainTimers(() => {
       if (swappedBack || !manager) return;
+      drivesAtSwap = counts.drives;
       const m = manager;
       swappedBack = m.setStrategy(new PassthroughStrategy())
         .then(() => m.setStrategy(strategy));
@@ -674,7 +677,8 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length === 1);
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
-      await settle(20);
+      assert.ok(drivesAtSwap !== undefined);
+      assert.strictEqual(counts.drives, drivesAtSwap, 'the stale timer must not start a drive');
       assert.strictEqual(calls.length, 1, `the drain armed before the swap called the provider ${calls.length - 1} more time(s)`);
     } finally {
       timers.restore();
@@ -689,11 +693,14 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const strategy = newStrategy(true);
     let manager: ContextManager | undefined;
     let switched: Promise<unknown> | undefined;
+    const counts = countDrives(strategy);
+    let drivesAtSwitch: number | undefined;
     // As the drain re-arms after its first tick, switch the manager to another
     // branch, as a host's branch surgery does; the timer runs once the
     // switch's re-initialization is done.
     const timers = watchDrainTimers(() => {
       if (switched || !manager) return;
+      drivesAtSwitch = counts.drives;
       const m = manager;
       store.createBranch('elsewhere');
       switched = m.switchBranch('elsewhere');
@@ -708,7 +715,8 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length >= 1);
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
-      await settle(20);
+      assert.ok(drivesAtSwitch !== undefined);
+      assert.strictEqual(counts.drives, drivesAtSwitch, 'the stale timer must not start a drive');
       assert.strictEqual(calls.length, 1, `the drain armed before the switch called the provider ${calls.length - 1} more time(s)`);
 
       manager.addMessage('User', [{ type: 'text', text: `after the switch ${filler(30)}` }]);

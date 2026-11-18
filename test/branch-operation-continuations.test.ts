@@ -1,4 +1,4 @@
-import { it } from 'node:test';
+import { it, mock } from 'node:test';
 import { AsyncResource } from 'node:async_hooks';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -50,19 +50,17 @@ it('terminal drain catch never looks up a failed branch and tolerates a throwing
   } finally { fx.store.currentBranch = branch; fx.close(); }
 });
 
-for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
+for (const site of ['repair', 'tick'] as const) {
   it(`${site} continuation stops at lifecycle entry before an initialize override reaches super`, async () => {
     const fx = await fixture(), pause = barrier(), setup = barrier();
     let replacement: Promise<void> | undefined;
     let handed = 0;
     let warnings = 0;
-    const completions: Promise<unknown>[] = [];
     try {
       fx.raw.setLoadRepairHandler(() => { handed++; });
       inside(fx.raw).diag = { warn() { warnings++; }, error() { warnings++; } };
-      const source = inside(fx.raw).loadedBranchIdentity;
-      // All three continuations run with the real pre-replacement operation scope.
-      let pending: Promise<void> | undefined;
+      // Both continuations start in the real pre-replacement operation scope.
+      let pending: Promise<unknown> | undefined;
       let repairCallback: (() => void) | undefined;
       let entered = false;
       if (site === 'repair') {
@@ -71,13 +69,9 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
           globalThis.queueMicrotask = callback => { repairCallback = AsyncResource.bind(callback); };
           inside(fx.raw).deliverLoadRepair({ stateId: 'x' });
         } finally { globalThis.queueMicrotask = enqueue; }
-      } else if (site === 'drain') {
-        inside(fx.raw).compressionQueue = [{}];
-        Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => { entered = true; return observeDrainCompletion(pause.wait, completions); } });
-        inside(fx.raw).driveSpeculativeDrain({});
       } else {
         Object.defineProperty(fx.raw, 'sweepPaidOffQuarantineRecords', { configurable: true, value: () => { entered = true; return pause.wait; } });
-        pending = site === 'tick' ? fx.raw.tick({} as StrategyContext) : inside(fx.raw).soundQuarantineAlarmIfNeeded(source);
+        pending = fx.manager.tick();
       }
       assert.ok(site === 'repair' ? repairCallback : entered, `${site} must reach its held seam before replacement`);
       fx.raw.hold = setup.wait;
@@ -88,14 +82,81 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
       pause.release();
       if (repairCallback) assert.doesNotThrow(repairCallback, 'scheduled repair callback cannot throw into the host');
       await pending;
-      if (site === 'drain') {
-        assert.ok(completions.length > 0, 'drain completion must be observable');
-        await Promise.all(completions);
-      }
       assert.equal(handed, 0);
       assert.equal(warnings, 0, 'stale work must stop, not trip guarded mirrors and reach diagnostics');
     } finally { pause.release(); setup.release(); await replacement; fx.close(); }
   });
+}
+
+for (const site of ['drain', 'alarm'] as const) {
+  for (const reenter of [false, true]) {
+    it(`public ${site} continuation ${reenter ? 'stops at lifecycle entry' : 'does observable work when still current'}`, async () => {
+      const fx = await fixture(), pause = barrier(), setup = barrier(), initializing = barrier();
+      const raw = inside(fx.raw);
+      const completions: Promise<unknown>[] = [];
+      let replacement: Promise<void> | undefined;
+      let pending: Promise<unknown> | undefined;
+      let entered = false, resumed = false, probes = 0, scheduled = 0, reads = 0, errors = 0;
+      const probe = site === 'drain' ? 'isBranchIdentityCurrent' : 'isCompressionBranchCurrent';
+      const original = raw[probe];
+      raw[probe] = function (...args: unknown[]) {
+        if (resumed) probes++;
+        return Reflect.apply(original, this, args);
+      };
+      raw.diag = { warn() {}, error() { errors++; } };
+      try {
+        if (site === 'drain') {
+          fx.raw.onPresented = async (_rows, ctx) => {
+            raw.compressionQueue = [0, 1];
+            raw.driveSpeculativeDrain(ctx);
+          };
+          fx.raw.tick = () => {
+            entered = true;
+            // Consume an item but leave more work. No-progress must not mask
+            // a lost epoch fence when the held tick resolves.
+            raw.compressionQueue.shift();
+            raw._drainProgress++;
+            return observeDrainCompletion(pause.wait, completions);
+          };
+          fx.manager.addMessage('user', [{ type: 'text', text: 'start background drain' }]);
+          assert.equal(completions.length, 1, 'observe the actual drain continuation');
+        } else {
+          raw.sweepPaidOffQuarantineRecords = () => { entered = true; return pause.wait; };
+          const read = raw.readCompressionQuarantineStatus;
+          raw.readCompressionQuarantineStatus = function (...args: unknown[]) {
+            reads++;
+            return Reflect.apply(read, this, args);
+          };
+          pending = fx.manager.tick();
+        }
+        assert.ok(entered, 'public entry reached the held operation');
+        if (reenter) {
+          fx.raw.hold = setup.wait;
+          fx.raw.onInitializeEntered = initializing.release;
+          replacement = fx.manager.setStrategy(fx.raw);
+          await initializing.wait;
+        }
+        // Observe scheduling itself, not whether a timer happens to run
+        // before a sleep or is later stopped by a second fence.
+        const timer = site === 'drain' ? mock.method(globalThis, 'setTimeout', () => { scheduled++; }) : undefined;
+        try {
+          resumed = true;
+          pause.release();
+          await pending;
+          await Promise.all(completions);
+        } finally { timer?.mock.restore(); resumed = false; }
+        assert.equal(site === 'drain' ? scheduled : reads, reenter ? 0 : 1);
+        if (reenter) {
+          assert.equal(probes, 0, 'obsolete work should stop before branch currency probing');
+          assert.equal(errors, 0, 'the stale path should be silent');
+        } else assert.ok(probes > 0, 'the live path must reach the branch currency probe');
+      } finally {
+        pause.release(); setup.release();
+        await Promise.allSettled([pending, replacement, ...completions]);
+        fx.close();
+      }
+    });
+  }
 }
 
 it('already-stale checkpoint hygiene is silent, including repeated calls', async () => {
@@ -189,9 +250,15 @@ it('reentrant retryAfterMs cannot pause a replacement load', async () => {
 
 it('final head reset refusal still reports the stored transition and duplicate retry risk', async () => {
   const fx = await fixture();
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
   try {
-    Object.defineProperty(fx.raw, 'resetHeadWindow', { configurable: true, value: () => { throw new Error('stale branch continuation'); } });
-    await assert.rejects(fx.manager.resetHeadWindow('transition'), /transition add finished: message .*stored.*another transition message/s);
+    Object.defineProperty(fx.raw, 'resetHeadWindow', { configurable: true, value: () => { throw revoked.proxy; } });
+    await assert.rejects(fx.manager.resetHeadWindow('transition'), (error: Error) => {
+      assert.equal(error.cause, revoked.proxy);
+      assert.match(error.message, /transition add finished: message .*stored.*another transition message/s);
+      return true;
+    });
   } finally { fx.close(); }
 });
 

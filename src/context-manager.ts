@@ -2134,7 +2134,7 @@ export class ContextManager {
       try {
         this.tellPresentation(left, entered, (id) => record[positionOf(id)!]!);
       } catch (error) {
-        logThrown('[context-manager] presentRows presented its rows, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+        logThrown(`[context-manager] presentRows presented its rows, and telling the strategy of them failed; ${this.closed ? 'the manager is closed' : 'it is told at its next notification'}:`, error, this.diag);
       }
       return ordinals;
     });
@@ -2151,9 +2151,8 @@ export class ContextManager {
    * (deferPresented): for the rows the window holds when it is made.
    * Where the manager's own work around a
    * call throws (the rows' reading, the context it builds), no hook of
-   * that call has run: the call's rows wait, as rows a delivery that
-   * failed to read left waiting do, to be heard at the strategy's next
-   * notification, and the error is thrown on.
+   * that call has run: while the manager remains open, the rows wait to
+   * be heard at the strategy's next notification. The error is thrown on.
    */
   private tellPresentation(left: readonly LeftRow[], entered: readonly MessageId[], rowOf: (id: MessageId) => StoredMessage): void {
     let leftTold = left.length === 0;
@@ -2178,8 +2177,10 @@ export class ContextManager {
       if (scope === null || (this.inHookScope(scope) && stillIn())) this.notifyPresented(enteredRows, false);
       else this.deferPresented(enteredRows, false);
     } catch (error) {
-      if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal, by }) => ({ id, ordinal, by })), info: { undone: false, removed: false } });
-      for (const id of entered) this.presentedUnheard.set(id, this.presentedUnheard.get(id) === true);
+      if (!this.closed) {
+        if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal, by }) => ({ id, ordinal, by })), info: { undone: false, removed: false } });
+        for (const id of entered) this.presentedUnheard.set(id, this.presentedUnheard.get(id) === true);
+      }
       throw error;
     }
   }
@@ -2280,7 +2281,7 @@ export class ContextManager {
           return at === undefined ? undefined : record[at];
         });
       } catch (error) {
-        logThrown('[context-manager] retractRows took its rows out, and telling the strategy of them failed; it is told at its next notification:', error, this.diag);
+        logThrown(`[context-manager] retractRows took its rows out, and telling the strategy of them failed; ${this.closed ? 'the manager is closed' : 'it is told at its next notification'}:`, error, this.diag);
       }
     });
   }
@@ -2292,9 +2293,9 @@ export class ContextManager {
    * own. Both calls' rows are found before either hook runs, and the
    * second call is made where the first's hook leaves it (deferRetracted),
    * as presentRows makes its second. Where the manager's own work around a
-   * call throws, what it was for waits, as tellPresentation's rows do (a
-   * waiting call tells a row the store no longer holds by its id, in a
-   * call of its own), and the error is thrown on.
+   * call throws, what it was for waits if the manager is still open, as
+   * tellPresentation's rows do (a waiting call tells a row the store no
+   * longer holds by its id, in a call of its own). The error is thrown on.
    */
   private tellRetraction(left: readonly LeftRow[], info: Retraction, rowOf: (id: MessageId) => StoredMessage | undefined): void {
     const removed: Retraction = { undone: info.undone, removed: true };
@@ -2313,7 +2314,7 @@ export class ContextManager {
       if (scope === null || this.inHookScope(scope)) this.notifyRetracted(gone, removed);
       else this.deferRetracted(gone, removed);
     } catch (error) {
-      if (waiting.left.length > 0) this.retractedUnheard.push(waiting);
+      if (!this.closed && waiting.left.length > 0) this.retractedUnheard.push(waiting);
       throw error;
     }
   }
@@ -2438,7 +2439,7 @@ export class ContextManager {
       try {
         this.tellGone(left);
       } catch (error) {
-        logThrown(`[context-manager] ${operation} took its rows out, and telling the strategy of them failed; it is told at its next notification:`, error, this.diag);
+        logThrown(`[context-manager] ${operation} took its rows out, and telling the strategy of them failed; ${this.closed ? 'the manager is closed' : 'it is told at its next notification'}:`, error, this.diag);
       }
       return left.map((row) => row.id);
     });
@@ -2447,8 +2448,8 @@ export class ContextManager {
   /**
    * Tell the strategy rows retractGone took out, by their ids, with
    * `removed`. Where the manager's own work around the call throws, no hook
-   * of it has run: the call waits, to be made at the strategy's next
-   * notification, and the error is thrown on.
+   * of it has run: the call waits for the strategy's next notification if
+   * the manager is still open. The error is thrown on.
    */
   private tellGone(left: readonly LeftRow[]): void {
     const told = left.map(({ id, ordinal, by }): RetractedRow => ({ id, ordinal, by }));
@@ -2456,7 +2457,7 @@ export class ContextManager {
     try {
       this.notifyRetracted(told, info);
     } catch (error) {
-      if (told.length > 0) this.retractedUnheard.push({ left: told, info });
+      if (!this.closed && told.length > 0) this.retractedUnheard.push({ left: told, info });
       throw error;
     }
   }
@@ -4482,7 +4483,7 @@ export class ContextManager {
           'another transition message.',
         { cause },
       );
-    const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    const reasonOf = describeThrown;
     // How much of the transition's body the window holds: every shard,
     // some, or none. A listener of a sharded transition's first shard can
     // present that shard before the rest is stored. One the record no
@@ -4688,6 +4689,7 @@ export class ContextManager {
     const current = observeStoreBranch(this.store);
     const currentBranchId = this.store.currentBranch().id;
     // Both final store reads can synchronously start a newer initialization.
+    if (this.closed) throw new Error('ContextManager closed during strategy initialization');
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
       if (strategy !== this.strategy) this.detachStrategy(strategy);
       throw new InitializationSupersededError(selection);
@@ -4992,10 +4994,10 @@ export class ContextManager {
       this.notifyRetracted(left, info);
     } catch (err) {
       // No hook of the call has run: the manager's own work around it threw.
-      this.retractedUnheard.push({ left, info });
+      if (!this.closed) this.retractedUnheard.push({ left, info });
       const rows = told.length === 1 ? `removed message ${told[0]!.id}` : `${told.length} removed messages`;
       logThrown(
-        `[context-manager] telling the strategy that ${rows} left the window failed; the removal stands, and it is told at its next notification:`.replaceAll('%', '%%'),
+        `[context-manager] telling the strategy that ${rows} left the window failed; the removal stands; ${this.closed ? 'the manager is closed' : 'it is told at its next notification'}:`.replaceAll('%', '%%'),
         err,
         this.diag,
       );
@@ -5134,7 +5136,7 @@ export class ContextManager {
   }
 
   /** Make notifyPresented's call now; false means observation failed and rows remain pending. */
-  private tellPresented(rows: readonly StoredMessage[], enteredLegacy: boolean): boolean {
+  private tellPresented(rows: readonly StoredMessage[], enteredLegacy: boolean | ReadonlyMap<MessageId, boolean>): boolean {
     if (rows.length === 0 || this.closed) return true;
     const strategy = this.strategy;
     let presented: boolean;
@@ -5165,10 +5167,10 @@ export class ContextManager {
       legacy = this.windowIndex.mode() === 'legacy';
       scope = this.hookScope();
     } catch (err) {
-      // The rows are already stored. Observation failure is not an add failure,
-      // but it is not delivery either. Retain them without immediately retrying
-      // the same failed observation; the next notification/open can redeliver.
-      this.waitToBeHeard(rows, enteredLegacy);
+      // Publish a failed first delivery before formatting the diagnostic:
+      // formatting can reenter with another notification. waitToBeHeard
+      // skips closed managers. A retry drain restores its own waiting map.
+      if (typeof enteredLegacy === 'boolean') this.waitToBeHeard(rows, enteredLegacy);
       terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
       return false;
     }
@@ -5199,7 +5201,7 @@ export class ContextManager {
         // presented while an initialization runs do, and are heard once
         // the strategy is initialized (at once where it is), those the
         // window of the branch it initialized on holds.
-        this.deferPresented(rows.slice(i), legacy);
+        this.deferPresented(rows.slice(i), enteredLegacy);
         return true;
       }
       const message = rows[i]!;
@@ -5222,15 +5224,19 @@ export class ContextManager {
    * initialized on, unless a hook moved the store itself). Nothing after
    * close().
    */
-  private deferPresented(rows: readonly StoredMessage[], legacy: boolean): void {
+  private deferPresented(rows: readonly StoredMessage[], legacy: boolean | ReadonlyMap<MessageId, boolean>): void {
     if (this.closed) return;
     this.waitToBeHeard(rows, legacy);
     if (this.initializedAttempt === this.initializationAttempt) this.deliverUnheard();
   }
 
   /** Rows that wait to be heard entering the window (presentedUnheard), with whether they entered a legacy window. */
-  private waitToBeHeard(rows: readonly StoredMessage[], legacy: boolean): void {
-    for (const row of rows) this.presentedUnheard.set(row.id, legacy || this.presentedUnheard.get(row.id) === true);
+  private waitToBeHeard(rows: readonly StoredMessage[], legacy: boolean | ReadonlyMap<MessageId, boolean>): void {
+    if (this.closed) return;
+    for (const row of rows) {
+      const enteredLegacy = typeof legacy === 'boolean' ? legacy : legacy.get(row.id) === true;
+      this.presentedUnheard.set(row.id, enteredLegacy || this.presentedUnheard.get(row.id) === true);
+    }
   }
 
   /**
@@ -5548,7 +5554,7 @@ export class ContextManager {
     this.presentedUnheard = new Map();
     this.drainingPresented = true;
     try {
-      if (this.tellPresented(rows, false)) return true;
+      if (this.tellPresented(rows, waiting)) return true;
       // Observation failed before any hook ran. Restore the original per-row
       // provenance, not just the mode observed during this delivery attempt.
       for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);

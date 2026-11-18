@@ -5,6 +5,7 @@ import { AsyncResource } from 'node:async_hooks';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 
 const inside = (value: object): any => value;
@@ -121,4 +122,102 @@ it('initialization cannot commit after its final branch-id read starts a newer a
     await replacement;
     await assert.doesNotReject(manager.compile({ maxTokens: 1000, reserveForResponse: 100 }));
   } finally { armed = false; release(); await replacement; store.currentBranch = currentBranch; manager.close(); rmSync(path, { recursive: true, force: true }); }
+});
+
+it('interrupted mixed presentation drain preserves each row’s admitting window on return to legacy', async () => {
+  const path = mkdtempSync(join(tmpdir(), 'c20-presentation-'));
+  const heard: string[] = [];
+  let first: string | undefined;
+  let replacement: Promise<void> | undefined;
+  let legacyBranch: string;
+  const manager = await ContextManager.open({ path, strategy: {
+    name: 'legacy-notifications',
+    checkReadiness() { return { ready: true }; },
+    select() { throw new Error('not used'); },
+    async onNewMessage(row) {
+      heard.push(row.id);
+      if (row.id === first) replacement = manager.switchBranch(legacyBranch);
+    },
+  } });
+  const raw = inside(manager), original = raw.hookScope;
+  let failScope = false;
+  let failed = 0;
+  raw.diag = { error() {}, warn() {} };
+  raw.hookScope = function () {
+    if (failScope) { failed++; throw new Error('scope unavailable'); }
+    return original.call(this);
+  };
+  const add = (text: string) => manager.addMessage('user', [{ type: 'text', text }]);
+  try {
+    legacyBranch = manager.getStore().currentBranch().name;
+    const explicit = add('heard initially; will be re-presented only on the fork');
+    heard.length = 0;
+    failScope = true;
+    first = add('first legacy row; hook interrupts drain');
+    const second = add('second legacy row; must survive interruption');
+    await manager.fork('presented');
+    manager.presentRows([]); // freeze the inherited legacy window
+    manager.retractRows([explicit]);
+    manager.presentRows([explicit]); // enroll as nonlegacy, with observation still failing
+    assert.equal(manager.windowMode(), 'presented');
+    assert.ok(failed > 0);
+    assert.deepEqual(heard, []);
+
+    failScope = false;
+    manager.presentRows([add('third notification triggers the queued drain')]);
+    assert.ok(replacement, 'the first queued hook switched branches');
+    await replacement;
+    assert.equal(manager.windowMode(), 'legacy');
+    assert.deepEqual(manager.getAllMessages().map(row => row.id), [explicit, first, second]);
+    assert.deepEqual(heard, [first, second], 'only the remaining legacy-entered row is redelivered');
+  } finally {
+    await replacement?.catch(() => {});
+    manager.close();
+    rmSync(path, { recursive: true, force: true });
+  }
+});
+
+it('closing on the final branch-id read rejects public reinitialization', async () => {
+  const path = mkdtempSync(join(tmpdir(), 'c20-close-init-'));
+  const store = JsStore.openOrCreate({ path });
+  const currentBranch = store.currentBranch;
+  let armed = false, closed = false;
+  const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false });
+  const manager = await ContextManager.open({ store, strategy });
+  const initialize = strategy.initialize.bind(strategy);
+  strategy.initialize = async ctx => { await initialize(ctx); armed = true; };
+  store.currentBranch = function () {
+    return new Proxy(currentBranch.call(this), { get(target, key, receiver) {
+      if (key === 'id' && armed) {
+        armed = false;
+        manager.close();
+        closed = true;
+      }
+      return Reflect.get(target, key, receiver);
+    } });
+  };
+  try {
+    await assert.rejects(manager.setStrategy(strategy), /closed during strategy initialization/);
+    assert.equal(closed, true);
+    assert.equal(store.isClosed(), false, 'the caller owns the store');
+  } finally { store.currentBranch = currentBranch; manager.close(); store.close(); rmSync(path, { recursive: true, force: true }); }
+});
+
+it('health reports survive a revoked Proxy thrown while reading report inputs', async () => {
+  const path = mkdtempSync(join(tmpdir(), 'c20-hostile-health-'));
+  const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false });
+  const manager = await ContextManager.open({ path, strategy });
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  const raw = inside(strategy);
+  try {
+    const store = manager.getStore();
+    const get = store.getStateJson;
+    store.getStateJson = function (id: string) {
+      if (id === raw.compressionRefusalQuarantineLedgerStateId) throw revoked.proxy;
+      return get.call(this, id);
+    };
+    assert.equal(strategy.getStrandedSummaries().summaries, null);
+    assert.equal(strategy.getCompressionDebt().state, 'unknown');
+  } finally { manager.close(); rmSync(path, { recursive: true, force: true }); }
 });

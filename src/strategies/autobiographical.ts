@@ -237,8 +237,15 @@ function staleHealthReportMessage(report: string): string {
   return `The ${report} could not be read from an obsolete continuation. Its values are unknown. Use a host-owned dispatcher outside the old callback scope, then call the strategy's health method on the current load.`;
 }
 
+const quarantineMutationRecovery = 'earlier writes may have completed; inspect the original branch before retrying: select or reinitialize it through ContextManager, then call the current strategy from a host-owned dispatcher outside the old callback scope; obtain fresh intent, never automatically resend';
+
+function isStaleHealthFailure(cause: unknown): boolean {
+  // A revoked or hostile Proxy can throw from its prototype lookup.
+  try { return cause instanceof StaleBranchOperationError; } catch { return false; }
+}
+
 function compressionQuarantineUnreadableMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression quarantine report');
+  if (isStaleHealthFailure(cause)) return staleHealthReportMessage('compression quarantine report');
   return [
     'Compression of new conversation has stalled.',
     `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
@@ -248,7 +255,7 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
 }
 
 function strandedSummariesFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('stranded-summaries report');
+  if (isStaleHealthFailure(cause)) return staleHealthReportMessage('stranded-summaries report');
   return [
     'The stranded-summaries read failed.',
     `Cause: ${causeText(cause)}`,
@@ -274,7 +281,7 @@ function strandedNoStoreMessage(): string {
  * values. How to surface either failure is the host's to say.
  */
 function compressionDebtReportFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression debt report');
+  if (isStaleHealthFailure(cause)) return staleHealthReportMessage('compression debt report');
   return [
     'The compression debt report failed.',
     `Cause: ${causeText(cause)}`,
@@ -2855,7 +2862,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     await this.clearObservedCompressionQuarantine(key, undefined, source);
     const current = this.compressionBranchCurrentForCleanup(source);
     if (current !== true) {
-      throw new Error(`Compression quarantine clear uncertain: branch/load ${current === undefined ? 'unavailable' : 'changed'}; earlier writes may have completed; inspect the original branch before retrying and dispatch fresh intended work through ContextManager`);
+      throw new Error(`Compression quarantine clear uncertain: branch/load ${current === undefined ? 'unavailable' : 'changed'}; ${quarantineMutationRecovery}`);
     }
   }
 
@@ -3030,7 +3037,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!isCanonicalQuarantineKey(active.record.familyKey)) return { status: 'unreadable', reason: 'ledger-entry' };
       const requireReleaseBinding = () => {
         if (this.loadedBranchIdentity !== identity || !this.isBranchIdentityCurrent(identity)) {
-          throw new Error('Compression quarantine release uncertain: authorized branch binding changed during operation; earlier writes may have completed; inspect the original branch before retrying and dispatch fresh intended work through ContextManager');
+          throw new Error(`Compression quarantine release uncertain: authorized branch binding changed during operation; ${quarantineMutationRecovery}`);
         }
       };
       requireReleaseBinding();
@@ -3627,9 +3634,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The loaded identity no longer matches either, so each entrypoint that
    * requires the loaded branch throws, getSummary() and getStats() among
    * them, and a drain tick already scheduled does nothing. None of these
-   * checks reads the store, which the manager may close next. The health
-   * reads, such as getCompressionQuarantineStatus(), still never throw.
-   * initialize() starts afresh.
+   * checks reads the store, which the manager may close next. Detach does not
+   * make health report bodies throw. initialize() starts afresh.
    */
   detach(): void {
     this.branchOperations.assertCurrent();
@@ -3703,6 +3709,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.previewPins = null;
     this._lastPreview = undefined;
     this._dryRunSelect = false;
+    this._ownedIdsCache = null;
     this.thinkingBound = false;
     this.selectPricing = null;
     this.acrossMode = 'take';
@@ -5608,7 +5615,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store) throw new Error('Compression quarantine store is not initialized');
     // Authorize only the branch/load the caller checked, never a reentrant initializer.
     if (!this.isCompressionBranchCurrent(source)) {
-      throw new Error('Compression quarantine append refused stale branch-scoped mutation: authorized binding changed during operation');
+      throw new Error(`Compression quarantine append refused stale branch-scoped mutation: authorized binding changed during operation; ${quarantineMutationRecovery}`);
     }
     const stored = this.branchMutation(this.store!, 'appendToStateJsonWithIdentity', this.compressionRefusalQuarantineLedgerStateId, event, 'eventId', 'sequence');
     return { ...event, eventId: stored.id, sequence: stored.sequence } as CompressionQuarantineEvent;
@@ -5681,7 +5688,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const write = store[method];
     this.requireBranchMutation('write', origin);
     authorize();
-    if (store !== origin?.store) throw new Error('Writer target differs from branch operation origin');
+    if (store !== origin?.store) {
+      throw new Error('Writer target differs from branch operation origin; earlier writes may have completed; inspect the original branch before retrying and dispatch only fresh intended work outside the old callback scope');
+    }
     if (typeof write !== 'function') throw new TypeError(`Chronicle writer ${method} is unavailable`);
     return Reflect.apply(write, store, args);
   }
@@ -5849,7 +5858,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Public quarantine status for health surfaces (/healthz, fleet-watch,
-   * connectome-doctor) and the repeating alarm below.
+   * connectome-doctor). The report body returns unreadable on read failure.
+   * A synchronous call reentering private boundary-symbol lookup can still
+   * be refused before reaching the body; defer instrumentation from there.
    */
   getCompressionQuarantineStatus(now: number = Date.now()): CompressionQuarantineStatus {
     return this.readCompressionQuarantineStatus(now).status;
@@ -6134,10 +6145,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
     if (interval <= 0) return;
     const now = Date.now();
-    // Idle path: nothing alarmed and not yet due for a check. (Entry into
-    // quarantine still gets its immediate one-shot alert from
-    // emitCompressionQuarantineAlert; the klaxon picks it up on the first
-    // tick after the interval. No ticks means no repeating alarm.)
+    // The repeat clock measures from the last alarm, not quarantine entry.
+    // A fresh load can alarm on its first tick, independently of the
+    // one-shot alert at exhaustion. No ticks means no repeating alarm.
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Best-effort stale-hold sweep when its interval is due, not before every
     // status read; retained holds are not proof of raw debt.
@@ -6148,6 +6158,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (now - this.quarantineSweepLastAt >= interval) {
       this.quarantineSweepLastAt = now;
       await this.sweepPaidOffQuarantineRecords(source);
+      // An override may hold replacement initialization before super changes
+      // the branch generation. Stop before probing the old branch/status.
+      if (!this.branchOperations.isBindingCurrent()) return;
     }
     // A strategy detached, or loaded again on another branch, during the
     // sweep sounds no alarm for the branch it swept.
@@ -6268,7 +6281,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       projection = this.readCompressionQuarantineProjection();
     } catch (error) {
       if (error instanceof StaleBranchOperationError) return;
-      this.diag.warn(`[compression-quarantine] paid-off sweep skipped: observation/read unavailable (maintenance failed: ${quarantineFailureCategory(error)}); later status reads do not establish that maintenance ran`);
+      this.diag.warn(`[compression-quarantine] paid-off sweep skipped: observation/read unavailable (maintenance failed: ${quarantineFailureCategory(error)}); check the branch and backing-store access before the next interval-paced tick; readable status alone does not establish that maintenance ran`);
       return;
     }
     try {
@@ -6276,7 +6289,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const records = this.store.getStateJson(this.chunksStateId);
       const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
       if (chunkRecords.length === 0) {
-        this.diag.warn('[compression-quarantine] paid-off sweep skipped: chunk records unavailable or empty; holds retained, maintenance not completed');
+        this.diag.warn('[compression-quarantine] paid-off sweep skipped: chunk records unavailable or empty; holds retained, maintenance not completed; check chunk persistence and backing-store diagnostics before the next interval-paced tick');
         return; // Never sweep blind.
       }
       const byHash = new Map<string, ChunkRecord>();
@@ -6299,7 +6312,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
-      this.diag.warn(`[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect status to confirm holds (maintenance failed: ${quarantineFailureCategory(error)})`);
+      this.diag.warn(`[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect quarantine status to confirm holds and check backing-store diagnostics before the next interval-paced tick (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
   }
 
@@ -6377,7 +6390,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return Array.isArray(entry.sourceIds) ? paidOff(entry.sourceIds) : true;
       }, undefined, source);
     } catch (error) {
-      this.diag.warn(`[autobiographical] compression progress sweep failed; write may have landed, inspect stored progress before retrying: ${describeCompressionFailure(error)}`);
+      this.diag.warn(`[autobiographical] compression progress sweep failed; write may have landed, check backing-store diagnostics; the sweep will be eligible again on its normal tick cadence: ${describeCompressionFailure(error)}`);
     }
   }
 
@@ -9367,6 +9380,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     this.tick(ctx)
       .then(() => {
+        // Lifecycle entry may supersede this productive tick even before
+        // the new initializer changes the load identity.
+        if (!this.branchOperations.isBindingCurrent()) return;
         // Progress = the tick actually processed a queue item (compress or
         // merge), tracked by `_drainProgress`. A queue-length delta is the
         // wrong signal: a productive merge tick can also enqueue a follow-on
@@ -9479,7 +9495,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (after sweeping records whose debt is already paid).
     await this.soundQuarantineAlarmIfNeeded(sourceBranch);
     // Detached, or the branch moved, during the sweep: nothing more to do.
-    if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+    if (!this.branchOperations.isBindingCurrent() || !this.isCompressionBranchCurrent(sourceBranch)) return;
     this.sweepCompressionProgressIfDue(ctx, sourceBranch);
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
@@ -20367,6 +20383,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const at of positions) consumed[at] = 1;
         entries.push(kept);
       } else {
+        // The rebuild already detected a same-index replacement. The memo's
+        // old failed/fresh decision does not apply to the replacement record.
+        if (kept && kept.record !== rec) partition = null;
         msgs = []; positions = [];
         for (const id of rec.sourceIds) {
           const at = position.get(id);

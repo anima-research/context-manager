@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextManager } from '../src/context-manager.js';
-import { AutobiographicalStrategy, type Chunk } from '../src/strategies/autobiographical.js';
+import { AutobiographicalStrategy, type Chunk, type ChunkRecord } from '../src/strategies/autobiographical.js';
 
 type Lane = {
   chunks: Chunk[];
@@ -153,6 +153,33 @@ it('a cached rebuild still prunes decided chunks and withdrawn merges, and recut
     const ordered = lane.compressionQueue.slice();
     lane.orderCompressionQueue();
     assert.deepEqual(lane.compressionQueue, ordered, 'cached and full ordering agree after recut');
+  } finally {
+    manager.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('public add reclassifies a fully resolvable record replaced at the same index', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'queue-record-replaced-'));
+  const strategy = new AutobiographicalStrategy({
+    autoTickOnNewMessage: false, targetChunkTokens: 100, headWindowTokens: 0,
+    recentWindowTokens: 0, l1HoldbackChunks: 0,
+  });
+  const manager = await ContextManager.open({ path: dir, strategy });
+  const lane = strategy as unknown as Lane & { chunkRecords: ChunkRecord[] };
+  const add = () => manager.addMessage('User', [{ type: 'text', text: 'word '.repeat(110) }]);
+  try {
+    for (let i = 0; i < 20; i++) add();
+    const record = lane.chunkRecords[0]!;
+    assert.ok(record.sourceIds.length > 1);
+    const oldKey = lane.chunkKey(lane.chunks[0]!);
+    lane.compressionFailureOrder.set(oldKey, 1);
+    lane.orderCompressionQueue();
+    assert.equal(lane.compressionQueue.at(-1), 0, 'the old record was in the cached failed partition');
+    lane.chunkRecords[0] = { ...record, sourceIds: record.sourceIds.slice(1) };
+    add();
+    assert.equal(lane.compressionFailureOrder.has(oldKey), false, 'stale failure bookkeeping is pruned');
+    assert.equal(lane.compressionQueue[0], 0, 'the replacement is classified as fresh work');
   } finally {
     manager.close();
     rmSync(dir, { recursive: true, force: true });

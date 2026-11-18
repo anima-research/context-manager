@@ -21,8 +21,10 @@ Build each tree, then run the harness with its built entrypoint:
 
 ```sh
 mkdir -p /tmp/c14b
+git show 1eb75a95467279c39182ccc95d2521d0fe871181:scripts/bench-operation-scope.mjs \
+  >/tmp/c14b/bench-operation-scope.mjs
 systemd-run --user --scope -p MemoryMax=4G env TMPDIR=/tmp/c14b \
-  node scripts/bench-operation-scope.mjs <tree>/dist/src/index.js \
+  node /tmp/c14b/bench-operation-scope.mjs <tree>/dist/src/index.js \
   --sizes=1024,4096 --modes=adaptive
 ```
 
@@ -142,68 +144,10 @@ mode or state-preservation assertion was removed.
 
 ### Comparable fixture and limits
 
-Historical timing provenance limitation: the harness revision/blob used for
-the two round-16 triplets was not recorded. These triplets are not exactly
-reproducible fixture qualifications and must not be cited as current-head costs.
-
-The following measurements use the same real-store adaptive fixture at both
-sizes. Main is the offline local `main` / merge base
-`59043beb14365d1044a88f9aeeb0a2f1a735ad8b`; before is the starting tip above.
-After is the r16 source in this change (autobiographical source blob
-`2bee927dcaee88e829abafaba8c065639e8e5795`, operation-scope source blob
-`b39e33cce169bc6c37f454ea49f915e962fe335c`). Node 22.23.3, Chronicle 0.7.0,
-Membrane 0.9.0; all runs offline under `MemoryMax=4G`, `TMPDIR=/tmp/c16`.
-
-Main predates `cappedForSend`, so the harness now records that probe as absent
-instead of failing its reachability assertion. It still requires populated
-summaries, summary rendering and adaptive picker reachability on every tree.
-Main is an older, materially different tree, not an isolated no-fence build of
-this PR. A main/head gap cannot all be attributed to the origin fence.
-
-The default harness also wraps `cappedForSend` on the instance. Such external
-instrumentation cannot be unwrapped as a library-owned helper, and adds its own
-history-sized callback/context cost during insertion. A first default-harness
-triplet gave add medians (main / before / after) of **0.132 / 0.454 / 0.274 ms**
-at 1,024 and **0.480 / 1.798 / 0.840 ms** at 4,096. That after sample preceded
-a small allocation-only cleanup of the non-batched compile path.
-
-For the ordinary-add comparison below, `--probe-after-add` installs those same
-probes **after** insertion, before compression/compile. Both options use the
-same population and provider; this is not silently substituted for the older
-instrumented numbers. Reproduce against each built entrypoint:
-
-```sh
-mkdir -p /tmp/c16
-systemd-run --user --scope -p MemoryMax=4G env TMPDIR=/tmp/c16 \
-  node scripts/bench-operation-scope.mjs <tree>/dist/src/index.js \
-  --sizes=1024,4096 --modes=adaptive --probe-after-add
-```
-
-Milliseconds; each entry is **main / before / after**.
-
-| Messages | Add | Warm compile | Compression | Reload |
-| ---: | ---: | ---: | ---: | ---: |
-| 1024 | 0.143 / 0.448 / 0.285 | 3.716 / 9.233 / 8.756 | 13.514 / 17.047 / 19.223 | 5.583 / 12.255 / 13.562 |
-| 4096 | 0.520 / 1.882 / 0.641 | 21.143 / 47.566 / 36.025 | 47.964 / 67.492 / 59.267 | 19.880 / 37.761 / 31.643 |
-
-The add gap above main falls from **0.141 ms** at 1,024 to **0.121 ms**
-at 4,096 in this triplet, versus 0.305 / 1.362 ms before. At 4,096 the
-after add is about **23% above main**, and **66% below before**. This is a
-substantial improvement, not equality with main or a proven latency bound.
-
-There was **one sequential main/before/after triplet**, not three independent
-pairs or a confidence interval. Each process populated 1,024 then 4,096 messages.
-Add is the median of all growing-history insertions, not a median of repeated
-inserts into an already-full store. Compile has 30 samples after 10 warmups;
-compression takes active two-tick rounds, and reload is a single observation.
-The exhaustive fence replay overlapped main and part of before; other jobs also
-ran on the shared host. Timing differences include CPU/JIT/GC noise. The earlier
-profiled baseline run is not mixed into these latency medians.
-
-Every tree produced 306 / 1,226 summaries and provider calls and 195 / 655 picker
-builds. With deferred probes, before/after both recorded 362,992 / 5,219,960
-capped-message calls (main has no such seam). At 4,096, process high-water RSS
-was 275,040 / 341,012 / 347,412 KiB, including the preceding 1,024 fixture.
+The two historical round-16 timing triplets are omitted: their harness revision
+was not recorded, and the checked-out harness cannot reproduce their exact
+instrumentation. The insertion regression above checks work counts, not
+relative timing against main.
 
 This bounds the **additional fence work in the ordinary fixture**, not total
 insertion complexity: main and this PR still rebuild/price history. Arbitrary
@@ -339,3 +283,65 @@ Its extra phase-observation mirror reads are included: within-chunk samples
 range 172–180 context resolutions and 63–65 mirror checks; closure/release
 samples are 227/73, identically at both sizes. These are instrumentation-specific
 phase counts, not a revision of the earlier two-position exact-tip 178/63 audit.
+
+## Round 20: enabled AsyncLocalStorage instances after close
+
+On Node 22.23.3, at baseline `ba376e2b` with the lockfile dependencies,
+`scripts/bench-operation-scope-lifecycle.mjs` opened and closed fresh
+AutobiographicalStrategy managers sequentially on one empty, host-owned
+Chronicle store. Each row uses two fresh processes; the control disables just
+the per-strategy ALS after each close in this callback-free fixture. After GC,
+the probe times 20,000 sequential unrelated awaits (median of five samples
+after one warmup) and reads V8 heap before the timing loop.
+
+```sh
+npm run build
+for n in 0 100 500 1000; do
+  for mode in retain disable; do
+    node --expose-gc scripts/bench-operation-scope-lifecycle.mjs "$n" "$mode"
+  done
+done
+```
+
+| Closed managers | Await time, retained / disabled (ms) | V8 heap, retained / disabled (MiB) |
+| ---: | ---: | ---: |
+| 0 | 3.28 / 2.51 | 13.22 / 13.22 |
+| 100 | 138.56 / 3.51 | 13.84 / 13.82 |
+| 500 | 595.58 / 4.31 | 14.05 / 13.99 |
+| 1,000 | 1,498.31 / 3.14 | 14.15 / 14.03 |
+
+This shows substantial unrelated async-event cost on this Node runtime even
+without stored history. Heap differences are one post-GC process sample per
+configuration, not an isolated retained-size measurement; neither the timings
+nor the heap numbers qualify production hosts or other runtimes.
+
+The control is not a safe reclamation policy. Close/detach cannot prove that
+host timers, promises, or bound callbacks have stopped. Some can outlive a
+settled tick or detach and call a reattached strategy; disabling its storage
+would remove the very origin used to distinguish their work from fresh calls.
+Counting outstanding manager calls alone cannot establish that quiescence.
+There is no automatic disable in this round.
+
+## Round 21: selection fence cost
+
+Selection uses the same fence as `ba376e2b`. There is no row window or
+historical-row exemption: when selection visits a row, wrapped helpers and
+guarded mirrors still check origin. This trades proportional fence work for
+keeping the ordinary checks and strategy receiver throughout the window.
+
+On Node 22.23.3 with lockfile dependencies, the offline warm adaptive
+`kv-stable` text fixture described in Round 18 sent all rows and ran the
+picker once per sample. The table counts context resolutions and binding
+guard calls (including guarded mirror accesses), not tokenization or
+rendering operations. The two counters can overlap; do not add them.
+
+| Rows | Select context resolutions | Select binding guards | Compile context resolutions | Compile binding guards |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 655 | 247 | 669 | 251 |
+| 100 | 2,721 | 877 | 2,735 | 881 |
+| 1,000 | 23,421 | 7,177 | 23,435 | 7,181 |
+
+Reproduce after building with `node scripts/bench-operation-select.mjs 10 100 1000`.
+In this fixture the counts grow roughly in proportion to the rows visited,
+plus setup work. Other row shapes and selection paths can have different
+counts. This is not a fixed budget or a production latency measurement.

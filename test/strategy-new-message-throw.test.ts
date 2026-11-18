@@ -26,6 +26,7 @@ import { describe, it, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { inspect } from 'node:util';
+import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
 import type { StoredMessage, StrategyContext } from '../src/index.js';
@@ -164,6 +165,46 @@ describe('a strategy onNewMessage that fails without rejecting (#288)', () => {
       written.includes(`Strategy onNewMessage failed for message ${id} (body group zz-%s): [object Object] ns=agents/zz-unprintable`),
       `reported: ${written}`,
     );
+  });
+
+  it('delivers an earlier legacy add before an add made during scope error formatting', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    let manager: ContextManager | undefined;
+    const heard: string[] = [];
+    let armed = false;
+    const currentBranch = store.currentBranch.bind(store);
+    const add = (body: string) => manager!.addMessage('User', [text(body)]);
+    try {
+      manager = await ContextManager.open({ store, strategy: {
+        name: 'legacy',
+        checkReadiness: () => ({ ready: true }),
+        select: () => [],
+        get onNewMessage() {
+          armed = true;
+          return async (row: StoredMessage) => {
+            const block = row.content[0];
+            if (block?.type === 'text') heard.push(block.text);
+          };
+        },
+      } });
+      armed = false;
+      store.currentBranch = () => {
+        if (!armed) return currentBranch();
+        // Fail once, after the first notification looks up its hook.
+        store.currentBranch = currentBranch;
+        throw { [inspect.custom]() { add('B'); return 'failed scope observation'; } };
+      };
+      const written = await stderrDuring(async () => {
+        add('A');
+        assert.deepEqual(heard, ['A', 'B'], 'both adds are heard before the outer add returns');
+      });
+      assert.match(written, /Strategy presentation scope lookup failed .* failed scope observation/);
+      add('C');
+      assert.deepEqual(heard, ['A', 'B', 'C'], 'the first add was not requeued after logging');
+    } finally {
+      manager?.close();
+      store.close();
+    }
   });
 
   it('a rejection with a value console cannot format is still logged, and nothing is left unhandled', async () => {

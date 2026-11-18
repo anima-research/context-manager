@@ -275,17 +275,27 @@ it('11/17: immutable name remains readable but stale report reads request a fres
 });
 
 for (const unreadable of [false, true]) it(`16: an active alarm sweeps at most once per interval even when maintenance fails (unreadable=${unreadable})`, async () => {
-  const fx = await fixture(); let sweeps = 0;
+  const fx = await fixture(); let failures = 0, warnings = 0;
   try {
     fx.raw.config.quarantineAlarmIntervalMs = 3_600_000;
     fx.raw.quarantineAlarmActive = true;
     fx.raw.quarantineAlarmScope = { ns: 'default', branch: 'main' };
-    fx.raw.readCompressionQuarantineStatus = () => ({ status: { count: 1, keys: ['held'], spans: [], ...(unreadable ? { unreadable: true } : {}) }, error: new Error('status unavailable') });
-    fx.raw.sweepPaidOffQuarantineRecords = async () => { sweeps++; };
-    fx.raw.diag = { error() {}, warn() {} };
+    fx.raw.readCompressionQuarantineStatus = () => ({
+      status: { count: 1, keys: ['held'], spans: [], ...(unreadable ? { unreadable: true } : {}) },
+      ...(unreadable ? { error: new Error('status unavailable') } : {}),
+    });
+    fx.raw.readCompressionQuarantineProjection = () => new Map([['held', {}]]);
+    const get = fx.store.getStateJson;
+    fx.store.getStateJson = function (id: string) {
+      if (id === fx.raw.chunksStateId) { failures++; throw new Error('chunk records unavailable'); }
+      return get.call(this, id);
+    };
+    fx.raw.diag = { error() {}, warn(line: string) { if (line.includes('paid-off sweep incomplete')) warnings++; } };
     await fx.raw.soundQuarantineAlarmIfNeeded();
+    assert.equal(failures, 1);
+    assert.equal(warnings, 1, 'the real sweep must hit and handle the failed store read');
     await fx.raw.soundQuarantineAlarmIfNeeded();
-    assert.equal(sweeps, 1);
+    assert.equal(failures, 1, 'the next alarm check must not retry maintenance');
   } finally { fx.close(); }
 });
 
@@ -350,13 +360,23 @@ it('an unreadable presentation mode does not grant legacy delivery on another br
     fx.strategy.onNewMessage = async () => { heard++; };
     manager.diag = { error() {}, warn() {} };
     const id = fx.manager.addMessage('User', [{ type: 'text', text: 'shared record' }]);
-    heard = 0;
-    const row = manager.createStrategyContext().messageStore.get(id);
-    manager.windowIndex.mode = () => { throw new Error('mode unavailable'); };
-    assert.equal(manager.tellPresented([row]), false);
-    assert.equal(manager.presentedUnheard.get(id), false, 'unknown mode cannot confer legacy eligibility');
-    manager.windowIndex.mode = mode;
     fx.store.createBranchAt('other-legacy', 'main', fx.store.currentSequence());
+    fx.manager.presentRows([]);
+    fx.manager.retractRows([id]);
+    heard = 0;
+    let failMode = true;
+    Object.defineProperty(fx.strategy, 'onNewMessage', { configurable: true, get() {
+      if (failMode) {
+        failMode = false;
+        manager.windowIndex.mode = function () {
+          manager.windowIndex.mode = mode;
+          throw new Error('mode unavailable');
+        };
+      }
+      return async () => { heard++; };
+    } });
+    fx.manager.presentRows([id]);
+    assert.equal(manager.presentedUnheard.get(id), false, 'unknown mode cannot confer legacy eligibility');
     await fx.manager.switchBranch('other-legacy');
     assert.equal(heard, 0);
   } finally { manager.windowIndex.mode = mode; fx.close(); }

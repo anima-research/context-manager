@@ -2,6 +2,7 @@
 import { after, describe, it, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { AsyncResource } from 'node:async_hooks';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -971,6 +972,7 @@ describe('Anima Review regressions', () => {
       assert.equal((fx.strategy.gate(event.record) as any)?.record.key, event.key, 'tolerant native gate retains the historical hold');
       assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
       assert.equal(fx.strategy.gate(event.record), undefined);
+      assert.deepEqual(inspect(fx.strategy, { key: selected.key }).records, [], 'strict inspection no longer lists the released hold');
     }
     const claims: Event[] = JSON.parse(readFileSync('test/fixtures/quarantine-legacy-claim.json', 'utf8'));
     const claim = claims.find(entry => entry.kind === 'claim')!;
@@ -1706,7 +1708,7 @@ it('a success-clear diagnostic covers adoption without asserting a new provider 
   assert.doesNotMatch(lines.join('\n'), /newer request shape/);
 });
 
-it('a progress sweep acknowledges a landed write when sync fails', async (t) => {
+it('a progress sweep warns the write may have landed when sync fails', async (t) => {
   const fx = await fixture(t, 'progress-sync-diagnostic');
   const native = fx.strategy as any;
   const lines: string[] = [];
@@ -1719,7 +1721,7 @@ it('a progress sweep acknowledges a landed write when sync fails', async (t) => 
     fx.store.sync = () => { throw new Error('sync failed'); };
     native.sweepPaidOffCompressionProgress(fx.ctx);
     assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), []);
-    assert.match(lines.join('\n'), /write may have landed.*inspect.*progress/);
+    assert.match(lines.join('\n'), /write may have landed.*check backing-store diagnostics.*normal tick cadence/);
     assert.doesNotMatch(lines.join('\n'), /progress remains/);
   } finally { fx.store.sync = sync; }
 });
@@ -1768,4 +1770,104 @@ describe('review 16 held native lock', () => {
       } finally { unlock(); await holder; await pending?.catch(() => {}); hook.mock.restore(); }
     });
   }
+});
+
+for (const operation of ['clear', 'release'] as const) {
+  it(`public ${operation} uncertainty directs callback recovery through a fresh host scope`, async (t) => {
+    const dispatcher = new AsyncResource('startup-quarantine-dispatch');
+    t.after(() => dispatcher.emitDestroy());
+    const fx = await fixture(t, `r20-recovery-${operation}`);
+    const originalBranch = fx.store.currentBranch().name;
+    fx.store.createBranch('elsewhere');
+    const intent = selection(fx.strategy);
+    let replacement: Promise<void> | undefined;
+    const move = () => {
+      replacement = fx.manager.switchBranch('elsewhere');
+      void replacement.catch(() => {});
+    };
+    const hook = operation === 'clear'
+      ? (() => {
+          // Let the real clear complete before changing the load at the
+          // outer public method's uncertainty boundary.
+          const target = fx.strategy as any;
+          const clear = target.clearObservedCompressionQuarantine.bind(target);
+          return mock.method(target, 'clearObservedCompressionQuarantine', async (...args: unknown[]) => {
+            const changed = await clear(...args);
+            move();
+            return changed;
+          });
+        })()
+      : (() => {
+          const append = fx.store.appendToStateJsonWithIdentity.bind(fx.store);
+          return mock.method(fx.store, 'appendToStateJsonWithIdentity', (...args: Parameters<typeof append>) => {
+            const result = append(...args);
+            if ((args[1] as Event).reason === 'operator-waiver') move();
+            return result;
+          });
+        })();
+    t.after(() => hook.mock.restore());
+    fx.strategy.tick = async () => {
+      const current = () => fx.manager.getStrategy() as Probe;
+      let message = '';
+      await assert.rejects(
+        operation === 'clear'
+          ? current().clearCompressionRefusalQuarantine(intent.key)
+          : current().releaseCompressionRefusalQuarantine(intent),
+        (error: Error) => { message = error.message; return true; },
+      );
+      assert.ok(replacement, 'the mutation landed and branch replacement began');
+      await replacement;
+      await fx.manager.switchBranch(originalBranch);
+      assert.equal(current().inspectCompressionRefusalQuarantine().status, 'branchUnavailable',
+        'even a successful manager switch and getStrategy() do not rebind the callback');
+      dispatcher.runInAsyncScope(() => {
+        assert.equal(inspect(current()).totalRecords, 0, 'fresh inspection sees the landed write, not a receipt');
+        assert.equal(fx.ledger().filter(event => event.kind === 'clear').length, 1, 'recovery did not resend');
+      });
+      assert.match(message, /uncertain:.*earlier writes may have completed/);
+      assert.match(message, /inspect the original branch.*ContextManager.*host-owned dispatcher outside the old callback scope/);
+      assert.match(message, /obtain fresh intent, never automatically resend/);
+    };
+    await fx.manager.tick();
+  });
+}
+
+it('the guide distinguishes inherited alarm scope from an old binding submitted in a fresh scope', async (t) => {
+  const dispatcher = new AsyncResource('startup-quarantine-dispatch');
+  t.after(() => dispatcher.emitDestroy());
+  const fx = await fixture(t, 'r20-alarm-scope');
+  const originalBranch = fx.store.currentBranch().name;
+  let run: Promise<void> | undefined;
+  fx.strategy.setQuarantineAlarmHandler(() => {
+    if (run) return;
+    run = (async () => {
+      const intent = selection(fx.strategy);
+      await fx.manager.fork('alarm-other');
+      await fx.manager.switchBranch(originalBranch);
+      const current = fx.manager.getStrategy() as Probe;
+      const before = fx.ledger();
+      const inheritedInspection = current.inspectCompressionRefusalQuarantine().status;
+      const inheritedRelease = (await current.releaseCompressionRefusalQuarantine(intent)).status;
+      assert.equal(inheritedInspection, 'branchUnavailable');
+      assert.equal(inheritedRelease, 'branchUnavailable');
+
+      await dispatcher.runInAsyncScope(async () => {
+        const fresh = inspect(current);
+        assert.notEqual(fresh.binding.loadId, intent.expectedBinding.loadId);
+        assert.equal((await current.releaseCompressionRefusalQuarantine(intent)).status, 'stale');
+        assert.deepEqual(fx.ledger(), before);
+      });
+
+      // The API already distinguishes these cases; the regression here
+      // includes its operator-facing decision table.
+      const guide = readFileSync('docs/keyed-compression-quarantine.md', 'utf8');
+      const decision = (status: string) => guide.split('\n').find(line => line.startsWith('| `' + status + '` |')) ?? '';
+      assert.match(decision(inheritedRelease), /obsolete async scope/);
+      assert.match(decision('stale'), /current committed load/);
+    })();
+    void run.catch(() => {}); // the alarm handler contract is synchronous
+  });
+  await fx.manager.tick();
+  assert.ok(run, 'the public tick must deliver a real quarantine alarm');
+  await run;
 });

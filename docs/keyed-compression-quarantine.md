@@ -46,8 +46,9 @@ strategy: that legacy library method accepts an omitted key meaning all.
 `inspectCompressionRefusalQuarantine({ key?, limit? })` is synchronous and
 metadata-only. It uses the existing native projection without a maintenance
 tick, paid-off sweep, repair, provider request, or journal write. Calling it
-before initialization, after detach, or after an uninitialized branch change
-returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
+before initialization, after detach, after an uninitialized branch change, or
+from an obsolete inherited async scope returns `branchUnavailable`. A
+failed/malformed read returns `unreadable`,
 not an empty list, with coarse `reason: 'store-read'` (the store threw) or
 `'ledger-entry'` (stored data failed validation). Store error text is never
 returned; unexpected projection/programmer errors propagate. Inspection
@@ -143,11 +144,11 @@ pretending configuration is actual use or correlating an unrelated call.
 | Result | Meaning / host action |
 | --- | --- |
 | `released` | Exact key/generation was cleared under the native lock; includes key, generation, and observed `remainingRecords`. Record the acknowledgement; no inference of coverage or provider work. |
-| `stale` | Branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
+| `stale` | The call has a current committed load, but the submitted branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
 | `not-held` | No active record for this full key under the matched binding. No mutation. This is **not** acknowledgement of an earlier uncertain operation. |
 | `unsupported` | Selected lineage has no trustworthy native generation. No mutation, no fallback writer or legacy clear. Capability absent is also unsupported at the host boundary. |
 | `unreadable` | Authoritative projection could not be read/validated before writes. Coarse `reason` distinguishes `store-read` from `ledger-entry`, without store error text. No mutation. Surface failure, not an empty quarantine. `ledger-entry` can persist below 256 events; restart and clear-all are not repair operations. |
-| `branchUnavailable` | Strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle rather than retrying against another instance. |
+| `branchUnavailable` | The call is in an obsolete async scope, the strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle or dispatch outside the obsolete scope as appropriate. Do not retry against another instance. |
 | `invalidSelection` | Missing/empty/partial/wildcard/all key, absent generation/binding, or invalid inspect bounds. No clear-all interpretation. |
 | Rejected promise / exception | Unexpected projection or mutation-path failure, potentially before any write or after a landed write. Preserve intent as **uncertain**. Do not fabricate `released` from a missing key or automatically resend. |
 
@@ -275,13 +276,27 @@ without changing the replacement load's diagnostic state. This covers the
 report body, not synchronous reentry while a proxy resolves the private boundary
 symbol: that wrapper can throw before the method runs. Defer such instrumentation.
 
-For an intentional fresh operation, use a ContextManager entrypoint (manager
-calls create new origins). A host-owned queue must actually execute outside the
-obsolete async context: a startup-created `f => setImmediate(f)` still inherits
+For an intentional fresh operation that ContextManager exposes, use its
+entrypoint (manager calls create new origins). A host-owned queue must actually
+execute outside the obsolete async context: a startup-created `f => setImmediate(f)` still inherits
 its caller's context. An `AsyncResource` created outside callbacks and used via
-`runInAsyncScope` can provide host-owned dispatch. Validate intent against the
-current load. ContextManager has no debt/stranded-health entrypoints: for those
-reads, use that host-owned dispatch scope and call the current strategy's
+`runInAsyncScope` can provide host-owned dispatch. ContextManager has no
+quarantine inspect/clear/release or debt/stranded-health entrypoints. For
+these operations, use that host-owned dispatch scope and call the current
+strategy directly. Awaiting a manager lifecycle call or fetching the strategy
+with `getStrategy()` does not change the caller's origin.
+
+For example, if an alarm callback inspects and then the manager switches away
+and back, an inherited continuation or timer gets `branchUnavailable` on both
+inspection and release, even with the original branch loaded again. From the
+startup-created dispatcher, inspection returns `ok` with a new binding (if
+readable), while release using the old binding returns `stale`. A same-instance
+reinitialization has the same effect. Do not use release to probe an old intent:
+after an uncertain clear or release, select or reinitialize the original branch
+through the manager, inspect from the fresh dispatcher, and obtain new intent
+before submitting any mutation. An absent hold is not an acknowledgement.
+
+For health reads in that dispatcher, call the current strategy's
 `getCompressionDebt()` or `getStrandedSummaries()` directly. A stale-origin
 `failure: 'report'` is not a configuration-fault diagnosis and uses one-line
 fresh-scope guidance rather than the normal Cause/Effect/Fix format. Do not wrap
@@ -299,3 +314,8 @@ Alarm episodes identify namespace and branch only, not backing stores. Reusing a
 strategy on a different backing store with the same names can end the previous
 episode; this is not evidence that the original store was checked. Stable backing
 store identity and checkpoint retry/reuse policy remain separate contract choices.
+
+Same-instance reloads that interrupt selection may lose the marker metadata
+for a retained previous cache-key list, reducing warm-prefix reuse. The list
+can also reflect a superseded dry selection. Neither is proof that the
+previous request was sent.

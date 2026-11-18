@@ -2,13 +2,16 @@
 // No provider calls. Counters include all installed helper wrappers and mirrors.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { AutobiographicalStrategy, ContextManager } from '../dist/src/index.js';
 const median = xs => [...xs].sort((a,b) => a-b)[Math.floor(xs.length/2)];
-for (const size of [1024, 4096, 16384]) {
-  const path = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'select-cost-'));
+const sizes = process.argv.length > 2 ? process.argv.slice(2).map(Number) : [1024, 4096, 16384];
+assert.ok(sizes.every(n => Number.isSafeInteger(n) && n > 0), 'sizes must be positive integers');
+for (const size of sizes) {
+  const path = mkdtempSync(join(tmpdir(), 'select-cost-'));
   const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false,
     targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0,
     l1HoldbackChunks: 0, quarantineAlarmIntervalMs: 0, adaptiveResolution: true,

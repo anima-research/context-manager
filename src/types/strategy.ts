@@ -374,7 +374,9 @@ export interface ContextStrategy {
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
    * addMessage that stored it, after a holdCompression hold is placed, and
-   * its synchronous part runs before addMessage returns. A sharded add is
+   * its synchronous part normally runs before addMessage returns. For the
+   * onNewMessage adapter, a failed scope/window-mode observation leaves the
+   * notification pending for a later notification on this manager. A sharded add is
    * told once, after every shard is stored, with every shard, as a
    * presentRows gives a body; a strategy with only onNewMessage hears each
    * shard in turn at that point. A sharded write that fails tells the
@@ -531,7 +533,10 @@ export interface ContextStrategy {
    * form of onPresented, called only for a strategy without onPresented, at
    * the points onPresented says. While the manager is in legacy mode, that
    * is after a message is added to the store, inside the write that stored
-   * it, so its synchronous part runs before addMessage returns. Once a host
+   * it, so its synchronous part normally runs before addMessage returns.
+   * If the adapter cannot read its scope or window mode, the rows remain
+   * pending in this manager until a later notification; close discards them.
+   * Once a host
    * presents rows on the branch, it is from presentRows, once per row
    * presented, in window order, and no longer at the add: a row stored and
    * not presented isn't in the window the context reads. Each row's call
@@ -2606,8 +2611,9 @@ export interface AutobiographicalConfig {
    * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
    * the summarizer is the agent, and it must never be shown itself using a tool
    * it does not have. Enabling (or changing) this is a new request regime, so
-   * already-quarantined chunks earn a fresh bounded attempt without a manual
-   * clear. See `tool-prose-hoist.ts` for the canary record.
+   * a previously unseen regime can allow a fresh bounded attempt without a
+   * manual clear. Returning to a used regime is still subject to its retained
+   * exact-key, family and shape-cap holds. See `tool-prose-hoist.ts` for the canary record.
    */
   compressionToolProseFallback?: {
     /** Declared name of the real note-taking tool that receives the prose. */

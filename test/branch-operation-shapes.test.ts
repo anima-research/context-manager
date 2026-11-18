@@ -291,8 +291,8 @@ it('nested boundary resolutions retain an ancestor owner origin', async () => {
   assert.equal(a.mirror, 0);
 });
 
-it('initialization detaches discarded order caches without traversing old history', () => {
-  const scope = new BranchOperationScope(() => ({ load: 1 }), () => true, () => 0);
+it('public reinitialization detaches the real order caches without traversing old history', async () => {
+  const fx = await fixture();
   class OldOrder extends Map<string, number> {
     [Symbol.iterator](): MapIterator<[string, number]> { throw new Error('history traversed'); }
     entries(): MapIterator<[string, number]> { throw new Error('history traversed'); }
@@ -301,12 +301,23 @@ it('initialization detaches discarded order caches without traversing old histor
     forEach(): void { throw new Error('history traversed'); }
   }
   const old = new OldOrder([['a', 1]]);
-  const target = { order: old, source: ['a'] };
-  (scope.install as Function)(target, new Set(), new Set(), new Set(['order', 'source']));
-  callStrategy(target, 'initialize', () => scope.isolateMirrors());
-  assert.equal(target.order.size, 0);
-  assert.deepEqual(target.source, []);
-  assert.equal(old.get('a'), 1, 'old captured shell remains intact');
+  const source = new Proxy([{ id: 'a' }], {
+    get(target, key, receiver) {
+      if (key === Symbol.iterator || key === '0') throw new Error('source history traversed');
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  try {
+    const strategy = new AutobiographicalStrategy(config);
+    const manager = await fx.open(fx.newStore(), strategy);
+    const raw = strategy as any;
+    raw._storeOrder = old;
+    raw._storeOrderSource = source;
+    await manager.setStrategy(strategy);
+    assert.notEqual(raw._storeOrder, old);
+    assert.notEqual(raw._storeOrderSource, source);
+    assert.equal(old.get('a'), 1, 'old captured shell remains intact');
+  } finally { fx.close(); }
 });
 
 it('uninitialized base mirrors have guarded own descriptors and refuse stale writes', async () => {

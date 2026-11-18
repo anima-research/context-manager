@@ -16,7 +16,7 @@ const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex
 const sites = [
   { name: 'text blob', method: 'storeBlob', occurrence: 1, image: false },
   { name: 'media blob', method: 'storeBlob', occurrence: 1, image: true },
-  { name: 'envelope blob', method: 'storeBlob', occurrence: 2, image: true },
+  { name: 'envelope blob', method: 'storeBlob', occurrence: 2, image: true, singleImage: true },
   { name: 'envelope registration', method: 'registerState', occurrence: 1, image: true },
   { name: 'envelope index', method: 'treeSet', occurrence: 1, image: true },
 ] as const;
@@ -33,6 +33,8 @@ for (const site of sites) {
     const manager = await ContextManager.open({ store, strategy, membrane: { complete: async (request: unknown) => {
       requestBytes = Buffer.from(JSON.stringify(request));
       if (site.image) assert.ok(requestBytes.includes(media), 'the real authoring request carries inline media');
+      if ('singleImage' in site) assert.equal(requestBytes.toString().split(media).length - 1, 1,
+        'only one media blob lookup precedes the envelope blob');
       armed = true;
       return answer;
     } } as never });
@@ -43,7 +45,8 @@ for (const site of sites) {
       await manager.switchBranch(branchA);
       for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [
         { type: 'text', text: `MSG-${i} ${'substantive event '.repeat(60)}` },
-        ...(site.image ? [{ type: 'image' as const, source: { type: 'base64' as const, mediaType: 'image/png', data: media } }] : []),
+        ...(site.image && (!('singleImage' in site) || i === 0)
+          ? [{ type: 'image' as const, source: { type: 'base64' as const, mediaType: 'image/png', data: media } }] : []),
       ]);
       await manager.compile({ maxTokens: 100000, reserveForResponse: 100 });
       Object.defineProperty(store, site.method, { configurable: true, get() {

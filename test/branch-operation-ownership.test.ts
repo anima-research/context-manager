@@ -137,7 +137,7 @@ it('release migration names host callback refusals, dispatch limits and the inte
   // document must not require synchronized literal prose in all the others.
   for (const text of [breaking, lifecycle, types, guidance].map(prose)) {
     assert.match(text, /lifecycle/i);
-    assert.match(text, /(?:supported only through|must be invoked via)\s+`?ContextManager/);
+    assert.match(text, /\b(?:lifecycle\b[^.!?]{0,160}\bContextManager|ContextManager\b[^.!?]{0,160}\blifecycle)\b/i);
     assert.match(text, /direct.{0,100}(?:unsupported|not supported)/i);
     assert.match(text, /invalidat.{0,50}(?:load|generation)/i);
     assert.match(text, /throw/i);
