@@ -458,17 +458,61 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       }, `the window at ${top} leaves no room for the stub's ${stubPrice}, and this store can't fold to make it`);
       const fits = await cm.compile(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice, dryRun: true });
       assert.equal(fits.renderStats!.request!.stubTokens, stubPrice, 'the stub is priced as the store prices its block');
+      const refused = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
+      assert.equal(refused.fits, false);
+      assert.equal(refused.requestLimitTokens, top);
       if (label === 'adaptive') {
-        const refused = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
         const planned = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top + stubPrice })!;
         assert.equal(refused.fits, false, 'a preview the stubs refused doesn\'t fit');
         assert.equal(refused.exhausted, planned.exhausted, 'and reports the picker as its plan found it');
-        assert.equal(refused.requestLimitTokens, top, 'and the limit');
+      } else {
+        assert.equal(refused.exhausted, true, 'no picker plan exists');
+        assert.deepEqual(refused.resolutions, {});
+        assert.equal(refused.moves, 0);
+        assert.equal(refused.producedCount, 0);
       }
       assert.ok(requestTokens(fits.renderStats!) + stubPrice <= top + stubPrice, 'and the request with it is within the limit');
       cm.close();
     });
   }
+
+  it('stops an over-budget first plan before a fitting stub-room retry can replace it', async (t) => {
+    const { cm, strategy } = await seededAt('stub-first-plan-over', 1, {}, 6);
+    const budget = { maxTokens: 100_000, reserveForResponse: 600 };
+    try {
+      cm.addMessage('User', [{ type: 'text', text: 'the quick brown fox keeps running. '.repeat(1500) }]);
+      cm.addMessage('Claude', [{ type: 'text', text: 'Let me look.' }, { type: 'tool_use', id: 'x1', name: 'look', input: {} }] as ContentBlock[]);
+      cm.addMessage('User', [{ type: 'text', text: 'And what did you see?' }]);
+      const open = await cm.compile(budget, undefined, { requestOverhead: OVERHEAD, dryRun: true });
+      const options = { requestOverhead: OVERHEAD, requestLimitTokens: requestTokens(open.renderStats!) };
+      let attempt = 0;
+      const emitter = strategy as unknown as { estimateTokens(content: ContentBlock[]): number };
+      const originalEstimate = emitter.estimateTokens;
+      t.mock.method(emitter, 'estimateTokens', (content: ContentBlock[]) => {
+        const tokens = originalEstimate.call(strategy, content);
+        return attempt > 1 ? Math.ceil(tokens / 2) : tokens;
+      });
+      const originalRun = Picker.prototype.run;
+      t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+        const result = originalRun.call(this, inputs, budget);
+        attempt++;
+        // The first plan is over, though its emitter reaches a stub refusal.
+        // If allowed to retry, the second plan and discounted emission fit.
+        return { ...result, finalTokens: attempt === 1 ? budget.totalBudget + 1 : 1, exhausted: false };
+      });
+      const preview = cm.previewContext(budget, undefined, options)!;
+      assert.equal(preview.fits, false, 'the first plan refuses before stub-room retry');
+      assert.equal(attempt, 1);
+      assert.equal(preview.finalTokens, preview.budgetTokens + 1);
+      for (const dryRun of [true, false]) {
+        attempt = 0;
+        await assert.rejects(cm.compile(budget, undefined, { ...options, dryRun }), /Adaptive plan check/);
+        assert.equal(attempt, 1, `dryRun=${dryRun} takes the same first gate`);
+      }
+    } finally {
+      cm.close();
+    }
+  });
 
   it('keeps the first fitting plan and stub refusal when the reserved-room retry plan is over budget', async (t) => {
     const { cm, strategy } = await seededAt('stub-retry-plan-over', 1, {}, 6);

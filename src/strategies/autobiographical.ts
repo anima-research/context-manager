@@ -2805,9 +2805,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const partial = this._lastPreview as PreviewResult | undefined;
         // A plan already over the budget is refused at its gate by the live
         // compile, with the numbers its preview recorded and the plan's list
-        // (which the preview gives as this dry run sees it), so a later stage's
-        // refusal of this dry run doesn't change the answer: the preview is the
-        // plan's, as when nothing later throws.
+        // (which the preview gives as this dry run sees it). Return that
+        // plan report rather than reconstructing it from refusal diagnostics.
         if (partial?.fits === false) return partial;
         // Infeasible at this budget. That is an ANSWER, not a failure — it is
         // the whole reason to preview before applying. Report it with the
@@ -15828,20 +15827,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Hard-fail whenever the picker's current plan exceeds the hard budget.
     // A `produce` op only schedules a missing summary; it does not make the
     // current raw plan feasible and must never authorize an inference.
-    // A dry run reports infeasibility via `_lastPreview.fits` instead: the
-    // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause. Except
-    // under a provisional multiplier above 1, which a committing select
-    // would drop and retry at (selectPath): the dry run throws the same
-    // refusal so it takes the same fallback, and its preview says what the
-    // real compile will do. If the retry at 1 is still over, it reports.
-    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    // A stub-room retry must take the live plan gate too: withRoomForStubs
-    // discards a retry that cannot fit and restores the first stub refusal's
-    // preview. Letting a dry retry emit could instead leave its over-budget
-    // plan in _lastPreview, even if the emitter prices below the picker.
-    const stubRoomRetry = this.selectPricing?.stubReserve !== undefined;
-    if (!planFits && (!dryRun || dryFallback || stubRoomRetry)) {
+    // Dry selects take the same gates and retries as live compilation.
+    // previewContext converts the refusal into the plan report recorded above;
+    // neither previews nor dry compiles may emit an already-infeasible plan.
+    if (!planFits) {
       // The plan's middle is what's over, priced as the plan priced it, so
       // the pins keeping raw tokens there are named. The refusals after the
       // plan count other things (an emitted prefix, a shard's text alone)

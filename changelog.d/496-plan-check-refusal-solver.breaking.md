@@ -27,6 +27,12 @@
   OverBudgetError`, `budget`, `actual`, `clearedBy` and every other
   diagnostic are as they were, as are the messages and diagnostics of every
   other refusal, which leave the three fields out.
+  Ordinary dry-run compilation now takes the same plan gates as live
+  compilation and throws when its first plan exceeds the hard budget,
+  including after a provisional calibration retry drops the multiplier to 1.
+  Previews report that refused plan without attempting a stub-room retry.
+  A dry compile whose stub-room retry plan exceeds its reduced budget now
+  throws the original stub refusal, as live compilation does.
   A preview whose stub-room retry plan exceeds its reduced budget now
   reports the original stub refusal and its fitting plan's exhaustion flag,
   just as a live compile discards that retry.

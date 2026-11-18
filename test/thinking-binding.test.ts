@@ -1488,8 +1488,8 @@ describe('thinking binding: a summary\u2019s carriers', () => {
     assert.deepEqual(preview.messages, stripped.messages, 'a binding dry compile, with no committing compile before it');
     await assert.rejects(
       renderAdaptiveFixture({ carrierPolicy: 'full' }, carriers, 900, { dryRun: true }, BIND_DROP),
-      /Emission overran the plan/,
-      'a dry compile without the option, after a binding compile, prices as configured: it reports an infeasible plan rather than refusing it, so it fails where its render overruns',
+      /Adaptive plan check \([^)]+\): /,
+      'a dry compile without the option, after a binding compile, prices as configured and refuses at the same plan gate as live compilation',
     );
     // previewContext takes the option too.
     const previewed: Record<string, boolean> = {};

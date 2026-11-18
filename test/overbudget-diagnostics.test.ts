@@ -1271,6 +1271,9 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Tail emission dropped reserved recent-window messages/);
+      for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
+        assert.equal(Reflect.has(error.diagnostics, field), false, field);
+      }
       assert.deepEqual(error.clearedBy, ['compression']);
       strategy.produce = false;
       const without = await refusal(manager);
@@ -1305,10 +1308,9 @@ describe('OverBudgetError.clearedBy', () => {
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 2; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(10) }]);
         if (running) strategy.startCompressing();
-        // A dry run reports a plan over the budget rather than refusing it,
-        // and this one renders within the budget, so nothing later throws:
-        // the dry compile resolves, and the preview is the one the plan recorded.
-        await manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, { dryRun: true });
+        // Dry compilation takes the same plan gate; preview converts the
+        // refusal into the recorded plan's report.
+        await assert.rejects(manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, { dryRun: true }), /Adaptive plan check/);
         const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
         assert.ok(preview);
         assert.equal(preview.fits, false);
@@ -1323,7 +1325,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  it('keeps the plan\'s list and numbers in a preview whose plan is over when a later stage refuses with another', async () => {
+  it('keeps the plan\'s list and numbers before a later structural refusal', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -1341,8 +1343,8 @@ describe('OverBudgetError.clearedBy', () => {
       manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
       strategy.startCompressing();
       const dry = await refusal(manager, { dryRun: true });
-      assert.match(dry.message, /^Structural repair did not retain the newest turn/);
-      assert.deepEqual(dry.clearedBy, []);
+      assert.match(dry.message, /^Adaptive plan check/);
+      assert.deepEqual(dry.clearedBy, ['compression']);
       // The live compile refuses the plan at its gate first, so the preview
       // names what that refusal names.
       const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
@@ -1355,7 +1357,7 @@ describe('OverBudgetError.clearedBy', () => {
       // The preview's numbers are that refusal's too, not the later stage's.
       assert.equal(preview.finalTokens, live.actual);
       assert.equal(preview.budgetTokens, live.budget);
-      assert.notEqual(dry.actual, live.actual, 'the later stage measured something else');
+      assert.equal(dry.actual, live.actual, 'dry and live stop at the same gate');
     });
   });
 

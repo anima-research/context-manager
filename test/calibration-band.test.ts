@@ -1004,13 +1004,13 @@ describe('estimator calibration band', () => {
     const flags: boolean[] = [];
     const runs = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
       const result = originalRun.call(this, inputs, budget);
-      const exhausted = flags.length === 0;
+      const exhausted = flags.length > 0;
       flags.push(exhausted);
       return { ...result, exhausted };
     });
     const dry = await calibrationWarnings(async () => reopened.cm.previewContext(tight, undefined, { render: true })!);
-    assert.deepEqual(flags, [true, false], 'discarded provisional pick, then fitting retry');
-    assert.equal(dry.result.exhausted, false, 'the retry owns the preview flag');
+    assert.deepEqual(flags, [false, true], 'discarded provisional pick, then fitting retry');
+    assert.equal(dry.result.exhausted, true, 'a fitting retry retains its true solver flag');
     runs.mock.restore();
     assert.equal(dry.result.fits, true, 'the preview says what the real compile will do');
     assert.deepEqual([dry.result.stats!.calibration!.multiplier, dry.result.stats!.calibration!.reset?.discardedMultiplier], [1, 1.45]);
@@ -1029,7 +1029,16 @@ describe('estimator calibration band', () => {
     stillOver.internals.store!.setStateJson(stillOver.internals.calibrationStateId, unstamped);
     stillOver.cm.close();
     const stillOverReopened = await openSharded('picker-over', false);
+    flags.length = 0;
+    t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = originalRun.call(this, inputs, budget);
+      const exhausted = flags.length === 0;
+      flags.push(exhausted);
+      return { ...result, exhausted };
+    });
     const overPreview = stillOverReopened.cm.previewContext(over)!;
+    assert.deepEqual(flags, [true, false]);
+    assert.equal(overPreview.exhausted, false, 'the over-budget retry owns the flag too');
     assert.equal(overPreview.fits, false);
     assert.ok(overPreview.finalTokens < P * 1.1, `reported at the dropped multiplier: ${overPreview.finalTokens} vs ${P} at 1.0`);
     stillOverReopened.cm.close();
