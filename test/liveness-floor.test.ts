@@ -454,23 +454,25 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
       const recovered = await reader.manager.compile(budget, undefined, { dryRun: true });
       assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined);
       breakIt();
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned(cause, cause, cause); // Dry recovery clears its own original cause.
       await failsFloor(() => reader.manager.compile(budget));
-      warned(cause, cause); // Dry recovery never clears live suppression.
+      warned(cause, cause, cause); // Dry recovery never clears live suppression.
       cause = 'different dry failure';
       await failsFloor(() => reader.manager.previewContext(budget));
-      warned('original floor failure', 'original floor failure', cause);
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause);
       cause = 'original floor failure';
       await failsFloor(() => reader.manager.compile(budget));
-      warned(cause, cause, 'different dry failure');
+      warned(cause, cause, cause, 'different dry failure');
       // Live recovery must not clear the separate dry record either.
       forest.minimumTokens = minimumTokens;
       await reader.manager.compile(budget);
       breakIt();
       cause = 'different dry failure';
       await failsFloor(() => reader.manager.previewContext(budget));
-      warned('original floor failure', 'original floor failure', cause);
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause);
       await failsFloor(() => reader.manager.compile(budget));
-      warned('original floor failure', 'original floor failure', cause, cause);
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause, cause);
     } finally {
       forest.minimumTokens = minimumTokens;
       floor.restore();

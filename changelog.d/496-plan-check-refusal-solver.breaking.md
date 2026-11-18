@@ -24,7 +24,13 @@
   real solver, an infeasible minimum frontier returns before search, while
   a ceiling fallback takes an already-feasible minimum cut; the fallback
   flag is telemetry, not a reason for the plan check to refuse. A true flag
-  at this refusal indicates disagreement between plan and solver accounting.
+  at this refusal indicates disagreement between plan and solver accounting
+  when token costs and budgets are integral. Fractional provider
+  `usage.outputTokens` can produce fractional summary costs: the rejection
+  bound is floored but the solve budget is not. With zero grace, a
+  100.25-token cut fits a 100.5-token solve budget yet fails the hard bound
+  of 100 with matching accounting, `pickerExhausted=false`, and possibly a
+  true fallback flag.
   Synthetic
   failure injection covers forwarding a true fallback flag on refusal, not
   reachability of that combination in a real solve. A host

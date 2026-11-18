@@ -721,6 +721,46 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
+  it('refuses a fractional-budget real kv-unified cut despite matching accounting', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
+      carrierPolicy: 'full', overBudgetGraceRatio: 0, autoTickOnNewMessage: false, speculativeProduction: false,
+      kvUnified: {
+        policy: {
+          alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+          cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+          continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+          continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+        },
+        tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+        treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+      },
+    });
+    strategy.useRealPicker = true;
+    const run = Picker.prototype.run;
+    const picks: Array<{ cost: number; budget: number; exhausted: boolean }> = [];
+    t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = run.call(this, inputs, budget);
+      picks.push({ cost: result.finalTokens, budget: budget.totalBudget, exhausted: result.exhausted });
+      return result;
+    });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 12 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(100) }]));
+      strategy.seedCarrierL1('L1-fractional', ids.slice(0, -1), 100.25);
+      const minimum = await refusal(manager, undefined, { maxTokens: 100, reserveForResponse: 0 });
+      assert.equal(minimum.actual % 1, 0.25, 'provider-style fractional summary cost survives plan accounting');
+      picks.length = 0;
+      const error = await refusal(manager, undefined, { maxTokens: minimum.actual + 0.25, reserveForResponse: 0 });
+      assert.equal(error.actual, minimum.actual);
+      assert.equal(error.budget, Math.floor(minimum.actual + 0.25));
+      assert.deepEqual(picks, [{ cost: error.actual, budget: error.actual + 0.25, exhausted: false }]);
+      assert.equal(error.diagnostics.pickerExhausted, false);
+      assert.equal(error.diagnostics.labelCeilingFallback, false);
+    });
+  });
+
   it('leaves the solver fields out of a refusal that comes before the plan', async () => {
     const strategy = new AutobiographicalStrategy({
       adaptiveResolution: true,

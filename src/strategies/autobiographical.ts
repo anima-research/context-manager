@@ -6826,7 +6826,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const failures = this._dryRunSelect ? this.dryFloorFailures : this.floorFailures;
     if (failures.has(kind)) return;
     failures.add(kind);
-    this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+    this.diag.warn(`[autobiographical] floor not computed (${this._dryRunSelect ? 'dry' : 'live'}), so floor= is left off the plan line until it is: ${cause}`);
   }
 
   /** An estimate of what the queued work would take off the floor once it
@@ -15768,8 +15768,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } else if (shadowResult.exhausted) {
           const plan =
             `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
-            `${Math.floor(prodBudget * (1 - slack))}, and it can fold no further with the summaries ` +
-            `the store has now and asks for none`;
+            `${Math.floor(prodBudget * (1 - slack))}, and no production was requested`;
           this.diag.warn(
             shadowResult.finalTokens > prodLine
               ? `autobio: production target ${prodBudget} unreachable with the summaries the store has ` +

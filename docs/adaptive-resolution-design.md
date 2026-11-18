@@ -517,10 +517,14 @@ labels it `exhausted`, without claiming a provenance for the normalized value.
 shadow solve's ceiling hit, and is absent for other solvers. Refusals before
 the plan omit these fields. With the real solver, an infeasible minimum
 frontier returns before search; a search that hits the ceiling falls back
-to an already-feasible minimum cut. Thus a live ceiling fallback is not a
-reason for this plan-check refusal. A real kv-unified refusal here carries
-`exhausted=true`; a true fallback flag at this refusal means the plan's
-accounting disagreed with the solver's. A synthetic pre-feasibility exception
+to an already-feasible minimum cut. With integral token costs and budgets, a live ceiling fallback is not a
+reason for this plan-check refusal: a real kv-unified refusal here carries
+`exhausted=true`, and a true fallback flag means the plan's accounting
+disagreed with the solver's. There is a rounding exception: the rejection
+bound is floored but the solve budget is not. With zero grace, a 100.25-token
+cut fits a 100.5-token solve budget yet exceeds the hard bound of 100, even
+with matching accounting, `exhausted=false`, and possibly a ceiling fallback.
+Provider `usage.outputTokens` can supply fractional summary costs. A synthetic pre-feasibility exception
 exercises forwarding the flag, not reachability in a real solve.
 
 `moves` is the number of chunks whose resolution changed from the level
