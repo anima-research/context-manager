@@ -56,6 +56,8 @@ before any dispatch instead emits `compression:no-dispatch` for `compress_l1`, w
 `reason` of `deferral`, `withdrawal`, or `error`, and a bounded `detail`. It has
 no request, message, system, or response payload and does not claim a send.
 This operation-wide boundary also covers preparation and quarantine-read failures.
+The missing-model halt is exempt: it retains its sole `no-compression-model`
+audit event with `fatal: true`, rather than appending an ordinary no-dispatch outcome.
 Normal pre-send returns emit one outcome too: `quarantine` for a durable hold,
 `stopped` for overlap or exhausted/held work, or `no-op` for work completed
 without a provider call (including adoption, deduplication, stubs and coalescing).

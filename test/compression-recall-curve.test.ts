@@ -5336,7 +5336,7 @@ it('warns without replacing a successful compression when receipt preparation th
 
 
 describe('public tick operation-wide no-dispatch boundary', () => {
-  for (const exit of ['preparation', 'quarantine-read', 'opening', 'tools', 'branch-discard', 'adoption', 'quarantine', 'reused-exhaustion'] as const) {
+  for (const exit of ['preparation', 'fatal-lookalike', 'quarantine-read', 'opening', 'tools', 'branch-discard', 'adoption', 'quarantine', 'reused-exhaustion'] as const) {
     it(`records exactly one pre-send outcome for ${exit}`, async () => {
       const log = `${freshPath()}-public-no-dispatch.jsonl`;
       paths.push(log);
@@ -5356,6 +5356,13 @@ describe('public tick operation-wide no-dispatch boundary', () => {
       try {
         queue();
         if (exit === 'preparation') hooks.prepareCompressionAhead = () => { throw localError; };
+        if (exit === 'fatal-lookalike') {
+          // Only the actual, already-audited fatal is exempt, not hook errors
+          // with the same text or a spoofed class name.
+          localError.name = 'MissingCompressionModelError';
+          localError.message = 'compressionModel is NOT configured. Memory formation is halted';
+          hooks.prepareCompressionAhead = () => { throw localError; };
+        }
         if (exit === 'opening') hooks.getCompressionOpening = () => { throw localError; };
         if (exit === 'tools') hooks.familyWaitsForTools = () => true;
         if (exit === 'quarantine-read') {
@@ -5397,7 +5404,7 @@ describe('public tick operation-wide no-dispatch boundary', () => {
         }
         const before = mock.calls.length;
         const { result } = await quiet(() => fx.manager.tick());
-        assert.equal(result.status, ['preparation', 'quarantine-read', 'opening'].includes(exit) ? 'rejected' : 'fulfilled');
+        assert.equal(result.status, ['preparation', 'fatal-lookalike', 'quarantine-read', 'opening'].includes(exit) ? 'rejected' : 'fulfilled');
         if (exit === 'quarantine-read') assert.equal((result as PromiseRejectedResult).reason.name, 'CompressionQuarantineUnreadableError');
         assert.equal(mock.calls.length, before, 'public tick never sends on this exit');
         const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];

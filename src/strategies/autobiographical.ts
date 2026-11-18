@@ -285,6 +285,9 @@ class CompressionQuarantineUnreadableError extends Error {
   }
 }
 
+/** Already audited fatals, identified without inspecting arbitrary thrown values. */
+const missingCompressionModelErrors = new WeakSet<object>();
+
 /**
  * Whether a merge group still stands as it was recorded: every source present
  * and unparented. The sweep removes a merge-quarantine record once it
@@ -2372,7 +2375,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         + "recipe names the model whose voice these memories are.";
       this.diag.error(msg);
       logCompressionCall({ event: "no-compression-model", fatal: true }, this.ns);
-      throw new Error(msg);
+      const error = new Error(msg);
+      missingCompressionModelErrors.add(error);
+      throw error;
     }
     return m;
   }
@@ -11052,7 +11057,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     onToolsDeferred?: () => void,
   ): Promise<void> {
     // One operation-wide boundary owns no-send receipts, including preparation
-    // and normal returns. Dispatch telemetry below only marks actual sends.
+    // and normal returns, except the separately audited missing-model fatal.
+    // Dispatch telemetry below only marks actual sends.
     const outcome: {
       dispatched: boolean;
       reason: 'no-op' | 'quarantine' | 'stopped' | 'deferral' | 'withdrawal' | 'error';
@@ -11075,7 +11081,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       outcome.failure = { error };
       throw error;
     } finally {
-      if (!outcome.dispatched && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
+      if (!outcome.dispatched && !missingCompressionModelErrors.has(outcome.failure?.error as object)
+        && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
         try {
           if (outcome.failure) {
             const { error } = outcome.failure;
