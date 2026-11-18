@@ -10,11 +10,15 @@ import type { StrategyContext } from '../src/types/index.js';
 
 import { observeDrainCompletion } from './_harness/drain-completion.js';
 
-const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 function barrier() { let release!: () => void; const wait = new Promise<void>(r => { release = r; }); return { wait, release }; }
 class Probe extends AutobiographicalStrategy {
   hold?: Promise<void>;
-  async initialize(ctx: StrategyContext) { if (this.hold) await this.hold; await super.initialize(ctx); }
+  onInitializeEntered?: () => void;
+  async initialize(ctx: StrategyContext) {
+    this.onInitializeEntered?.();
+    if (this.hold) await this.hold;
+    await super.initialize(ctx);
+  }
 }
 // Private seams are invoked only under real installed operation wrappers.
 const inside = (s: object): any => s;
@@ -77,7 +81,10 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
       }
       assert.ok(site === 'repair' ? repairCallback : entered, `${site} must reach its held seam before replacement`);
       fx.raw.hold = setup.wait;
+      const initializing = barrier();
+      fx.raw.onInitializeEntered = initializing.release;
       replacement = fx.manager.setStrategy(fx.raw);
+      await initializing.wait;
       pause.release();
       if (repairCallback) assert.doesNotThrow(repairCallback, 'scheduled repair callback cannot throw into the host');
       await pending;
@@ -156,13 +163,14 @@ it('detach failure diagnostic tolerates a second throwing protocol lookup and st
   } finally { armed = false; fx.close(); }
 });
 
-it('replacement initialization hands over an old queued repair report once', async () => {
+it('replacement initialization hands over an old queued repair report once', { timeout: 10_000 }, async () => {
   const fx = await fixture(); let handed = 0;
+  const delivered = barrier();
   try {
-    fx.raw.setLoadRepairHandler(() => { handed++; });
+    fx.raw.setLoadRepairHandler(() => { handed++; delivered.release(); });
     inside(fx.raw).deliverLoadRepair({ stateId: 'x' });
     await fx.manager.setStrategy(fx.raw);
-    await turn();
+    await delivered.wait;
     assert.equal(handed, 1);
   } finally { fx.close(); }
 });

@@ -1,4 +1,4 @@
-/** Local cancellation ownership and non-throwing health/report callbacks. */
+/** Local cancellation ownership and stale-result health/report callbacks. */
 import { it } from 'node:test';
 import { AsyncResource } from 'node:async_hooks';
 import assert from 'node:assert/strict';

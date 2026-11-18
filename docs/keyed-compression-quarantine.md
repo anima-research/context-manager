@@ -271,14 +271,20 @@ health methods can return `unknown`, `unreadable` or `branchUnavailable`. Handle
 each method's result contract, not just an exception name. Earlier writes may
 have completed; a refusal is not a rollback receipt. `getCompressionDebt()` keeps
 its never-throw contract even for inherited stale intervals, returning `unknown`
-without changing the replacement load's diagnostic state.
+without changing the replacement load's diagnostic state. This covers the
+report body, not synchronous reentry while a proxy resolves the private boundary
+symbol: that wrapper can throw before the method runs. Defer such instrumentation.
 
 For an intentional fresh operation, use a ContextManager entrypoint (manager
 calls create new origins). A host-owned queue must actually execute outside the
 obsolete async context: a startup-created `f => setImmediate(f)` still inherits
 its caller's context. An `AsyncResource` created outside callbacks and used via
 `runInAsyncScope` can provide host-owned dispatch. Validate intent against the
-current load; do not wrap
+current load. ContextManager has no debt/stranded-health entrypoints: for those
+reads, use that host-owned dispatch scope and call the current strategy's
+`getCompressionDebt()` or `getStrandedSummaries()` directly. A stale-origin
+`failure: 'report'` is not a configuration-fault diagnosis and uses one-line
+fresh-scope guidance rather than the normal Cause/Effect/Fix format. Do not wrap
 arbitrary old work in a new manager operation merely to bypass its refusal.
 Lifecycle methods, including subclass overrides, are supported only through
 ContextManager. Direct lifecycle calls are unsupported, not guaranteed to be

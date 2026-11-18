@@ -295,6 +295,10 @@ it('initialization detaches discarded order caches without traversing old histor
   const scope = new BranchOperationScope(() => ({ load: 1 }), () => true, () => 0);
   class OldOrder extends Map<string, number> {
     [Symbol.iterator](): MapIterator<[string, number]> { throw new Error('history traversed'); }
+    entries(): MapIterator<[string, number]> { throw new Error('history traversed'); }
+    keys(): MapIterator<string> { throw new Error('history traversed'); }
+    values(): MapIterator<number> { throw new Error('history traversed'); }
+    forEach(): void { throw new Error('history traversed'); }
   }
   const old = new OldOrder([['a', 1]]);
   const target = { order: old, source: ['a'] };
@@ -303,4 +307,31 @@ it('initialization detaches discarded order caches without traversing old histor
   assert.equal(target.order.size, 0);
   assert.deepEqual(target.source, []);
   assert.equal(old.get('a'), 1, 'old captured shell remains intact');
+});
+
+it('uninitialized base mirrors have guarded own descriptors and refuse stale writes', async () => {
+  const fx = await fixture();
+  const strategy = new AutobiographicalStrategy(config);
+  const manager = await fx.open(fx.newStore(), strategy);
+  const raw = strategy as any;
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  strategy.tick = async () => {
+    entered();
+    await held;
+    assert.throws(() => { raw.reliefYield = { mark: 'obsolete', l1Attempts: 1 }; }, /stale/);
+  };
+  const pending = manager.tick();
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(strategy, 'reliefYield');
+    assert.equal(typeof descriptor?.get, 'function');
+    assert.equal(typeof descriptor?.set, 'function');
+    await started;
+    await manager.setStrategy(strategy);
+    release();
+    await pending;
+    assert.equal(raw.reliefYield, undefined);
+  } finally { release(); await pending; fx.close(); }
 });

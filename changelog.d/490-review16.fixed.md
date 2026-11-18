@@ -4,9 +4,7 @@
   currency still refuses pause installation, now with a diagnostic.
 - Release pending compression slots by exact promise and load ownership after
   an initialization override fails before `super`; replacement loads remain
-  fenced. Immutable strategy names stay readable from obsolete callbacks, and
-  stale health/stranded reads request fresh manager dispatch rather than report
-  a configuration fault.
+  fenced.
 - Reject superseded branch selections instead of silently adopting a nested
   switch. Invalidate manager initialization before switch bookkeeping can fail,
   reconcile stale outer observations even when their names match nested records,

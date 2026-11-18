@@ -233,12 +233,12 @@ function causeText(thrown: unknown): string {
  * characters (causeText) it stays under 500, where connectome-host's status
  * notices and agent-framework's alert webhook cut a message.
  */
-function staleHealthReportMessage(report: string, cause: StaleBranchOperationError): string {
-  return `The ${report} could not be read from an obsolete continuation. Its values are unknown. Dispatch a fresh health read through ContextManager outside the old callback scope. Cause: ${causeText(cause)}`;
+function staleHealthReportMessage(report: string): string {
+  return `The ${report} could not be read from an obsolete continuation. Its values are unknown. Use a host-owned dispatcher outside the old callback scope, then call the strategy's health method on the current load.`;
 }
 
 function compressionQuarantineUnreadableMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression quarantine report', cause);
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression quarantine report');
   return [
     'Compression of new conversation has stalled.',
     `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
@@ -248,7 +248,7 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
 }
 
 function strandedSummariesFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('stranded-summaries report', cause);
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('stranded-summaries report');
   return [
     'The stranded-summaries read failed.',
     `Cause: ${causeText(cause)}`,
@@ -269,11 +269,12 @@ function strandedNoStoreMessage(): string {
 /**
  * What an operator reads when the debt report itself fails. Outside the
  * ledger it reads only the strategy's own state and the options it was
- * given, so a throw there is a fault in context-manager or in those options.
- * How to report it is the host's to say.
+ * given, so a non-stale throw there points to context-manager or those options.
+ * An obsolete callback instead gets one-line fresh-scope guidance with unknown
+ * values. How to surface either failure is the host's to say.
  */
 function compressionDebtReportFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression debt report', cause);
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression debt report');
   return [
     'The compression debt report failed.',
     `Cause: ${causeText(cause)}`,
@@ -5997,7 +5998,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * from `fn`, or a rejection of what it returns (a promise or any
    * thenable), is logged, and stops neither the load nor the next report.
    * The report isn't handed over again, and the getter gives it until a
-   * newer one.
+   * newer one. A stale delivery stays held until this instance has a current
+   * load again; detach or failed replacement alone does not deliver it.
    */
   setLoadRepairHandler(fn: (report: LoadRepairReport) => unknown): void {
     this.onLoadRepair = fn;
@@ -6137,7 +6139,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // emitCompressionQuarantineAlert; the klaxon picks it up on the first
     // tick after the interval. No ticks means no repeating alarm.)
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
-    // Best-effort stale-hold sweep before reading status; not proof of debt.
+    // Best-effort stale-hold sweep when its interval is due, not before every
+    // status read; retained holds are not proof of raw debt.
     const source = capturedSource ?? this.loadedBranchIdentity;
     if (!source) return;
     // Keep checking status so ordinary clears stand down an episode promptly,
@@ -6303,8 +6306,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Sweep ladder progress on its own cadence, from tick: at most every
    * COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS, whatever the quarantine alarm's
-   * state (it can be off, and an active alarm would otherwise sweep on every
-   * tick), and a slot with no progress costs one small read.
+   * state (it can be off, and its paid-off hold sweep is paced separately),
+   * and a slot with no progress costs one small read.
    */
   private sweepCompressionProgressIfDue(ctx: StrategyContext, source: CompressionOperationBranch): void {
     const now = Date.now();
@@ -10454,7 +10457,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * A report that couldn't read something says in `error` what happened,
    * what it means and what to do, for the operator who reads it: a line
-   * saying what happened, then `Cause:`, `Effect:` and `Fix:` lines.
+   * saying what happened, then `Cause:`, `Effect:` and `Fix:` lines. An obsolete
+   * continuation instead gets one-line guidance to a fresh host-dispatched read.
    * `failure` names which read failed, and each count it couldn't compute is
    * `null`, never 0.
    *
@@ -10470,10 +10474,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * there with the same words.
    *
    * When anything else fails (`failure` `report`), the state is `unknown` and
-   * every count is `null`. Outside the ledger the report reads only the
-   * strategy's own state and the options it was given, so that's a fault in
-   * context-manager or in those options, and compression itself may be
-   * running normally.
+   * every count is `null`. An obsolete continuation is refused with fresh-scope
+   * guidance, not a configuration-fault diagnosis. Otherwise the report reads
+   * only strategy state and options, so a failure points to context-manager or
+   * those options. Compression itself may be running normally.
    *
    * `oldestPendingAgeMs` and `lastMintAt` are also `null` when nothing is
    * pending or nothing has been minted; in a report that failed outright,
@@ -10491,14 +10495,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * pending chunk — chunk records carry no timestamps of their own.
    * It changes nothing but its note of the failure it last logged and what
    * its read of the ledger names once per load, with that read's warn line,
-   * and it never throws (health surface contract).
+   * and the report body never throws. As with other wrapped methods, a call
+   * made synchronously while a proxy is resolving the private boundary symbol
+   * can throw before reaching this body; defer such instrumentation.
    */
   getCompressionDebt(now: number = Date.now()): {
     state: 'healthy' | 'degraded' | 'critical' | 'unknown';
     /**
      * What happened, what it means and what to do, for an operator: a line saying what
-     * happened, then `Cause:`, `Effect:` and `Fix:` lines. Present whenever a count
-     * below is `null` for that reason.
+     * happened, then `Cause:`, `Effect:` and `Fix:` lines, or one-line fresh-scope
+     * guidance for an obsolete continuation. Present whenever a count below is
+     * `null` for that reason.
      */
     error?: string;
     /** Which read failed, whenever `error` is present: the compression quarantine ledger, which compression needs, or the report itself. */
@@ -10662,7 +10669,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * getCompressionDebt places none: read it when the list is wanted, such as
    * in an audit, rather than on every request. When the ledger can't be
    * read, or no store is open, or the list itself fails, `summaries` and
-   * `tokens` are null and `error` says why. Never throws.
+   * `tokens` are null and `error` says why. The report body never throws;
+   * synchronous reentry during private boundary-symbol resolution can throw
+   * before reaching it. Defer instrumentation from that proxy lookup.
    */
   getStrandedSummaries(): { summaries: StrandedSummary[]; tokens: number } | { summaries: null; tokens: null; error: string } {
     let quarantined: ReadonlyMap<string, ActiveCompressionQuarantine>;
@@ -12765,7 +12774,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // record, for a span that's covered, and the record's one-shot alert
       // goes out with it. That takes sibling strategies with different
       // families over one store. The record stands until the klaxon's
-      // paid-off sweep, which runs before it reads, finds the span's chunk
+      // interval-paced paid-off sweep finds the span's chunk
       // compressed or gone, or an operator clears it; the progress sweep
       // drops the progress by its own rule. Across processes nothing
       // coordinates.

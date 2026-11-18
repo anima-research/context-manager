@@ -1,6 +1,6 @@
-- Autobiographical/Knowledge insertion reuses operation-local helper calls and
-  captured mirror shells while rebuilding history and pricing send forms.
-  Ordinary add fence work no longer repeats for every historical record/message
+- The new origin boundary's Autobiographical/Knowledge insertion path reuses
+  operation-local helper calls and captured mirror shells while rebuilding history and pricing send forms.
+  Ordinary add fence work avoids repeated per-historical-record/message checks
   in the measured fixture; origin propagation, guarded mirrors, lifecycle
   isolation and durable-writer checks remain in place. Exact built-in
   Passthrough/WindowedPassthrough instances bypass the inapplicable origin

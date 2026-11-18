@@ -266,7 +266,9 @@ it('11/17: immutable name remains readable but stale report reads request a fres
     assert.equal(name, 'autobiographical');
     for (const report of [debt, stranded]) {
       assert.match(report.error, /obsolete|stale/);
-      assert.match(report.error, /fresh.*ContextManager/);
+      assert.match(report.error, /host-owned dispatcher outside the old callback scope/);
+      assert.match(report.error, /call the strategy's health method on the current load/);
+      assert.doesNotMatch(report.error, /through ContextManager/);
       assert.doesNotMatch(report.error, /fault in context-manager/);
     }
   } finally { finish.release(); await pending?.catch(() => {}); fx.close(); }

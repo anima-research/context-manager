@@ -1180,7 +1180,7 @@ export class ContextManager {
           // shard is stored, where the last shard's listeners left the store:
           // on another branch they wait, as rows a hook stopped do.
           this.writingShards = null;
-          if (onBranch()) this.notifyPresented(heard);
+          if (onBranch()) this.notifyPresented(heard, true);
           else this.deferPresented(heard, true);
         } catch (err) {
           this.writingShards = null;
@@ -1254,7 +1254,7 @@ export class ContextManager {
             }
             waitInLegacyWindow(unread);
             try {
-              if (here && unread.length === 0) this.notifyPresented(rows);
+              if (here && unread.length === 0) this.notifyPresented(rows, true);
               else this.deferPresented(rows, true);
             } catch (error) {
               this.waitToBeHeard(rows, true);
@@ -2175,7 +2175,7 @@ export class ContextManager {
           return false;
         }
       };
-      if (scope === null || (this.inHookScope(scope) && stillIn())) this.notifyPresented(enteredRows);
+      if (scope === null || (this.inHookScope(scope) && stillIn())) this.notifyPresented(enteredRows, false);
       else this.deferPresented(enteredRows, false);
     } catch (error) {
       if (!leftTold) this.retractedUnheard.push({ left: left.map(({ id, ordinal, by }) => ({ id, ordinal, by })), info: { undone: false, removed: false } });
@@ -4687,6 +4687,11 @@ export class ContextManager {
     }
     const current = observeStoreBranch(this.store);
     const currentBranchId = this.store.currentBranch().id;
+    // Both final store reads can synchronously start a newer initialization.
+    if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      if (strategy !== this.strategy) this.detachStrategy(strategy);
+      throw new InitializationSupersededError(selection);
+    }
     if (
       current.name !== expectedBranch.name ||
       current.generation !== expectedBranch.generation ||
@@ -5015,7 +5020,7 @@ export class ContextManager {
     // its presentRows, and the strategy hears it then.
     if (this.windowIndex.mode() === 'legacy') {
       if (this.writingShards) this.writingShards.heard.push(message);
-      else this.notifyPresented([message]);
+      else this.notifyPresented([message], true);
     }
   }
 
@@ -5050,15 +5055,16 @@ export class ContextManager {
    * rejection. It can also return no promise, which isn't a failure. Either
    * way the rows stay stored and in the window, as do a sharded body's
    * remaining shards, and the strategy isn't offered them again. Only the
-   * strategy's member lookups and call are caught: the manager's own work
-   * around it, the context it hands the strategy among it, still fails an add, as
-   * onMessage's note says. A presentRows or retractRows, whose window
+   * strategy's member lookups and call, plus the legacy adapter's mode/scope
+   * observation, are caught. Failed adapter observations leave rows pending;
+   * the manager's other work, including creating the strategy context, still fails
+   * an add, as onMessage's note says. A presentRows or retractRows, whose window
    * write has landed by then, logs it instead, and the rows wait to be
    * heard at the strategy's next notification (tellPresentation). The
    * log is logThrown's, which survives a thrown value that can't be
    * formatted.
    */
-  private notifyPresented(rows: readonly StoredMessage[]): void {
+  private notifyPresented(rows: readonly StoredMessage[], legacy: boolean): void {
     if (rows.length === 0 || this.closed) return;
     // The rows wait for the manager's strategy, whichever instance that is
     // once it is initialized, so they wait while one without a row hook
@@ -5072,25 +5078,17 @@ export class ContextManager {
     // tellPresentation's second call is. So too where the store can't say
     // its branch before the retry, and a move can't be seen.
     const scope = this.retryScope();
-    // Whether the rows entered a legacy window: read before a retried hook
-    // can move the store, where one may run; otherwise only if they wait.
-    let legacy: boolean | undefined;
-    if (scope !== null) {
-      try {
-        legacy = this.windowIndex.mode() === 'legacy';
-      } catch {
-        legacy = undefined;
-      }
-    }
+    // Callers know which window admitted these rows. Keep that provenance even
+    // when a later mode/scope observation fails or a retried hook moves branches.
     if (this.callWaits()) {
-      this.waitToBeHeard(rows, legacy ?? this.windowIndex.mode() === 'legacy');
+      this.waitToBeHeard(rows, legacy);
       return;
     }
     if (!this.leftInScope(scope) || (scope !== null && legacy === false && !this.allInWindow(rows))) {
-      this.deferPresented(rows, legacy ?? false);
+      this.deferPresented(rows, legacy);
       return;
     }
-    this.tellPresented(rows);
+    this.tellPresented(rows, legacy);
   }
 
   /** Whether the window holds every row; false where the index can't be read to tell. */
@@ -5136,7 +5134,7 @@ export class ContextManager {
   }
 
   /** Make notifyPresented's call now; false means observation failed and rows remain pending. */
-  private tellPresented(rows: readonly StoredMessage[]): boolean {
+  private tellPresented(rows: readonly StoredMessage[], enteredLegacy: boolean): boolean {
     if (rows.length === 0 || this.closed) return true;
     const strategy = this.strategy;
     let presented: boolean;
@@ -5170,7 +5168,7 @@ export class ContextManager {
       // The rows are already stored. Observation failure is not an add failure,
       // but it is not delivery either. Retain them without immediately retrying
       // the same failed observation; the next notification/open can redeliver.
-      this.waitToBeHeard(rows, legacy ?? false);
+      this.waitToBeHeard(rows, enteredLegacy);
       terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
       return false;
     }
@@ -5550,7 +5548,11 @@ export class ContextManager {
     this.presentedUnheard = new Map();
     this.drainingPresented = true;
     try {
-      return this.tellPresented(rows);
+      if (this.tellPresented(rows, false)) return true;
+      // Observation failed before any hook ran. Restore the original per-row
+      // provenance, not just the mode observed during this delivery attempt.
+      for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
+      return false;
     } catch (err) {
       // The manager's own work before the strategy's call failed, so no
       // hook ran: the rows wait again.

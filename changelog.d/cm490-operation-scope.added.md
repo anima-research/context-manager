@@ -3,7 +3,9 @@
   late assignments and forwarding proxies. Library-owned Chronicle writers
   reject obsolete invocation origins before dispatch. Direct external calls to
   arbitrary instance functions outside ContextManager are not covered by this
-  manager boundary; protected helper signatures are unchanged.
+  manager boundary. The fence adds no protected scope parameter; send-form
+  pricing helpers separately accept an optional operation-local cache argument
+  (see the subclass migration note).
 - Scope ContextManager's optional strategy-member checks, capability guards,
   initialization, presentation, preview and rendering metadata reads as well as
   method calls. Context-preserving async continuations started by those accessors or
@@ -37,3 +39,7 @@
   Reconciled branch-name mismatches identify the observed selection and recovery
   without claiming that an initialization ran. Stale health reports name the
   unavailable report and request a fresh health read outside the obsolete scope.
+- The new boundary keeps immutable strategy names readable from obsolete
+  callbacks, holds obsolete hygiene away from a replacement load's warning, and
+  gives stale health/stranded reports one-line guidance to host-dispatched reads
+  on the current strategy rather than diagnosing configuration faults.

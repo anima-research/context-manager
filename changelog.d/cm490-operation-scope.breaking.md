@@ -18,15 +18,20 @@
   `instanceof`. Its name is diagnostic, not a universal public result contract:
   mutations may instead reject with ordinary reinitialization/uncertain-outcome
   errors, and health reads return unknown/unreadable/unavailable results.
-  `getCompressionDebt()` remains non-throwing, including its stale error path.
+  `getCompressionDebt()` returns unknown on its stale error path, but synchronous
+  reentry during private boundary-symbol resolution can throw before the report
+  body runs; defer instrumentation from that proxy lookup. Fresh debt/stranded
+  reads need host-owned dispatch to the strategy, not a manager health method.
   Earlier writes may have completed: refusals do not imply rollback.
   This is not a sandbox for arbitrary host schedulers: event/abort listeners
   execute in the dispatching context, not their registration context, and host
   AsyncResources can replace context. Library-owned provider cancellation binds
   abort dispatch to its cancelled origin, but external dispatch is not covered.
 - **Strategy authors reflecting on or instrumenting methods/fields:** prototype
-  methods are installed as per-instance non-enumerable wrappers preserving name
-  and arity; loaded fields are guarded accessors. Wrap the instance method rather
+  methods are installed as per-instance wrappers preserving name, arity and the
+  original descriptor's enumerability (normally non-enumerable class methods;
+  assigned enumerable prototype methods become enumerable own wrappers).
+  Loaded fields are guarded accessors. Wrap the instance method rather
   than monkeypatching the prototype after construction, and adapt own-property
   descriptor checks to accessors. Manager calls now probe a private boundary
   symbol: forwarding proxies must forward symbol lookups (returning `undefined`
@@ -51,3 +56,9 @@
   retry risk. Its `cause` is the original thrown value, preserving its identity
   and type there; catch the wrapper and inspect `cause` rather than relying on
   top-level `instanceof`. The stored transition is not rolled back.
+- **Subclass authors overriding send-form helpers:** pricing may pass an optional
+  operation-local `SendForms` cache as the third `prunedForSend` argument and
+  fourth `cappedForSend` argument. Existing calls may omit it. Overrides should
+  tolerate/forward that extra argument rather than require an exact arguments
+  count; this also applies to KnowledgeStrategy subclasses. The fence itself
+  does not add a scope parameter to protected helper calls.
