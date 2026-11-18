@@ -8,13 +8,21 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch', 'wrong-range', 'summary-without-call', 'error-then-cap', 'receipt-sync-error']) {
-  test(`executing surgery CLI offline: ${scenario}`, () => {
+  test(`executing surgery CLI offline: ${scenario}`, (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
     try {
       const receiptPath = scenario === 'receipt-inside' ? join(dir, 'store', 'records.log') : join(dir, 'receipt.json');
       if (scenario === 'receipt-existing') writeFileSync(receiptPath, 'preserve me');
-      if (scenario === 'receipt-dangling') symlinkSync(join(dir, 'missing'), receiptPath);
+      if (scenario === 'receipt-dangling') {
+        try { symlinkSync(join(dir, 'missing'), receiptPath); }
+        catch (error) {
+          if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+            t.skip('File symlinks require Windows privilege or Developer Mode'); return;
+          }
+          throw error;
+        }
+      }
       const tracePath = join(dir, 'trace.jsonl');
       const storePath = join(dir, 'store');
       mkdirSync(storePath);
@@ -23,7 +31,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       writeFileSync(join(dir, 'op.json'), JSON.stringify({
         storePath, toolsPath: join(dir, 'tools.json'), receiptPath,
         expectedRecordsSha256: hash('stopped backup'), expectedToolsSha256: hash('[]'),
-        namespace: 'offline', branchName: 'surgery/offline', expectedParentBranch: 'main',
+        namespace: 'offline', isolate: true, branchName: 'surgery/offline', expectedParentBranch: 'main',
         targetChunkIndex: 0, expectedSourceRange: ['first', 'last'], expectedQuarantineKey: 'quarantined',
         summaryParticipant: 'Claude', strategyConfig: { compressionInstructions: { templates: { opening: 'offline opening' } } }, acknowledgeStoppedCopiedOrBackedUpStore: true,
       }));

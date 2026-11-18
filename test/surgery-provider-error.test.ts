@@ -1,3 +1,4 @@
+import { SurgeryTransportCapError } from '../src/surgery/one-request-transport.js';
 import test from 'node:test';
 import { CompressionWithdrawn, isCompressionWithdrawn } from '../src/compression-withdrawn.js';
 import assert from 'node:assert/strict';
@@ -30,4 +31,14 @@ test('sanitization preserves own withdrawal and admission classification', () =>
   assert.equal(safe.retryAfterMs, 1234);
   assert.equal(safe.providerErrorCode, 'offline_code');
   assert.ok(!JSON.stringify(safe).includes('private source'));
+});
+
+test('non-string provider messages cannot break sanitization', () => {
+  const safe = sanitizeSurgeryProviderError({type:'context_length', message:400});
+  assert.equal(safe.type, 'context_length');
+});
+
+test('local transport cap keeps its trusted diagnostic', () => {
+  assert.match(sanitizeSurgeryProviderError(new SurgeryTransportCapError()).message, /ONE_PROVIDER_REQUEST_CAP/);
+  assert.doesNotMatch(sanitizeSurgeryProviderError(new Error('ONE_PROVIDER_REQUEST_CAP private')).message, /ONE_PROVIDER_REQUEST_CAP/);
 });

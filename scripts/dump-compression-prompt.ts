@@ -208,30 +208,21 @@ async function main() {
     });
   }
 
-  // 5. Instruction (doc-aware if all chunk messages are one body: one
-  // ingestion, read as the strategy reads it, body-runs.ts)
+  // 5. Approximate reading context: apply production's 2:1 threshold,
+  // but raw-text pricing still differs from prepared/calibrated production tokens.
   const firstAt = allMessages.findIndex((m) => m.id === chunkMessages[0].id);
   const body = firstAt >= 0 && allMessages[firstAt]!.bodyGroupId ? bodyBoundsIn(allMessages, firstAt) : null;
   const bodyMessages = body ? allMessages.slice(body.from, body.to + 1) : [];
   const allSameGroup = body !== null && chunkMessages.every((m) => bodyMessages.some((b) => b.id === m.id));
+  const rawTokens = (messages: typeof chunkMessages) => messages.reduce((total, m) => total + Math.ceil(m.content
+    .filter((b: ContentBlock) => b.type === 'text').map((b: any) => b.text).join('').length / 4), 0);
+  const originalTokens = rawTokens(bodyMessages);
+  const chunkTokens = rawTokens(chunkMessages);
   let instructionText: string;
-  if (allSameGroup) {
-    // Compute doc context like the strategy does
-    let originalTokens = 0;
-    for (const m of bodyMessages) {
-      const t = m.content
-        .filter((b: ContentBlock) => b.type === 'text')
-        .map((b: any) => b.text)
-        .join('');
-      originalTokens += Math.ceil(t.length / 4);
-    }
-    const title =
-      (chunkMessages[0].metadata?.sourceId as string | undefined) ??
+  if (allSameGroup && chunkTokens > 0 && originalTokens >= 2 * chunkTokens) {
+    const title = (chunkMessages[0].metadata?.sourceId as string | undefined) ??
       `doc-${chunkMessages[0].bodyGroupId!.slice(0, 16)}`;
-    instructionText = formatDocChunkInstruction(
-      { title, style: 'chronological', originalTokens },
-      targetTokens
-    );
+    instructionText = formatDocChunkInstruction({ title, style: 'chronological', originalTokens }, targetTokens);
   } else {
     instructionText = formatInstruction(targetTokens);
   }

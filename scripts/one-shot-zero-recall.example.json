@@ -10,7 +10,7 @@
   "expectedSourceRange": ["first-message-id", "last-message-id"],
   "expectedQuarantineKey": "exact-active-key",
   "summaryParticipant": "resident",
-  "strategyConfig": {},
+  "strategyConfig": { "compressionModel": "claude-sonnet-4-5" },
   "receiptPath": "/absolute/path/receipt.json",
   "acknowledgeStoppedCopiedOrBackedUpStore": true
 }

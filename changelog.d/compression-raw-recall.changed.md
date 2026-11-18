@@ -6,9 +6,9 @@
   recall-curve replacement also use constructed identity, not matching raw text.
 
 - Changed default request bytes also change refusal-family identities. Persisted
-  quarantine/ladder outcomes under the old family are not reused; absent a
-  per-chunk quarantine cap, previously attempted work may incur new paid calls.
+  quarantine/ladder outcomes under the old family are not reused; until the
+  per-chunk quarantine cap is reached, previously attempted work may incur new paid calls.
 
-- Our earlier answer was incomplete: default instruction wording is unchanged,
-  not default full request bytes or provenance hashes. Ordinary `compress_l1`
+- Default instruction wording is unchanged; full request bytes and provenance
+  hashes are not. Ordinary `compress_l1`
   telemetry changes too (last dispatched request and constructed recall totals).

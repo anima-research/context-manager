@@ -1864,7 +1864,7 @@ function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
  */
 export function isCarrierTransportRejection(error: unknown): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
-  const msg = (e?.message ?? '').toLowerCase();
+  const msg = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
   const badRequest =
     e?.httpStatus === 400 ||
     (typeof e?.type === 'string' && e.type.toLowerCase().includes('invalid')) ||
@@ -13601,6 +13601,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               chunk_message_ids: chunk.messages.map((m) => m.id),
               chunk_size: chunk.messages.length,
               prior_summary_count: priorSummaries.length,
+              request_scope: stitchedFoldRequestHashes ? 'last-split-piece' : 'last-dispatched-attempt',
+              response_scope: 'whole-chunk',
               prior_summary_count_kept: loggedRecallCount,
               prior_summary_tokens: loggedRecallTokens,
               has_doc_context: docContext !== null,

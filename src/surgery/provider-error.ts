@@ -1,3 +1,4 @@
+import { SurgeryTransportCapError } from './one-request-transport.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { isCarrierTransportRejection } from '../strategies/autobiographical.js';
 
@@ -9,7 +10,7 @@ export function sanitizeSurgeryProviderError(thrown: unknown): Error & {
   providerAdmission?: 'deferred'; retryAfterMs?: number; providerErrorCode?: string;
 } {
   const source = thrown as { name?: unknown; type?: unknown; httpStatus?: unknown; retryable?: unknown; providerAdmission?: unknown; retryAfterMs?: unknown; providerErrorCode?: unknown } | null;
-  const message = isCarrierTransportRejection(thrown)
+  const message = thrown instanceof SurgeryTransportCapError ? 'ONE_PROVIDER_REQUEST_CAP: local transport guard prevented another send' : isCarrierTransportRejection(thrown)
     ? 'Provider call failed (invalid_request: thinking carriers rejected); message omitted to protect source content'
     : 'Provider call failed; message omitted to protect source content';
   const safe = new Error(message);

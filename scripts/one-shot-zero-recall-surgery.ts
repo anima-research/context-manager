@@ -24,6 +24,7 @@ import { Membrane, AnthropicAdapter, NativeFormatter, type NormalizedRequest } f
 interface Config {
   storePath: string;
   namespace: string;
+  isolate?: boolean;
   branchName: string;
   expectedParentBranch: string;
   expectedRecordsSha256: string;
@@ -83,7 +84,7 @@ let call: Record<string,unknown>|null=null;
 const proxy=new Proxy(actual,{get(target,prop,receiver){if(prop!=='complete'){const v=Reflect.get(target,prop,receiver);return typeof v==='function'?v.bind(target):v;}return async(req:NormalizedRequest, options?: Parameters<Membrane['complete']>[1])=>{if(call)throw Object.assign(new CompressionWithdrawn('ONE_CALL_CAP'),{providerAdmission:'deferred'});const active=manager!.getStrategy() as SurgeryStrategy;const tr=active.transformation;if(!tr||!active.authoredRequest)throw Object.assign(new CompressionWithdrawn('No trusted L1 authoring'),{providerAdmission:'deferred'});assertZeroRecallConstruction(req,active.authoredRequest);const sent=req;const raw=JSON.stringify(sent);const startedAt=new Date().toISOString();call={startedAt,removedRecallIds:tr.removedRecallIds,originalMessages:tr.originalMessageCount,sentMessages:tr.sentMessageCount,originalMessagesSha256:tr.originalSha256,transformedMessagesSha256:tr.transformedSha256,originalRequestSha256:tr.originalSha256,transformedRequestSha256:tr.transformedSha256,transformedBytes:Buffer.byteLength(raw),status:'started'};receipt={...receipt,status:'calling',call};saveReceipt();try{const response=await target.complete(sent,{...options,retry:false});const usage=response.details?.usage??response.usage;call={...call,endedAt:new Date().toISOString(),status:'completed',stopReason:response.stopReason,usage,contentTypes:response.content.map(b=>b.type)};return response;}catch(e){const safe=sanitizeSurgeryProviderError(e);call={...call,endedAt:new Date().toISOString(),status:'error',providerError:{name:safe.name,message:safe.message,type:safe.type,httpStatus:safe.httpStatus,retryable:safe.retryable}};throw safe;}};}});
 let manager: ContextManager | undefined;
 try {
-manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace});
+manager=await ContextManager.open({path:config.storePath,strategy,membrane:proxy,namespace:config.namespace,isolate:config.isolate});
 manager.setToolDefinitions(tools);
 const cmSource=manager.queryMessages({ participant: 'Context Manager' }).messages;
 assertZeroRecallSourceSafe(cmSource, strategy.opening());

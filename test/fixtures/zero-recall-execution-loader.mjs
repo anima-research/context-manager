@@ -42,7 +42,8 @@ export async function load(url, context, nextLoad) {
     const message = (participant, value) => ({ participant, content: [text(value)] });
     const trace = value => appendFileSync(process.env.SURGERY_TRACE, JSON.stringify(value) + '\\n');
     export class ContextManager {
-      static async open({ strategy, membrane }) {
+      static async open({ strategy, membrane, isolate }) {
+        if (isolate !== true) throw new Error('CLI dropped isolate option');
         trace({ opened: true });
         strategy.chunks = [{ index: 0, messages: [{ id: 'first' }, { id: 'last' }] }];
         strategy.summaries = [];

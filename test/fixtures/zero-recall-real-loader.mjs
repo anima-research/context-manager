@@ -1,9 +1,14 @@
 // The CLI, manager, store, quarantine binding/clearing and L1 ladder are real.
-// Only provider I/O is stubbed; queued merges are fixture state.
+// Provider I/O is stubbed; merge scenarios also force scheduling/queue state,
+// and carrier injects a synthetic authored thinking block to reach fallback.
+let membraneUrl;
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
     if (specifier === '../src/context-manager.js') return { url: 'real-fixture:manager', shortCircuit: true };
-    if (specifier === '@animalabs/membrane') return { url: 'real-fixture:membrane', shortCircuit: true };
+    if (specifier === '@animalabs/membrane') {
+      membraneUrl = (await nextResolve(specifier, context)).url;
+      return { url: 'real-fixture:membrane', shortCircuit: true };
+    }
   }
   return nextResolve(specifier, context);
 }
@@ -65,6 +70,31 @@ export async function load(url, context, nextLoad) {
       }
     }
   ` };
+  if (url === 'real-fixture:membrane' && process.env.SURGERY_CASE.startsWith('sdk-')) return {
+    format: 'module', shortCircuit: true, source: `
+      import { AnthropicAdapter as RealAdapter, Membrane as RealMembrane, NativeFormatter } from ${JSON.stringify(membraneUrl)};
+      import { appendFileSync } from 'node:fs';
+      export { NativeFormatter };
+      export class AnthropicAdapter extends RealAdapter {
+        constructor(options) {
+          super(options);
+          // Only HTTP is fake: CLI must install the guard and SDK retry policy.
+          this.client.fetch = async (_input, init) => {
+            appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({sdkRetries:this.client.maxRetries, redirect:init?.redirect}) + '\\n');
+            const status = process.env.SURGERY_CASE === 'sdk-rate' ? 429 : 500;
+            return new Response(JSON.stringify({type:'error', error:{type:status === 429 ? 'rate_limit_error' : 'api_error', message:'offline'}}),
+              {status, headers:{'content-type':'application/json', 'retry-after-ms':'1', 'x-should-retry':'true'}});
+          };
+        }
+      }
+      export class Membrane extends RealMembrane {
+        complete(request, options) {
+          if (options?.retry !== false) throw new Error('CLI must disable Membrane retries');
+          return super.complete(request, options);
+        }
+      }
+    `
+  };
   if (url === 'real-fixture:membrane') return { format: 'module', shortCircuit: true, source: `
     import { appendFileSync } from 'node:fs';
     export class AnthropicAdapter { client = { fetch: async () => { throw new Error('offline only'); }, maxRetries: 2, withOptions(options) { return { ...this, ...options }; } }; }

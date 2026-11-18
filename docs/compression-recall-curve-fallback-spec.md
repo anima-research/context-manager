@@ -252,7 +252,7 @@ branch-pinned lock appends an active-projection checkpoint first, then redacts
 the preceding event range and asks Chronicle to compact the state. The
 append-first order makes both crash gaps replay-equivalent and avoids an unsafe
 read/replace whole-array snapshot. A checkpoint retains the newest 1,024 active
-exhausted families; older families expire and may make a new canonical-first
+exhausted families per authoring namespace; older families in each namespace expire and may make a new canonical-first
 attempt. Between checkpoints at most 128 two-event exhaustion/pending-alert
 groups can accumulate, so both active state and event history have a finite
 bound. Within that window, a family remains until its key changes, an

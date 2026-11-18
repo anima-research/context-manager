@@ -80,7 +80,7 @@ for (const placement of ['head', 'middle', 'opening'] as const) {
 }
 
 
-test('zero-recall surgery shares the strategy grammar: dotted IDs accepted, multiline IDs refused', () => {
+test('zero-recall surgery serialized header grammar: dotted IDs accepted, multiline IDs refused', () => {
   for (const id of ['archive.1', 'multi\nline', 'multi\rline', 'multi\u2028line', 'multi\u2029line']) {
     const pair = [text('Context Manager', `[CM] Recall memory ${id}.`), text('mythos', 'memory')];
     const input = new CollapseProbe().collapse([...pair, text('Context Manager', 'OPEN'), text('user', 'source')]);

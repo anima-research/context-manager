@@ -498,6 +498,7 @@ it('a recall-shaped custom opening does not split consecutive source turns', asy
     const calls = await run(mode, 'own', { templates: { opening } }, {}, SameSpeaker);
     assert.equal(calls.length, baseline.length);
     for (const [i, request] of calls.entries()) {
+      assert.ok(texts(request).includes(opening), 'configured opening reached the real request');
       assert.ok(!texts(request).includes('[CM] The conversation resumes.'));
       const originalOpening = baseline[i]!.messages.find(m => m.participant === 'Context Manager')!.content;
       const restored = structuredClone(request);

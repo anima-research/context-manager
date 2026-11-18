@@ -7,7 +7,8 @@ for (const status of [429, 500]) test(`surgery sends only one real SDK transport
   const adapter = new AnthropicAdapter({ apiKey: 'offline', cacheKeepalive: { enabled: false } });
   const seam = adapter as unknown as { client: { fetch: typeof fetch; maxRetries: number } };
   let sends = 0;
-  seam.client.fetch = async () => {
+  seam.client.fetch = async (_input, init) => {
+    assert.equal(init?.redirect, 'error', 'redirects must not bypass the send guard');
     sends++;
     return new Response(JSON.stringify({ type: 'error', error: { type: status === 429 ? 'rate_limit_error' : 'api_error', message: 'offline' } }), {
       status, headers: { 'content-type': 'application/json', 'retry-after-ms': '1', 'x-should-retry': 'true' },

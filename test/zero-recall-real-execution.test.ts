@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 
-for (const scenario of ['carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty']) {
+for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty']) {
   test(`surgery CLI with real manager and public strategy tick: ${scenario}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zr-'));
     try {
@@ -51,6 +51,7 @@ for (const scenario of ['carrier', 'rejection', 'rate', 'overload', 'merge-cap',
       const result = spawnSync(process.execPath, ['--import',registration,resolve('dist/scripts/one-shot-zero-recall-surgery.js'), '--config',join(dir,'op.json'),'--execute'], {
         encoding:'utf8', timeout:30000, env:{...process.env,ANTHROPIC_API_KEY:'offline',SURGERY_CASE:scenario,
           SURGERY_TRACE:join(dir,'sent'),SURGERY_STATE:join(dir,'state'),CONTEXT_MANAGER_COMPRESSION_LOG:log} });
+      assert.ok(existsSync(receiptPath), result.stdout + result.stderr);
       const receipt = JSON.parse(readFileSync(receiptPath,'utf8'));
       const state = JSON.parse(readFileSync(join(dir,'state'),'utf8'));
       const logs = existsSync(log) ? readFileSync(log,'utf8') : '';
@@ -74,6 +75,12 @@ for (const scenario of ['carrier', 'rejection', 'rate', 'overload', 'merge-cap',
         assert.equal(state.mergeFailures.length,0);
         assert.equal(state.mergeRuns.length,0);
         assert.ok(state.mergeQueue.some((m: {sourceIds:string[]}) => m.sourceIds.includes('L1-101')), 'unrelated merge stays queued');
+      } else if (scenario.startsWith('sdk-')) {
+        assert.equal(result.status, 1, result.stdout + result.stderr);
+        assert.equal(receipt.call.status, 'error');
+        const sends = readFileSync(join(dir,'sent'),'utf8').trim().split('\n').map(line => JSON.parse(line));
+        assert.deepEqual(sends, [{sdkRetries:0, redirect:'error'}], 'real CLI installed one-send SDK policy');
+        assert.equal(receipt.call.providerError.httpStatus, scenario === 'sdk-rate' ? 429 : 500);
       } else {
         assert.equal(result.status,1);
         assert.equal(receipt.status,'failed');

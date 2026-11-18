@@ -29,10 +29,10 @@ Consecutive source turns can therefore collapse without the former synthetic
 resume turn, even with default settings. This also applies before the L1 opening and throughout L2 raw sources.
 Changed request bytes change request hashes and refusal-family identities: old
 family outcomes may not be reused, so previously attempted work may incur new
-paid calls (unless a per-chunk quarantine cap prevents them). Ordinary L1
+paid calls (until the per-chunk quarantine cap is reached). Ordinary L1
 `compress_l1` telemetry also changes: it describes the last dispatched attempt
 and counts recalls by construction identity, including pair/envelope overhead.
-Our earlier answer claiming unchanged defaults and provenance was incomplete.
+Default instruction wording is unchanged; full request bytes and provenance hashes are not.
 
 ## Slots and placeholders
 
