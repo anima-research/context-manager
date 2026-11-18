@@ -4456,11 +4456,12 @@ export class ContextManager {
     // what a later call that goes ahead does: it stores a second transition.
     // After a close(), or while a strategy initializes, a later call refuses
     // at once.
-    const refuse = (reason: string, where: string, finalResetUncertain = false): Error =>
+    const refuse = (reason: string, where: string, finalResetUncertain = false, cause?: unknown): Error =>
       new Error(
         `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} ` +
           `${where}, and ${finalResetUncertain ? 'the final head-window reset failed or is uncertain' : "the head window wasn't reset"}. A later resetHeadWindow() that goes ahead adds ` +
           'another transition message.',
+        { cause },
       );
     const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
     // How much of the transition's body the window holds: every shard,
@@ -4583,7 +4584,7 @@ export class ContextManager {
     try {
       callStrategy(resettable, 'resetHeadWindow', (strategy) => strategy.resetHeadWindow(msgId));
     } catch (error) {
-      throw refuse(reasonOf(error), whereNow('stored and maybe presented'), true);
+      throw refuse(reasonOf(error), whereNow('stored and maybe presented'), true, error);
     }
 
     return summary;

@@ -38,9 +38,10 @@ export function callStrategy<S extends object, T>(strategy: S, key: PropertyKey,
 }
 
 /**
- * One origin per invocation tree, including promises and scheduled
- * callbacks. The storage is per instance: calling another strategy starts its
- * own operation. Lifecycle entrypoints deliberately start independent trees.
+ * One origin per library invocation and its context-preserving continuations.
+ * This is not a host callback sandbox: event/abort dispatch uses the dispatching
+ * context, not the registration context; host schedulers can replace context.
+ * Storage is per instance: calling another strategy starts its own operation. Lifecycle entrypoints deliberately start independent trees.
  *
  * The manager boundary is authoritative, independent of the strategy's method
  * representation. Prototype wrappers additionally scope direct calls to existing
@@ -118,6 +119,12 @@ export class BranchOperationScope<Identity extends object> {
         return work();
       }, lifecycle, { key, claimed: false });
     });
+  }
+
+  /** Library-owned dispatch only: preserve its origin when another load cancels it.
+   * Arbitrary host listeners/schedulers are not intercepted or rebound. */
+  bind<T extends (...args: any[]) => any>(callback: T): T {
+    return AsyncLocalStorage.bind(callback);
   }
 
   /** Snapshot before looking up a writer, which itself may invoke a host hook. */

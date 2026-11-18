@@ -1,0 +1,23 @@
+- Fence manager-to-AutobiographicalStrategy invocations before resolving and
+  calling strategy methods, including instance functions, class-field arrows,
+  late assignments and forwarding proxies. Library-owned Chronicle writers
+  reject obsolete invocation origins before dispatch. Direct external calls to
+  arbitrary instance functions outside ContextManager are not covered by this
+  manager boundary; protected helper signatures are unchanged.
+- Scope ContextManager's optional strategy-member checks, capability guards,
+  initialization, presentation, preview and rendering metadata reads as well as
+  method calls. Context-preserving async continuations started by those accessors or
+  forwarding proxy traps cannot write a replacement AutobiographicalStrategy load through
+  the library's guarded writers. Boundary-protocol lookup work is also fenced;
+  protected calls made synchronously before that lookup resolves fail closed.
+- The new per-invocation boundary includes lifecycle-entry epochs (before an
+  asynchronous initialize override reaches `super`), ancestor origins and
+  local generation checks for mirror access; durable writers retain branch
+  checks. Preview/select unwind only their own current load, and initialization
+  restores preview configuration and detaches discarded order caches without
+  copying history-sized shells. Held repair reports and handlers are shared
+  across loads; replacement initialization schedules delivery of pending reports.
+  Provider cancellation dispatch preserves the cancelled origin. These are
+  properties of the new boundary, not fixes to a previously released boundary.
+- The new branch/load-generation checks preserve newer reentrant switch
+  observations and reconcile returned-to branches.

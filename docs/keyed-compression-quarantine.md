@@ -240,22 +240,38 @@ shared HTTP/WebUI/MCP/model-tool mutation surface in this library change.
 
 ### Callback ownership and operation scope
 
-AsyncLocalStorage follows the invocation tree, not who wrote a callback. A host
-callback invoked during a strategy operation, and timers, microtasks, promises
-or abort listeners it creates, inherit that operation's load and lifecycle epoch.
-A later direct strategy call from that tree is **not a fresh host operation**:
-a replacement initialize or detach makes guarded reads and writes throw a
-`StaleBranchOperationError`. Awaited work can reject; scheduled callbacks and
-abort listeners must catch stale refusals themselves, since they have no caller
-promise for the library to handle. Do not let such exceptions escape an event
-callback. Only library-owned continuations have library-owned catch boundaries.
+The fence covers library invocations and continuations that preserve their
+AsyncLocalStorage context. It is **not a sandbox for host-scheduled work**.
+Timers (including intervals), microtasks and promises created in a strategy
+callback normally inherit that invocation's load and lifecycle epoch, so later
+direct strategy access can be refused after initialize or detach. In contrast,
+event and abort listeners run in the **dispatching context, not the registration
+context**. A host-owned emitter, scheduler or AsyncResource can therefore lose
+or replace the origin; the library cannot infer it from callback ownership.
+Do not rely on this fence to authorize arbitrary host callbacks. Library-owned
+provider cancellation explicitly dispatches abort in the cancelled call's origin,
+so that its listeners do not inherit the replacement initializer's holder; this
+does not bind externally dispatched signals or unrelated host events.
+
+Host callback owners must catch refusals locally (and handle rejected promises),
+and cancel obsolete timers/intervals on lifecycle changes. No caller promise
+exists for the library to catch a thrown timer/listener exception. Only
+library-owned continuations have library-owned catch boundaries. A stale refusal
+may be an error named `StaleBranchOperationError`, but that constructor is internal
+and **not exported**: do not import it for `instanceof`. Some public mutation
+methods reject with an ordinary reinitialization/uncertain-outcome error instead;
+health methods can return `unknown`, `unreadable` or `branchUnavailable`. Handle
+each method's result contract, not just an exception name. Earlier writes may
+have completed; a refusal is not a rollback receipt. `getCompressionDebt()` keeps
+its never-throw contract even for inherited stale intervals, returning `unknown`
+without changing the replacement load's diagnostic state.
 
 For an intentional fresh operation, enqueue intent to a host-owned dispatcher
 created outside strategy callbacks, or use a manager entrypoint (manager calls
-create new origins). Do not wrap arbitrary old work in a new manager operation
-merely to bypass its stale refusal. Direct instance-function overrides do not
-acquire a fresh scope automatically; prototype entrypoints retain inherited scope.
-
+create new origins). Validate that intent against the current load; do not wrap
+arbitrary old work in a new manager operation merely to bypass its refusal.
+Direct instance-function overrides do not acquire a fresh scope automatically;
+prototype entrypoints retain inherited scope.
 Alarm episodes identify namespace and branch only, not backing stores. Reusing a
 strategy on a different backing store with the same names can end the previous
 episode; this is not evidence that the original store was checked. Stable backing

@@ -4,8 +4,9 @@
  * quarantine the alarm last sounded on may still hold records: not when the
  * status read fails, and not while the strategy reads another branch or
  * namespace. Scope is names only: a different backing store with the same
- * names can end the episode, without checking the original store. A ledger entry with no usable record or generation holds no
- * chunk back, so the projection leaves it out and names it, and a compression
+ * names can end the episode, without checking the original store. A ledger entry
+ * with no usable record or generation holds no chunk back, so the projection
+ * leaves it out (naming it only when a string key is available), and a compression
  * or a clear no longer throws on it; a ledger or legacy snapshot that holds no
  * list is read as holding nothing, a checkpoint that holds none replaces what
  * came before it with nothing, and each is named.
@@ -288,7 +289,7 @@ describe('the compression-quarantine all-clear requires an empty read under the 
     });
     assert.deepEqual(status, { count: 0, keys: [], spans: [], unreadable: true });
     assert.deepEqual(failing.lines, [
-      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed: unclassified) ns=default',
+      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed: unclassified); check backing-store access and diagnostics to restore monitoring ns=default',
     ], 'one line, and no warning from the paid-off sweep');
     assert.deepEqual(failing.handled, [], 'no handler call, all-clear or alarm');
 

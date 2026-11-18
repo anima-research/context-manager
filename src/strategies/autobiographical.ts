@@ -2624,8 +2624,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
   /** Advanced by endGeneration(): on every initialize, every ContextManager branch switch included, and at detach(). */
   private compressionBranchGeneration = 0;
-  /** The controller of each provider call out (callProvider), until the call settles. */
-  private readonly callsOut = new Set<AbortController>();
+  /** Origin-bound cancellation of each provider call out, until the call settles. */
+  private readonly callsOut = new Set<() => void>();
   /**
    * Branch whose derived mirrors completed initialization. This is deliberately
    * absent while initialize() is running: partially loaded summaries/chunks/
@@ -2747,6 +2747,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       'branchOperations', 'compressionBranchGeneration', 'loadedBranchIdentity',
       'initializingBranchIdentity', 'store', 'ns', 'callsOut', 'compressionPause', 'config',
       'configProvenance', 'unreportedEffectiveConfig', 'diag', 'nativeFormatter', 'obsoleteHygieneSaidThrough', 'previewBaseConfig',
+      // Process-wide report delivery and cross-load alarm episodes are not branch mirrors.
+      'onLoadRepair', 'heldLoadRepairs', 'latestLoadRepair', 'onQuarantineAlarm',
+      'quarantineAlarmLastAt', 'quarantineAlarmActive', 'quarantineAlarmOperatorWaived',
+      'quarantineAlarmScope', 'quarantineUnreadableSaidAt',
     ]), new Set(['kvUnifiedReuse']), new Set(['_storeOrder', '_storeOrderSource']));
   }
 
@@ -2790,9 +2794,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * constructor returns, so a report emitted where the config resolves would
    * label every KnowledgeStrategy instance 'autobiographical'. Emitting on
    * first use instead costs nothing an operator can observe — `initialize` is
-   * the one gate every real use passes, since every other entrypoint throws
-   * until a branch is loaded — and it needs no cooperation from subclasses,
-   * which a post-construction hook would.
+   * the gate for loaded-branch work; health/inspection entrypoints may return
+   * unknown, unreadable or branchUnavailable before a branch is loaded. It needs
+   * no cooperation from subclasses, which a post-construction hook would.
    */
   private reportEffectiveConfigOnce(namespace: string): void {
     const report = this.unreportedEffectiveConfig;
@@ -3612,14 +3616,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.compressionBranchGeneration !== expected) return false;
     this.branchOperations.advanceLifecycle(expected + 1);
     this.compressionBranchGeneration++;
-    for (const call of [...this.callsOut]) call.abort();
+    // Abort listeners execute in the dispatching context, not where registered.
+    // Each library-owned abort is bound to its provider origin, never this new
+    // lifecycle holder. External signal/event dispatch is outside this fence.
+    for (const abort of [...this.callsOut]) abort();
     return true;
   }
 
   /**
    * `membrane.complete()` for the current generation's work, with a
-   * controller of its own kept in callsOut while the call is out, so that
-   * the generation's end cancels it. Each site checks its work's currency
+   * controller of its own, with an origin-bound abort kept in callsOut while
+   * the call is out, so that the generation's end cancels it. Each site checks its work's currency
    * just before, with nothing awaited between, so the generation is the
    * work's own.
    *
@@ -3645,11 +3652,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const formatter = this.nativeFormatter;
     this.requireBranchMutation('callProvider');
     const call = new AbortController();
-    this.callsOut.add(call);
+    const abort = this.branchOperations.bind(() => call.abort());
+    this.callsOut.add(abort);
     try {
       return await Reflect.apply(complete, membrane, [request, { formatter, signal: call.signal }]);
     } finally {
-      this.callsOut.delete(call);
+      this.callsOut.delete(abort);
     }
   }
 
@@ -6066,7 +6074,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (now - this.quarantineUnreadableSaidAt < interval) return;
       this.quarantineUnreadableSaidAt = now;
       this.diag.error(
-        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed: ${quarantineFailureCategory(error)})`,
+        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed: ${quarantineFailureCategory(error)}); check backing-store access and diagnostics to restore monitoring`,
       );
       return;
     }
@@ -10485,7 +10493,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return report;
     } catch (thrown) {
       const error = compressionDebtReportFailedMessage(thrown);
-      this.noteCompressionDebtFailure(error, thrown);
+      // Health reads must never throw, including the failure path's guarded
+      // per-load log state. Do not log into a replacement load from an old timer.
+      try { this.noteCompressionDebtFailure(error, thrown); } catch { /* stale/error reporting is best effort */ }
       return {
         state: 'unknown',
         error,
@@ -10620,6 +10630,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  and again when the failure's text changes or after a report reads. The
    *  first report that reads after a failure logs that it does, once. */
   private noteCompressionDebtFailure(error: string | undefined, thrown: unknown): void {
+    if (!this.branchOperations.isBindingCurrent()) return;
     if (error === undefined) {
       if (this.compressionDebtFailureLogged === null) return;
       this.compressionDebtFailureLogged = null;
