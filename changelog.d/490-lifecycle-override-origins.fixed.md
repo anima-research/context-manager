@@ -1,3 +1,7 @@
-- Keep subclass `initialize` and `detach` continuations bound to their own load
-  generation, including before and after `super`, so a superseded lifecycle
-  cannot mutate a replacement load's mirrors or invalidate its initialization.
+- Lifecycle methods (`initialize` and `detach`), including subclass overrides,
+  are supported only through `ContextManager`. On that path their continuations
+  stay bound to their own load generation, including before and after `super`.
+  Direct lifecycle calls are unsupported and are not guaranteed to fail without
+  effects: a direct arrow `initialize` calling `super.initialize` can invalidate
+  the current load before throwing. Recover by reinitializing through
+  `ContextManager.setStrategy`, not by retrying the direct call.

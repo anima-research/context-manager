@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 /** Internal control-flow error: obsolete work must not touch a replacement load. */
 export class StaleBranchOperationError extends Error {
   constructor() {
-    super('AutobiographicalStrategy refused stale branch-scoped continuation; earlier writes may have completed');
+    super('AutobiographicalStrategy refused stale branch-scoped continuation; earlier writes may have completed; inspect the original branch and dispatch fresh intended work through ContextManager, not the obsolete continuation');
     this.name = 'StaleBranchOperationError';
   }
 }

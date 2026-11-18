@@ -204,12 +204,14 @@ When a family exhausts:
   - normalized fallback limit and context budget;
   - the exact ordered bounded attempt/admission plan (IDs, hashes, bounds, and
     dispositions).
-- suppress additional provider calls while the key is unchanged;
+- suppress additional provider calls while the key is unchanged and its hold remains active;
 - retry only when:
   - recall frontier changes;
   - target chunk changes;
   - model/config changes;
   - operator explicitly clears/retries the record;
+  - automatic hygiene clears it (including the orphan heuristic when a persisted
+    chunk record is missing, even if the source span remains raw);
   - its ledger entry can't be used: a record that isn't an object with a
     string key and chunk hash, or that carries another entry's key, or a
     generation that isn't a non-empty string. No version writes one, so only
@@ -303,10 +305,15 @@ Suggested trace events:
 9. Tool-use/result pairing remains valid.
 10. No thinking/private/tool payload is removed or altered by fallback construction.
 11. All-refused writes durable quarantine and stores no summary.
-12. Same unchanged request after restart makes no provider call.
-13. Changed frontier/model changes the request key but retains same-source/regime
-    holds: retry is permitted only below the shape cap. Changed chunk membership
-    changes the source identity; it does not delete old holds.
+12. Same unchanged request after restart makes no provider call while its hold
+    remains active. Automatic orphan cleanup can remove the hold even when a
+    lost persisted chunk record's source span is still raw, allowing a retry.
+13. Changed frontier/model changes the request key; old holds remain stored.
+    With source-only fallback enabled, a model change also changes the
+    source-only request hash and hence the regime: old-regime holds do not
+    count toward the new regime's shape cap. Changes within the same regime
+    permit retry only below its cap. Changed chunk membership changes the
+    source identity; it does not delete old holds.
 14. Duplicate/concurrent producers still store only one L1 summary.
 
 ### Integration

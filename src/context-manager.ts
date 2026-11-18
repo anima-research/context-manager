@@ -5142,8 +5142,16 @@ export class ContextManager {
     }
     // The strategy, initialization and branch the calls are made under, and
     // the window the rows entered, before any hook runs.
-    const scope = this.hookScope();
-    const legacy = this.windowIndex.mode() === 'legacy';
+    let scope: ReturnType<ContextManager['hookScope']>;
+    let legacy: boolean;
+    try {
+      scope = this.hookScope();
+      legacy = this.windowIndex.mode() === 'legacy';
+    } catch (err) {
+      // The rows are already stored. Observation failure is not an add failure.
+      terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
+      return;
+    }
     // Whether a presented row is in the window still: a hook can take it
     // out. A read that throws can't tell, so the row waits, as below.
     const inWindow = (id: MessageId) => {
@@ -5293,11 +5301,16 @@ export class ContextManager {
   private tellRetracted(left: readonly RetractedRow[], info: Retraction): void {
     if (left.length === 0 || this.closed) return;
     const strategy = this.strategy;
-    if (!callStrategy(strategy, 'onRetracted', (strategy) => Boolean(strategy.onRetracted))) return;
+    const failed = terminalCatch((err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag));
+    try {
+      if (!callStrategy(strategy, 'onRetracted', (strategy) => Boolean(strategy.onRetracted))) return;
+    } catch (err) {
+      failed(err);
+      return;
+    }
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
     const ids = left.map((l) => l.id);
     const ctx = this.createStrategyContext();
-    const failed = terminalCatch((err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag));
     try {
       Promise.resolve(callStrategy(strategy, 'onRetracted', (strategy) => strategy.onRetracted!(rows, ctx, { ...info, ids }))).catch(failed);
     } catch (err) {

@@ -3101,7 +3101,8 @@ describe('the quarantine names each stuck span once, with its messages and age',
     await fx.strategy.run(chunk, managerContext(fx.manager));
     assert.equal(mock.calls.length, 4, 'two rungs per shape');
 
-    const status = fx.strategy.getCompressionQuarantineStatus();
+    const readAt = Date.now();
+    const status = fx.strategy.getCompressionQuarantineStatus(readAt);
     const created = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { record: { created: number } }> })
       .readCompressionQuarantineProjection();
     assert.equal(status.count, 2, 'a record per shape');
@@ -3112,7 +3113,8 @@ describe('the quarantine names each stuck span once, with its messages and age',
     assert.equal(span!.lastMessageId, fx.ids[12]);
     assert.equal(span!.records, 2);
     assert.equal(span!.answeredAttempts, 4, 'each record holds both of its answers');
-    assert.ok(span!.closedAgeMs !== null && span!.closedAgeMs >= 0 && span!.closedAgeMs < 60_000, `aged from its messages: ${span!.closedAgeMs}`);
+    const closedAt = Math.max(...chunk.messages.map(message => message.timestamp.getTime()).filter(Number.isFinite));
+    assert.equal(span!.closedAgeMs, Math.max(0, readAt - closedAt), 'age from message closure at the supplied read time');
     assert.equal(span!.latestOutcome, 'refusal', "the newest record's last answer, not the oldest's");
     assert.equal(span!.quarantinedAt, Math.min(...[...created.values()].map((active) => active.record.created)), 'refused since its earliest record');
 
@@ -3377,12 +3379,13 @@ describe('the span table, read from records the test writes', () => {
   it("dates a span from its messages' valid timestamps, skipping an invalid Date", async () => {
     const fx = await build(scripted([]).membrane);
     const ids = fx.ids.slice(2, 5);
-    const twoHoursAgo = Date.now() - 2 * 3_600_000;
+    const readAt = Date.now();
+    const twoHoursAgo = readAt - 2 * 3_600_000;
     // First, where a NaN would have stuck as the close time.
     fx.strategy.adopt(chunkOf(fx, ids, [new Date(Number.NaN), new Date(twoHoursAgo - 60_000), new Date(twoHoursAgo)]));
     writeLedger(fx, [{ hash: hashOf(ids), created: 100, outcomes: [] }]);
-    const [span] = fx.strategy.getCompressionQuarantineStatus().spans;
-    assert.ok(span!.closedAgeMs !== null && Math.abs(span!.closedAgeMs - 2 * 3_600_000) < 60_000, `aged from the newest valid timestamp: ${span!.closedAgeMs}`);
+    const [span] = fx.strategy.getCompressionQuarantineStatus(readAt).spans;
+    assert.equal(span!.closedAgeMs, 2 * 3_600_000, 'age from the newest valid timestamp at the supplied read time');
     fx.manager.close();
   });
 

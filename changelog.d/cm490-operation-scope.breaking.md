@@ -5,12 +5,15 @@
   callback's own continuation after `await manager.fork(...)` or
   `await manager.switchBranch(...)`: awaiting a lifecycle call does not rebind
   the rest of that callback to the new load, even without a timer or separately
-  scheduled promise. Move intentional new-load work to a manager entrypoint or
-  the host-owned dispatcher below; do not continue using the old strategy scope.
-  Catch errors and rejections in
-  each callback, cancel obsolete work on lifecycle changes, and send intentional
-  fresh work to a host-owned dispatcher created outside strategy callbacks (or
-  a manager entrypoint), validating current intent rather than retrying old work.
+  scheduled promise. Use a ContextManager entrypoint for intentional new-load
+  work; do not continue using the old strategy scope. Catch errors/rejections
+  in each callback and cancel obsolete work on lifecycle changes. A host dispatcher
+  is fresh only if it actually executes outside the old async context: merely
+  creating `const dispatch = f => setImmediate(f)` at startup does not help,
+  since calling it inside the callback creates the immediate in that callback's
+  context. Hosts implementing their own dispatch can create an `AsyncResource`
+  outside strategy callbacks and use its `runInAsyncScope` to dispatch intent.
+  Validate current intent rather than retrying obsolete work.
   `StaleBranchOperationError` is internal and not exported; do not import it for
   `instanceof`. Its name is diagnostic, not a universal public result contract:
   mutations may instead reject with ordinary reinitialization/uncertain-outcome
@@ -28,9 +31,15 @@
   descriptor checks to accessors. Manager calls now probe a private boundary
   symbol: forwarding proxies must forward symbol lookups (returning `undefined`
   for absent properties), not throw on unrecognized symbols. Lookup failures
-  are deliberately not swallowed as a fallback to unscoped work. Public/protected signatures and subclass
-  `super` calls are unchanged. Shared handler/report/episode metadata is not a
-  branch mirror. There is no new cross-process transaction, lock or rollback.
+  are deliberately not swallowed as a fallback to unscoped work. Lifecycle
+  methods (`initialize`/`detach`), including subclass overrides, are supported
+  only through ContextManager. Direct calls are unsupported: a direct arrow
+  `initialize` calling `super.initialize` can invalidate the current load before
+  throwing. Recover through `ContextManager.setStrategy`. Within manager lifecycle calls,
+  prototype and class-field overrides may call `super`; signatures are unchanged.
+  Subclasses must not redeclare guarded loaded mirrors as fields: derived field
+  initialization replaces the accessors and defeats that isolation. Shared
+  handler/report/episode metadata is not a branch mirror. There is no new cross-process transaction, lock or rollback.
 - **Runtime integrators:** the new operation boundary uses `node:async_hooks`
   `AsyncLocalStorage` (Node ≥22.12; also required by the published Bun source
   export). Bun must implement Node-compatible propagation and class-field

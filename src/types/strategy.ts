@@ -303,11 +303,17 @@ export interface ContextStrategy {
 
   /**
    * Initialize the strategy with context.
-   * Called when strategy is set on ContextManager.
+   * Lifecycle methods, including subclass overrides, are supported only through
+   * ContextManager. Called when strategy is set on ContextManager.
+   * Direct calls are unsupported, not side-effect-free refusals: a direct arrow
+   * override calling super.initialize can invalidate the current load before
+   * throwing. Recover through ContextManager.setStrategy.
    */
   initialize?(ctx: StrategyContext): Promise<void>;
 
   /**
+   * Lifecycle methods, including subclass overrides, are supported only through
+   * ContextManager; direct calls are unsupported and may have partial effects.
    * The manager is done with this strategy: setStrategy() replaced it, the
    * manager closed, or the open() that was initializing it failed. The
    * strategy stops the work it still has running for that manager, so it
@@ -1691,12 +1697,12 @@ export interface CompressionQuarantineSpan {
   lastMessageId: string | null;
   /**
    * How long since its chunk closed, from the newest of its messages'
-   * timestamps: how long it has stayed raw. Null when unknown.
+   * timestamps. Not proof it is still raw; cleanup may have failed. Null when unknown.
    */
   closedAgeMs: number | null;
   /**
    * When its earliest record was made (ms since the epoch): how long it has
-   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * been refused, where `closedAgeMs` measures time since chunk closure. The
    * alarm line shows it as "refusing since". A re-cut chunk's records start
    * over.
    */
@@ -1882,7 +1888,9 @@ export interface AutobiographicalConfig {
    * registered handler) while ANY chunk is quarantined. Quarantined chunks
    * can exhaust the context budget while raw; stale holds can remain after
    * best-effort cleanup failures, so the alarm is not proof of debt. It repeats until the
-   * quarantine empties. Default 15 min; 0 disables (tests only).
+   * quarantine empties, checked only when tick runs (no independent timer).
+   * Unreadable status suppresses the normal notification. Default 15 min;
+   * 0 disables (tests only).
    */
   quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */

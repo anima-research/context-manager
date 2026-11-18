@@ -1,0 +1,1 @@
+- Fence opt-in autobiographical mint-preimage blob, state registration and envelope-index writes against origin replacement, including reentry during writer lookup. Receipt persistence remains best-effort; already-dispatched host writes cannot be rolled back.

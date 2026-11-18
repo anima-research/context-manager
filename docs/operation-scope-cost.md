@@ -19,6 +19,7 @@ Both used Node 22.23.3, Chronicle 0.7.0, Membrane 0.9.0 and the same probes.
 Build each tree, then run the harness with its built entrypoint:
 
 ```sh
+mkdir -p /tmp/c14b
 systemd-run --user --scope -p MemoryMax=4G env TMPDIR=/tmp/c14b \
   node scripts/bench-operation-scope.mjs <tree>/dist/src/index.js \
   --sizes=1024,4096 --modes=adaptive
@@ -53,11 +54,15 @@ scoped (each process also ran the 1,024-message fixture first).
 
 ## Acceptance basis and limits
 
-For this PR's local fixture, we accept up to **10 ms extra median warm adaptive
+The earlier local fixture used a provisional ceiling of **10 ms extra median warm adaptive
 compile and 2 ms extra median add at 4,096 messages** in exchange for retaining
-origin checks on ordinary calls. The measured increases are 5.91 ms (19%) and
+origin checks on ordinary calls. These are historical results for the named
+source tree, not qualification of the current head or an approved project cost
+budget. The measured increases are 5.91 ms (19%) and
 1.11 ms (185%), respectively. The add regression is substantial in relative
-terms; it is not free or hidden by a provider call. Compression and populated
+terms; it is not free or hidden by a provider call. Nor is this a fixed
+per-entry boundary cost: rebuild loops repeatedly read guarded mirrors while
+walking history, so per-insertion overhead grows with history. Compression and populated
 reload also cost more in this sample. This is an explicit, limited safety/cost
 tradeoff, not an established project-wide performance policy or host latency
 SLA; latency-sensitive callback owners should qualify their actual resident
@@ -68,3 +73,29 @@ large hold population, kv-unified solver population, other adaptive policy or
 Bun performance is established here. The smoke regression checks reachability
 and compressed rendering, not unstable wall-clock thresholds. Broader cost
 claims need those measurements, not a more elaborate fence on this evidence.
+
+## Round 15b measurement (2026-11-18)
+
+One fresh sequential pre-scope/submitted-source pair used the same harness,
+Node 22.23.3, Chronicle 0.7.0 and Membrane 0.9.0, offline, under a
+`MemoryMax=4G` scope with `TMPDIR=/tmp/c15b`. Pre-scope is the same
+`a8de6130211899f61d15de71ec8273ed66968e76` tree. Submitted source is r15
+`bd84c91ef019bfa7aac308a2e76c7d00c00a6f85` plus this round's error-recovery
+patch (autobiographical source blob `5fa64b4bbcad17091b163fb0947aaba3447d94d2`;
+operation-scope blob `5c6a855dee37d5b12f60c4faa5b70c96963a3f9a`;
+unchanged harness blob `916a22ccc7be794e2ebc9be5f952e754cd3491a0`).
+The fixture produced the same 306 / 1,226 summaries and calls at 1,024 / 4,096
+messages. Milliseconds, with the same within-run sampling as above:
+
+| Messages | Add pre / submitted | Compile pre / submitted | Compression pre / submitted | Reload pre / submitted |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 0.188 / 0.453 | 5.948 / 8.108 | 16.815 / 17.707 | 9.247 / 9.877 |
+| 4,096 | 0.550 / 1.820 | 31.085 / 36.421 | 60.268 / 59.974 | 32.299 / 34.881 |
+
+At 4,096 messages, add increased **1.270 ms (+231%)** and warm compile
+**5.336 ms (+17%)**. This does not supersede the historical three-pair
+**+185%** add result with a new general estimate: it is only one pair on a
+shared CPU, with regression tests also running during part of measurement.
+It confirms substantial history-dependent overhead, not an approved budget or
+production qualification. No speculative optimization was made; all population
+and tail-latency limitations above still apply.

@@ -141,7 +141,7 @@ jobs:
       - name: Branch operation regressions on latest Node
         if: matrix.node == 'latest'
         run: |
-          for file in dist/test/branch-operation*.test.js; do node "$file" || exit; done
+          for file in dist/test/branch-operation*.test.js dist/test/branch-generation-reentry.test.js dist/test/strategy-detach.test.js; do node "$file" || exit; done
 
       - name: Pack
         run: npm pack --pack-destination "$RUNNER_TEMP"

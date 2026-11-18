@@ -191,7 +191,9 @@ Changing the global model affects other normal compression too.
 
 The next ordinary alarm check on the same live, already-open episode retains
 siblings with matching persisted raw chunk records and eventually reports the
-observed record count on its existing interval. The existing sweep treats a
+observed record count when tick runs after its existing interval. There is no
+independent alarm timer: a stopped tick loop emits no repeat alarms, and an
+unreadable status suppresses the normal status notification. The existing sweep treats a
 missing chunk record as orphanhood and may clear a sibling even if its source
 span remains raw; the raw-span alarm is not guaranteed in that case. When a
 waiver-request episode reads empty it ends once,
@@ -271,12 +273,22 @@ have completed; a refusal is not a rollback receipt. `getCompressionDebt()` keep
 its never-throw contract even for inherited stale intervals, returning `unknown`
 without changing the replacement load's diagnostic state.
 
-For an intentional fresh operation, enqueue intent to a host-owned dispatcher
-created outside strategy callbacks, or use a manager entrypoint (manager calls
-create new origins). Validate that intent against the current load; do not wrap
+For an intentional fresh operation, use a ContextManager entrypoint (manager
+calls create new origins). A host-owned queue must actually execute outside the
+obsolete async context: a startup-created `f => setImmediate(f)` still inherits
+its caller's context. An `AsyncResource` created outside callbacks and used via
+`runInAsyncScope` can provide host-owned dispatch. Validate intent against the
+current load; do not wrap
 arbitrary old work in a new manager operation merely to bypass its refusal.
-Direct instance-function overrides do not acquire a fresh scope automatically;
-prototype entrypoints retain inherited scope.
+Lifecycle methods, including subclass overrides, are supported only through
+ContextManager. Direct lifecycle calls are unsupported, not guaranteed to be
+side-effect-free refusals: a direct arrow `initialize` that calls
+`super.initialize` can invalidate the current load before throwing. Recover by
+reinitializing through `ContextManager.setStrategy`, not by retrying the direct
+call. Other direct
+instance-function overrides do not acquire a fresh scope automatically;
+prototype entrypoints retain inherited scope. Subclasses must not redeclare
+loaded mirrors as fields, which would replace their guarded accessors.
 Alarm episodes identify namespace and branch only, not backing stores. Reusing a
 strategy on a different backing store with the same names can end the previous
 episode; this is not evidence that the original store was checked. Stable backing
