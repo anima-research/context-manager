@@ -919,6 +919,10 @@ describe('OverBudgetError diagnostics', () => {
     assert.match(error.message, /deepest fold level=L0/);
     assert.doesNotMatch(error.message, /planned|attempted|picker chunks/);
     assert.doesNotMatch(error.message, /available|inventory|configured|undefined/);
+    assert.match(
+      new OverBudgetError({ actual: 6, budget: 5, diagnostics: { ...diagnostics, solver: 'kv-unified' } }).message,
+      /^Adaptive plan check \(kv-unified\): 6 tokens exceed hard budget 5 /,
+    );
   });
 });
 

@@ -291,8 +291,9 @@ export class OverBudgetError extends Error {
     diagnostics: OverBudgetError['diagnostics'];
     /** What clears the refusal besides a larger budget; empty when left out. */
     clearedBy?: readonly OverBudgetClearedBy[];
-    /** Which stage refused — defaults to the legacy "Adaptive picker exhausted"
-     *  wording. The plan check and emission sites pass their own stage so a
+    /** Which stage refused — when omitted, defaults to "Adaptive picker exhausted"
+     *  if diagnostics.solver is undefined, otherwise "Adaptive plan check (<solver>)".
+     *  The plan check and emission sites pass their own stage so a
      *  refusal doesn't imply that no further folds are possible. */
     stage?: string;
   }) {
