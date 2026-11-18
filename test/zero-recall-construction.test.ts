@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { getMintRequestPreimageBytes } from '../src/index.js';
 import test from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
@@ -25,8 +25,11 @@ class Probe extends ZeroRecallSurgeryStrategy {
 }
 
 async function exercise(content: ContentBlock[], options: AutobiographicalOptions = {}, rejectCarriers = false,
-  inspect?: (request: NormalizedRequest, expected: ContentBlock[]) => void, rawResult = false) {
+  inspect?: (request: NormalizedRequest, expected: ContentBlock[]) => void, rawResult = false, transientFirst = false) {
   const dir = mkdtempSync(join(tmpdir(), 'zc-'));
+  const priorLog = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  const logPath = join(dir, 'compression.jsonl');
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
   const strategy = new Probe({ compressionModel: 'mock', headWindowTokens: 0, recentWindowTokens: 0,
     targetChunkTokens: 100, minChunkCharsForLLM: 0, mergeThreshold: 99, autoTickOnNewMessage: false,
     persistMintPreimages: true, quarantineAlarmIntervalMs: 0, compressionRefusalCurveFallbacks: 0, ...options });
@@ -56,6 +59,7 @@ async function exercise(content: ContentBlock[], options: AutobiographicalOption
     ]) assert.throws(() => assertZeroRecallConstruction(changed, authored ?? constructed.request), /differs from trusted/);
     inspect?.(sent, expected.answer.content);
     requests.push(structuredClone(sent));
+    if (transientFirst && requests.length === 1) throw new Error('offline transient');
     if (rejectCarriers && requests.length === 1) throw Object.assign(new Error('invalid_request: thinking cannot be modified'), { httpStatus: 400, type: 'invalid_request', retryable: false });
     return { content: [text('new summary')], stopReason: 'end_turn' };
   } };
@@ -70,7 +74,19 @@ async function exercise(content: ContentBlock[], options: AutobiographicalOption
       tokens: 20, sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 0 });
     const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
     const messages = ctx.messageStore.getAll().filter(m => m.id === source);
-    const compression = strategy.compress({ index: 1, startIndex: 2, endIndex: 3, messages, tokens: 100, compressed: false }, ctx);
+    const chunk: Chunk = { index: 1, startIndex: 2, endIndex: 3, messages, tokens: 100, compressed: false };
+    let compression = strategy.compress(chunk, ctx);
+    if (transientFirst) {
+      await assert.rejects(compression, /offline transient/);
+      const runs = (strategy as unknown as { compressionFailureRuns: Map<string, { run: { key: string } }> }).compressionFailureRuns;
+      assert.equal(runs.size, 1);
+      const [runSubject, value] = [...runs][0];
+      assert.equal(value.run.key, createHash('sha256').update(JSON.stringify({ runSubject, curveLabel: 'canonical', stripped: false })).digest('hex'),
+        'authoring is not a carrier-stripped retry');
+      compression = strategy.compress(chunk, ctx);
+      await compression;
+      assert.equal(runs.size, 0, 'successful non-carrier retry clears the failed run');
+    }
     if (rawResult) {
       await assert.rejects(compression, /Raw tool result collapsed into recall answer/);
     } else if (!content.some(b => b.type === 'text' && b.text.trim())) {
@@ -80,6 +96,15 @@ async function exercise(content: ContentBlock[], options: AutobiographicalOption
       assert.equal(strategy.observed, 1, 'refusal happened in the construction observer, not a missing-tools deferral');
     } else {
       await compression;
+      const entries = readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const trace = entries.reverse().find(entry => entry.event === 'compression:attempt').metadata;
+      assert.deepEqual(trace.recallIds, []);
+      assert.deepEqual(trace.recallLevels, []);
+      assert.equal(trace.leafCoverageHash, createHash('sha256').update('[]').digest('hex'));
+      const receipt = entries.find(entry => entry.operation === 'compress_l1' && entry.messages);
+      assert.equal(receipt.metadata.prior_summary_count_kept, 0);
+      assert.equal(receipt.metadata.prior_summary_tokens, 0);
+      assert.ok(!JSON.stringify(receipt.messages).includes('[CM] Recall memory'));
       const hash = strategy.minted()!.provenance!.requestHash;
       const sentBytes = JSON.stringify(requests.at(-1));
       assert.equal(hash, createHash('sha256').update(sentBytes).digest('hex'),
@@ -88,7 +113,11 @@ async function exercise(content: ContentBlock[], options: AutobiographicalOption
         'persisted provenance reconstructs the request the provider received');
     }
     return requests;
-  } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    manager.close(); rmSync(dir, { recursive: true, force: true });
+    if (priorLog === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = priorLog;
+  }
 }
 
 test('constructed expectations share empty-text sanitization and cache-control stripping', async () => {
@@ -180,3 +209,145 @@ test('raw tool results cannot collapse into a user-participant recall answer', a
     { summaryParticipant: 'user' }, false, undefined, true);
   assert.equal(calls.length, 0, 'refuse before raw source can be removed or sent');
 });
+
+// Keep a refused canonical rung durable by interrupting its source-only rung,
+// then read that same branch through the other strategy's authoring mode.
+for (const surgeryFirst of [true, false]) {
+  test(`refusal progress is isolated between surgery and ordinary authoring (${surgeryFirst})`, async () => {
+    class SwitchingProbe extends Probe {
+      surgery = surgeryFirst;
+      protected override compressionOutcomeNamespace() {
+        return this.surgery ? super.compressionOutcomeNamespace() : undefined;
+      }
+      protected override authorL1CompressionRequest(request: NormalizedRequest, ids: readonly string[]) {
+        return this.surgery ? super.authorL1CompressionRequest(request, ids) : request;
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'zi-'));
+    const strategy = new SwitchingProbe({ compressionModel: 'mock', headWindowTokens: 0,
+      recentWindowTokens: 0, targetChunkTokens: 100, minChunkCharsForLLM: 0,
+      mergeThreshold: 99, autoTickOnNewMessage: false, compressionRefusalCurveFallbacks: 0,
+      compressionSourceOnlyFallback: true, quarantineAlarmIntervalMs: 0 });
+    let phase = 0;
+    const calls: NormalizedRequest[][] = [[], []];
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls[phase].push(structuredClone(request));
+      if (phase === 0) {
+        if (calls[0].length === 1) return { content: [], stopReason: 'refusal' };
+        throw new Error('offline interruption');
+      }
+      return { content: [text('new summary')], stopReason: 'end_turn' };
+    } };
+    const manager = await ContextManager.open({ path: dir, strategy, membrane: membrane as never });
+    try {
+      const first = manager.addMessage('user', [text('prior covered turn')]);
+      manager.addMessage('Claude', [text('raw middle')]);
+      const source = manager.addMessage('user', [text('source turn '.repeat(50))]);
+      strategy.seed({ id: 'L1-100', level: 1, content: 'stored summary', tokens: 20,
+        sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 0 });
+      const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
+      const chunk: Chunk = { index: 1, startIndex: 2, endIndex: 3,
+        messages: ctx.messageStore.getAll().filter(m => m.id === source), tokens: 100, compressed: false };
+      await assert.rejects(strategy.compress(chunk, ctx));
+      assert.equal(calls[0].length >= 1, true);
+      phase = 1;
+      strategy.surgery = !surgeryFirst;
+      await strategy.compress(chunk, ctx);
+      assert.equal(calls[1].length, 1, 'other strategy must dispatch its own canonical request');
+      const hasRecall = JSON.stringify(calls[1][0]).includes('[CM] Recall memory L1-100.');
+      assert.equal(hasRecall, surgeryFirst, 'ordinary canonical retains recall; surgery canonical removes it');
+      assert.ok(strategy.minted(), 'the other strategy can mint despite the prior refusal');
+    } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('authored canonical transient failures use and clear the non-carrier failure run', async () => {
+  assert.equal((await exercise([text('summary')], {}, false, undefined, false, true)).length, 2);
+});
+
+for (const surgeryFirst of [true, false]) {
+  test(`quarantine shape caps are isolated between authoring modes (${surgeryFirst})`, async () => {
+    class SwitchingProbe extends Probe {
+      surgery = surgeryFirst;
+      budget(value: number) { this.config.compressionContextBudgetTokens = value; }
+      heldSources() {
+        return (this as unknown as { quarantinedChunkSources(): Map<string, readonly string[]> }).quarantinedChunkSources();
+      }
+      checkRetention() {
+        const internal = this as unknown as {
+          compressionRefusalQuarantineLedgerStateId: string;
+          captureCompressionBranch(): unknown;
+          checkpointCompressionQuarantineIfNeeded(source: unknown): void;
+        };
+        const id = internal.compressionRefusalQuarantineLedgerStateId;
+        type Event = { kind: string; key: string; created: number; record: {
+          key: string; familyKey: string; normalizedConfig: { outcomeNamespace?: string };
+        } };
+        const events = this.store!.getStateJson(id) as Event[];
+        const examples = [undefined, 'zero-recall-surgery-v1'].map(namespace =>
+          events.find(e => e.kind === 'exhausted' && e.record.normalizedConfig.outcomeNamespace === namespace)!);
+        // A full newer namespace must not evict the older namespace at a
+        // checkpoint. Each namespace independently drops its oldest excess.
+        const crowded = examples.flatMap((example, mode) => Array.from({ length: 1025 }, (_, index) => {
+          const key = `retention-${mode}-${index}`;
+          return { ...example, key, eventId: key, sequence: mode * 1025 + index,
+            created: mode * 1025 + index,
+            record: { ...example.record, key, familyKey: key, created: mode * 1025 + index } };
+        }));
+        this.store!.setStateJson(id, crowded);
+        internal.checkpointCompressionQuarantineIfNeeded(internal.captureCompressionBranch());
+        assert.equal(this.getCompressionQuarantineStatus().count, 2048,
+          'checkpoint retains up to 1024 records independently in each namespace');
+      }
+      protected override compressionOutcomeNamespace() {
+        return this.surgery ? super.compressionOutcomeNamespace() : undefined;
+      }
+      protected override authorL1CompressionRequest(request: NormalizedRequest, ids: readonly string[]) {
+        return this.surgery ? super.authorL1CompressionRequest(request, ids) : request;
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'zc-'));
+    const strategy = new SwitchingProbe({ compressionModel: 'mock', headWindowTokens: 0,
+      recentWindowTokens: 0, targetChunkTokens: 100, minChunkCharsForLLM: 0,
+      mergeThreshold: 99, autoTickOnNewMessage: false, compressionRefusalCurveFallbacks: 0,
+      quarantineAlarmIntervalMs: 0 });
+    const calls: NormalizedRequest[] = [];
+    const membrane = { complete: async (request: NormalizedRequest) => {
+      calls.push(structuredClone(request));
+      return { content: [], stopReason: 'refusal' };
+    } };
+    const manager = await ContextManager.open({ path: dir, strategy, membrane: membrane as never });
+    try {
+      const first = manager.addMessage('user', [text('prior covered turn')]);
+      manager.addMessage('Claude', [text('raw middle')]);
+      const source = manager.addMessage('user', [text('source turn '.repeat(50))]);
+      strategy.seed({ id: 'L1-100', level: 1, content: 'stored summary', tokens: 20,
+        sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 0 });
+      const ctx = (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
+      const chunk: Chunk = { index: 1, startIndex: 2, endIndex: 3,
+        messages: ctx.messageStore.getAll().filter(m => m.id === source), tokens: 100, compressed: false };
+      for (const budget of [100_000, 101_000, 102_000]) {
+        strategy.budget(budget);
+        const before = calls.length;
+        await strategy.compress(chunk, ctx);
+        assert.ok(calls.length > before, 'each of three shapes must exhaust its own ladder');
+      }
+      assert.equal(strategy.getCompressionQuarantineStatus().count, 3);
+      strategy.budget(103_000);
+      const before = calls.length;
+      await strategy.compress(chunk, ctx);
+      assert.equal(calls.length, before, 'the first mode is capped at three quarantined shapes');
+      strategy.surgery = !surgeryFirst;
+      assert.equal(strategy.heldSources().size, 0, 'other-mode quarantines must not suppress queued work or raw history');
+      await strategy.compress(chunk, ctx);
+      assert.ok(calls.length > before, 'the other mode must not inherit the exhausted shape cap');
+      assert.equal(JSON.stringify(calls[before]).includes('[CM] Recall memory L1-100.'), surgeryFirst);
+      assert.equal(strategy.getCompressionQuarantineStatus().count, 4, 'both modes retain their own exhaustion');
+      strategy.surgery = surgeryFirst;
+      assert.equal(strategy.heldSources().size, 1);
+      strategy.surgery = !surgeryFirst;
+      assert.equal(strategy.heldSources().size, 1);
+      strategy.checkRetention();
+    } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}

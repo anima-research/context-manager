@@ -1098,19 +1098,14 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
  * compression model changed while it was in flight.
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
-/**
- * The hash of the request each failed L1 call actually dispatched, keyed by
- * its error. A rung's outcome keeps the rung's identity, but after a carrier
- * rejection the rung dispatches its stripped request, whose failures are a
- * run of their own (chunkRunKey).
- */
-const dispatchedRequestHash = new WeakMap<object, string>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
 }
 
 interface CompressionRefusalNormalizedConfig {
+  /** Absent on historical ordinary records; isolates request-authoring modes. */
+  outcomeNamespace?: string;
   accountingVersion: number;
   fallbackLimit: number;
   contextBudgetTokens: number;
@@ -3327,6 +3322,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected observeL1CompressionRequest(_request: NormalizedRequest, _recallIds: readonly string[]): void {}
 
+  /** Outcome identities for opt-in request rewriting must not alias ordinary
+   * ladders. Undefined preserves the historical ordinary family identity.
+   */
+  protected compressionOutcomeNamespace(): string | undefined { return undefined; }
+
   /** Opt-in L1 authoring, before dispatch identity and accepted provenance are
    * formed. The default returns the identical request; surgery overrides this
    * rather than editing bytes behind the strategy's transport boundary.
@@ -5244,6 +5244,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // earn a fresh bounded family even when the old regime already filled its
     // cap. Within the new regime the cap remains sticky.
     const sameRegime = sameHash.filter((active) =>
+      active.record.normalizedConfig?.outcomeNamespace === record.normalizedConfig.outcomeNamespace &&
       active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
         record.normalizedConfig.sourceOnlyFallbackEnabled &&
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
@@ -5372,9 +5373,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
     if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
     const projection = this.readCompressionQuarantineProjection();
+    // Retention is per authoring mode too: one mode's churn must not evict
+    // the other mode's durable refusals and silently reopen its paid ladders.
+    const counts = new Map<string | undefined, number>();
     const retained = [...projection.values()]
       .sort((a, b) => b.record.created - a.record.created)
-      .slice(0, COMPRESSION_QUARANTINE_MAX_ACTIVE);
+      .filter(({ record }) => {
+        const namespace = record.normalizedConfig?.outcomeNamespace;
+        const count = counts.get(namespace) ?? 0;
+        counts.set(namespace, count + 1);
+        return count < COMPRESSION_QUARANTINE_MAX_ACTIVE;
+      });
     const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
       generationId: item.generationId,
       record: item.record,
@@ -7023,7 +7032,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
     const toolProseFallback = this.toolProseHoistOptions();
+    const outcomeNamespace = this.compressionOutcomeNamespace();
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
+      ...(outcomeNamespace === undefined ? {} : { outcomeNamespace }),
       accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
       fallbackLimit,
       contextBudgetTokens,
@@ -7039,6 +7050,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(toolProseFallback ? { toolProseFallback } : {}),
     };
     const familyKey = sha256Json({
+      ...(outcomeNamespace === undefined ? {} : { outcomeNamespace }),
       model,
       chunkSourceHash,
       frontierHash,
@@ -11743,7 +11755,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       undefined,
       sourceOnlyFallbackRequestHash,
     );
-    const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
+    const outcomeNamespace = this.compressionOutcomeNamespace();
+    const runSubject = chunkRunSubject(outcomeNamespace === undefined
+      ? quarantineRecord.chunkSourceHash
+      : sha256Json([outcomeNamespace, quarantineRecord.chunkSourceHash]), chunk.messages);
     // The attempt's first read of the ledger that can stop it, before any
     // model call: while the ledger can't be read, every attempt that would
     // call the model stops here, so the error says what that means for the
@@ -11980,6 +11995,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     /** Responses the provider gave for a carrier-stripped copy (runAttempt's
      *  degraded path), whose count is the copy's, not the planned request's. */
     const countedStripped = new WeakSet<object>();
+    const strippedErrors = new WeakSet<object>();
+    let loggedRequest = request;
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
@@ -12042,6 +12059,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
+          loggedRequest = attemptRequest;
           response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
@@ -12049,7 +12067,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
             noteDispatchedModel(error, attemptRequest);
-            if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -12090,11 +12107,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = this.authorL1CompressionRequest(stripReasoningFromRequest(preparedRequest), recallIds);
           try {
+            loggedRequest = acceptedRequest;
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
-              dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
+              strippedErrors.add(retryError);
             }
             throw retryError;
           }
@@ -12110,13 +12128,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
         }
         const stopReason = this.compressionResponseStopReason(response);
+        const sentRecallSet = new Set(acceptedRequest.messages.map(recallHeaderId).filter(id => id !== undefined));
+        const sentRecallIds = recallIds.filter(id => sentRecallSet.has(id));
+        const sentLeafIds = sentRecallIds.flatMap(id => {
+          const summary = summariesById.get(id);
+          return summary ? this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [] : [];
+        }).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
         const trace: CompressionAttemptTrace = {
           curveLabel,
-          recallIds,
-          recallLevels,
+          recallIds: sentRecallIds,
+          recallLevels: recallLevels.filter((_level, i) => sentRecallSet.has(recallIds[i]!)),
           ...(expandedParentId ? { expandedParentId } : {}),
           ...(expandedChildIds ? { expandedChildIds } : {}),
-          leafCoverageHash,
+          leafCoverageHash: sentRecallIds.length === recallIds.length ? leafCoverageHash : sha256Json(sentLeafIds),
           requestHash: sha256Json(acceptedRequest),
           messageCount: acceptedRequest.messages.length,
           estimatedTokens: this.estimateCompressionRequestTokens(acceptedRequest),
@@ -12295,7 +12319,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: unknown,
         curveLabel: string,
         requestHash: string,
-        streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
           // Counted against the request actually dispatched (the stripped one
@@ -12304,7 +12327,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
-            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash),
+            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, error !== null && typeof error === 'object' && strippedErrors.has(error)),
             compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched),
           );
           // The decision is the rung's outcome, which ends its run (noteOutcome).
@@ -12371,7 +12394,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 error,
                 curveLabel,
                 requestHash,
-                (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
@@ -13512,28 +13534,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       logCompressionCall({
         operation: 'compress_l1',
-        // The DISPATCHED bytes, read off the request object — deliberately
-        // NOT ctx.systemPrompt again. This finally runs after an awaited
-        // round trip and that getter is live, so a host activation landing
-        // mid-flight would make this receipt name a prompt the call never
-        // sent. Every rung that can actually reach the wire from here
-        // (withAppendedInstruction, withoutToolsParam,
-        // stripReasoningFromRequest) derives from `request` by spread, and the
-        // recall-curve variants from `authoredRequest`, its unprepared form;
-        // each leaves `system` untouched, as preparation does, so the
-        // canonical request's field is the sent value for all of them. Null
-        // when the request carried no system field, so the pre-threading log
-        // shape is preserved exactly; summarized (not verbatim) when it did,
-        // matching how `messages` is logged. `messages` summarizes the
-        // prepared canonical request.
-        system: request.system ? summarizeTelemetryText(request.system) : null,
-        messages: summarizeTelemetryMessages(request.messages),
+        // Summarize the last request actually dispatched, including opt-in
+        // authoring and carrier fallback, not the prepared recall-bearing plan.
+        system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
+        messages: summarizeTelemetryMessages(loggedRequest.messages),
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
           chunk_size: chunk.messages.length,
           prior_summary_count: priorSummaries.length,
-          prior_summary_count_kept: keptSummaries.length,
-          prior_summary_tokens: recallTokens,
+          prior_summary_count_kept: keptSummaries.filter(summary => loggedRequest.messages.some(m => recallHeaderId(m) === summary.id)).length,
+          prior_summary_tokens: loggedRequest === request ? recallTokens : keptSummaries
+            .filter(summary => loggedRequest.messages.some(m => recallHeaderId(m) === summary.id))
+            .reduce((total, summary) => total + summary.tokens, 0),
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
@@ -15118,7 +15130,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const sources = new Map<string, readonly MessageId[] | undefined>();
     for (const { record } of projection.values()) {
-      if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION) continue;
+      if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION ||
+          record.normalizedConfig?.outcomeNamespace !== this.compressionOutcomeNamespace()) continue;
       const listed = isIdList(record.sourceIds) ? record.sourceIds : undefined;
       if (!sources.get(record.chunkSourceHash)) sources.set(record.chunkSourceHash, listed);
     }

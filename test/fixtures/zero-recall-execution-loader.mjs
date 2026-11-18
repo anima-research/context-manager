@@ -1,5 +1,6 @@
-// Only replace the CLI's external store/provider boundary. Strategy construction,
-// the observation hook, source guard and request transform remain production code.
+// Stub CLI orchestration, including manager.tick (not the production ladder).
+// The observation hook, source guard and request transform remain production code.
+// Ladder integration is covered separately in zero-recall-construction.test.ts.
 export async function resolve(specifier, context, nextResolve) {
   if (context.parentURL?.endsWith('/scripts/one-shot-zero-recall-surgery.js')) {
     if (specifier === '../src/context-manager.js') return { url: 'stub:manager', shortCircuit: true };
@@ -40,7 +41,8 @@ export async function load(url, context, nextLoad) {
           getStrategy: () => strategy,
           setToolDefinitions: tools => trace({ tools }),
           queryMessages: () => ({ messages: process.env.SURGERY_CASE === 'unsafe'
-            ? [message('Context Manager', '[CM] Recall memory raw.')] : [] }),
+            ? [message('Context Manager', '[CM] Recall memory raw.')]
+            : process.env.SURGERY_CASE === 'opening-collision' ? [message('Context Manager', strategy.opening())] : [] }),
           currentBranch: () => branch,
           fork: async name => { trace({ fork: name }); return branch = { name }; },
           tick: async () => {

@@ -21,16 +21,19 @@ const source = git('rev-parse', 'HEAD');
 const sourceTree = git('rev-parse', 'HEAD^{tree}');
 // Compare bytes to HEAD independently of index stat/assume-unchanged flags.
 function sourceFilesChanged() {
-  const paths = git('ls-tree', '-rz', '--name-only', 'HEAD').split('\0').filter(Boolean);
-  return paths.filter(path => {
+  const entries = git('ls-tree', '-rz', 'HEAD').split('\0').filter(Boolean);
+  return entries.flatMap(entry => {
+    const [metadata, path] = [entry.slice(0, entry.indexOf('\t')), entry.slice(entry.indexOf('\t') + 1)];
+    const mode = metadata.split(' ')[0];
     try {
       const full = resolve(root, path);
+      if ((mode === '120000') !== lstatSync(full).isSymbolicLink()) return [path];
       const bytes = lstatSync(full).isSymbolicLink() ? readlinkSync(full, { encoding: 'buffer' }) : readFileSync(full);
       const hash = execFileSync('git', ['-C', root, 'hash-object', '--stdin', '--no-filters'],
         { input: bytes, encoding: 'utf8', env: gitEnv, timeout: 10000 }).trim();
-      return hash !== git('rev-parse', 'HEAD:' + path);
+      return hash !== git('rev-parse', 'HEAD:' + path) ? [path] : [];
     } catch (error) {
-      if (error.code === 'ENOENT') return true;
+      if (error.code === 'ENOENT') return [path];
       throw new Error(`Unable to inspect source path ${JSON.stringify(path)}: ${error.message}. Check source-path type, permissions and readability, then retry.`, { cause: error });
     }
   });

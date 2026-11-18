@@ -1,23 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'provider-error']) {
+for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error']) {
   test(`executing surgery CLI offline: ${scenario}`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
     try {
-      const receiptPath = join(dir, 'receipt.json');
+      const receiptPath = scenario === 'receipt-inside' ? join(dir, 'store', 'records.log') : join(dir, 'receipt.json');
+      if (scenario === 'receipt-existing') writeFileSync(receiptPath, 'preserve me');
       const tracePath = join(dir, 'trace.jsonl');
-      writeFileSync(join(dir, 'records.log'), 'stopped backup');
+      const storePath = join(dir, 'store');
+      mkdirSync(storePath);
+      writeFileSync(join(storePath, 'records.log'), 'stopped backup');
       writeFileSync(join(dir, 'tools.json'), '[]');
       writeFileSync(join(dir, 'op.json'), JSON.stringify({
-        storePath: dir, toolsPath: join(dir, 'tools.json'), receiptPath,
+        storePath, toolsPath: join(dir, 'tools.json'), receiptPath,
         expectedRecordsSha256: hash('stopped backup'), expectedToolsSha256: hash('[]'),
         namespace: 'offline', branchName: 'surgery/offline', expectedParentBranch: 'main',
         targetChunkIndex: 0, expectedSourceRange: ['first', 'last'], expectedQuarantineKey: 'quarantined',
@@ -30,13 +33,21 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'provider-err
         resolve('dist/scripts/one-shot-zero-recall-surgery.js'), '--config', join(dir, 'op.json'), '--execute'],
       { encoding: 'utf8', timeout: 30000, env: { ...process.env, ANTHROPIC_API_KEY: 'offline-stub-only',
         SURGERY_TRACE: tracePath, SURGERY_CASE: scenario } });
+      if (scenario === 'receipt-inside' || scenario === 'receipt-existing') {
+        assert.equal(result.status, 1);
+        assert.match(result.stderr, scenario === 'receipt-inside' ? /outside the disposable store/ : /already exists/);
+        assert.ok(!existsSync(tracePath), 'receipt safety is checked before opening the store');
+        assert.equal(readFileSync(receiptPath, 'utf8'), scenario === 'receipt-inside' ? 'stopped backup' : 'preserve me');
+        return;
+      }
+      assert.match(result.stderr, /restore a fresh copy/, 'recovery guidance precedes mutation');
       assert.ok(existsSync(tracePath), result.stderr || result.stdout);
       const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const sent = trace.filter(event => event.sent).map(event => event.sent);
       assert.equal(result.status, scenario === 'success' ? 0 : 1, result.stderr);
       assert.equal(sent.length, ['success', 'repeat', 'provider-error'].includes(scenario) ? 1 : 0);
-      if (scenario === 'unsafe') {
-        assert.match(result.stderr, /Raw recall-shaped/);
+      if (scenario === 'unsafe' || scenario === 'opening-collision') {
+        assert.match(result.stderr, scenario === 'unsafe' ? /Raw recall-shaped/ : /collides with compression opening/);
         assert.ok(!trace.some(event => event.fork || event.cleared), 'source safety precedes mutation');
         assert.ok(!existsSync(receiptPath));
         return;
@@ -68,7 +79,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'provider-err
       if (scenario === 'provider-error') assert.equal(receipt.call.status, 'error');
       if (scenario !== 'success') assert.match(receipt.recovery, /restore a fresh copy/);
       else assert.equal(receipt.after.newSummaries.length, 1);
-      assert.equal(readFileSync(join(dir, 'records.log'), 'utf8'), 'stopped backup');
+      assert.equal(readFileSync(join(dir, 'store', 'records.log'), 'utf8'), 'stopped backup');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }

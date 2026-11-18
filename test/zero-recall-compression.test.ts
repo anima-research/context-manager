@@ -148,3 +148,16 @@ test('source safety accepts ordinary CM history and inspects every block', () =>
     ],
   }]), /Raw recall-shaped/);
 });
+
+test('surgery refuses a tool pair crossing the recall deletion boundary', () => {
+  const answer: NormalizedMessage = { participant: 'Claude', content: [
+    { type: 'text', text: 'memory' }, { type: 'tool_use', id: 'crossing', name: 'mock', input: {} },
+  ] };
+  const raw: NormalizedMessage = { participant: 'user', content: [
+    { type: 'tool_result', toolUseId: 'crossing', content: [{ type: 'text', text: 'raw result' }] },
+  ] };
+  assert.throws(() => transformZeroRecallCompression([
+    text('Context Manager', '[CM] Recall memory L1-1.'), answer,
+    text('Context Manager', 'OPEN'), raw,
+  ], 'OPEN', [{ id: 'L1-1', answer }]), /Tool pair crosses recall deletion boundary/);
+});

@@ -7,6 +7,7 @@ import { captureZeroRecallConstruction, transformConstructedZeroRecallCompressio
  * Recall removal authors the accepted request before dispatch and provenance hashing.
  */
 export class ZeroRecallSurgeryStrategy extends AutobiographicalStrategy {
+  protected override compressionOutcomeNamespace(): string | undefined { return 'zero-recall-surgery-v1'; }
   authoredRequest?: NormalizedRequest;
   transformation?: ReturnType<typeof transformConstructedZeroRecallCompression>;
   protected override authorL1CompressionRequest(request: NormalizedRequest, recallIds: readonly string[]): NormalizedRequest {

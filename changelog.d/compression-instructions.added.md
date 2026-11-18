@@ -29,3 +29,8 @@
 - Instruction-setting inspection avoids absent proxy option descriptors, preserves
   unrelated option receivers, and reports instruction inspection failures without
   caller values. Unrelated outer-option failures keep their original errors.
+- Add protected `authorL1CompressionRequest` for opt-in request rewriting before
+  accepted provenance hashing. Overrides must call `super` or explicitly invoke
+  `observeL1CompressionRequest` to preserve observation; rewriting strategies
+  must override `compressionOutcomeNamespace` to isolate durable outcomes from
+  ordinary request families.

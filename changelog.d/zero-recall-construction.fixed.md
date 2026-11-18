@@ -22,3 +22,12 @@
   SHA-256 of JSON.stringify(messages) before surgery and as actually sent, not
   hashes of the full request objects.
 - KnowledgeStrategy retains default construction for primitive JavaScript options.
+- Surgery family progress, quarantine and failure runs are isolated from ordinary
+  recall-bearing compression, so their deterministic refusals cannot be reused
+  across authoring modes. Attempt traces and compression logs describe sent recalls.
+- Surgery refuses deletion of a memory when it would orphan a raw tool result.
+  The CLI emits recovery guidance before opening the store and requires a new
+  receipt destination outside the disposable store (exclusive creation).
+- **Surgery receipt consumers:** `provenanceMode` is now `authored-request`, not
+  `external-receipt-only`; update parsers to accept the new value. The restored
+  message-digest compatibility aliases remain unchanged.

@@ -51,17 +51,20 @@ For example, create a **local detached worktree** at the chosen public commit
 SOURCE_SHA=a81d20656d8991f4d5963719535cab11703ff879
 SOURCE_ROOT="$PWD/node_modules/.cache/cm486/source-$SOURCE_SHA"
 mkdir -p "$(dirname "$SOURCE_ROOT")"
-git worktree add --detach "$SOURCE_ROOT" "$SOURCE_SHA"
+git -c core.autocrlf=false -c core.eol=lf worktree add --detach "$SOURCE_ROOT" "$SOURCE_SHA"
 ln -s "$PWD/node_modules" "$SOURCE_ROOT/node_modules"
 ```
 
 Reuse the same locked compiler/dependencies, installed with scripts disabled.
 **Modern source already containing the option and harness needs no port.**
-Only for a legacy tree lacking the option, copy and port the synthetic harness:
+Copy the synthetic harness whenever the selected source lacks it (including
+feature-era commits). Port it only when the option itself is absent:
 
 ```sh
-if [ ! -f "$SOURCE_ROOT/src/compression-instructions.ts" ]; then
+if [ ! -f "$SOURCE_ROOT/test/compression-instructions-harness.ts" ]; then
   cp test/compression-instructions-harness.ts "$SOURCE_ROOT/test/"
+fi
+if [ ! -f "$SOURCE_ROOT/src/compression-instructions.ts" ]; then
   python3 - "$SOURCE_ROOT/test/compression-instructions-harness.ts" <<'PY'
 import sys
 p = sys.argv[1]

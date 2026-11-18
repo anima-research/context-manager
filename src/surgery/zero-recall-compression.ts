@@ -136,6 +136,15 @@ export function transformZeroRecallCompression(
   }
 
 
+  // Never leave a raw result whose matching use was deleted with a memory.
+  const keptUses = new Set(kept.flatMap(m => m.content.flatMap(b => b.type === 'tool_use' ? [b.id] : [])));
+  const removedUses = new Set(messages.filter(m => !kept.includes(m))
+    .flatMap(m => m.content.flatMap(b => b.type === 'tool_use' ? [b.id] : [])));
+  if (kept.some(m => m.content.some(b => b.type === 'tool_result'
+    && removedUses.has(b.toolUseId) && !keptUses.has(b.toolUseId)))) {
+    throw new Error('Tool pair crosses recall deletion boundary; refusing zero-recall surgery');
+  }
+
   const originalJson = JSON.stringify(messages);
   const transformedJson = JSON.stringify(kept);
   return {

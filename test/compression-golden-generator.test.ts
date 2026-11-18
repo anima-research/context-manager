@@ -293,3 +293,21 @@ it('generator rebuilds separate producer scenarios, ignoring stale producer dist
     });
   });
 });
+
+it('generator refuses a symlink blob materialized as an ordinary file', () => {
+  fixture((root, git) => {
+    // Simulate core.symlinks=false without requiring OS symlink privileges.
+    writeFileSync(join(root, 'src/link.ts'), 'product.ts');
+    git('add', 'src/link.ts');
+    const blob = git('rev-parse', ':src/link.ts');
+    git('update-index', '--cacheinfo', '120000,' + blob + ',src/link.ts');
+    git('-c', 'user.name=Synthetic Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'tracked symlink');
+    git('config', 'core.symlinks', 'false');
+    assert.equal(git('status', '--porcelain'), '', 'Git treats the emulated symlink as clean');
+    const result = capture(root);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Refusing dirty source worktree/);
+    assert.match(result.stderr, /src\/link.ts/);
+  });
+});
