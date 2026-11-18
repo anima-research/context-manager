@@ -900,7 +900,7 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  it('enriches emission-stage failures as well as picker-stage failures', async () => {
+  it('enriches emission-stage failures as well as picker-stage failures', async (t) => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -918,7 +918,11 @@ describe('OverBudgetError diagnostics', () => {
       strategy.seedPyramid([id], 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      const select = t.mock.method(strategy, 'select');
       const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 })!;
+      const previewError = select.mock.calls[0]?.error;
+      assert.ok(previewError instanceof OverBudgetError);
+      assert.match(previewError.message, /^Emission overran the plan/);
       assert.equal(preview.fits, false);
       assert.equal(preview.exhausted, true, 'a late non-stub refusal overrides the fitting plan\'s false flag');
       for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {

@@ -15779,8 +15779,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const calibration = this._calibrationProvisional !== null
             ? `under provisional calibration (multiplier ${this._calibration}), ` : '';
           const plan =
-            calibration + `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
-            `${Math.floor(prodBudget * (1 - slack))}, and no production was requested`;
+            calibration + `the solver's plan for it is ${shadowResult.finalTokens} tokens, and no production was requested`;
           const boundStatus = shadowResult.finalTokens > prodLine ? 'exceeds' : 'is within';
           this.diag.warn(
             `autobio: production target ${prodBudget}: ${plan}; this plan ${boundStatus} the ` +

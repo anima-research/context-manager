@@ -44,6 +44,10 @@
   retry at multiplier 1. If that retry fits and passes the remaining gates,
   the dry compile returns normally; otherwise it throws. Without an eligible
   retry, an over-budget first plan throws immediately.
+  If a live compile falls back to taking summaries across windows after its
+  dry leave probe fails the plan check, the fallback warning now includes
+  the bounded `OverBudgetError: Adaptive plan check (...)` text in place of
+  the fixed "its plan is over the budget" explanation.
   Hosts using adaptive `compile(budget, injections, { dryRun: true })` must now catch
   `OverBudgetError`, or use `previewContext` to inspect infeasibility via
   `fits: false` rather than consuming entries from a refused plan.

@@ -243,7 +243,7 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.ok(compiled.messages.length > 0, 'live compile must still succeed');
     const line = warnings.find((w) => w.includes('production target 100:'));
     assert.ok(line, `expected a shadow warning, got: ${JSON.stringify(warnings)}`);
-    assert.match(line, /over its soft target of \d+, and no production was requested/);
+    assert.match(line, /plan for it is \d+ tokens, and no production was requested/);
     assert.match(line, /this plan exceeds the 102-token rejection bound/);
     await assert.rejects(manager.compile({ maxTokens: 300, reserveForResponse: 200 }),
       (err: unknown) => err instanceof OverBudgetError && /^Head\/tail reservation exceeded budget/.test(err.message));
