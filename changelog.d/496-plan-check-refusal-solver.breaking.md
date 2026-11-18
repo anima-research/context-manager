@@ -1,6 +1,10 @@
 - **Hosts matching adaptive refusal messages, using dry compiles, or rendering
   previews:** update message matches from "Adaptive picker exhausted" to
-  "Adaptive plan check (solver)" (#496).
+  the stable prefix `"Adaptive plan check ("` (#496), for example with
+  `error.message.startsWith("Adaptive plan check (")`. The parentheses
+  contain the actual solver name, not the literal word `solver`. Prefer
+  `instanceof OverBudgetError` and `diagnostics.solver !== undefined`
+  to recognise this refusal without parsing its message.
   The refusal now says which solver planned, and no longer says the picker
   was exhausted when it wasn't. That refusal tests the plan's size against the hard budget, not
   the solver's `exhausted`, but its message opened "Adaptive picker
@@ -29,8 +33,10 @@
   diagnostic are as they were, as are the messages and diagnostics of every
   other refusal, which leave the three fields out.
   Ordinary dry-run compilation now takes the same plan gates as live
-  compilation and throws when its first plan exceeds the hard budget,
-  including after a provisional calibration retry drops the multiplier to 1.
+  compilation: an over-budget first plan can trigger a provisional-calibration
+  retry at multiplier 1. If that retry fits and passes the remaining gates,
+  the dry compile returns normally; otherwise it throws. Without an eligible
+  retry, an over-budget first plan throws immediately.
   Hosts using `compile(..., { dryRun: true })` must now catch
   `OverBudgetError`, or use `previewContext` to inspect infeasibility via
   `fits: false` rather than consuming entries from a refused plan.

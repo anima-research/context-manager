@@ -570,7 +570,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     }
   });
 
-  it('makes room for the stubs with one more select, pricing the stubs that select sends', async () => {
+  it('makes room for the stubs with one more select, pricing the stubs that select sends', async (t) => {
     const { cm } = await seededAt('stub-room', 1, {}, 60, true);
     for (let i = 0; i < 20; i++) {
       cm.addMessage('Claude', [{ type: 'text', text: `Looking ${i}.` }, { type: 'tool_use', id: `o${i}`, name: 'look', input: { at: i } }] as ContentBlock[]);
@@ -590,6 +590,22 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
     assert.ok(after.length < before.length, `it folded away some unanswered calls (${after.length} of ${before.length} stubs)`);
     assert.equal(room.renderStats!.request!.stubTokens, price, 'and the stubs it sends are priced, not the first select\'s');
     assert.ok(requestTokens(room.renderStats!) + price <= top, `the request with them, ${requestTokens(room.renderStats!) + price}, is within ${top}`);
+    const picks: Array<ReturnType<Picker['run']>> = [];
+    const originalRun = Picker.prototype.run;
+    t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = originalRun.call(this, inputs, budget);
+      // Opposite flags make stale first-pick reporting observable even if
+      // both plans happen to use the same resolutions.
+      const pick = { ...result, exhausted: picks.length === 0 };
+      picks.push(pick);
+      return pick;
+    });
+    const preview = cm.previewContext(BUDGET, undefined, { requestOverhead: OVERHEAD, requestLimitTokens: top })!;
+    assert.equal(picks.length, 2, 'preview also retries with room reserved for stubs');
+    assert.equal(preview.fits, true);
+    assert.equal(preview.exhausted, false, 'reports the successful retry, not the first pick');
+    assert.equal(preview.finalTokens, picks[1].finalTokens);
+    assert.deepEqual(preview.resolutions, Object.fromEntries(picks[1].finalResolutions));
     cm.close();
   });
 

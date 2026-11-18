@@ -581,6 +581,9 @@ describe('OverBudgetError diagnostics', () => {
           assert.doesNotMatch(error.message, /deepest planned level/);
         } else {
           assert.match(error.message, /^Hierarchical emission overran the budget/);
+          for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
+            assert.equal(Reflect.has(error.diagnostics, field), false, field);
+          }
           assert.match(error.message, /attempted representation level=L0/);
         }
       });
@@ -1311,8 +1314,10 @@ describe('OverBudgetError.clearedBy', () => {
         // Dry compilation takes the same plan gate; preview converts the
         // refusal into the recorded plan's report.
         await assert.rejects(manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, { dryRun: true }), /Adaptive plan check/);
-        const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
+        const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 }, undefined, { render: true });
         assert.ok(preview);
+        assert.equal(Reflect.has(preview, 'entries'), false);
+        assert.equal(Reflect.has(preview, 'stats'), false);
         assert.equal(preview.fits, false);
         assert.equal(preview.finalTokens, 10_000, 'the preview is the plan\'s, not a later refusal\'s');
         assert.equal(preview.exhausted, false, 'an over-budget plan retains the solver flag');
@@ -1325,7 +1330,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  it('keeps the plan\'s list and numbers before a later structural refusal', async () => {
+  it('refuses an overstated plan before structural repair', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -1338,8 +1343,8 @@ describe('OverBudgetError.clearedBy', () => {
     strategy.produce = true;
     await withManager(strategy, async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'message ' + 'word '.repeat(10) }]);
-      // An unanswered call is the newest turn; the structural repair trims it
-      // and then refuses, naming nothing.
+      // An unanswered call is the newest turn; structural repair would trim
+      // it and refuse, but the overstated plan must stop at the earlier gate.
       manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
       strategy.startCompressing();
       const dry = await refusal(manager, { dryRun: true });
