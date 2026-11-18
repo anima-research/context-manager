@@ -15,6 +15,8 @@ import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
+import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import { JsStore } from '@animalabs/chronicle';
 
 const dir = mkdtempSync(join(tmpdir(), 'calibration-band-'));
@@ -929,7 +931,7 @@ describe('estimator calibration band', () => {
     }
   });
 
-  it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async () => {
+  it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async (t) => {
     // The picker's over-budget throw is dry-run-guarded (a preview reports
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
@@ -998,7 +1000,18 @@ describe('estimator calibration band', () => {
     first.internals.store!.setStateJson(first.internals.calibrationStateId, unstamped);
     first.cm.close();
     const reopened = await openSharded('picker', false);
+    const originalRun = Picker.prototype.run;
+    const flags: boolean[] = [];
+    const runs = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = originalRun.call(this, inputs, budget);
+      const exhausted = flags.length === 0;
+      flags.push(exhausted);
+      return { ...result, exhausted };
+    });
     const dry = await calibrationWarnings(async () => reopened.cm.previewContext(tight, undefined, { render: true })!);
+    assert.deepEqual(flags, [true, false], 'discarded provisional pick, then fitting retry');
+    assert.equal(dry.result.exhausted, false, 'the retry owns the preview flag');
+    runs.mock.restore();
     assert.equal(dry.result.fits, true, 'the preview says what the real compile will do');
     assert.deepEqual([dry.result.stats!.calibration!.multiplier, dry.result.stats!.calibration!.reset?.discardedMultiplier], [1, 1.45]);
     assert.deepEqual(dry.lines, []);

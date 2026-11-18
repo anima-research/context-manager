@@ -1,6 +1,7 @@
-- **The refusal of an adaptive plan over the budget says which solver
-  planned, and no longer says the picker was exhausted when it wasn't**
-  (#496). That refusal tests the plan's size against the hard budget, not
+- **Hosts matching the adaptive refusal's opening words:** update matches
+  from "Adaptive picker exhausted" to "Adaptive plan check (solver)" (#496).
+  The refusal now says which solver planned, and no longer says the picker
+  was exhausted when it wasn't. That refusal tests the plan's size against the hard budget, not
   the solver's `exhausted`, but its message opened "Adaptive picker
   exhausted" regardless of the picker's exhaustion flag. It now opens, for example,
   "Adaptive plan check (kv-unified): N tokens exceed hard budget M (head=…"
@@ -26,3 +27,6 @@
   OverBudgetError`, `budget`, `actual`, `clearedBy` and every other
   diagnostic are as they were, as are the messages and diagnostics of every
   other refusal, which leave the three fields out.
+  A preview whose stub-room retry plan exceeds its reduced budget now
+  reports the original stub refusal and its fitting plan's exhaustion flag,
+  just as a live compile discards that retry.

@@ -15836,7 +15836,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // refusal so it takes the same fallback, and its preview says what the
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    if (!planFits && (!dryRun || dryFallback)) {
+    // A stub-room retry must take the live plan gate too: withRoomForStubs
+    // discards a retry that cannot fit and restores the first stub refusal's
+    // preview. Letting a dry retry emit could instead leave its over-budget
+    // plan in _lastPreview, even if the emitter prices below the picker.
+    const stubRoomRetry = this.selectPricing?.stubReserve !== undefined;
+    if (!planFits && (!dryRun || dryFallback || stubRoomRetry)) {
       // The plan's middle is what's over, priced as the plan priced it, so
       // the pins keeping raw tokens there are named. The refusals after the
       // plan count other things (an emitted prefix, a shard's text alone)

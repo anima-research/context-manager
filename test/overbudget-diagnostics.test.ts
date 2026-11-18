@@ -855,6 +855,7 @@ describe('OverBudgetError diagnostics', () => {
       autoTickOnNewMessage: false,
       speculativeProduction: false,
     });
+    strategy.exhausted = false;
     strategy.drift = true;
     strategy.level = 5;
     await withManager(strategy, async (manager) => {
@@ -863,6 +864,9 @@ describe('OverBudgetError diagnostics', () => {
       strategy.seedPyramid([id], 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 })!;
+      assert.equal(preview.fits, false);
+      assert.equal(preview.exhausted, true, 'a late non-stub refusal overrides the fitting plan\'s false flag');
       for (const field of ['solver', 'pickerExhausted', 'labelCeilingFallback']) {
         assert.equal(Reflect.has(error.diagnostics, field), false, field);
       }
@@ -1292,6 +1296,7 @@ describe('OverBudgetError.clearedBy', () => {
         speculativeProduction: false,
       });
       strategy.overstate = true;
+      strategy.exhausted = false;
       strategy.produce = true;
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 2; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(10) }]);
@@ -1304,6 +1309,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.ok(preview);
         assert.equal(preview.fits, false);
         assert.equal(preview.finalTokens, 10_000, 'the preview is the plan\'s, not a later refusal\'s');
+        assert.equal(preview.exhausted, false, 'an over-budget plan retains the solver flag');
         assert.deepEqual(preview.clearedBy, running ? ['compression'] : []);
         // The live compile refuses the same plan at the picker's gate, with the same list.
         const live = await refusal(manager);
