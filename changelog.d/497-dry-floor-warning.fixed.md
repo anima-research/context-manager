@@ -1,0 +1,1 @@
+- Dry selects restore floor-warning suppression state, so previews neither silence a later live warning nor re-enable a suppressed one.

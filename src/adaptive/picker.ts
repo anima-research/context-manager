@@ -505,8 +505,9 @@ export interface PickerResult {
   /** Solver-owned exhaustion (see FoldingSolution.exhausted): greedy =
    *  above soft target with nothing left to fold/produce; kv-stable = even
    *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
-   *  kv-unified = realizable frontier infeasible at the hard budget, even
-   *  when missing summaries are requested. Not proof compression cannot help.
+   *  kv-unified = realizable frontier infeasible at pre-grace totalBudget,
+   *  even when missing summaries are requested; this can still fit the
+   *  grace-expanded hard rejection budget. Not proof compression cannot help.
    *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
   /** Number of chunks whose resolution changed from the `currentResolution`

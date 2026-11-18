@@ -15209,6 +15209,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store, { dryRun });
+    // kv-unified solves against pre-grace totalBudget: exhaustion need not
+    // mean the plan exceeds the grace-expanded rejectionBudget below.
     const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
     const room = budget.maxTokens - budget.reserveForResponse;
     const { maxTokens, rejectionBudget } = this.boundsUnderRequestLimit(
@@ -22740,6 +22742,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       orphanWarned: this._orphanWarned,
       prevCacheKeys: this._prevCacheKeys,
       lastFrontierTokens: this.lastFrontierTokens,
+      floorFailure: this.floorFailure,
       transitionBlocked: this.transitionBlocked,
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
@@ -22772,6 +22775,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._orphanWarned = saved.orphanWarned;
       this._prevCacheKeys = saved.prevCacheKeys;
       this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.floorFailure = saved.floorFailure;
       this.transitionBlocked = saved.transitionBlocked;
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;

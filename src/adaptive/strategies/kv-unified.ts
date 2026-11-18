@@ -184,6 +184,8 @@ export class KvUnifiedStrategy implements FoldingSolver {
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
     const penalty = changePenaltyOf(this.options);
     const options = {
+      // Feasibility (and exhaustion) uses the pre-grace solve budget, not
+      // the compile's grace-expanded hard rejection bound.
       ...this.options, maxTokens: budget.totalBudget,
       // The same for every cut outside the carried family, so it is the
       // tolerance the carried layout is kept within.

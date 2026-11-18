@@ -506,7 +506,8 @@ The adaptive plan-check refusal names the solver in its message and exposes
 `solver`, `pickerExhausted`, and `labelCeilingFallback` diagnostics. The
 picker's normalized exhaustion flag uses `FoldingSolution.exhausted` when
 supplied, preserving solver-specific semantics (for example, kv-unified
-reports an infeasible frontier); otherwise it is derived as no production
+reports a frontier infeasible at the pre-grace `FoldingBudget.totalBudget`,
+not necessarily at the grace-expanded hard rejection budget); otherwise it is derived as no production
 requests and applied tokens above the soft target. It does not generally
 mean nothing remains to fold, nor does it trigger this refusal. The message
 labels it `exhausted`, without claiming a provenance for the normalized value.

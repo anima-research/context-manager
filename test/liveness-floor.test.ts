@@ -28,6 +28,7 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import { Picker } from '../src/adaptive/picker.js';
 import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -407,6 +408,42 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
       floor.restore();
     }
     reader.manager.close();
+  });
+
+  it('restores floor-warning suppression after fitting and refused dry selects', async (t) => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const forest = CanonicalSummaryForest.prototype;
+    const minimumTokens = forest.minimumTokens;
+    const breakIt = () => { forest.minimumTokens = () => { throw new Error('dry floor failure'); }; };
+    const floor = collectFloorWarnings();
+    try {
+      breakIt();
+      await reader.manager.compile(budget, undefined, { dryRun: true });
+      assert.strictEqual(floor.warnings.length, 1, 'the dry failure is reported');
+      const run = Picker.prototype.run;
+      const pick = t.mock.method(Picker.prototype, 'run', function (this: Picker, ...args: Parameters<Picker['run']>) {
+        return { ...run.apply(this, args), finalTokens: budget.maxTokens * 2 };
+      });
+      const preview = reader.manager.previewContext(budget)!;
+      pick.mock.restore();
+      assert.strictEqual(preview.fits, false, 'premise: a refused dry select');
+      assert.strictEqual(floor.warnings.length, 2, 'the fitting dry select did not suppress the refused one');
+      await reader.manager.compile(budget);
+      assert.strictEqual(floor.warnings.length, 3, 'neither dry select suppresses the live warning');
+      forest.minimumTokens = minimumTokens;
+      const recovered = await reader.manager.compile(budget, undefined, { dryRun: true });
+      assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined, 'premise: the dry floor succeeded');
+      breakIt();
+      await reader.manager.compile(budget);
+      assert.strictEqual(floor.warnings.length, 3, 'a successful dry floor does not clear the live suppression');
+    } finally {
+      forest.minimumTokens = minimumTokens;
+      floor.restore();
+      reader.manager.close();
+    }
   });
 
   it('says once that a floor whose computation fails is missing, again when it recurs or the store is opened again, and the compile goes on', async () => {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { ContextEntry, ContextInjection, ContextLogView, MessageStoreView, RenderStats, SelectOptions, StoredMessage, TokenBudget } from '../src/types/index.js';
-import type { RequestOverhead } from '../src/index.js';
+import type { RequestOverhead, OverBudgetError } from '../src/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy, jsonTokenEstimator } from '../src/index.js';
@@ -486,6 +486,7 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       const open = await cm.compile(budget, undefined, { requestOverhead: OVERHEAD, dryRun: true });
       const options = { requestOverhead: OVERHEAD, requestLimitTokens: requestTokens(open.renderStats!) };
       let attempt = 0;
+      let forceFirstOver = false;
       const emitter = strategy as unknown as { estimateTokens(content: ContentBlock[]): number };
       const originalEstimate = emitter.estimateTokens;
       t.mock.method(emitter, 'estimateTokens', (content: ContentBlock[]) => {
@@ -496,10 +497,20 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
         const result = originalRun.call(this, inputs, budget);
         attempt++;
-        // The first plan is over, though its emitter reaches a stub refusal.
-        // If allowed to retry, the second plan and discounted emission fit.
-        return { ...result, finalTokens: attempt === 1 ? budget.totalBudget + 1 : 1, exhausted: false };
+        // With forceFirstOver, the first plan is over. The control below
+        // proves its emission would otherwise refuse for stubs and retry
+        // into a fitting second plan with discounted emission.
+        return { ...result, finalTokens: forceFirstOver && attempt === 1 ? budget.totalBudget + 1 : 1, exhausted: false };
       });
+      assert.equal(open.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result' &&
+        (b as { toolUseId: string }).toolUseId === 'x1').length, 1, 'premise: the fixture emits a stub');
+      const control = await cm.compile(budget, undefined, { ...options, dryRun: true });
+      assert.equal(attempt, 2, 'premise: a fitting first plan triggers a stub-room retry');
+      assert.ok(control.renderStats!.request!.stubTokens! > 0, 'the fitting retry still emits stubs');
+      assert.ok(requestTokens(control.renderStats!) + control.renderStats!.request!.stubTokens! <= options.requestLimitTokens,
+        'premise: the discounted retry fits including stubs');
+      attempt = 0;
+      forceFirstOver = true;
       const preview = cm.previewContext(budget, undefined, options)!;
       assert.equal(preview.fits, false, 'the first plan refuses before stub-room retry');
       assert.equal(attempt, 1);
@@ -544,6 +555,15 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
         attempts.push({ budget: budget.totalBudget, tokens: finalTokens, exhausted: retry });
         return { ...result, finalTokens, exhausted: retry };
       });
+      const planGateStages: string[] = [];
+      const refusals = strategy as unknown as {
+        overBudgetError(budget: TokenBudget, details: { stage: string }): OverBudgetError;
+      };
+      const originalRefusal = refusals.overBudgetError;
+      t.mock.method(refusals, 'overBudgetError', function (budget: TokenBudget, details: { stage: string }) {
+        if (details.stage.startsWith('Adaptive plan check')) planGateStages.push(details.stage);
+        return originalRefusal.call(strategy, budget, details);
+      });
       const options = { requestOverhead: OVERHEAD, requestLimitTokens: limit };
       await assert.rejects(cm.compile(budget, undefined, options), (error: Error) => {
         assert.match(error.message, /^The tool-result stubs the pairing repair added/);
@@ -554,13 +574,15 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
         }
         return true;
       });
-      assert.equal(attempts.length, 2, 'the live retry reached the plan gate');
+      assert.equal(attempts.length, 2, 'the live select retried');
+      assert.equal(planGateStages.length, 1, 'the live retry refused at the plan gate, not emission');
       assert.ok(attempts[0].tokens <= attempts[0].budget, 'first plan fits');
       assert.ok(attempts[1].tokens > attempts[1].budget, 'retry plan does not');
       assert.ok(attempts[1].budget < attempts[0].budget, 'retry reserves stub room');
       discountEmission = false;
       const preview = cm.previewContext(budget, undefined, options)!;
       assert.equal(attempts.length, 4, 'preview follows the same retry');
+      assert.equal(planGateStages.length, 2, 'the dry retry also refused at the plan gate, not emission');
       assert.equal(preview.fits, false);
       assert.equal(preview.exhausted, false, 'the first fitting plan, not the discarded retry');
       assert.equal(preview.requestLimitTokens, limit, 'reports the original stub refusal, not an over-budget retry plan');
