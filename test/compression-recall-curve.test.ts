@@ -4228,6 +4228,7 @@ describe('tool-prose hoist admission', () => {
     const failureSnapshot = (fx: Fixture) => [...failureRuns(fx)].map(([subject, entry]) => ({
       subject, ...entry, run: { ...entry.run, domain: entry.run.domain.split('\u0000').slice(1).join('\u0000') },
     }));
+    const admissionDecisionChecks = new WeakMap<Fixture, () => number>();
     async function seedFailureRun(fx: Fixture, membrane: ReturnType<typeof flexibleMembrane>['membrane'], kind?: Kind) {
       const seam = membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
       const complete = seam.complete;
@@ -4246,16 +4247,34 @@ describe('tool-prose hoist admission', () => {
       } finally { seam.complete = complete; }
       if (kind) {
         const strategy = fx.strategy as unknown as {
+          compressionAdmission(...args: unknown[]): { disposition: string };
+          compressionResponseStopReason(...args: unknown[]): unknown;
           prepareCompressionCandidate(request: NormalizedRequest, curveLabel: string): NormalizedRequest;
         };
         const prepare = strategy.prepareCompressionCandidate;
         strategy.prepareCompressionCandidate = function (request, curveLabel) {
-          if (curveLabel === label(kind)) {
-            assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
-              'the gated rung still has its open failure history after canonical answers');
-          }
+          if (curveLabel === label(kind)) assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
+            'the gated rung still has its open history at preparation');
           return prepare.call(this, request, curveLabel);
         };
+        const admission = strategy.compressionAdmission;
+        let decisions = 0;
+        let answered = false;
+        const inspect = strategy.compressionResponseStopReason;
+        strategy.compressionResponseStopReason = function (...args) {
+          answered = true;
+          return inspect.apply(this, args);
+        };
+        strategy.compressionAdmission = function (...args) {
+          const result = admission.apply(this, args);
+          if (answered && result.disposition === 'admission_rejected') {
+            decisions++;
+            assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
+              'admission rejection preserves the gated rung history at the decision');
+          }
+          return result;
+        };
+        admissionDecisionChecks.set(fx, () => decisions);
       }
     }
 
@@ -4563,26 +4582,6 @@ describe('tool-prose hoist admission', () => {
       } finally { fx.manager.close(); }
     });
 
-    it('an answered rung ends its old provider streak before a throwing resume warning', async () => {
-      const mock = flexibleMembrane([{ stop: 'end_turn', text: 'memory' }]);
-      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
-      const local = new Error('local resume warning failed');
-      const seam = fx.strategy as unknown as {
-        resumeCompressionLane(): void;
-        noteCompressionLanded(membrane: unknown, model: string): void;
-      };
-      try {
-        await seedFailureRun(fx, mock.membrane);
-        for (const entry of failureRuns(fx).values()) entry.run.failures = 7;
-        seam.noteCompressionLanded(mock.membrane, MODEL);
-        seam.resumeCompressionLane = () => { throw local; };
-        await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === local);
-        assert.equal(mock.calls.length, 1, 'the provider answered, no fallback was spent');
-        assert.equal(failureRuns(fx).size, 1);
-        assert.equal([...failureRuns(fx).values()][0]!.run.failures, 1, 'local failure starts a fresh run');
-        assert.equal(quarantineEvents(fx.manager).filter(e => e.kind === 'exhausted').length, 0);
-      } finally { fx.manager.close(); }
-    });
 
     for (const kind of kinds) it(`${kind} preserves interrupted gated failure history across logging modes`, async () => {
       const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
@@ -4747,6 +4746,10 @@ describe('tool-prose hoist admission', () => {
                   const outcome = exhaustedOutcomes(a).find(o => o.curveLabel === label(kind));
                   assert.equal(outcome?.outcome, scenario === 'provider-rejected' ? 'provider_error' : 'admission_rejected',
                     `${kind}: the control exercises ${scenario}`);
+                }
+                if (scenario === 'admission-rejected') {
+                  assert.ok(admissionDecisionChecks.get(a)!() > 0, 'control inspected the rejected admission');
+                  assert.ok(admissionDecisionChecks.get(b)!() > 0, 'probe inspected the rejected admission');
                 }
                 assert.equal(b.target.compressed, a.target.compressed);
                 assert.deepEqual(probe.calls, control.calls);

@@ -1025,7 +1025,69 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
-  it('a fresh carrier rejection ends the old run before a progress write fails', async () => {
+  for (const logging of [false, true]) for (const success of [false, true]) {
+    it(`receipt getters cannot replace compression result: logging=${logging}, success=${success}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const original = failure('server');
+      let dispatched: NormalizedRequest | undefined;
+      const poison = () => Object.defineProperty(dispatched!.messages[0]!, 'content', {
+        get() { throw new Error('receipt content getter failed'); },
+      });
+      const membrane = { complete: async (request: NormalizedRequest) => {
+        dispatched = request;
+        if (!success) { poison(); throw original; }
+        return OK('persisted memory');
+      } };
+      const fx = await build(membrane);
+      const seam = fx.strategy as unknown as { noteCompressionLanded(...args: unknown[]): void };
+      const land = seam.noteCompressionLanded;
+      seam.noteCompressionLanded = function (...args) { land.apply(this, args); poison(); };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        if (success) {
+          await fx.strategy.run(fx.target(), managerContext(fx.manager));
+          assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted memory'));
+        } else await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === original);
+      } finally {
+        seam.noteCompressionLanded = land;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
+  it('main reset-order regression: repeated successful unstripped answers with failing resume warnings', async () => {
+    const mock = scripted([OK('memory')]);
+    const fx = await build(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    const local = new Error('local resumed warning sink failed');
+    const counts: number[] = [];
+    try {
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after')) throw local;
+        warn.apply(seam.diag, args);
+      };
+      for (let i = 1; i <= 7; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === local);
+        counts.push(l1RunsOf(fx.strategy)[0]!.failures);
+      }
+      assert.deepEqual(counts, [1, 2, 3, 4, 5, 6, 7], 'same failure-run counts as main, not repeated ones');
+      fx.strategy.land(mock.membrane);
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(mock.calls.length, 8, 'one paid unstripped call per failure, then the persistent bound');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1);
+      assert.ok(JSON.stringify(progressSlot(fx.manager)).includes('persistent-') ||
+        JSON.stringify(fx.strategy.getCompressionQuarantineStatus()).includes('persistent-'));
+      assert.deepEqual(l1RunsOf(fx.strategy), [], 'the persistent decision ends the run');
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
+
+  it('a fresh carrier rejection preserves the old run when its progress write fails', async () => {
     const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
       type: 'invalid_request', retryable: false, httpStatus: 400,
     });
@@ -1037,7 +1099,7 @@ describe('every rung keeps its own identity across a resume', () => {
     let writeHits = 0;
     try {
       await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-      l1RunsOf(fx.strategy)[0]!.failures = 7;
+      l1RunsOf(fx.strategy)[0]!.failures = 3;
       fx.strategy.land(mock.membrane);
       seam.recordCompressionFamilyProgress = function (...args) {
         if (writeHits++ === 0) throw localError;
@@ -1046,7 +1108,7 @@ describe('every rung keeps its own identity across a resume', () => {
       await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
       assert.ok(writeHits > 0);
       assert.equal(mock.calls.length, 2, 'no stripped call after the local write failure');
-      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 1, 'the local write starts a fresh run');
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 4, 'as on main, the local write extends the shared run');
       assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
     } finally { seam.recordCompressionFamilyProgress = write; fx.manager.close(); }
   });
@@ -1491,7 +1553,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('an answered merge ends its old run before a resume warning fails', async () => {
+  it('an answered merge preserves its old run when a resume warning fails', async () => {
     const mock = scripted([{ throw: failure('server') }, OK('merged memory')]);
     const fx = await queued(mock.membrane, { config: { hierarchical: true } });
     const ids = fx.manager.queryMessages({}).messages.map(m => m.id);
@@ -1516,14 +1578,14 @@ describe('compression lane: failures are evidence only by the company they keep'
       }
       assert.equal(mock.calls.length, 1);
       assert.equal(seam.mergeFailureRuns.size, 1);
-      [...seam.mergeFailureRuns.values()][0]!.failures = 7;
+      [...seam.mergeFailureRuns.values()][0]!.failures = 3;
       fx.strategy.land(mock.membrane);
       fx.strategy.expirePause();
       seam.resumeCompressionLane = () => { resumeHits++; throw localError; };
       await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), error => error === localError);
       assert.equal(resumeHits, 1);
       assert.equal(mock.calls.length, 2);
-      assert.equal([...seam.mergeFailureRuns.values()][0]?.failures, 1, 'local resume error starts a fresh run');
+      assert.equal([...seam.mergeFailureRuns.values()][0]?.failures, 4, 'as on main, local resume error extends the shared run');
       assert.equal(laneOf(fx.strategy).mergeQueue.length, 1, 'merge stays queued, not persistently rejected');
       assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
     } finally { seam.resumeCompressionLane = resume; fx.manager.close(); }

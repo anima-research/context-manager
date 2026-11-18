@@ -12102,11 +12102,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // The carrier call has been classified. Fallback setup/progress
           // failures are local, not failures of that dispatched request.
           failedAttempt = undefined;
-          // A reused rejection may come from a sibling strategy, leaving this
-          // instance's old carrier-provider run open. End it before local errors
-          // can extend it. This also restarts post-answer local-error runs: they
-          // share this key, so preserving them would require a distinct identity.
-          this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           if (!known) {
             noteOutcome({
               curveLabel: carrierLabel,
@@ -12115,6 +12110,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
           }
+          // Preserve main's reset boundary: the carrier progress write above
+          // must succeed before this shared local/provider run is ended.
+          this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -12123,7 +12121,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:carrier-transport-fallback',
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
           failedAttempt = undefined;
@@ -12141,11 +12139,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (response && typeof response === 'object') countedStripped.add(response);
         }
         failedAttempt = undefined;
-        // End this call's provider run before resuming. For split parts this
-        // is the part key, not the enclosing split-stitch rung's failure key;
-        // that run ends only after the whole fold completes.
-        this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
+        // As on main, a local resume failure precedes the shared run reset.
+        // Split parts end only their own key, not the enclosing stitch rung.
         this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
+        this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
@@ -12268,7 +12265,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           plan: quarantineRecord.plan,
           outcomes: familyRecord,
         },
-      }, this.ns);
+      }, this.ns, quarantineRecord.chunkSourceHash);
       /**
        * What either exhaustion exit does once the family's exhaustion is
        * decided: a span a row left while the ledger's lock was awaited is
@@ -12412,7 +12409,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt-reused',
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel, requestHash, outcome: known.outcome },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           // Another ladder's answer, perhaps another process's, decided the
           // rung: a run this process opened on it before then ends here.
           endRungRuns(curveLabel);
@@ -12660,7 +12657,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               : 'compression:canonical-incomplete',
           operation: 'compress_l1',
           metadata: canonicalMetadata,
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
         let fallbackResponse: NormalizedResponse | undefined;
 
         // One bounded attempt of a tool-prose-hoisted request. Same receipts
@@ -13001,7 +12998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt-reused',
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel: 'split-stitch', requestHash: splitLeafHash, outcome: knownSplit.outcome },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
         } else if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
           const leafHash = splitLeafHash;
           const textOf = (m: { content: ContentBlock[] }): string =>
@@ -13273,7 +13270,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
             };
             this.diag.error(`[autobiographical] split-stitch fold stitched for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
-            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } }, this.ns);
+            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } }, this.ns, quarantineRecord.chunkSourceHash);
           } else {
             const reason = abortReason ?? 'refused';
             // A provider error, a piece's rejection or the rung's decision,
@@ -13289,7 +13286,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             };
             noteOutcome(splitOutcome);
             this.diag.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
-            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns);
+            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns, quarantineRecord.chunkSourceHash);
           }
         }
         if (!fallbackResponse) {
@@ -13555,7 +13552,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: 'compress_l1',
           metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length, summary_id: entry.id },
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
       }
       this._compressionCount++;
       logSummaryId = entry.id;
@@ -13574,7 +13571,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           event: 'compression:curve-succeeded',
           operation: 'compress_l1',
           metadata: successfulTrace,
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
       }
 
       // The summary is written. A strategy let go of, or loaded again, while
@@ -13642,9 +13639,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             model,
             ...trace,
           },
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
       }
-      logCompressionCall({
+      withCompressionLog(() => logCompressionCall({
         operation: 'compress_l1',
         // The DISPATCHED bytes, read off the request object — deliberately
         // NOT ctx.systemPrompt again. This finally runs after an awaited
@@ -13678,7 +13675,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
-      }, this.ns);
+      }, this.ns, quarantineRecord.chunkSourceHash), this.ns,
+        `compression receipt diagnostic failed: chunk=${quarantineRecord.chunkSourceHash}`);
     }
   }
 
@@ -14666,10 +14664,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Any answer from the provider ends its route's pause and backoff,
       // whatever the disposition gate below makes of it (a refusal included),
       // and on whatever branch: the pause is the route's, not the branch's.
-      // End the answered request's run before a local resume warning can throw.
-      if (this.isCompressionBranchCurrent(sourceBranch)) {
-        this.mergeFailureRuns.delete(mergeFailureKey({ level: targetLevel, sourceIds }));
-      }
       this.resumeCompressionLane(ctx.membrane, this.compressionRequestModel(acceptedRequest));
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to

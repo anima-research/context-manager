@@ -307,19 +307,14 @@ raw text the fold accepts, not text after summary extraction: empty raw text is 
 text is `success`, including `<thinking>hidden</thinking>` alone when wrapper
 recovery is disabled. That thinking-only part is accepted into the raw fold. This is existing fold behavior, not a change to
 acceptance; the stitched summary is still extracted before persistence.
-Answered calls end only their own provider failure key before lane resume.
-Split parts use part keys, while interrupted split-stitch work uses the rung key;
-that enclosing run ends on whole-fold completion, not on an individual answer.
-Local failures still share provider-run identities. Ending a run on an
-unstripped provider answer, before a carrier progress write or L1 lane resume,
-or on a merge answer before merge resume, can reset repeated local failures.
-For example, if a paused lane's diagnostic sink throws on each resumed warning,
-each successful unstripped answer deletes the run before the warning throws.
-The interrupt then starts the run again at one: even with other compression
-landing between retries, the rung may never be decided and paid calls can
-continue. Separate local/provider retry histories are deferred as a
-retry-accounting change, not a diagnostic correction; this round does not change
-that behavior.
+Failure-run reset ordering matches main: a carrier rejection's progress write
+precedes the unstripped-key reset; L1 lane resume precedes the answered request's
+reset; merge resume precedes the caller's reset on completion. Local failures
+still share provider-run identities, so a throwing resumed-warning sink after
+successful unstripped answers accumulates failures when other compression lands
+between retries and reaches the persistent bound. This diagnostic trace does not
+change that retry accounting. Split parts end only their part keys after resume;
+the enclosing split-stitch run ends on whole-fold completion, not a part's answer.
 Canonical and plain-prose end-turn answers are not success until extraction
 succeeds; extraction errors are logged as `provider_error` / `malformed_content`.
 Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)

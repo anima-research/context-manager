@@ -55,5 +55,7 @@
   fold acceptance or stitching; canonical extraction errors no longer log success.
   Planned-fallback diagnostics use a pre-dispatch scalar snapshot, immune to
   nested mutations shared with a stripped retry.
-- End carrier and merge provider-failure runs before local progress writes or
-  resume warnings can fail, so local errors cannot complete an old provider streak.
+- Preserve main's failure-run reset boundaries: carrier progress writes and L1
+  and merge resume warnings precede their shared local/provider run resets.
+  Local errors can therefore extend an existing streak to its persistent bound;
+  diagnostic tracing does not reset this history early.
