@@ -410,7 +410,7 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
     reader.manager.close();
   });
 
-  it('restores floor-warning suppression after fitting and refused dry selects', async (t) => {
+  it('deduplicates floor warnings across polling previews, dry refusals and live selects', async (t) => {
     const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
     reader.read(24);
     await reader.drain();
@@ -423,6 +423,8 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
       breakIt();
       await reader.manager.compile(budget, undefined, { dryRun: true });
       assert.strictEqual(floor.warnings.length, 1, 'the dry failure is reported');
+      for (let i = 0; i < 5; i++) reader.manager.previewContext(budget);
+      assert.strictEqual(floor.warnings.length, 1, 'polling previews do not repeat the warning');
       const run = Picker.prototype.run;
       const pick = t.mock.method(Picker.prototype, 'run', function (this: Picker, ...args: Parameters<Picker['run']>) {
         return { ...run.apply(this, args), finalTokens: budget.maxTokens * 2 };
@@ -430,15 +432,20 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
       const preview = reader.manager.previewContext(budget)!;
       pick.mock.restore();
       assert.strictEqual(preview.fits, false, 'premise: a refused dry select');
-      assert.strictEqual(floor.warnings.length, 2, 'the fitting dry select did not suppress the refused one');
+      assert.strictEqual(floor.warnings.length, 1, 'a refused preview shares suppression');
       await reader.manager.compile(budget);
-      assert.strictEqual(floor.warnings.length, 3, 'neither dry select suppresses the live warning');
+      assert.strictEqual(floor.warnings.length, 1, 'the live select shares the already reported cause');
       forest.minimumTokens = minimumTokens;
       const recovered = await reader.manager.compile(budget, undefined, { dryRun: true });
       assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined, 'premise: the dry floor succeeded');
       breakIt();
       await reader.manager.compile(budget);
-      assert.strictEqual(floor.warnings.length, 3, 'a successful dry floor does not clear the live suppression');
+      assert.strictEqual(floor.warnings.length, 1, 'a successful dry floor does not clear the live suppression');
+      forest.minimumTokens = () => { throw new Error('a different dry failure'); };
+      reader.manager.previewContext(budget);
+      breakIt();
+      await reader.manager.compile(budget);
+      assert.strictEqual(floor.warnings.length, 2, 'another dry cause cannot clear suppression for the live cause');
     } finally {
       forest.minimumTokens = minimumTokens;
       floor.restore();

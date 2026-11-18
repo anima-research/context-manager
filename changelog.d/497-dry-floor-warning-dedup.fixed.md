@@ -1,0 +1,1 @@
+- Deduplicate missing-floor warnings across polling previews and internal window-rule probes without letting dry-run recovery clear live warning suppression.

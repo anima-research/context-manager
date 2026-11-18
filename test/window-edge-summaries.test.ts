@@ -2,6 +2,7 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError, UncoveredDropError } from '../src/index.js';
+import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { StrategyContext } from '../src/types/strategy.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -422,6 +423,26 @@ describe('a live select with those summaries left out that fails after its dry r
     }
     assert.fail('premise: a compile sends the select with summaries left out');
   }
+
+  it('flat-profile: a fitting leave probe and its live run share floor-warning suppression', async (t) => {
+    const lines = capture(t);
+    const { manager, strategy, budget } = await leaving('flat-profile');
+    const modes: string[] = [];
+    t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+      const state = strategy as unknown as { acrossMode: string; _dryRunSelect: boolean };
+      modes.push(`${state.acrossMode}:${state._dryRunSelect ? 'dry' : 'live'}`);
+      throw new Error('leave probe floor failure');
+    });
+    lines.length = 0;
+    try {
+      await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.ok(modes.includes('leave:dry'), 'premise: the leave probe computed the floor');
+      assert.ok(modes.includes('leave:live'), 'premise: the live leave run computed the floor too');
+      assert.strictEqual(lines.filter((l) => l.includes('floor not computed')).length, 1, 'the probe and live run warn only once');
+    } finally {
+      await manager.close();
+    }
+  });
 
   const refusals = [
     [OverBudgetError, refusal],

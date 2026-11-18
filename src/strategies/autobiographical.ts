@@ -3145,7 +3145,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // itself leaves this load in place until the manager initializes it again
     // (setStrategy(getStrategy())).
     this.namedDroppedQuarantineKeys.clear();
-    this.floorFailure = undefined;
+    this.floorFailures.clear();
     this.namedUnlistedQuarantineState.clear();
     this.compressionDebtFailureLogged = null;
 
@@ -6808,7 +6808,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.noteFloorFailure(`no cut meets the plan's constraints (${floor.certificate.reason}, ${conflicts} conflicting leaves)`);
         return null;
       }
-      this.floorFailure = undefined;
+      // Dry selects may add warning suppression, but only live recovery clears it.
+      if (!this._dryRunSelect) this.floorFailures.clear();
       return floor.floorTokens;
     } catch (error) {
       this.noteFloorFailure(describeCompressionFailure(error));
@@ -6816,13 +6817,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Says once, for a run of compiles whose floor is missing for the same
-   *  cause, why it is, since the report goes missing from each while it
-   *  lasts. Causes that differ only in their numbers or ids count as one. */
+  /** Says once per cause until a live floor succeeds why the report is
+   *  missing. Dry selects share suppression but cannot clear it, so polling
+   *  previews and internal leave probes do not repeat warnings. Causes that
+   *  differ only in their numbers or ids count as one. */
   private noteFloorFailure(cause: string): void {
     const kind = cause.replace(/[0-9a-f]{8,}|\d+/gi, '#');
-    if (kind === this.floorFailure) return;
-    this.floorFailure = kind;
+    if (this.floorFailures.has(kind)) return;
+    this.floorFailures.add(kind);
     this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
   }
 
@@ -10553,8 +10555,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
   /** This select's floor and the budget its plan check refuses above (#415). */
   private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
-  /** The cause of the last floor computation that failed, while it keeps failing (floorTokens). */
-  private floorFailure: string | undefined;
+  /** Causes reported since the last successful live floor computation (floorTokens). */
+  private floorFailures = new Set<string>();
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
@@ -22719,7 +22721,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * What a dry select puts back on every path out (see the dry branch in
    * `select`), saved now: the returned function puts it back. A dry select
    * and `renderAsNewest` share it, so a render leaves what the next compile
-   * reads as it found it.
+   * reads as it found it. Warning suppression is deliberately shared: dry
+   * floor failures add causes, but only a live floor success clears them.
    */
   private saveDryRunState(store: MessageStoreView): () => void {
     const saved = {
@@ -22742,7 +22745,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       orphanWarned: this._orphanWarned,
       prevCacheKeys: this._prevCacheKeys,
       lastFrontierTokens: this.lastFrontierTokens,
-      floorFailure: this.floorFailure,
       transitionBlocked: this.transitionBlocked,
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
@@ -22775,7 +22777,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._orphanWarned = saved.orphanWarned;
       this._prevCacheKeys = saved.prevCacheKeys;
       this.lastFrontierTokens = saved.lastFrontierTokens;
-      this.floorFailure = saved.floorFailure;
       this.transitionBlocked = saved.transitionBlocked;
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
