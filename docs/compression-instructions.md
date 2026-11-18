@@ -55,6 +55,10 @@ was sent). With logging enabled, a deferral, withdrawal, or error ending an oper
 before any dispatch instead emits `compression:no-dispatch` for `compress_l1`, with `dispatched: false`, a
 `reason` of `deferral`, `withdrawal`, or `error`, and a bounded `detail`. It has
 no request, message, system, or response payload and does not claim a send.
+This operation-wide boundary also covers preparation and quarantine-read failures.
+Normal pre-send returns emit one outcome too: `quarantine` for a durable hold,
+`stopped` for overlap or exhausted/held work, or `no-op` for work completed
+without a provider call (including adoption, deduplication, stubs and coalescing).
 Cancellation of an already-out call retains that call's snapshot.
 
 ## Slots and placeholders

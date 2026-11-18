@@ -1358,10 +1358,10 @@ AutobiographicalStrategy.prototype.migrateChunkRecords = function (store) {
         try {
           const surgery = { ...ordinary, key: 'surgery', normalizedConfig: { outcomeNamespace: 'zero-recall-surgery-v1' } };
           store.setStateJson('probe/autobio:compression-refusal-quarantine', [
-            ...(form === 'legacy' ? [surgery] : []), ...(mixed ? [ordinary] : []),
+            ...(form === 'legacy' ? [surgery, ...(mixed ? [ordinary] : [])] : []),
           ]);
           store.setStateJson('probe/autobio:compression-refusal-quarantine-events', form === 'ledger'
-            ? [{ kind: 'exhausted', key: surgery.key, eventId: 'surgery-generation', record: surgery, outcomes: [], created: 1 }] : []);
+            ? [surgery, ...(mixed ? [ordinary] : [])].map(record => ({ kind: 'exhausted', key: record.key, eventId: record.key + '-generation', record, outcomes: [], created: 1 })) : []);
         } finally { store.close(); }
       };
       write(false);

@@ -61,7 +61,7 @@ export async function load(url, context, nextLoad) {
               return { ...result, config: { ...result.config, model: 'tampered' } };
             };
           }
-          if (scenario === 'carrier') {
+          if (scenario === 'carrier' || scenario === 'sdk-carrier') {
             // Exercise the transport's carrier-rejection path with a carrier
             // outside the deleted recalls (ordinary raw thinking is stripped).
             const author = strategy.authorL1CompressionRequest.bind(strategy);
@@ -102,9 +102,9 @@ export async function load(url, context, nextLoad) {
           // Only HTTP is fake: CLI must install the guard and SDK retry policy.
           this.client.fetch = async (_input, init) => {
             appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({sdkRetries:this.client.maxRetries, redirect:init?.redirect}) + '\\n');
-            const status = process.env.SURGERY_CASE === 'sdk-rate' ? 429 : 500;
-            return new Response(JSON.stringify({type:'error', error:{type:status === 429 ? 'rate_limit_error' : 'api_error', message:'offline'}}),
-              {status, headers:{'content-type':'application/json', 'retry-after-ms':'1', 'x-should-retry':'true'}});
+            const status = process.env.SURGERY_CASE === 'sdk-carrier' ? 400 : process.env.SURGERY_CASE === 'sdk-rate' ? 429 : 500;
+            return new Response(JSON.stringify({type:'error', error:{type:status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'api_error', message:status === 400 ? 'thinking blocks cannot be modified' : 'offline'}}),
+              {status, headers:{'content-type':'application/json', 'retry-after-ms':'1', 'x-should-retry':status === 400 ? 'false' : 'true'}});
           };
         }
       }

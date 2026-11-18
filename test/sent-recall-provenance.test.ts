@@ -57,8 +57,11 @@ for (const [sourceOnly, omitRecall, mode] of [[true, false], [false, false], [fa
         else await reopened.tick();
         assert.equal(requests.length, 1, 'one public tick dispatch');
         assert.ok(JSON.stringify(requests[0]).includes('quoted header follows'), 'raw quote was actually sent');
-        const rawIndex = requests[0]!.messages.findIndex((message, index, messages) => message.participant === 'Context Manager' && message.content.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === '[CM] Recall memory L1-100.' && messages[index + 1]?.content.some(block => block.type === 'text' && block.text === 'prior memory'));
-        assert.ok(rawIndex >= 0, 'standalone raw identical header/answer pair survives');
+        const rawIndex = requests[0]!.messages.findIndex((message, index, messages) => messages[index - 1]?.content.some(block => block.type === 'text' && block.text === 'raw lead before identical pair') && message.participant === 'Context Manager' && message.content.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === '[CM] Recall memory L1-100.' && messages[index + 1]?.content.some(block => block.type === 'text' && block.text === 'prior memory'));
+        const rawLeadIndex = requests[0]!.messages.findIndex(message => message.content.some(block => block.type === 'text' && block.text === 'raw lead before identical pair'));
+        assert.ok(rawLeadIndex >= 0);
+        assert.equal(rawIndex, rawLeadIndex + 1, 'raw pair follows its raw lead, not the earlier constructed recall');
+        assert.ok(requests[0]!.messages[rawLeadIndex + 3]?.content.some(block => block.type === 'text' && block.text.includes('quoted header follows')), 'raw source follows the identical pair');
         const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
         const receipt = entries.find(e => e.operation === 'compress_l1' && !e.event);
         const trace = entries.find(e => e.event === 'compression:attempt');

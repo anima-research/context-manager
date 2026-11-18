@@ -113,7 +113,9 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         assert.equal(receipt.call.transformedRequestSha256, receipt.call.transformedMessagesSha256);
         assert.notEqual(receipt.call.originalRequestSha256, receipt.call.transformedRequestSha256);
       }
-      assert.ok(trace.filter(event => event.closed).every(event => event.statusAtClose !== 'finished'));
+      const closed = trace.filter(event => event.closed);
+      assert.equal(closed.length, 1, 'manager close must be attempted exactly once');
+      assert.ok(closed.every(event => event.statusAtClose !== 'finished'));
       if (scenario !== 'success' && scenario !== 'close-error') assert.equal(receipt.status, 'failed');
       if (scenario === 'fork-mismatch') {
         assert.ok(trace.some(event => event.fork));

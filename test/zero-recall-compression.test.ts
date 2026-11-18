@@ -160,6 +160,11 @@ test('surgery refuses a tool pair crossing the recall deletion boundary', () => 
     text('Context Manager', '[CM] Recall memory L1-1.'), answer,
     text('Context Manager', 'OPEN'), raw,
   ], 'OPEN', [{ id: 'L1-1', answer }]), /Tool pair crosses recall deletion boundary/);
+  assert.throws(() => transformZeroRecallCompression([
+    text('Context Manager', '[CM] Recall memory L1-1.'), answer,
+    text('Context Manager', 'OPEN'), raw, answer,
+  ], 'OPEN', [{ id: 'L1-1', answer }]), /Tool pair crosses recall deletion boundary/,
+  'reusing the deleted answer object later must not retain its earlier occurrence');
 });
 
 

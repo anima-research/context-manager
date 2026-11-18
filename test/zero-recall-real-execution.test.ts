@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 
-for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty', 'mismatch']) {
+for (const scenario of ['sdk-rate', 'sdk-overload', 'sdk-carrier', 'carrier', 'rejection', 'rate', 'overload', 'merge-cap', 'merge-relief', 'merge-failed', 'merge-empty', 'mismatch']) {
   test(`surgery CLI with real manager and public strategy tick: ${scenario}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zr-'));
     try {
@@ -57,7 +57,7 @@ for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rat
       const logs = existsSync(log) ? readFileSync(log,'utf8') : '';
       assert.ok(!(result.stdout + result.stderr + logs + JSON.stringify(state)).includes('private source echoed'));
       assert.equal(receipt.clearedQuarantineKey, 'fixture', result.stdout + result.stderr);
-      if (scenario === 'carrier' || scenario === 'rejection') {
+      if (scenario === 'carrier' || scenario === 'sdk-carrier' || scenario === 'rejection') {
         assert.equal(state.pause, undefined, 'unsent call-cap withdrawal never pauses the lane');
         assert.equal(receipt.error?.name, 'CompressionWithdrawn');
         assert.match(receipt.error?.message ?? '', /ONE_CALL_CAP/, 'a second admission actually reached the cap');
@@ -93,18 +93,22 @@ for (const scenario of ['sdk-rate', 'sdk-overload', 'carrier', 'rejection', 'rat
         assert.equal(receipt.call.status, 'error');
         const sends = readFileSync(join(dir,'sent'),'utf8').trim().split('\n').map(line => JSON.parse(line));
         assert.deepEqual(sends, [{sdkRetries:0, redirect:'error'}], 'real CLI installed one-send SDK policy');
-        assert.equal(receipt.call.providerError.httpStatus, scenario === 'sdk-rate' ? 429 : 500);
+        assert.equal(receipt.call.providerError.httpStatus, scenario === 'sdk-carrier' ? 400 : scenario === 'sdk-rate' ? 429 : 500);
         assert.equal(receipt.call.providerError.name, 'MembraneError');
-        assert.equal(receipt.call.providerError.type, scenario === 'sdk-rate' ? 'rate_limit' : 'server');
-        assert.equal(receipt.call.providerError.retryable, true);
-        assert.match(JSON.stringify(state.pause), new RegExp(`${scenario === 'sdk-rate' ? 'rate_limit' : 'server'}:${scenario === 'sdk-rate' ? 429 : 500}`));
+        assert.equal(receipt.call.providerError.type, scenario === 'sdk-carrier' ? 'invalid_request' : scenario === 'sdk-rate' ? 'rate_limit' : 'server');
+        assert.equal(receipt.call.providerError.retryable, scenario !== 'sdk-carrier');
+        if (scenario === 'sdk-carrier') {
+          assert.equal(state.pause, undefined);
+          assert.match(logs, /carrier-transport-fallback/);
+          assert.match(JSON.stringify(state.progress), /canonical:carrier-rejected/);
+        } else assert.match(JSON.stringify(state.pause), new RegExp(`${scenario === 'sdk-rate' ? 'rate_limit' : 'server'}:${scenario === 'sdk-rate' ? 429 : 500}`));
       } else {
         assert.equal(result.status,1);
         assert.equal(receipt.status,'failed');
         assert.equal(receipt.call.providerError.name,'ProviderError');
         assert.equal(receipt.call.providerError.httpStatus, scenario === 'rate' ? 429 : scenario === 'overload' ? 529 : 400);
         assert.equal(receipt.call.providerError.type, scenario === 'rate' ? 'rate_limit' : scenario === 'overload' ? 'overloaded' : 'invalid_request');
-        if (scenario === 'carrier' || scenario === 'rejection') {
+        if (scenario === 'carrier' || scenario === 'sdk-carrier' || scenario === 'rejection') {
           assert.ok(JSON.stringify(state.progress).includes(scenario === 'carrier' ? 'canonical:carrier-rejected' : 'provider_error'), JSON.stringify(state));
           if (scenario === 'carrier') assert.match(logs,/carrier-transport-fallback/);
         } else assert.match(JSON.stringify(state), new RegExp(`${scenario === 'rate' ? 'rate_limit' : 'overloaded'}:${scenario === 'rate' ? 429 : 529}`));

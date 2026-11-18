@@ -145,7 +145,7 @@ function logCompressionCall(entry: Record<string, unknown>, namespace: string): 
     const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
   } catch (err) {
-    namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
+    try { namespaceDiagnostics(() => namespace).warn('compression log write failed:', err); } catch { /* Best effort, including diagnostics. */ }
   }
 }
 
@@ -11051,6 +11051,74 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // declared: no call was made.
     onToolsDeferred?: () => void,
   ): Promise<void> {
+    // One operation-wide boundary owns no-send receipts, including preparation
+    // and normal returns. Dispatch telemetry below only marks actual sends.
+    const outcome: {
+      dispatched: boolean;
+      reason: 'no-op' | 'quarantine' | 'stopped' | 'deferral' | 'withdrawal' | 'error';
+      detail: string;
+      failure?: { error: unknown };
+    } = { dispatched: false, reason: 'no-op', detail: 'Compression completed without a provider call' };
+    const started = Date.now();
+    const stopped = (reason: typeof outcome.reason, detail: string, notify?: () => void) => () => {
+      outcome.reason = reason;
+      outcome.detail = detail;
+      notify?.();
+    };
+    try {
+      await this.compressChunkHierarchicalOperation(chunk, ctx, outcome,
+        stopped('quarantine', 'Durable quarantine holds this request family', onQuarantineSkip),
+        stopped('stopped', 'Request stopped by overlap or an exhausted/held family', onRequestStopped),
+        stopped('withdrawal', 'Joined work was discarded', onJoinedWorkDiscarded),
+        stopped('deferral', 'Waiting for host tool definitions', onToolsDeferred));
+    } catch (error) {
+      outcome.failure = { error };
+      throw error;
+    } finally {
+      if (!outcome.dispatched && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
+        try {
+          if (outcome.failure) {
+            const { error } = outcome.failure;
+            outcome.reason = 'error';
+            outcome.detail = 'Compression stopped before dispatch';
+            try {
+              outcome.reason = isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait ? 'deferral'
+                : isCompressionWithdrawn(error) || compressionFailureKind(error) === 'abort'
+                  || (error instanceof Error && error.name === 'CompressionBranchDiscard') ? 'withdrawal' : 'error';
+              outcome.detail = boundFailureLogText(error instanceof Error ? error.message : String(error));
+            } catch { /* Keep a payload-free fallback even for hostile thrown values. */ }
+          } else if (chunk.compressed) {
+            outcome.reason = 'no-op';
+            outcome.detail = 'Chunk covered without a provider call (adoption, deduplication or stub)';
+          }
+          logCompressionCall({
+            event: 'compression:no-dispatch',
+            operation: 'compress_l1',
+            metadata: {
+              chunk_message_ids: chunk.messages.map(message => message.id),
+              model: this.config.compressionModel,
+              dispatched: false,
+              reason: outcome.reason,
+              detail: outcome.detail,
+              latency_ms: Date.now() - started,
+            },
+          }, this.ns);
+        } catch {
+          // Observability must never replace an operation's result or error.
+        }
+      }
+    }
+  }
+
+  private async compressChunkHierarchicalOperation(
+    chunk: Chunk,
+    ctx: StrategyContext,
+    outcome: { dispatched: boolean; failure?: { error: unknown } },
+    onQuarantineSkip: () => void,
+    onRequestStopped: () => void,
+    onJoinedWorkDiscarded: () => void,
+    onToolsDeferred: () => void,
+  ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
     if (!ctx.membrane) {
@@ -12011,7 +12079,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logWithdrawn = false;
-    let noDispatchOutcome: { reason: 'deferral' | 'withdrawal' | 'error'; detail: string } | undefined;
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
@@ -12072,6 +12139,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       const commit = () => {
+        outcome.dispatched = true;
         loggedRequest = request;
         loggedScope = scope;
         loggedRecallCount = count;
@@ -13567,15 +13635,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
-      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && !loggedRequest) {
-        let detail = 'Compression stopped before dispatch';
-        try { detail = boundFailureLogText(error instanceof Error ? error.message : String(error)); } catch { /* Telemetry cannot replace the error. */ }
-        noDispatchOutcome = {
-          reason: isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait ? 'deferral'
-            : isCompressionWithdrawn(error) || compressionFailureKind(error) === 'abort' ? 'withdrawal' : 'error',
-          detail,
-        };
-      }
+      outcome.failure = { error };
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
       // A host's withdrawal isn't a failure: the host asked for it, so its
       // receipts say withdrawn rather than carrying an error, a moved
@@ -13635,19 +13695,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               chunk_hash: quarantineRecord.chunkSourceHash,
               model,
               ...trace,
-            },
-          }, this.ns);
-        }
-        if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && !loggedRequest && noDispatchOutcome) {
-          logCompressionCall({
-            event: 'compression:no-dispatch',
-            operation: 'compress_l1',
-            metadata: {
-              chunk_message_ids: chunk.messages.map(message => message.id),
-              model,
-              dispatched: false,
-              ...noDispatchOutcome,
-              latency_ms: Date.now() - callStart,
             },
           }, this.ns);
         }
@@ -13858,6 +13905,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected checkMergeThreshold(): void {
+    if (!this.allowsMergeScheduling()) return;
     this.requireBranchMutation('checkMergeThreshold');
     phaseChannel.report('merge-threshold'); // liveness-watchdog phase
     const bottomUp = this.landsAsPlanned();

@@ -96,6 +96,7 @@ export function transformZeroRecallCompression(
   }
   const recallEnd = boundaries[0]!;
   const kept: NormalizedMessage[] = [];
+  const retainedPositions = new Set<number>();
   const removedRecallIds: string[] = [];
 
   for (let i = 0; i < messages.length; i++) {
@@ -111,6 +112,7 @@ export function transformZeroRecallCompression(
     }
     if (id === undefined) {
       kept.push(message);
+      retainedPositions.add(i);
       continue;
     }
 
@@ -140,8 +142,8 @@ export function transformZeroRecallCompression(
   // Match each result to its most recent preceding use, not an unrelated
   // earlier use with the same id. Reused ids must not mask deleted calls.
   const retainedUses = new Map<string, boolean>();
-  for (const message of messages) {
-    const retained = kept.includes(message);
+  for (const [index, message] of messages.entries()) {
+    const retained = retainedPositions.has(index);
     for (const block of message.content) {
       if (block.type === 'tool_use') retainedUses.set(block.id, retained);
       if (block.type === 'tool_result' && retainedUses.has(block.toolUseId)

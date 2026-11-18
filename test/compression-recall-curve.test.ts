@@ -2658,7 +2658,11 @@ describe('compression refusal recall curves', () => {
         .find(entry => entry.operation === 'compress_l1' && !entry.event);
       assert.equal(receipt.metadata.prior_summary_count_kept, 2);
       assert.equal(receipt.metadata.prior_summary_token_estimate, 'text-content-estimate');
-      assert.ok(receipt.metadata.prior_summary_tokens > 1000 && receipt.metadata.prior_summary_tokens < 10000, 'replayed text includes the literal preamble plus pair/envelope overhead, not 20000 stored tokens');
+      const expectedTokens = fx.parents.reduce((total, entry) => {
+        const replayed = '<thinking>' + 'literal preamble '.repeat(200) + '</thinking>' + entry.content;
+        return total + managerContext(fx.manager).messageStore.estimateTokens({ content: [text(replayed)] } as StoredMessage) + 50;
+      }, 0);
+      assert.equal(receipt.metadata.prior_summary_tokens, expectedTokens, 'exact replayed text estimate plus pair overhead, not stored thinking tokens');
       assert.equal(quarantineEvents(fx.manager).length, 0);
       fx.manager.close();
     } finally {
@@ -2667,8 +2671,9 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  for (const empty of [false, true]) {
-    it(`recall telemetry ${empty ? 'skips empty ID lookup' : 'reports a failed projection as unavailable'} without blocking dispatch`, async () => {
+  for (const mode of ['empty', 'unavailable', 'transient'] as const) {
+    const empty = mode === 'empty';
+    it(`recall telemetry ${mode} without blocking dispatch`, async () => {
       const log = `${freshPath()}-unavailable.jsonl`;
       paths.push(log);
       const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
@@ -2687,7 +2692,10 @@ describe('compression refusal recall curves', () => {
         internals.persistedCanonicalSummariesById = () => {
           reads++;
           // Only the log preparation read fails; planning reads stay real.
-          if (authoring) { telemetryReads++; throw new Error('private store error'); }
+          if (authoring) {
+            telemetryReads++;
+            if (mode !== 'transient' || telemetryReads === 1) throw new Error('private store error');
+          }
           return original();
         };
         const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
@@ -2697,9 +2705,9 @@ describe('compression refusal recall curves', () => {
         assert.equal(telemetryReads, empty ? 0 : 2);
         const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
           .find(entry => entry.operation === 'compress_l1' && !entry.event);
-        assert.equal(receipt.metadata.prior_summary_count_kept, empty ? 0 : null);
-        assert.equal(receipt.metadata.prior_summary_tokens, empty ? 0 : null);
-        assert.equal(receipt.metadata.prior_summary_token_estimate, empty ? 'stored-summary-estimate' : 'unavailable');
+        assert.equal(receipt.metadata.prior_summary_count_kept, empty ? 0 : mode === 'transient' ? 2 : null);
+        assert.equal(receipt.metadata.prior_summary_tokens, empty ? 0 : mode === 'transient' ? 140 : null);
+        assert.equal(receipt.metadata.prior_summary_token_estimate, mode === 'unavailable' ? 'unavailable' : 'stored-summary-estimate');
         assert.equal(logs.filter(line => line.includes('recall telemetry unavailable')).length, empty ? 0 : 1);
         assert.ok(!logs.join('').includes('private store error'));
         assert.equal(quarantineEvents(fx.manager).length, 0);
@@ -5223,6 +5231,7 @@ describe('L1 no-dispatch outcome receipts', () => {
           assert.equal(entries.filter(entry => entry.operation === 'compress_l1' && !entry.event).length, 0);
           const outcomes = entries.filter(entry => entry.event === 'compression:no-dispatch');
           assert.equal(outcomes.length, logging ? 1 : 0);
+          assert.deepEqual(quarantineEvents(fx.manager), [], 'no unsent attempt exhausts a family, with or without logging');
           if (!logging) { assert.equal(existsSync(log), false); return; }
           const outcome = outcomes[0];
           assert.equal(outcome.operation, 'compress_l1');
@@ -5319,6 +5328,150 @@ it('warns without replacing a successful compression when receipt preparation th
     assert.equal(logs.filter(line => line.includes('receipt preparation failed')).length, 1);
     assert.ok(!logs.join('').includes('private payload'));
   } finally {
+    fx.manager.close();
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+  }
+});
+
+
+describe('public tick operation-wide no-dispatch boundary', () => {
+  for (const exit of ['preparation', 'quarantine-read', 'opening', 'tools', 'branch-discard', 'adoption', 'quarantine', 'reused-exhaustion'] as const) {
+    it(`records exactly one pre-send outcome for ${exit}`, async () => {
+      const log = `${freshPath()}-public-no-dispatch.jsonl`;
+      paths.push(log);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+      const mock = flexibleMembrane([{ stop: 'refusal' }]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: false });
+      const localError = new Error(`local ${exit} failure`);
+      const hooks = fx.strategy as unknown as {
+        prepareCompressionAhead(r: NormalizedRequest): NormalizedRequest;
+        prepareCompressionCandidate(r: NormalizedRequest, label: string): NormalizedRequest;
+        getCompressionOpening(): string;
+        familyWaitsForTools(): boolean;
+        exhaustCompressionRequestFamily(...args: unknown[]): Promise<unknown>;
+      };
+      const queue = () => { fx.target.index = 0; fx.strategy.setTickWork([fx.target], [0]); };
+      try {
+        queue();
+        if (exit === 'preparation') hooks.prepareCompressionAhead = () => { throw localError; };
+        if (exit === 'opening') hooks.getCompressionOpening = () => { throw localError; };
+        if (exit === 'tools') hooks.familyWaitsForTools = () => true;
+        if (exit === 'quarantine-read') {
+          // Leave tick's alarm/sweep and prompt-layout reads intact; fail the
+          // durable admission read after preparation, as an unreadable ledger.
+          let prepared = false;
+          const prepare = hooks.prepareCompressionAhead.bind(fx.strategy);
+          hooks.prepareCompressionAhead = r => { const result = prepare(r); prepared = true; return result; };
+          const store = fx.manager.getStore();
+          const read = store.getStateJson.bind(store);
+          store.getStateJson = id => {
+            if (prepared && id === 'default/autobio:compression-refusal-quarantine-events') { prepared = false; throw localError; }
+            return read(id);
+          };
+        }
+        if (exit === 'branch-discard') {
+          const prepare = hooks.prepareCompressionCandidate.bind(fx.strategy);
+          hooks.prepareCompressionCandidate = (r, label) => {
+            const result = prepare(r, label);
+            fx.strategy.detach();
+            return result;
+          };
+        }
+        if (exit === 'adoption') {
+          fx.strategy.seed(summary('L1-999', 1, fx.target.messages.map(m => m.id),
+            fx.target.messages[0]!.id, fx.target.messages.at(-1)!.id));
+        }
+        if (exit === 'quarantine' || exit === 'reused-exhaustion') {
+          const exhaust = hooks.exhaustCompressionRequestFamily.bind(fx.strategy);
+          if (exit === 'reused-exhaustion') {
+            hooks.exhaustCompressionRequestFamily = async () => { throw new CompressionWithdrawn('interrupted before exhaustion'); };
+          }
+          const first = await quiet(() => fx.manager.tick());
+          assert.equal(first.result.status, exit === 'quarantine' ? 'fulfilled' : 'rejected');
+          assert.equal(mock.calls.length, 1, 'canonical refusal is durable');
+          hooks.exhaustCompressionRequestFamily = exhaust;
+          queue();
+          rmSync(log, { force: true });
+        }
+        const before = mock.calls.length;
+        const { result } = await quiet(() => fx.manager.tick());
+        assert.equal(result.status, ['preparation', 'quarantine-read', 'opening'].includes(exit) ? 'rejected' : 'fulfilled');
+        if (exit === 'quarantine-read') assert.equal((result as PromiseRejectedResult).reason.name, 'CompressionQuarantineUnreadableError');
+        assert.equal(mock.calls.length, before, 'public tick never sends on this exit');
+        const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+        const outcomes = entries.filter(e => e.event === 'compression:no-dispatch');
+        assert.equal(outcomes.length, 1, 'one structural boundary covers each exit');
+        const expected = exit === 'tools' ? 'deferral' : exit === 'branch-discard' ? 'withdrawal'
+          : exit === 'adoption' ? 'no-op' : exit === 'quarantine' ? 'quarantine'
+          : exit === 'reused-exhaustion' ? 'stopped' : 'error';
+        assert.equal(outcomes[0].metadata.reason, expected);
+        assert.equal(outcomes[0].metadata.dispatched, false);
+        assert.ok(outcomes[0].metadata.detail.length > 0);
+        assert.deepEqual(outcomes[0].metadata.chunk_message_ids, fx.target.messages.map(m => m.id));
+        for (const key of ['system', 'messages', 'request', 'response']) assert.equal(key in outcomes[0], false);
+        assert.equal(entries.filter(e => e.operation === 'compress_l1' && !e.event).length, 0);
+        if (exit !== 'quarantine' && exit !== 'reused-exhaustion') {
+          assert.deepEqual(quarantineEvents(fx.manager), [], 'unsent work creates no quarantine');
+        }
+      } finally {
+        fx.manager.close();
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+  }
+});
+
+
+it('public tick leaves merge discovery untouched when scheduling is disabled', async () => {
+  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'new summary' }]);
+  const fx = await fixture(mock.membrane, { mergeThreshold: 2 });
+  try {
+    (fx.strategy as unknown as { allowsMergeScheduling(): boolean }).allowsMergeScheduling = () => false;
+    fx.target.index = 0;
+    fx.strategy.setTickWork([fx.target], [0]);
+    await fx.manager.tick();
+    assert.equal(mock.calls.length, 1);
+    assert.equal(fx.target.compressed, true);
+    assert.deepEqual(fx.strategy.mergeQueueView(), [], 'contiguous L2 parents must not be discovered/enqueued');
+    // Positive control: the same frontier really is eligible when enabled.
+    (fx.strategy as unknown as { allowsMergeScheduling(): boolean }).allowsMergeScheduling = () => true;
+    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold();
+    assert.ok(fx.strategy.mergeQueueView().length > 0, 'ordinary discovery can queue the same frontier');
+  } finally { fx.manager.close(); }
+});
+
+it('a failed log write and throwing warning cannot skip later attempt records or the receipt', async () => {
+  const log = `${freshPath()}-warning-survival.jsonl`;
+  const invalid = `${freshPath()}-invalid-log`;
+  paths.push(log, invalid);
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+  const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'summary' }]);
+  const fx = await fixture(mock.membrane);
+  const warn = console.warn;
+  try {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(invalid, 'not a directory');
+    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold = () => {
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = `${invalid}/calls.jsonl`;
+    };
+    let warnings = 0;
+    console.warn = () => {
+      warnings++;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+      throw new Error('warning sink failed');
+    };
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.target.compressed, true);
+    assert.equal(warnings, 1, 'the first attempt write fails, including its warning');
+    const entries = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(entries.some(e => e.event === 'compression:attempt' && e.metadata.outcome === 'success'), 'later attempt still logged');
+    assert.equal(entries.filter(e => e.operation === 'compress_l1' && !e.event).length, 1, 'operation receipt still attempted');
+  } finally {
+    console.warn = warn;
     fx.manager.close();
     if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
     else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;

@@ -618,6 +618,16 @@ describe('split-stitch L1 fallback', () => {
           return result;
         } };
         fx = await build(membrane, { split: true });
+        // Give every authored attempt a distinct projection, so even another
+        // same-sized piece cannot masquerade as the last dispatched request.
+        const hooks = fx.strategy as unknown as { authorL1CompressionRequest(r: NormalizedRequest, ids: string[]): NormalizedRequest };
+        const author = hooks.authorL1CompressionRequest.bind(fx.strategy);
+        let authored = 0;
+        hooks.authorL1CompressionRequest = (request, ids) => {
+          const result = author(request, ids);
+          return { ...result, messages: [...result.messages, { participant: 'Context Manager',
+            content: [text('snapshot '.repeat(++authored * 17))] }] };
+        };
         if (ending === 'window') await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /split-stitch waits for its call window/);
         else await fx.strategy.run(fx.target, managerContext(fx.manager));
         const last = inner.calls.at(-1)!;
@@ -625,6 +635,12 @@ describe('split-stitch L1 fallback', () => {
         const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
           .find(entry => entry.operation === 'compress_l1' && !entry.event);
         assert.equal(receipt.metadata.request_scope, 'last-split-piece');
+        assert.deepEqual(receipt.messages, last.messages.map(message => ({
+          participant: message.participant,
+          blockCount: message.content.length,
+          blockTypes: message.content.map(block => block.type),
+          textChars: message.content.reduce((total, block) => total + (block.type === 'text' ? block.text.length : 0), 0),
+        })), 'receipt projection is the last actual piece call, not an earlier or unsent attempt');
         assert.equal(fx.strategy.entries().length, 0);
         if (ending === 'window') assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'waiting is not exhaustion');
         fx.manager.close();
