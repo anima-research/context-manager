@@ -173,6 +173,7 @@ it('reentrant retryAfterMs cannot pause a replacement load', async () => {
     const source = inside(fx.raw).loadedBranchIdentity;
     const error = { get retryAfterMs() { replacement = fx.manager.setStrategy(fx.raw); return Infinity; } };
     inside(fx.raw).pauseCompressionLane(source, {}, error, 'l1', 'chunk');
+    assert.ok(replacement, 'retryAfterMs getter must start replacement');
     await replacement;
     assert.equal(inside(fx.raw).compressionPause, null);
   } finally { await replacement; fx.close(); }
@@ -187,7 +188,7 @@ it('final head reset refusal still reports the stored transition and duplicate r
 });
 
 for (const lane of ['compression', 'merge']) {
-  it(`a real ${lane} failure remains observable after replacement`, async () => {
+  it(`an injected ${lane} implementation failure remains observable at tick after replacement`, async () => {
     const fx = await fixture(), started = barrier(), pause = barrier();
     const failure = new Error('original provider failure');
     try {

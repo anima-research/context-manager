@@ -23,3 +23,17 @@
   observations and reconcile returned-to branches.
 - The internal boundary slot permits function-binding forwarding proxies;
   manager calls still capture an origin before invoking strategy members.
+
+- Lifecycle methods (`initialize` and `detach`), including subclass overrides,
+  are supported only through `ContextManager`. On that path their continuations
+  stay bound to their own load generation, including before and after `super`.
+  Direct lifecycle calls are unsupported and are not guaranteed to fail without
+  effects: a direct arrow `initialize` calling `super.initialize` can invalidate
+  the current load before throwing. Recover by reinitializing through
+  `ContextManager.setStrategy`, not by retrying the direct call.
+- Failed presentation-scope observations stop the pending-notification drain
+  with rows retained, rather than retrying the same failed observation without
+  bound. An unknown window mode does not grant legacy-branch delivery rights.
+  Reconciled branch-name mismatches identify the observed selection and recovery
+  without claiming that an initialization ran. Stale health reports name the
+  unavailable report and request a fresh health read outside the obsolete scope.

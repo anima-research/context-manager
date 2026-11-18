@@ -1,5 +1,6 @@
 /** Local cancellation ownership and non-throwing health/report callbacks. */
 import { it } from 'node:test';
+import { AsyncResource } from 'node:async_hooks';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -128,7 +129,7 @@ it('release migration names host callback refusals, dispatch limits and the inte
   assert.match(breaking, /dispatcher/);
   assert.match(breaking, /runInAsyncScope/);
   const prose = (text: string) => text.replace(/\n\s*\*?\s*/g, ' ');
-  const lifecyclePath = 'changelog.d/490-lifecycle-override-origins.fixed.md';
+  const lifecyclePath = 'changelog.d/cm490-operation-scope.added.md';
   const lifecycle = readFileSync(existsSync(lifecyclePath) ? lifecyclePath : 'CHANGELOG.md', 'utf8');
   const types = readFileSync('src/types/strategy.ts', 'utf8');
   const guidance = readFileSync('docs/keyed-compression-quarantine.md', 'utf8');
@@ -146,7 +147,7 @@ it('release migration names host callback refusals, dispatch limits and the inte
 });
 
 it('new operation-scope release entries are not presented as fixes to released scope machinery', () => {
-  for (const name of ['cm490-r11c.fixed.md', 'cm490-r11d.fixed.md']) {
+  for (const name of ['cm490-r11c.fixed.md', 'cm490-r11d.fixed.md', '490-lifecycle-override-origins.fixed.md']) {
     assert.ok(!readdirSync('changelog.d').includes(name), `${name} describes newly added machinery`);
   }
   const path = 'changelog.d/cm490-continuations.fixed.md';
@@ -165,4 +166,24 @@ it('an uncertain final reset retains the original typed failure as its cause', a
       return true;
     });
   } finally { fx.close(); }
+});
+
+
+it('startup AsyncResource dispatch leaves both old boundary and strategy storage', async () => {
+  const dispatcher = new AsyncResource('host-startup-dispatch');
+  const fx = await fixture();
+  try {
+    const raw = inside(fx.strategy);
+    await raw.branchOperations.run(raw.loadedBranchIdentity, async () => {
+      await dispatcher.runInAsyncScope(async () => {
+        await fx.manager.fork('fresh-dispatch');
+        assert.equal(fx.store.currentBranch().name, 'fresh-dispatch');
+        assert.notEqual(fx.strategy.getCompressionDebt().state, 'unknown');
+        const id = fx.manager.addMessage('User', [{ type: 'text', text: 'fresh intent' }]);
+        assert.doesNotThrow(() => fx.strategy.resetHeadWindow(id));
+        assert.equal(raw.headWindowStartId, id);
+      });
+      assert.equal(fx.strategy.getCompressionDebt().state, 'unknown', 'dispatch does not rebind the obsolete caller');
+    });
+  } finally { dispatcher.emitDestroy(); fx.close(); }
 });

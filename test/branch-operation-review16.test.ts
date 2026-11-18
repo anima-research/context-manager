@@ -27,20 +27,27 @@ async function populate(manager: ContextManager) {
 function barrier() { let release!: () => void; const wait = new Promise<void>(r => { release = r; }); return { wait, release }; }
 
 it('1: secondary merge rejection probe cannot turn unknown currency into success', async () => {
-  const fx = await fixture(); const original = Object.assign(new Error('request rejected'), { type: 'invalid_request' });
+  const fx = await fixture(); const branch = fx.store.currentBranch;
+  const original = Object.assign(new Error('request rejected'), { type: 'invalid_request' }) as Error & { type: string };
   try {
     for (const key of ['sweepCompressionProgressIfDue', 'soundMergeQuarantineAlarmIfNeeded', 'checkMergeThreshold']) fx.raw[key] = () => {};
     fx.raw.mergeQueue = [{ level: 2, sourceIds: ['a', 'b'] }];
     fx.raw.mergeBlockedByHold = () => false;
-    fx.raw.executeMerge = async () => { throw original; };
+    let unavailable = false;
+    fx.raw.executeMerge = async () => { unavailable = true; throw original; };
     let probes = 0;
     fx.raw.compressionBranchCurrentForCleanup = () => ++probes === 1 ? true : undefined;
-    // The secondary probe is a real unavailable observation, not a moved branch.
-    fx.raw.compressionBranchCurrentAfterFailure = () => { throw original; };
+    // Keep the real preservation helper; fail its underlying observation.
+    const secondary = new Error('secondary observation unavailable');
+    fx.store.currentBranch = function () {
+      if (unavailable) throw secondary;
+      return branch.call(this);
+    };
     await assert.rejects(fx.manager.tick(), error => error === original);
+    assert.equal(original.cause, secondary);
     assert.equal(fx.raw.pendingCompression, null);
     assert.equal(fx.raw.mergeQueue.length, 1);
-  } finally { fx.close(); }
+  } finally { fx.store.currentBranch = branch; fx.close(); }
 });
 
 it('2: an unavailable post-landing merge-discovery probe cannot fail a persisted L1', async () => {
@@ -227,13 +234,22 @@ it('10: a stored legacy presentation is deferred when scope observation fails', 
     fx.strategy.onNewMessage = async () => { heard++; };
     manager.diag = { error() {}, warn() {} };
     const scope = manager.hookScope;
-    manager.hookScope = () => { throw new Error('scope unavailable'); };
+    let failedObservations = 0;
+    manager.hookScope = () => {
+      // An old infinite drain escapes at ten so the regression fails, not hangs.
+      if (++failedObservations >= 10) return scope.call(manager);
+      throw new Error('scope unavailable');
+    };
     const id = fx.manager.addMessage('User', [{ type: 'text', text: 'stored' }]);
     assert.equal(heard, 0);
     assert.ok(manager.presentedUnheard.has(id));
+    fx.manager.addMessage('User', [{ type: 'text', text: 'pending too' }]);
+    assert.equal(heard, 0);
+    assert.ok(failedObservations < 10, 'failed drain must stop instead of retrying its own requeue');
+    assert.equal(manager.presentedUnheard.size, 2);
     manager.hookScope = scope;
     fx.manager.addMessage('User', [{ type: 'text', text: 'next' }]);
-    assert.equal(heard, 2);
+    assert.equal(heard, 3);
     assert.equal(manager.presentedUnheard.size, 0);
   } finally { fx.close(); }
 });
@@ -320,5 +336,40 @@ it('5: carrier-rejection accounting also retains the transport error if progress
     fx.raw.recordCompressionFamilyProgress = () => { seam++; throw secondary; };
     await assert.rejects(fx.manager.tick(), error => { assert.ok(error === original, 'transport rejection must remain primary'); assert.equal((error as Error).cause, secondary); return true; });
     assert.ok(seam > 0);
+  } finally { fx.close(); }
+});
+
+
+it('an unreadable presentation mode does not grant legacy delivery on another branch', async () => {
+  const fx = await fixture(); const manager = inside(fx.manager); let heard = 0;
+  const mode = manager.windowIndex.mode;
+  try {
+    Object.defineProperty(fx.strategy, 'onPresented', { configurable: true, value: undefined });
+    fx.strategy.onNewMessage = async () => { heard++; };
+    manager.diag = { error() {}, warn() {} };
+    const id = fx.manager.addMessage('User', [{ type: 'text', text: 'shared record' }]);
+    heard = 0;
+    const row = manager.createStrategyContext().messageStore.get(id);
+    manager.windowIndex.mode = () => { throw new Error('mode unavailable'); };
+    assert.equal(manager.tellPresented([row]), false);
+    assert.equal(manager.presentedUnheard.get(id), false, 'unknown mode cannot confer legacy eligibility');
+    manager.windowIndex.mode = mode;
+    fx.store.createBranchAt('other-legacy', 'main', fx.store.currentSequence());
+    await fx.manager.switchBranch('other-legacy');
+    assert.equal(heard, 0);
+  } finally { manager.windowIndex.mode = mode; fx.close(); }
+});
+
+it('paid-off sweep warns when active holds cannot be checked against chunk data', async () => {
+  const fx = await fixture(); let diagnostics = 0;
+  try {
+    fx.raw.readCompressionQuarantineProjection = () => new Map([['held', {}]]);
+    const get = fx.store.getStateJson;
+    fx.store.getStateJson = function (id: string) {
+      return id === fx.raw.chunksStateId ? [] : get.call(this, id);
+    };
+    fx.raw.diag = { warn(line: string) { diagnostics++; assert.match(line, /chunk records unavailable or empty.*holds retained.*not completed/); } };
+    await fx.raw.sweepPaidOffQuarantineRecords(fx.raw.loadedBranchIdentity);
+    assert.equal(diagnostics, 1);
   } finally { fx.close(); }
 });

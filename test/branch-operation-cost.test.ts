@@ -22,20 +22,31 @@ it('ordinary add fence work stays bounded as record and message history grows', 
   scope.assertBindingCurrent = function () { mirrors++; return guard.call(this); };
   const manager = await ContextManager.open({ path: dir, strategy });
   try {
-    const samples: Array<{ contexts: number; mirrors: number }> = [];
-    for (let i = 0; i <= 4096; i++) {
+    const samples: Array<{ contexts: number; mirrors: number; insertion: number; phase: string }> = [];
+    for (let i = 0; i < 4104; i++) {
       contexts = mirrors = 0;
+      const beforeChunks = (strategy as any).chunks.length;
+      const beforeQueue = (strategy as any).compressionQueue.length;
       manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `MSG-${i} ${'word '.repeat(110)}` }]);
-      if (i === 1024 || i === 4096) samples.push({ contexts, mirrors });
+      if ((i >= 1024 && i < 1032) || i >= 4096) samples.push({ contexts, mirrors, insertion: i,
+        phase: (strategy as any).chunks.length > beforeChunks
+          ? ((strategy as any).compressionQueue.length > beforeQueue ? 'closure+holdback-release' : 'closure') : 'within-chunk' });
     }
-    t.diagnostic(`fence samples at 1024/4096 messages: ${JSON.stringify(samples)}`);
+    t.diagnostic(`eight consecutive fence samples at 1024/4096 messages: ${JSON.stringify(samples)}`);
     assert.ok((strategy as any).chunkRecords.length >= 1024, 'real persisted chunk history reached');
     for (const sample of samples) {
       assert.ok(sample.contexts > 0 && sample.mirrors > 0, 'fence probes actually ran');
       assert.ok(sample.contexts < 500 && sample.mirrors < 200, JSON.stringify(samples));
     }
-    assert.ok(samples[1]!.contexts <= samples[0]!.contexts + 10, JSON.stringify(samples));
-    assert.ok(samples[1]!.mirrors <= samples[0]!.mirrors + 10, JSON.stringify(samples));
+    for (let i = 0; i < 8; i++) {
+      assert.equal(samples[i + 8]!.phase, samples[i]!.phase);
+      assert.ok(samples[i + 8]!.contexts <= samples[i]!.contexts + 10, JSON.stringify(samples));
+      assert.ok(samples[i + 8]!.mirrors <= samples[i]!.mirrors + 10, JSON.stringify(samples));
+    }
+    for (const group of [samples.slice(0, 8), samples.slice(8)]) {
+      assert.equal(group.filter(s => s.phase === 'closure+holdback-release').length, 2);
+      assert.equal(group.filter(s => s.phase === 'within-chunk').length, 6);
+    }
   } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

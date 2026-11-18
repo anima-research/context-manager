@@ -2821,7 +2821,10 @@ export class ContextManager {
         `${cause instanceof Error ? cause.message : String(cause)}`, { cause },
       );
     }
-    if (attempt !== this.initializationAttempt || requested.name !== name) {
+    if (requested.name !== name) {
+      throw new Error(`Branch selection requested ${name}, but reconciliation found ${requested.name}; no strategy initialization ran for this selection; recover with switchBranch() or setStrategy()`);
+    }
+    if (attempt !== this.initializationAttempt) {
       throw new InitializationSupersededError({ branch: name, created });
     }
     await this.initializeStrategy(requested, { branch: name, created });
@@ -5132,19 +5135,19 @@ export class ContextManager {
     }
   }
 
-  /** Make notifyPresented's call of the initialized strategy, now. */
-  private tellPresented(rows: readonly StoredMessage[]): void {
-    if (rows.length === 0 || this.closed) return;
+  /** Make notifyPresented's call now; false means observation failed and rows remain pending. */
+  private tellPresented(rows: readonly StoredMessage[]): boolean {
+    if (rows.length === 0 || this.closed) return true;
     const strategy = this.strategy;
     let presented: boolean;
     try {
       presented = callStrategy(strategy, 'onPresented', (strategy) => Boolean(strategy.onPresented));
-      if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return;
+      if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return true;
     } catch (err) {
       // Strategy-owned member/protocol lookups are hook work too. The rows
       // are already stored; don't fail the add and invite a duplicate retry.
       terminalCatch((error: unknown) => logThrown(`Strategy presentation hook lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
-      return;
+      return true;
     }
     const ctx = this.createStrategyContext();
     if (presented) {
@@ -5154,7 +5157,7 @@ export class ContextManager {
       } catch (err) {
         failed(err);
       }
-      return;
+      return true;
     }
     // The strategy, initialization and branch the calls are made under, and
     // the window the rows entered, before any hook runs.
@@ -5167,9 +5170,9 @@ export class ContextManager {
       // The rows are already stored. Observation failure is not an add failure,
       // but it is not delivery either. Retain them without immediately retrying
       // the same failed observation; the next notification/open can redeliver.
-      this.waitToBeHeard(rows, legacy ?? true);
+      this.waitToBeHeard(rows, legacy ?? false);
       terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
-      return;
+      return false;
     }
     // Whether a presented row is in the window still: a hook can take it
     // out. A read that throws can't tell, so the row waits, as below.
@@ -5199,7 +5202,7 @@ export class ContextManager {
         // the strategy is initialized (at once where it is), those the
         // window of the branch it initialized on holds.
         this.deferPresented(rows.slice(i), legacy);
-        return;
+        return true;
       }
       const message = rows[i]!;
       const failed = terminalCatch((err: unknown) =>
@@ -5210,6 +5213,7 @@ export class ContextManager {
         failed(err);
       }
     }
+    return true;
   }
 
   /**
@@ -5546,7 +5550,7 @@ export class ContextManager {
     this.presentedUnheard = new Map();
     this.drainingPresented = true;
     try {
-      this.tellPresented(rows);
+      return this.tellPresented(rows);
     } catch (err) {
       // The manager's own work before the strategy's call failed, so no
       // hook ran: the rows wait again.
@@ -5556,7 +5560,6 @@ export class ContextManager {
     } finally {
       this.drainingPresented = false;
     }
-    return true;
   }
 
   private handleMessageEdit(messageId: MessageId, newContent: ContentBlock[]): void {

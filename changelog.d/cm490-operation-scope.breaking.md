@@ -46,3 +46,8 @@
   initialization. Boundary/cancellation regressions run on pinned Bun 1.4.4
   as well as Node; this is not a claim about other Bun versions or a browser
   build.
+- **Hosts catching reset errors:** a final strategy `resetHeadWindow` failure
+  is wrapped in an ordinary Error to report the stored transition and duplicate
+  retry risk. Its `cause` is the original thrown value, preserving its identity
+  and type there; catch the wrapper and inspect `cause` rather than relying on
+  top-level `instanceof`. The stored transition is not rolled back.

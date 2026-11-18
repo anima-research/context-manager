@@ -62,6 +62,12 @@ it('public add does no population-sized failure bookkeeping at 10, 100 and 1000 
           const original = map[method];
           Object.defineProperty(map, method, { value(key: string) { mapReads++; return original.call(map, key); } });
         }
+        const forEach = map.forEach;
+        Object.defineProperty(map, 'forEach', { value(callback: Function, receiver?: unknown) {
+          return forEach.call(map, (value: unknown, key: string) => {
+            visits++; callback.call(receiver, value, key, map);
+          });
+        } });
         for (const method of ['keys', 'values', 'entries', Symbol.iterator] as const) {
           const original = (map as any)[method];
           Object.defineProperty(map, method, { value: function* () {
@@ -69,16 +75,11 @@ it('public add does no population-sized failure bookkeeping at 10, 100 and 1000 
           } });
         }
       }
-      const iterateMerges = lane.mergeQueue[Symbol.iterator];
-      Object.defineProperty(lane.mergeQueue, Symbol.iterator, { value: function* () {
-        for (const merge of iterateMerges.call(lane.mergeQueue)) { mergeVisits++; yield merge; }
+      lane.mergeQueue = new Proxy(lane.mergeQueue, { get(target, key, receiver) {
+        if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) mergeVisits++;
+        return Reflect.get(target, key, receiver);
       } });
-      const mapMerges = lane.mergeQueue.map;
-      Object.defineProperty(lane.mergeQueue, 'map', { value(callback: (merge: unknown, index: number, array: unknown[]) => unknown) {
-        return mapMerges.call(lane.mergeQueue, (merge, index, array) => {
-          mergeVisits++; return callback(merge, index, array);
-        });
-      } });
+      lane.orderCompressionQueue(); // Re-prime identity cache after installing the observation proxy.
       const before = lane.chunks.length;
       // Cross two chunk closures AND holdback releases, so this is not merely
       // a cache hit on an insertion that leaves queue membership unchanged.

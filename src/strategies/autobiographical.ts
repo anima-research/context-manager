@@ -233,8 +233,12 @@ function causeText(thrown: unknown): string {
  * characters (causeText) it stays under 500, where connectome-host's status
  * notices and agent-framework's alert webhook cut a message.
  */
+function staleHealthReportMessage(report: string, cause: StaleBranchOperationError): string {
+  return `The ${report} could not be read from an obsolete continuation. Its values are unknown. Dispatch a fresh health read through ContextManager outside the old callback scope. Cause: ${causeText(cause)}`;
+}
+
 function compressionQuarantineUnreadableMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return cause.message;
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression quarantine report', cause);
   return [
     'Compression of new conversation has stalled.',
     `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
@@ -244,7 +248,7 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
 }
 
 function strandedSummariesFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return cause.message;
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('stranded-summaries report', cause);
   return [
     'The stranded-summaries read failed.',
     `Cause: ${causeText(cause)}`,
@@ -269,7 +273,7 @@ function strandedNoStoreMessage(): string {
  * How to report it is the host's to say.
  */
 function compressionDebtReportFailedMessage(cause: unknown): string {
-  if (cause instanceof StaleBranchOperationError) return cause.message;
+  if (cause instanceof StaleBranchOperationError) return staleHealthReportMessage('compression debt report', cause);
   return [
     'The compression debt report failed.',
     `Cause: ${causeText(cause)}`,
@@ -5862,8 +5866,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.store) return { status: { count: 0, keys: [], spans: [] } };
       const projection = this.readCompressionQuarantineProjection();
       if (projection.size === 0) return { status: { count: 0, keys: [], spans: [] } };
-      // A span can hold one record per request shape it exhausted
-      // (CHUNK_QUARANTINE_SHAPE_CAP), so records overstate how many spans are
+      // A span can hold CHUNK_QUARANTINE_SHAPE_CAP records per request-hash
+      // regime, and retain holds from earlier regimes; there is no total
+      // per-span cap. Thus records overstate how many spans are
       // stuck. Each span is named by the current chunk whose message ids its
       // records hash, and dated by those messages' timestamps, not by its
       // records: the age measures time since closure, not proof the chunk
@@ -6267,7 +6272,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (projection.size === 0) return;
       const records = this.store.getStateJson(this.chunksStateId);
       const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
-      if (chunkRecords.length === 0) return; // transient/no data — never sweep blind
+      if (chunkRecords.length === 0) {
+        this.diag.warn('[compression-quarantine] paid-off sweep skipped: chunk records unavailable or empty; holds retained, maintenance not completed');
+        return; // Never sweep blind.
+      }
       const byHash = new Map<string, ChunkRecord>();
       for (const r of chunkRecords) {
         if (r && Array.isArray(r.sourceIds)) byHash.set(sha256Json(r.sourceIds), r);
@@ -14016,7 +14024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.checkMergeThreshold();
       } catch (error) {
         if (error instanceof StaleBranchOperationError) return;
-        this.diag.warn(`[autobiographical] L1 landed; merge discovery deferred after maintenance failed: ${describeCompressionFailure(error)}`);
+        this.diag.warn(`[autobiographical] L1 landed; post-landing merge discovery failed (tick may retry and fail): ${describeCompressionFailure(error)}`);
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;

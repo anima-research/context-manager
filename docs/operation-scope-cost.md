@@ -142,6 +142,10 @@ mode or state-preservation assertion was removed.
 
 ### Comparable fixture and limits
 
+Historical timing provenance limitation: the harness revision/blob used for
+the two round-16 triplets was not recorded. These triplets are not exactly
+reproducible fixture qualifications and must not be cited as current-head costs.
+
 The following measurements use the same real-store adaptive fixture at both
 sizes. Main is the offline local `main` / merge base
 `59043beb14365d1044a88f9aeeb0a2f1a735ad8b`; before is the starting tip above.
@@ -260,8 +264,8 @@ Against archived `6124e0dd`, the first test fails as expected on its first add
 at population 10: **23** chunk-key calls, **11** map get/has calls, **50** map
 entry visits, **1** ordering call and **10** queued-merge visits.
 
-The earlier ordinary fence fixture now reports **177 / 177** context
-resolutions and **62 / 62** mirror checks at 1,024 / 4,096 messages. Historical
+The earlier 177/62 claim was false: exact-tip remeasurement found **178 / 178**
+context resolutions and **63 / 63** mirror checks at 1,024 / 4,096 messages. Historical
 r16 latency samples above were not rerun and are not new latency claims.
 The exhaustive reentry initializer trace pins retain their lengths (378 and
 406); one duplicate chunk-key return is replaced by the persistence-capability
@@ -285,3 +289,53 @@ checks** after **both 1,024 and 4,096 messages**. The earlier response's 177/62
 was false. These are not the 183/62 counts from the earlier round-16 source
 snapshot above. The safety fence remains enabled without reload; the insertion
 fix bounds its repeated history-walk work rather than bypassing authorization.
+
+## Round 18: current resident adaptive select/compile and picker (2026-11-18)
+
+The earlier answer that insertion counts made the compile concern moot was
+false. The raw adaptive path still resolves the installed `cappedForSend`
+wrapper per message (twice per message in this fixture), and other wrapped
+helpers and guarded mirrors contribute history-proportional work too. We retain
+these checks for origin safety; **the compile fence cost is not bounded
+independently of history**, and no production latency budget is approved here.
+This audit reports the overhead rather than bypassing the fence.
+
+Reproduce offline after `npm run build` with
+`node scripts/bench-operation-select.mjs`. This new, checked-in harness uses
+real Chronicle stores, no provider, a live adaptive `kv-stable` strategy, raw
+messages of 110 repeated words, zero configured head/recent/holdback windows,
+and a budget large enough to emit the history. It measures direct `select`,
+manager `compile`, and the actual `picker.run` called inside each; assertions
+require picker execution and history pricing. Each row uses 3 warmups and 10
+measured samples. Counter instrumentation wraps the original installed
+`cappedForSend`, `context`, and mirror guard, and times picker.run; the wrapper
+and counter costs are INCLUDED, not isolated fence-only latency. Direct select
+omits manager rendering, while compile includes it. No reload or insertion is
+timed, and no compressed-provider latency is implied.
+
+Source: round-18 working tree based on `3c622c8f02ac645906e0e0f4572993621d270c25`
+(tree equal to published `51463fa2`); pricing/fence algorithms unchanged by this
+round. Node 22.23.3, Chronicle 0.7.0, Membrane 0.9.0, Linux x64. The harness blob
+and strategy/scope blobs are recorded below so this is not another unlabelled
+historical fixture. Wall time is one local synthetic run, not a CI threshold.
+
+| Messages | select median ms | picker within select ms | compile median ms | picker within compile ms | compile context resolutions | compile mirror checks | capped calls per select/compile |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 5.236 | 1.301 | 5.692 | 0.927 | 23,987 | 7,349 | 2,048 |
+| 4,096 | 21.220 | 4.624 | 22.621 | 4.149 | 94,643 | 28,853 | 8,192 |
+| 16,384 | 104.752 | 23.212 | 135.300 | 23.573 | 377,267 | 114,869 | 32,768 |
+
+Direct select context/mirror counts: 23,973/7,345; 94,629/28,849;
+377,253/114,865. Exactly one real picker run occurred per sample. Counts show
+remaining fence overhead scales with history; timing includes ordinary picker,
+rendering and estimation work and does not identify a fence-only percentage.
+Historical main/tree timings above cannot substitute for these current paths.
+
+Harness blob: `ae237f404d5414e72b591030493109dc28e6fbf7`; strategy blob: `25e65e89996e9b5f0777c8a88ca385c19701f4c3`; scope blob: `b39e33cce169bc6c37f454ea49f915e962fe335c`.
+
+The expanded insertion regression now measures eight consecutive positions at
+both history sizes, including two chunk closures/holdback releases per group.
+Its extra phase-observation mirror reads are included: within-chunk samples
+range 172–180 context resolutions and 63–65 mirror checks; closure/release
+samples are 227/73, identically at both sizes. These are instrumentation-specific
+phase counts, not a revision of the earlier two-position exact-tip 178/63 audit.
