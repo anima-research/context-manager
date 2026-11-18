@@ -932,9 +932,10 @@ describe('estimator calibration band', () => {
   });
 
   it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async (t) => {
-    // The picker's over-budget throw is dry-run-guarded (a preview reports
-    // `fits: false` instead), so a preview under a provisional 1.45 said the
-    // window doesn't fit where the real compile drops to 1 and fits. Store B's
+    // The picker used to skip its over-budget throw in dry runs, so a preview
+    // under a provisional 1.45 reported `fits: false` where the real compile
+    // dropped to 1 and fit. Dry runs now take the same gate and calibration
+    // retry as live compiles, before previewContext reports a refusal. Store B's
     // signature ("Adaptive plan check (…): ...") is this path. It needs the
     // picker over and the emitter under, so that the picker's refusal is the
     // only one the preview can fall back at. The strategy's own prices don't

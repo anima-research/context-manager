@@ -493,8 +493,10 @@ Given:
 6. If produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the hard budget × (1 +
-   overBudgetGraceRatio), default ×1.02 — and this is not a dry-run
-   preview: throw OverBudgetError. (Rev 5.1: the throw no longer
+   overBudgetGraceRatio), default ×1.02 — throw OverBudgetError in live
+   and dry compilation alike. previewContext catches the refusal and returns
+   the plan with fits: false, without entries or stats even with render: true.
+   (Rev 5.1: the throw no longer
    consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
    shards via the rendering algorithm in §3.6.1.
@@ -980,8 +982,10 @@ solve(tree, F_prev, W, P):
       -- additionally reports blocked='target-floor'
 
 [strategy layer, after picker.run:]
-  finalTokens > W·(1 + overBudgetGraceRatio) and not a dry-run preview
-      → OverBudgetError (loud)
+  finalTokens > W·(1 + overBudgetGraceRatio)
+      → OverBudgetError in live and dry compilation alike
+      → previewContext reports fits: false without rendering (no entries or
+        stats, even with render: true)
 ```
 
 Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally

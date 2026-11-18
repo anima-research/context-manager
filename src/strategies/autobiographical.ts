@@ -2735,6 +2735,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * pin is removed or written; the pins it leaves out are left out of what
    * the select reads, not of the strategy's list.
    *
+   * Budget refusals return `fits: false`, not rendered entries or stats,
+   * even with `opts.render: true`. An over-budget adaptive plan is refused
+   * before rendering; a fitting preview can include both fields on request.
+   *
    * Two things this deliberately does NOT do:
    *  - It does not apply anything. Applying is `updateHotContextSettings` (for
    *    the four hot keys) or a restart (for everything else).
@@ -2801,12 +2805,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!(err instanceof OverBudgetError)) throw err;
         // Read through a cast: control-flow narrowing still has this pinned to
         // `undefined` from the reset above, but selectAdaptive may have filled
-        // it in before a late render-stage throw.
+        // it in before a plan-check or later render-stage throw.
         const partial = this._lastPreview as PreviewResult | undefined;
-        // A plan already over the budget is refused at its gate by the live
-        // compile, with the numbers its preview recorded and the plan's list
-        // (which the preview gives as this dry run sees it). Return that
-        // plan report rather than reconstructing it from refusal diagnostics.
+        // Live and dry compiles refuse an over-budget plan before rendering.
+        // Return its recorded report rather than reconstructing it from
+        // refusal diagnostics: even render:true has no entries or stats.
         if (partial?.fits === false) return partial;
         // Infeasible at this budget. That is an ANSWER, not a failure — it is
         // the whole reason to preview before applying. Report it with the
@@ -2838,7 +2841,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!preview) throw new NoFoldPlanToPreviewError();
       // Segment breakdown for the hypothetical compile, which select() kept
       // apart from the live one. Lets a caller show the previewed
-      // head/middle/tail split without re-deriving it.
+      // head/middle/tail split without re-deriving it. Budget refusals return
+      // above without entries or stats, even when rendering was requested.
       return {
         ...preview,
         ...(opts?.render
@@ -9682,7 +9686,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let failed: string | undefined;
     try {
       probe = run('leave', true);
-      if ((this._lastPreview as PreviewResult | undefined)?.fits === false) failed = 'its plan is over the budget';
     } catch (err) {
       failed = describeFailure(err);
     } finally {

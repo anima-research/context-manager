@@ -744,18 +744,18 @@ export interface SelectOptions {
    * head-window memo, and whether chunk records are trusted), all on every
    * path out, throws included.
    *
-   * What a dry select refuses is what a real compile refuses, with one
-   * exception: an over-budget plan is not thrown at the plan check. A plain
-   * dry compile then returns that plan's entries with no verdict, and
-   * `previewContext` is where infeasibility is reported. The head-and-tail
-   * check before the plan check, and any later stage that can't fit, still
-   * throw as for a real compile, leaving nothing behind; `previewContext`
-   * reports an over-budget throw, as the plan's own preview when the plan was
-   * already over the budget (the live compile refuses it at the plan check),
-   * and passes any other throw through. The passthrough strategies throw
-   * none of their budget refusals on a dry select: it returns what they would
-   * send, over the budget or without the newest message, with no verdict,
-   * and they have no `previewContext` report.
+   * Adaptive dry selects take the same budget gates and retries as live
+   * compilation, including throwing OverBudgetError when the plan exceeds
+   * the rejection budget. A plain dry compile does not return entries for
+   * a refused plan. `previewContext` catches budget refusals and reports
+   * `fits: false`; it returns an already-over-budget plan's report without
+   * rendering, so even `{render:true}` has no entries or stats. Other
+   * errors pass through. The passthrough strategies throw none of their
+   * budget refusals on a dry select: it returns what they would send, over
+   * the budget or without the newest message, with no verdict, and they
+   * have no `previewContext` report. Dry selects do not repair folded rows
+   * removed by another manager sharing the window; until a live select repairs
+   * them, the dry layout can differ from the next live compile's layout.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
@@ -989,12 +989,14 @@ export interface PreviewResult {
   /**
    * The rendered context this layout would produce. Only present when the
    * caller asked for it (`{render:true}`) — on a large store these entries are
-   * megabytes, so they are opt-in rather than always returned.
+   * megabytes, so they are opt-in rather than always returned. Absent on
+   * budget refusal, including an over-budget plan refused before rendering.
    */
   entries?: ContextEntry[];
   /**
    * Segment breakdown (head / middle / tail / summaries-by-level) for the
-   * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
+   * HYPOTHETICAL compile. Also `{render:true}` only, and absent on budget
+   * refusal, including a plan refused before rendering. Distinct from
    * `getRenderStats()`, which describes the last live compile, or is null
    * before one.
    */

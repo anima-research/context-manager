@@ -1,5 +1,6 @@
-- **Hosts matching the adaptive refusal's opening words:** update matches
-  from "Adaptive picker exhausted" to "Adaptive plan check (solver)" (#496).
+- **Hosts matching adaptive refusal messages, using dry compiles, or rendering
+  previews:** update message matches from "Adaptive picker exhausted" to
+  "Adaptive plan check (solver)" (#496).
   The refusal now says which solver planned, and no longer says the picker
   was exhausted when it wasn't. That refusal tests the plan's size against the hard budget, not
   the solver's `exhausted`, but its message opened "Adaptive picker
@@ -30,7 +31,13 @@
   Ordinary dry-run compilation now takes the same plan gates as live
   compilation and throws when its first plan exceeds the hard budget,
   including after a provisional calibration retry drops the multiplier to 1.
-  Previews report that refused plan without attempting a stub-room retry.
+  Hosts using `compile(..., { dryRun: true })` must now catch
+  `OverBudgetError`, or use `previewContext` to inspect infeasibility via
+  `fits: false` rather than consuming entries from a refused plan.
+  Previews report that refused plan without attempting a stub-room retry;
+  even with `render: true`, they return no `entries` or `stats`, since the
+  plan gate refuses before rendering. Render-preview consumers must handle
+  those fields being absent; fitting previews still render on request.
   A dry compile whose stub-room retry plan exceeds its reduced budget now
   throws the original stub refusal, as live compilation does.
   A preview whose stub-room retry plan exceeds its reduced budget now
