@@ -21,16 +21,16 @@
   transformedRequestSha256 fields remain compatibility aliases, respectively:
   SHA-256 of JSON.stringify(messages) before surgery and as actually sent, not
   hashes of the full request objects.
-- KnowledgeStrategy retains default construction for primitive JavaScript options.
+- KnowledgeStrategy accepts non-null primitive JavaScript options; null is
+  unsupported and throws in the superclass.
 - Surgery family progress, quarantine and failure runs are isolated from ordinary
   recall-bearing compression, so their deterministic refusals cannot be reused
-  across authoring modes. Attempt traces and compression logs describe sent recalls.
+  across authoring modes. Attempt traces and compression logs track sent recalls by constructed header
+  identity; subclass authoring that clones header blocks loses that identity.
 - Surgery refuses deletion of a memory when it would orphan a raw tool result.
   The CLI emits recovery guidance before opening the store and requires a new
   receipt destination outside the disposable store (exclusive creation).
-- **Surgery receipt consumers:** `provenanceMode` is now `authored-request`, not
-  `external-receipt-only`; update parsers to accept the new value. The restored
-  message-digest compatibility aliases remain unchanged.
+
 
 - One-shot execution now validates the quarantine key's chunk-source identity on
   both parent and fork. It reserves and syncs an external preflight receipt
@@ -62,3 +62,11 @@
 - Sent-recall telemetry tracks constructed header blocks, not raw Context Manager
   quotes, without adding metadata to requests. Ordinary repair/rebuild ignores
   surgery-only quarantine outcomes in both legacy snapshots and event ledgers.
+- One-shot receipts distinguish a failed tick or missing target summary from
+  successful store closure. Surgery ticks leave unrelated merges queued, even
+  when relief, failure ordering or the speculative cap would normally run them.
+  Sanitized provider failures retain their class, HTTP status and error type for
+  ladder classification and receipts; carrier fallback still cannot exceed the
+  one-call cap.
+- The standalone transform rejects crossing tool pairs in either direction,
+  including a retained raw use whose result would be deleted with a recall.

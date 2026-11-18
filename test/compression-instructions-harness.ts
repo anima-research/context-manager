@@ -73,7 +73,8 @@ export async function run(mode: Mode, pin: 'own' | 'mixed' | 'inherited', config
       ...extra, ...(config === undefined ? {} : { compressionInstructions: config }) });
     const membrane = { complete: async (request: NormalizedRequest) => {
       calls.push(structuredClone(request));
-      // Canonical/source-only split requests have four raw records. Pieces have one.
+      // Canonical/source-only requests have four raw records. Recursive pieces
+      // have two, then one; only single-record pieces are accepted below.
       if (firstResponse && calls.length === 1) return {
         content: firstResponse === 'empty' ? [] : [text('A nonempty tool-use preamble.'),
           { type: 'tool_use', id: 'mock-call', name: 'mock', input: {} }], stopReason: firstResponse === 'empty' ? 'end_turn' : 'tool_use',

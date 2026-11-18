@@ -13,7 +13,7 @@ const generator = resolve('scripts/generate-compression-main-golden.mjs');
 // runtime. Real modern + legacy request parity is checked separately.
 function fixture(check: (root: string, git: (...args: string[]) => string) => void, objectFormat?: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cm-golden-source-')));
-  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_'))),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
   const git = (...args: string[]) => execFileSync('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', ...args], { encoding: 'utf8', timeout: 10000, env }).trim();
   try {
@@ -48,7 +48,7 @@ function capture(root: string, env = process.env) {
 
 it('generator records actual source HEAD/tree, ignores Git overrides and preserves own undefined', () => {
   fixture((root, git) => {
-    const result = capture(root, { ...process.env, GIT_WORK_TREE: process.cwd(), GIT_DIR: resolve('.git') });
+    const result = capture(root, { ...process.env, GIT_WORK_TREE: process.cwd(), GIT_DIR: resolve('.git'), git_dir: resolve('.git'), git_work_tree: process.cwd() });
     assert.equal(result.status, 0, result.stderr);
     const golden = JSON.parse(readFileSync(join(root, 'dist/capture.json'), 'utf8'));
     assert.equal(golden.source, git('rev-parse', 'HEAD'));
@@ -221,6 +221,7 @@ it('generator reports compiler diagnostics and source inspection errors distinct
     const inspection = capture(root);
     assert.notEqual(inspection.status, 0);
     assert.match(inspection.stderr, /Unable to inspect source path.*src\/product\.ts.*EISDIR/);
+    assert.ok(inspection.stderr.includes(root));
     assert.match(inspection.stderr, /Check source-path type, permissions and readability/);
   });
 });

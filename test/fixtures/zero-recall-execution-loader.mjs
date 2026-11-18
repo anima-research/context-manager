@@ -42,7 +42,7 @@ export async function load(url, context, nextLoad) {
         strategy.readCompressionQuarantineProjection = () => {
           if (process.env.SURGERY_CASE === 'unreadable') throw new Error('quarantine ledger unreadable');
           return new Map([['quarantined', { record: { chunkSourceHash: createHash('sha256').update(JSON.stringify(
-            process.env.SURGERY_CASE === 'wrong-chunk' ? ['other'] : ['first', 'last'])).digest('hex') } }]]);
+            (process.env.SURGERY_CASE === 'wrong-chunk' || (process.env.SURGERY_CASE === 'fork-mismatch' && branch.name !== 'main')) ? ['other'] : ['first', 'last'])).digest('hex') } }]]);
         };
         strategy.clearCompressionRefusalQuarantine = async key => { trace({ clearEntered: key }); if (process.env.SURGERY_CASE === 'clear-error') throw new Error('clear failed'); trace({ cleared: key }); };
         let branch = { name: 'main' };
@@ -55,6 +55,7 @@ export async function load(url, context, nextLoad) {
           currentBranch: () => branch,
           fork: async name => { trace({ fork: name }); branch = { name }; return name; },
           tick: async () => {
+            if (process.env.SURGERY_CASE === 'no-summary') return;
             let request = { messages: [message('Context Manager', '[CM] Recall memory memory.'),
               message('Claude', 'stored answer'), message('Context Manager', strategy.opening()),
               message('user', 'raw source must survive')], config: { model: 'offline' } };
@@ -63,6 +64,7 @@ export async function load(url, context, nextLoad) {
             if (process.env.SURGERY_CASE === 'mismatch') request.config.model = 'tampered';
             await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
             if (process.env.SURGERY_CASE === 'repeat') await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
+            if (process.env.SURGERY_CASE === 'refusal') return;
             strategy.summaries.push({ id: 'new', sourceRange: { first: 'first', last: 'last' } });
           },
           close: () => {

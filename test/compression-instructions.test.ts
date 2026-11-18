@@ -115,18 +115,18 @@ it('existing hooks and reminders keep their precedence', async () => {
     assert.equal(instruction(calls.at(-1)!), `${expected}\n\nREMINDER`);
   }
   const calls = await run('chunk', 'inherited', { templates: { chunk: 'UNUSED CUSTOM CHUNK' } }, { witnessedInstruction: 'EXISTING {targetTokens}', witnessedIdentityReminder: 'WITNESS-REMINDER' });
-  assert.match(instruction(calls[0]!), /^EXISTING \d+\n\nWITNESS-REMINDER$/);
+  assert.equal(instruction(calls[0]!), 'EXISTING 2000\n\nWITNESS-REMINDER');
 });
 
 it('templates alone need no preset; partial overrides leave every other phase at DEFAULT', async () => {
   const config: CompressionInstructions = { templates: { chunk: 'ONLY CHUNK {targetTokens}' } };
-  assert.match(instruction((await run('chunk', 'own', config))[0]!), /^ONLY CHUNK \d+$/);
+  assert.equal(instruction((await run('chunk', 'own', config))[0]!), 'ONLY CHUNK 2000');
   for (const [mode, pin] of [['chunk', 'inherited'], ['reading', 'own'], ['merge', 'own'],
     ['fallback', 'inherited'], ['readingFallback', 'own'], ['transition', 'own']] as const) {
     assert.equal(requestBytes(await run(mode, pin, config)), requestBytes(await run(mode, pin)));
   }
   const pieces = await run('readingSplit', 'mixed', config);
-  for (const r of pieces.slice(-4)) assert.match(instruction(r), /^ONLY CHUNK \d+$/);
+  assert.deepEqual(pieces.slice(2).map(instruction), [1000, 500, 500, 1000, 500, 500].map(n => `ONLY CHUNK ${n}`));
 });
 
 it('constructor snapshots templates; later caller edits cannot reach request hooks', () => {
@@ -197,7 +197,7 @@ it('ordinary merge-only overrides do not own the separate source-level retry hoo
     assert.equal(instruction(calls[1]!), instruction(defaults[1]!));
     const selected = await run('fallback', pin, custom, {}, MergeOnly);
     assert.equal(instruction(selected[0]!), 'ORDINARY SUBCLASS');
-    assert.match(instruction(selected[1]!), pin === 'inherited' ? /^CUSTOM WMERGE 1 2 / : /^CUSTOM MERGE 1 2 /);
+    assert.equal(instruction(selected[1]!), pin === 'inherited' ? 'CUSTOM WMERGE 1 2 2000' : 'CUSTOM MERGE 1 2 2000');
   }
 });
 
@@ -205,8 +205,8 @@ for (const mode of ['fallback', 'readingFallback'] as const) {
   for (const pin of ['own', 'inherited'] as const) {
     it(`${mode}/${pin}: L3 retry shows L2 sources`, async () => {
       const calls = await run(mode, pin, custom, {}, Probe, 3);
-      assert.match(instruction(calls[0]!), mode === 'readingFallback' ? /^CUSTOM RMERGE 1 3 / : pin === 'inherited' ? /^CUSTOM WMERGE 1 3 / : /^CUSTOM MERGE 1 3 /);
-      assert.match(instruction(calls[1]!), pin === 'inherited' ? /^CUSTOM WMERGE 2 3 / : /^CUSTOM MERGE 2 3 /);
+      assert.equal(instruction(calls[0]!), mode === 'readingFallback' ? 'CUSTOM RMERGE 1 3 2560 2000' : pin === 'inherited' ? 'CUSTOM WMERGE 1 3 2000' : 'CUSTOM MERGE 1 3 2000');
+      assert.equal(instruction(calls[1]!), pin === 'inherited' ? 'CUSTOM WMERGE 2 3 2000' : 'CUSTOM MERGE 2 3 2000');
     });
   }
 }

@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error']) {
+for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error', 'no-summary', 'refusal', 'fork-mismatch']) {
   test(`executing surgery CLI offline: ${scenario}`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -47,7 +47,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const sent = trace.filter(event => event.sent).map(event => event.sent);
       assert.equal(result.status, scenario === 'success' ? 0 : 1, result.stderr);
-      assert.equal(sent.length, ['success', 'repeat', 'provider-error', 'close-error'].includes(scenario) ? 1 : 0);
+      assert.equal(sent.length, ['success', 'repeat', 'provider-error', 'close-error', 'refusal'].includes(scenario) ? 1 : 0);
       if (scenario === 'unsafe' || scenario === 'opening-collision') {
         assert.match(result.stdout, scenario === 'unsafe' ? /Raw recall-shaped/ : /collides with compression opening/);
         assert.ok(!trace.some(event => event.fork || event.cleared), 'source safety precedes mutation');
@@ -85,6 +85,11 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         assert.notEqual(receipt.call.originalRequestSha256, receipt.call.transformedRequestSha256);
       }
       assert.ok(trace.filter(event => event.closed).every(event => event.statusAtClose !== 'finished'));
+      if (scenario !== 'success' && scenario !== 'close-error') assert.equal(receipt.status, 'failed');
+      if (scenario === 'fork-mismatch') {
+        assert.ok(trace.some(event => event.fork));
+        assert.ok(!trace.some(event => event.cleared));
+      }
       if (scenario === 'close-error') {
         assert.equal(receipt.status, 'uncertain');
         assert.match(receipt.closeError, /durability is uncertain/);

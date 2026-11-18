@@ -10,7 +10,7 @@ const [sourceRoot, output] = process.argv.slice(2);
 if (!sourceRoot || !output) throw new Error('usage: node scripts/generate-compression-main-golden.mjs <source-worktree-root> <output.json>');
 const root = realpathSync(resolve(sourceRoot));
 // Ignore caller Git overrides: all provenance commands must inspect this root.
-const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_')));
 gitEnv.GIT_CONFIG_NOSYSTEM = '1';
 gitEnv.GIT_CONFIG_GLOBAL = '/dev/null';
 const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: gitEnv, timeout: 10000 }).replace(/\n$/, '');
@@ -34,7 +34,7 @@ function sourceFilesChanged() {
       return hash !== git('rev-parse', 'HEAD:' + path) ? [path] : [];
     } catch (error) {
       if (error.code === 'ENOENT') return [path];
-      throw new Error(`Unable to inspect source path ${JSON.stringify(path)}: ${error.message}. Check source-path type, permissions and readability, then retry.`, { cause: error });
+      throw new Error(`Unable to inspect source path ${JSON.stringify(resolve(root, path))}: ${error.message}. Check source-path type, permissions and readability, then retry.`, { cause: error });
     }
   });
 }

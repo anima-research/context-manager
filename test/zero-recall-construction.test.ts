@@ -9,7 +9,7 @@ import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy, type AutobiographicalOptions, type SummaryEntry, type StrategyContext } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import { ZeroRecallSurgeryStrategy } from '../src/surgery/zero-recall-strategy.js';
-import { assertZeroRecallConstruction, assertZeroRecallSourceSafe, transformConstructedZeroRecallCompression, captureZeroRecallConstruction } from '../src/surgery/zero-recall-compression.js';
+import { transformZeroRecallCompression, assertZeroRecallConstruction, assertZeroRecallSourceSafe, transformConstructedZeroRecallCompression, captureZeroRecallConstruction } from '../src/surgery/zero-recall-compression.js';
 
 const text = (value: string): ContentBlock => ({ type: 'text', text: value });
 const thinking: ContentBlock = { type: 'thinking', thinking: 'reasoning', signature: 'signed' };
@@ -512,3 +512,17 @@ for (const enabled of [false, true]) {
     }
   });
 }
+
+
+test('standalone transform refuses deleting a result whose raw tool use survives', () => {
+  const answer = { participant: 'Claude', content: [
+    { type: 'tool_result' as const, toolUseId: 'raw-call', content: [text('result')] },
+  ] };
+  assert.throws(() => transformZeroRecallCompression([
+    { participant: 'Claude', content: [{type:'tool_use', id:'raw-call', name:'mock', input:{}}] },
+    { participant: 'Context Manager', content: [text('[CM] Recall memory L1-1.')] },
+    answer,
+    { participant: 'Context Manager', content: [text('OPEN')] },
+    { participant: 'user', content: [text('raw')] },
+  ], 'OPEN', [{id:'L1-1', answer}]), /Tool pair crosses recall deletion boundary/);
+});

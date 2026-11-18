@@ -136,7 +136,7 @@ export function transformZeroRecallCompression(
   }
 
 
-  // Never leave a raw result whose matching use was deleted with a memory.
+  // Never delete just one side of a matched tool pair.
   // Match each result to its most recent preceding use, not an unrelated
   // earlier use with the same id. Reused ids must not mask deleted calls.
   const retainedUses = new Map<string, boolean>();
@@ -144,7 +144,8 @@ export function transformZeroRecallCompression(
     const retained = kept.includes(message);
     for (const block of message.content) {
       if (block.type === 'tool_use') retainedUses.set(block.id, retained);
-      if (retained && block.type === 'tool_result' && retainedUses.get(block.toolUseId) === false) {
+      if (block.type === 'tool_result' && retainedUses.has(block.toolUseId)
+        && retainedUses.get(block.toolUseId) !== retained) {
         throw new Error('Tool pair crosses recall deletion boundary; refusing zero-recall surgery');
       }
     }

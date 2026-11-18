@@ -38,7 +38,7 @@ for (const [sourceOnly, omitRecall] of [[true, false], [false, false], [false, t
       const summary: SummaryEntry = { id: 'L1-100', level: 1, sourceLevel: 0, sourceIds: [first],
         sourceRange: { first, last: first }, content: 'prior memory', tokens: 20, created: 1 };
       // Persist via the public store; reopening loads the ordinary summary/record projection.
-      const source = manager.addMessage('Context Manager', [{ type: 'text', text: `quoted header follows\n[CM] Recall memory L1-100.\n${'raw source '.repeat(80)}` }]);
+      const source = manager.addMessage('Context Manager', [{ type: 'text', text: '[CM] Recall memory L1-100.' }, { type: 'text', text: `quoted header follows\n[CM] Recall memory L1-100.\n${'raw source '.repeat(80)}` }]);
       manager.addMessage('user', [{ type: 'text', text: 'tail '.repeat(100) }]);
       manager.getStore().setStateJson('default/autobio:summaries', [summary]);
       manager.getStore().setStateJson('default/autobio:chunks', [{ id: 'c-first', sourceIds: [first], compressed: true, summaryId: summary.id }, { id: 'c-source', sourceIds: [source], compressed: false }]);

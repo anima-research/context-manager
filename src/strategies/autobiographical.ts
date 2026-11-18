@@ -1862,7 +1862,7 @@ function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
  * invalid_request 400 about thinking blocks (e.g. the "cannot be modified"
  * class), never a policy refusal. Retry once, stripped, loudly.
  */
-function isCarrierTransportRejection(error: unknown): boolean {
+export function isCarrierTransportRejection(error: unknown): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
   const msg = (e?.message ?? '').toLowerCase();
   const badRequest =
@@ -8979,8 +8979,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return true;
   }
 
+  /** Opt-in operations may restrict a tick to L1 without consuming or
+   * reprioritizing unrelated queued merges. Ordinary compression allows both.
+   */
+  protected allowsMergeScheduling(): boolean { return true; }
+
   async tick(ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('tick');
+    const allowMerges = this.allowsMergeScheduling();
     phaseChannel.report('compress-tick'); // liveness-watchdog phase
     // Quarantine is deferred debt, never a resting state: every quarantined
     // chunk keeps its span raw, the fold floor creeps, and the picker
@@ -9030,7 +9036,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // line below; left unset when no queued chunk could run.
     let mergeTurn: 'relief' | 'after a failed L1' | 'speculative cap' | undefined;
     for (const key of candidates) {
-      if (this.speculativeCapHolds()) {
+      if (allowMerges && this.speculativeCapHolds()) {
         mergeTurn = 'speculative cap';
         break;
       }
@@ -9052,12 +9058,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
-      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
+      if (allowMerges && failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
         mergeTurn = 'after a failed L1';
         break;
       }
       // A merge that takes more off the floor than this chunk's L1 goes first.
-      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
+      if (allowMerges && this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
         mergeTurn = 'relief';
         break;
       }
@@ -9225,6 +9231,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
     }
+
+    if (!allowMerges) return;
 
     if (this.mergePicksDeferred) {
       this.mergePicksDeferred = false;
