@@ -79,7 +79,8 @@ export function assertZeroRecallSourceSafe(messages: readonly Pick<NormalizedMes
  * The caller must establish that the prefix contains no raw recall-shaped history
  * or raw text equal to the opening (source safety can check both).
  * It does not annotate the request, generated summary, or prior turns; all
- * operation provenance belongs in the caller's external receipt.
+ * operation metadata belongs in the external receipt; the authoring strategy
+ * hashes and persists the returned request as ordinary mint provenance.
  * It never edits Chronicle or any source message. Callers must bind its use to
  * an exact stopped store, branch, chunk, request hash and one-shot receipt.
  */

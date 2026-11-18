@@ -50,6 +50,18 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'provider-err
         assert.deepEqual(receipt.call.removedRecallIds, ['memory']);
         assert.equal(receipt.call.originalMessages, 4);
         assert.equal(receipt.call.sentMessages, 2);
+        assert.equal(receipt.provenanceMode, 'authored-request');
+        assert.equal(receipt.call.transformedMessagesSha256, hash(JSON.stringify(sent[0].messages)));
+        const original = trace.find(event => event.original).original;
+        assert.equal(original.messages.length, 4);
+        assert.equal(receipt.call.originalMessagesSha256, hash(JSON.stringify(original.messages)));
+        assert.equal(receipt.call.originalRequestSha256, hash(JSON.stringify(original.messages)),
+          'legacy original alias hashes the pre-surgery messages, not the authored request');
+        assert.equal(receipt.call.transformedRequestSha256, hash(JSON.stringify(sent[0].messages)),
+          'legacy transformed alias hashes the messages actually sent');
+        assert.equal(receipt.call.originalRequestSha256, receipt.call.originalMessagesSha256);
+        assert.equal(receipt.call.transformedRequestSha256, receipt.call.transformedMessagesSha256);
+        assert.notEqual(receipt.call.originalRequestSha256, receipt.call.transformedRequestSha256);
       }
       if (scenario === 'repeat') assert.match(receipt.error.message, /ONE_CALL_CAP/);
       if (scenario === 'mismatch') assert.match(receipt.error.message, /differs from trusted/);

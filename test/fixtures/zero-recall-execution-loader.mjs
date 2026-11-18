@@ -14,8 +14,9 @@ export async function load(url, context, nextLoad) {
     export class NativeFormatter {}
     export class Membrane {
       bound = true;
-      async complete(request) {
+      async complete(request, options) {
         if (!this.bound) throw new Error('lost provider receiver');
+        if (!options?.formatter?.offline || !(options.signal instanceof AbortSignal)) throw new Error('lost complete options');
         appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({ sent: request }) + '\\n');
         if (process.env.SURGERY_CASE === 'provider-error') throw new Error('stub provider failure');
         return { content: [{ type: 'text', text: 'summary' }], stopReason: 'end_turn' };
@@ -43,13 +44,14 @@ export async function load(url, context, nextLoad) {
           currentBranch: () => branch,
           fork: async name => { trace({ fork: name }); return branch = { name }; },
           tick: async () => {
-            const request = { messages: [message('Context Manager', '[CM] Recall memory memory.'),
+            let request = { messages: [message('Context Manager', '[CM] Recall memory memory.'),
               message('Claude', 'stored answer'), message('Context Manager', strategy.opening()),
               message('user', 'raw source must survive')], config: { model: 'offline' } };
-            strategy.observeL1CompressionRequest(request, ['memory']);
+            trace({ original: request });
+            request = strategy.authorL1CompressionRequest(request, ['memory']);
             if (process.env.SURGERY_CASE === 'mismatch') request.config.model = 'tampered';
-            await membrane.complete(request);
-            if (process.env.SURGERY_CASE === 'repeat') await membrane.complete(request);
+            await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
+            if (process.env.SURGERY_CASE === 'repeat') await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
             strategy.summaries.push({ id: 'new', sourceRange: { first: 'first', last: 'last' } });
           },
           close: () => trace({ closed: true }),

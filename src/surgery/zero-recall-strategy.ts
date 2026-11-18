@@ -1,12 +1,22 @@
 import { AutobiographicalStrategy } from '../strategies/autobiographical.js';
 import type { NormalizedRequest } from '@animalabs/membrane';
-import { captureZeroRecallConstruction } from './zero-recall-compression.js';
+import { captureZeroRecallConstruction, transformConstructedZeroRecallCompression } from './zero-recall-compression.js';
 
 /** Opt-in construction observer for the one-shot surgery, not a live strategy default.
  * Caller must run assertZeroRecallSourceSafe on stopped raw CM history first.
- * Snapshots are ephemeral and must be matched before editing the intercepted request.
+ * Recall removal authors the accepted request before dispatch and provenance hashing.
  */
 export class ZeroRecallSurgeryStrategy extends AutobiographicalStrategy {
+  authoredRequest?: NormalizedRequest;
+  transformation?: ReturnType<typeof transformConstructedZeroRecallCompression>;
+  protected override authorL1CompressionRequest(request: NormalizedRequest, recallIds: readonly string[]): NormalizedRequest {
+    this.observeL1CompressionRequest(request, recallIds);
+    const transformed = transformConstructedZeroRecallCompression(request, this.opening(), this.construction!);
+    const authored = { ...request, messages: transformed.messages };
+    this.transformation = transformed;
+    this.authoredRequest = structuredClone(authored);
+    return authored;
+  }
   construction?: ReturnType<typeof captureZeroRecallConstruction>;
   opening() {
     // Use production preparation for custom openings containing serialized media.
@@ -29,6 +39,12 @@ export class ZeroRecallSurgeryStrategy extends AutobiographicalStrategy {
       && !this.summaryAnswerContent(s).some(b => b.type === 'text' && b.text.trim().length > 0))) {
       throw new Error('Unstable or empty recall answer; refusing zero-recall surgery');
     }
-    this.construction = captureZeroRecallConstruction(request, recallIds);
+    const construction = captureZeroRecallConstruction(request, recallIds);
+    // Stored answers with results are refused above. Any result that appears
+    // only after splitting/collapse therefore belongs to raw source history.
+    if (construction.expectedAnswers.some(({ answer }) => answer.content.some(b => b.type === 'tool_result'))) {
+      throw new Error('Raw tool result collapsed into recall answer; refusing zero-recall surgery');
+    }
+    this.construction = construction;
   }
 }

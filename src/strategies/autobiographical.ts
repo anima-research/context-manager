@@ -3327,6 +3327,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected observeL1CompressionRequest(_request: NormalizedRequest, _recallIds: readonly string[]): void {}
 
+  /** Opt-in L1 authoring, before dispatch identity and accepted provenance are
+   * formed. The default returns the identical request; surgery overrides this
+   * rather than editing bytes behind the strategy's transport boundary.
+   */
+  protected authorL1CompressionRequest(request: NormalizedRequest, recallIds: readonly string[]): NormalizedRequest {
+    this.observeL1CompressionRequest(request, recallIds);
+    return request;
+  }
+
   /**
    * `membrane.complete()` for the current generation's work, with a
    * controller of its own kept in callsOut while the call is out, so that
@@ -11996,6 +12005,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             name: 'CompressionBranchDiscard',
           });
         }
+        const preparedRequest = attemptRequest;
+        attemptRequest = this.authorL1CompressionRequest(preparedRequest, recallIds);
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -12031,7 +12042,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          this.observeL1CompressionRequest(attemptRequest, recallIds);
           response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
@@ -12078,9 +12088,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns);
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
-          acceptedRequest = stripReasoningFromRequest(attemptRequest);
+          acceptedRequest = this.authorL1CompressionRequest(stripReasoningFromRequest(preparedRequest), recallIds);
           try {
-            this.observeL1CompressionRequest(acceptedRequest, recallIds);
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);

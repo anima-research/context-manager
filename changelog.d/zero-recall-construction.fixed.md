@@ -9,4 +9,16 @@
 - Failed one-shot operations include backup-restoration guidance in their receipt
   even if a provider call was recorded before failure.
 
-- Surgery receipt readers should migrate `call.originalRequestSha256` to `call.originalMessagesSha256` and `call.transformedRequestSha256` to `call.transformedMessagesSha256`. Both old names remain transitional aliases; all four hash message arrays, not whole requests.
+- Zero-recall surgery removes recalls during L1 request authoring, before the
+  accepted request is hashed or its mint preimage persisted. Summary provenance
+  now describes the full request sent to the provider; the transport only
+  validates that authored snapshot and enforces the one-call cap.
+- Surgery refuses normalized recall answers containing raw tool results, avoiding
+  deletion of source results collapsed into a user-participant memory.
+- Surgery forwards the strategy's formatter and cancellation signal. Receipt
+  message digests use the explicit originalMessagesSha256 and
+  transformedMessagesSha256 names. The public originalRequestSha256 and
+  transformedRequestSha256 fields remain compatibility aliases, respectively:
+  SHA-256 of JSON.stringify(messages) before surgery and as actually sent, not
+  hashes of the full request objects.
+- KnowledgeStrategy retains default construction for primitive JavaScript options.

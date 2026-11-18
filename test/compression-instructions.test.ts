@@ -651,5 +651,8 @@ it('unrelated symbol descriptors are not inspected and primitive JS options reta
     },
   });
   assert.doesNotThrow(() => new Probe(config));
-  for (const value of [false, 1]) assert.doesNotThrow(() => new Probe(value as never));
+  for (const value of [false, 1]) {
+    assert.doesNotThrow(() => new Probe(value as never));
+    assert.doesNotThrow(() => new KnowledgeProbe(value as never));
+  }
 });
