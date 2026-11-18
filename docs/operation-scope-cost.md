@@ -1,40 +1,70 @@
 # Operation-boundary cost (offline local sample)
 
-The old raw-history-only sample did not create summaries or exercise the picker;
-it also did not await the asynchronous compile result. It did not establish the
-cost of compression or adaptive selection. The expanded
-`scripts/bench-operation-scope.mjs` awaits compile, builds actual L1/L2/L3 summaries
-with a deterministic in-process provider, and checks that measured compressed
-and adaptive compiles render summaries. Adaptive mode uses `kv-stable` with a
-constrained budget. Probes require `cappedForSend` and `buildPicker` to run.
+Every ordinary Autobiographical/Knowledge call still pays AsyncLocalStorage
+resolution, wrapper closures and guarded-field checks, even if the resident
+never switches or reloads. There is no no-reload fast path. The earlier
+raw-history-only benchmark neither created summaries nor awaited compile; it
+could not establish compressed/adaptive cost.
 
-The same harness was run on the tree immediately before operation scope was
-introduced, this round's starting tree, and the revised tree. Node 22.23.3,
-real Chronicle stores, local CPU, MemoryMax=4G, short TMPDIR, no network. Timings
-below are milliseconds. Compile is the median of 30 samples after 10 warmups;
-compression is the median of active two-tick rounds (including local persistence,
-not provider latency); reload is one same-instance setStrategy after population.
-Each tree used identical instrumentation. This is a noisy local sample, not a
-performance budget, latency qualification, or proof that overhead is negligible.
+## Reproduction and populations
 
-| Path | Messages | Compile before / start / revised | Compression before / start / revised | Reload before / start / revised |
-| --- | ---: | ---: | ---: | ---: |
-| raw | 32 | 0.334 / 0.305 / 0.279 | — / — / — | 0.963 / 0.933 / 0.740 |
-| raw | 256 | 0.926 / 0.834 / 0.769 | — / — / — | 0.979 / 1.188 / 1.226 |
-| raw | 1024 | 1.407 / 2.359 / 2.228 | — / — / — | 2.311 / 3.259 / 2.870 |
-| compressed | 32 | 0.164 / 0.298 / 0.192 | 1.895 / 3.194 / 2.181 | 1.728 / 2.398 / 1.530 |
-| compressed | 256 | 0.503 / 0.694 / 0.385 | 6.343 / 7.090 / 5.907 | 4.108 / 3.808 / 4.020 |
-| compressed | 1024 | 0.663 / 0.909 / 0.765 | 17.633 / 19.089 / 16.152 | 6.589 / 7.338 / 6.812 |
-| adaptive | 32 | 0.588 / 1.084 / 0.683 | 1.461 / 2.816 / 1.668 | 1.012 / 1.567 / 1.044 |
-| adaptive | 256 | 2.021 / 3.034 / 2.085 | 4.998 / 7.121 / 5.317 | 2.899 / 3.277 / 3.848 |
-| adaptive | 1024 | 6.457 / 8.073 / 6.959 | 17.327 / 19.733 / 16.235 | 7.079 / 9.786 / 8.199 |
+The same `scripts/bench-operation-scope.mjs` from
+`1eb75a95467279c39182ccc95d2521d0fe871181` was run against these built source trees:
 
-The 32/256/1,024-message compressed/adaptive fixtures produced 9/75/306
-summaries/provider calls, respectively; 1,024-message adaptive runs traversed
-887,792 capped-message calls and 195 picker builds across setup and measurement.
-The new boundary retains measurable hot-path overhead: at 1,024 messages this
-sample shows roughly 0.50 ms extra warm adaptive compile time versus pre-scope.
-This change keeps that cost for origin checks; it does not claim a new fast path.
-The smoke regression checks path reachability and actual compressed rendering,
-not unstable wall-clock thresholds. Results do not cover kv-unified solver
-populations, all adaptive policies, provider latency, or Bun propagation.
+- **Pre-scope:** `a8de6130211899f61d15de71ec8273ed66968e76`, immediately before
+  operation scope was introduced.
+- **Scoped:** `1eb75a95467279c39182ccc95d2521d0fe871181`.
+
+Both used Node 22.23.3, Chronicle 0.7.0, Membrane 0.9.0 and the same probes.
+Build each tree, then run the harness with its built entrypoint:
+
+```sh
+systemd-run --user --scope -p MemoryMax=4G env TMPDIR=/tmp/c14b \
+  node scripts/bench-operation-scope.mjs <tree>/dist/src/index.js \
+  --sizes=1024,4096 --modes=adaptive
+```
+
+Three sequential pre-scope/scoped pairs ran offline on a shared local CPU with
+real Chronicle stores and deterministic in-process provider output. This
+compares the complete source-tree changes, not isolated AsyncLocalStorage cost.
+Each run creates actual L1/L2/L3 summaries, awaits compile, requires summary
+rendering, and exercises `kv-stable` adaptive selection under a constrained
+budget. These are larger populated **synthetic** histories, not production
+traces. Setup/measurement at 1,024 / 4,096 messages produced 306 / 1,226
+summaries and provider calls, 887,792 / 13,610,616 capped-message calls, and
+195 / 655 picker builds. Those counts cover the whole run, not one compile.
+
+## Results
+
+Milliseconds; each cell is the median across three runs. Compile uses 30 samples
+after 10 warmups per run; compression uses active two-tick rounds, including
+local persistence but no provider latency. Add measures each insertion; reload
+is one same-instance `setStrategy` after population.
+
+| Messages | Add pre / scoped | Compile pre / scoped | Compression pre / scoped | Reload pre / scoped |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 0.203 / 0.436 | 6.605 / 7.193 | 16.667 / 17.528 | 8.308 / 9.603 |
+| 4,096 | 0.601 / 1.715 | 31.118 / 37.026 | 56.843 / 63.186 | 29.746 / 33.971 |
+
+Across runs, warm compile medians ranged from 5.665–7.442 / 7.152–7.712 ms
+at 1,024 messages, and 29.890–33.444 / 36.477–38.985 ms at 4,096.
+At 4,096, process high-water RSS was 300–305 MiB pre-scope and 326–336 MiB
+scoped (each process also ran the 1,024-message fixture first).
+
+## Acceptance basis and limits
+
+For this PR's local fixture, we accept up to **10 ms extra median warm adaptive
+compile and 2 ms extra median add at 4,096 messages** in exchange for retaining
+origin checks on ordinary calls. The measured increases are 5.91 ms (19%) and
+1.11 ms (185%), respectively. The add regression is substantial in relative
+terms; it is not free or hidden by a provider call. Compression and populated
+reload also cost more in this sample. This is an explicit, limited safety/cost
+tradeoff, not an established project-wide performance policy or host latency
+SLA; latency-sensitive callback owners should qualify their actual resident
+before rollout rather than assuming that never reloading avoids the cost.
+
+No representative production workload, tail-latency bound, history above 4,096,
+large hold population, kv-unified solver population, other adaptive policy or
+Bun performance is established here. The smoke regression checks reachability
+and compressed rendering, not unstable wall-clock thresholds. Broader cost
+claims need those measurements, not a more elaborate fence on this evidence.

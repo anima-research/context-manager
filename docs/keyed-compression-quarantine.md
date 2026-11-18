@@ -244,7 +244,12 @@ The fence covers library invocations and continuations that preserve their
 AsyncLocalStorage context. It is **not a sandbox for host-scheduled work**.
 Timers (including intervals), microtasks and promises created in a strategy
 callback normally inherit that invocation's load and lifecycle epoch, so later
-direct strategy access can be refused after initialize or detach. In contrast,
+direct strategy access can be refused after initialize or detach. The callback's
+own continuation after `await manager.fork(...)` or
+`await manager.switchBranch(...)` also retains its old origin: no timer or
+separately scheduled promise is needed, and awaiting the lifecycle call does not
+rebind subsequent strategy access to the new load. Use a fresh manager entrypoint
+or the host dispatcher described below for intentional new-load work. In contrast,
 event and abort listeners run in the **dispatching context, not the registration
 context**. A host-owned emitter, scheduler or AsyncResource can therefore lose
 or replace the origin; the library cannot infer it from callback ownership.

@@ -55,6 +55,7 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
       // All three continuations run with the real pre-replacement operation scope.
       let pending: Promise<void> | undefined;
       let repairCallback: (() => void) | undefined;
+      let entered = false;
       if (site === 'repair') {
         const enqueue = globalThis.queueMicrotask;
         try {
@@ -63,12 +64,13 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
         } finally { globalThis.queueMicrotask = enqueue; }
       } else if (site === 'drain') {
         inside(fx.raw).compressionQueue = [{}];
-        Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => pause.wait });
+        Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => { entered = true; return pause.wait; } });
         inside(fx.raw).driveSpeculativeDrain({});
       } else {
-        Object.defineProperty(fx.raw, 'sweepPaidOffQuarantineRecords', { configurable: true, value: () => pause.wait });
+        Object.defineProperty(fx.raw, 'sweepPaidOffQuarantineRecords', { configurable: true, value: () => { entered = true; return pause.wait; } });
         pending = site === 'tick' ? fx.raw.tick({} as StrategyContext) : inside(fx.raw).soundQuarantineAlarmIfNeeded(source);
       }
+      assert.ok(site === 'repair' ? repairCallback : entered, `${site} must reach its held seam before replacement`);
       fx.raw.hold = setup.wait;
       replacement = fx.manager.setStrategy(fx.raw);
       pause.release();

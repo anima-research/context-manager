@@ -1,7 +1,13 @@
 - **Host callback owners using Autobiographical or Knowledge strategies:**
   operations now retain their load origin through context-preserving async work.
   A timer/interval or promise created inside a strategy callback can later
-  refuse guarded access after initialize/detach. Catch errors and rejections in
+  refuse guarded access after initialize/detach. This also includes the
+  callback's own continuation after `await manager.fork(...)` or
+  `await manager.switchBranch(...)`: awaiting a lifecycle call does not rebind
+  the rest of that callback to the new load, even without a timer or separately
+  scheduled promise. Move intentional new-load work to a manager entrypoint or
+  the host-owned dispatcher below; do not continue using the old strategy scope.
+  Catch errors and rejections in
   each callback, cancel obsolete work on lifecycle changes, and send intentional
   fresh work to a host-owned dispatcher created outside strategy callbacks (or
   a manager entrypoint), validating current intent rather than retrying old work.
@@ -19,10 +25,15 @@
   methods are installed as per-instance non-enumerable wrappers preserving name
   and arity; loaded fields are guarded accessors. Wrap the instance method rather
   than monkeypatching the prototype after construction, and adapt own-property
-  descriptor checks to accessors. Public/protected signatures and subclass
+  descriptor checks to accessors. Manager calls now probe a private boundary
+  symbol: forwarding proxies must forward symbol lookups (returning `undefined`
+  for absent properties), not throw on unrecognized symbols. Lookup failures
+  are deliberately not swallowed as a fallback to unscoped work. Public/protected signatures and subclass
   `super` calls are unchanged. Shared handler/report/episode metadata is not a
   branch mirror. There is no new cross-process transaction, lock or rollback.
 - **Runtime integrators:** the new operation boundary uses `node:async_hooks`
   `AsyncLocalStorage` (Node ≥22.12; also required by the published Bun source
   export). Bun must implement Node-compatible propagation and class-field
-  initialization; no Bun verification or browser build is provided here.
+  initialization. Boundary/cancellation regressions run on pinned Bun 1.4.4
+  as well as Node; this is not a claim about other Bun versions or a browser
+  build.

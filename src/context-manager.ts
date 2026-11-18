@@ -5031,8 +5031,8 @@ export class ContextManager {
    * rejection. It can also return no promise, which isn't a failure. Either
    * way the rows stay stored and in the window, as do a sharded body's
    * remaining shards, and the strategy isn't offered them again. Only the
-   * strategy's call is caught: the manager's own work around it, the
-   * context it hands the strategy among it, still fails an add, as
+   * strategy's member lookups and call are caught: the manager's own work
+   * around it, the context it hands the strategy among it, still fails an add, as
    * onMessage's note says. A presentRows or retractRows, whose window
    * write has landed by then, logs it instead, and the rows wait to be
    * heard at the strategy's next notification (tellPresentation). The
@@ -5120,8 +5120,16 @@ export class ContextManager {
   private tellPresented(rows: readonly StoredMessage[]): void {
     if (rows.length === 0 || this.closed) return;
     const strategy = this.strategy;
-    const presented = callStrategy(strategy, 'onPresented', (strategy) => Boolean(strategy.onPresented));
-    if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return;
+    let presented: boolean;
+    try {
+      presented = callStrategy(strategy, 'onPresented', (strategy) => Boolean(strategy.onPresented));
+      if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return;
+    } catch (err) {
+      // Strategy-owned member/protocol lookups are hook work too. The rows
+      // are already stored; don't fail the add and invite a duplicate retry.
+      terminalCatch((error: unknown) => logThrown(`Strategy presentation hook lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
+      return;
+    }
     const ctx = this.createStrategyContext();
     if (presented) {
       const failed = terminalCatch((err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag));

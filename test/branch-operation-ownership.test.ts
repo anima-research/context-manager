@@ -101,7 +101,16 @@ it('alarm episode clocks and handlers are cross-load metadata, not cloned branch
     assert.equal(inside(fx.strategy).quarantineAlarmScope, scope);
     // A host callback may register process-wide handlers after its load ends.
     const old = inside(fx.strategy).branchOperations.run(inside(fx.strategy).loadedBranchIdentity,
-      () => new Promise<void>((resolve, reject) => setImmediate(() => { try { fx.strategy.setQuarantineAlarmHandler(() => {}); resolve(); } catch (error) { reject(error); } })));
+      () => new Promise<void>((resolve, reject) => setImmediate(() => {
+        try {
+          fx.strategy.setQuarantineAlarmHandler(() => {});
+          inside(fx.strategy).quarantineAlarmLastAt = 123;
+          inside(fx.strategy).quarantineAlarmActive = true;
+          assert.equal(inside(fx.strategy).quarantineAlarmLastAt, 123);
+          assert.equal(inside(fx.strategy).quarantineAlarmActive, true);
+          resolve();
+        } catch (error) { reject(error); }
+      })));
     await fx.manager.setStrategy(fx.strategy);
     await old;
   } finally { fx.close(); }

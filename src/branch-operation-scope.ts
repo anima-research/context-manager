@@ -185,6 +185,9 @@ export class BranchOperationScope<Identity extends object> {
     discardedMirrors: ReadonlySet<string> = new Set()): void {
     const scope = this;
     Object.defineProperty(target, strategyOperationBoundary, {
+      // Forwarders may bind functions returned by their get trap. A frozen
+      // data slot would require the trap to return this exact function.
+      configurable: true,
       value: <T>(key: PropertyKey, work: () => T) => scope.invoke(key, work),
     });
     const seen = new Set<PropertyKey>(['constructor']);

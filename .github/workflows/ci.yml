@@ -154,3 +154,24 @@ jobs:
           npm init -y > /dev/null
           npm install "$RUNNER_TEMP"/animalabs-context-manager-*.tgz
           node --input-type=module -e "await import('@animalabs/context-manager')"
+
+  bun-boundaries:
+    name: Branch boundaries (Bun 1.4.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.12.0'
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+      - name: Install pinned Bun runtime
+        run: npm install --prefix "$RUNNER_TEMP/bun" --no-save bun@1.4.4
+      - name: Verify Bun source export and boundary/cancellation regressions
+        run: |
+          bun="$RUNNER_TEMP/bun/node_modules/.bin/bun"
+          "$bun" -e "import assert from 'node:assert/strict'; assert.ok(import.meta.resolve('@animalabs/context-manager').endsWith('/src/index.ts')); await import('@animalabs/context-manager')"
+          "$bun" test --timeout 120000 test/branch-operation*.test.ts test/branch-generation-reentry.test.ts test/strategy-detach.test.ts

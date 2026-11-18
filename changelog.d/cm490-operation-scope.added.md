@@ -21,3 +21,5 @@
   properties of the new boundary, not fixes to a previously released boundary.
 - The new branch/load-generation checks preserve newer reentrant switch
   observations and reconcile returned-to branches.
+- The internal boundary slot permits function-binding forwarding proxies;
+  manager calls still capture an origin before invoking strategy members.

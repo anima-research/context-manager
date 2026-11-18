@@ -1480,7 +1480,7 @@ describe('round 9 progress authorization', () => {
     } finally { hook.mock.restore(); }
   });
 
-  it('syncs the store that received progress even if setStateJson rebinds the strategy', async (t) => {
+  it('refuses sync to either store when a landed progress write rebinds the strategy', async (t) => {
     const fx = await fixture(t, 'r9-progress-sync');
     const other = await fixture(t, 'r9-progress-sync-other');
     const impl = fx.strategy as any;
@@ -1494,10 +1494,10 @@ describe('round 9 progress authorization', () => {
       if (args[0] === fx.strategy.progressId) initialization = fx.strategy.initialize(other.ctx);
     });
     try {
-      impl.writeCompressionFamilyProgress(new Map(), source);
-      assert.ok(initialization);
-      assert.equal(syncA.mock.callCount(), 1);
-      assert.equal(syncB.mock.callCount(), 0);
+      assert.throws(() => impl.writeCompressionFamilyProgress(new Map(), source), /stale|reinitializ/);
+      assert.ok(initialization, 'the progress writer must rebind the strategy');
+      assert.equal(syncA.mock.callCount(), 0, 'stale work must not dispatch sync even to its original store');
+      assert.equal(syncB.mock.callCount(), 0, 'the replacement store must not receive old work');
       await initialization;
     } finally { hook.mock.restore(); syncA.mock.restore(); syncB.mock.restore(); }
   });
@@ -1607,4 +1607,79 @@ describe('round 10 nested maintenance sources', () => {
       assert.deepEqual(fx.ledger(), ledger);
     });
   }
+});
+
+it('a missing progress writer refuses release without clearing its hold or progress', async (t) => {
+  const fx = await fixture(t, 'missing-progress-writer');
+  const selected = selection(fx.strategy);
+  fx.store.setStateJson(fx.strategy.progressId, [{ familyKey: fx.event.record.familyKey,
+    chunkSourceHash: fx.event.record.chunkSourceHash, outcomes: [], updated: Date.now() }]);
+  const progress = fx.store.getStateJson(fx.strategy.progressId);
+  const ledger = fx.ledger();
+  const writer = fx.store.setStateJson;
+  try {
+    Object.defineProperty(fx.store, 'setStateJson', { configurable: true, writable: true, value: undefined });
+    await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /writer.*setStateJson/i);
+    assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
+    assert.deepEqual(fx.ledger(), ledger);
+  } finally { fx.store.setStateJson = writer; }
+});
+
+it('checkpoint hygiene failure reports uncertainty after a landed append without exposing payloads', async (t) => {
+  const fx = await fixture(t, 'hygiene-partial-write');
+  fx.append(...Array.from({ length: 260 }, () => ({ kind: 'clear', key: 'unused', targetClaimId: 'unused', created: 1 })));
+  const lines: string[] = [];
+  const native = fx.strategy as any;
+  native.diag = { warn(line: string) { lines.push(line); } };
+  const redact = fx.store.redactStateItems;
+  try {
+    fx.store.redactStateItems = () => { throw new Error('DO-NOT-EXPOSE-STORED-PAYLOAD'); };
+    assert.throws(() => native.checkpointCompressionQuarantineIfNeeded(native.loadedBranchIdentity), /DO-NOT-EXPOSE/);
+    assert.equal(fx.ledger().at(-1)!.kind, 'checkpoint', 'append landed before redaction failed');
+    assert.match(lines.join('\n'), /earlier writes may have landed.*inspect.*status.*unclassified/);
+    assert.doesNotMatch(lines.join('\n'), /DO-NOT-EXPOSE|discarded/);
+  } finally { fx.store.redactStateItems = redact; }
+});
+
+it('a missing-chunk sweep names its heuristic rather than claiming orphaned debt', async (t) => {
+  const fx = await fixture(t, 'sweep-heuristic-diagnostic');
+  const lines: string[] = [];
+  const native = fx.strategy as any;
+  native.diag = { error(line: string) { lines.push(line); }, warn() {} };
+  fx.store.setStateJson(native.chunksStateId, [{ sourceIds: ['different-live-chunk'], compressed: false }]);
+  await native.sweepPaidOffQuarantineRecords();
+  assert.equal(inspect(fx.strategy).totalRecords, 0);
+  assert.match(lines.join('\n'), /no matching chunk record.*heuristic.*live.*not ruled out/);
+  assert.doesNotMatch(lines.join('\n'), /orphaned by/);
+});
+
+it('a success-clear diagnostic covers adoption without asserting a new provider request', async (t) => {
+  const fx = await fixture(t, 'adoption-diagnostic');
+  const lines: string[] = [];
+  const native = fx.strategy as any;
+  native.diag = { error(line: string) { lines.push(line); }, warn() {} };
+  const calls = fx.calls.length;
+  await native.clearQuarantineForCompressedChunk(fx.chunk);
+  assert.equal(inspect(fx.strategy).totalRecords, 0);
+  assert.equal(fx.calls.length, calls);
+  assert.match(lines.join('\n'), /covered.*existing exact L1/);
+  assert.doesNotMatch(lines.join('\n'), /newer request shape/);
+});
+
+it('a progress sweep acknowledges a landed write when sync fails', async (t) => {
+  const fx = await fixture(t, 'progress-sync-diagnostic');
+  const native = fx.strategy as any;
+  const lines: string[] = [];
+  native.diag = { warn(line: string) { lines.push(line); } };
+  fx.store.setStateJson(fx.strategy.progressId, [{ familyKey: fx.event.record.familyKey,
+    chunkSourceHash: fx.event.record.chunkSourceHash, outcomes: [], updated: 0 }]);
+  fx.store.setStateJson(native.chunksStateId, []);
+  const sync = fx.store.sync;
+  try {
+    fx.store.sync = () => { throw new Error('sync failed'); };
+    native.sweepPaidOffCompressionProgress(fx.ctx);
+    assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), []);
+    assert.match(lines.join('\n'), /write may have landed.*inspect.*progress/);
+    assert.doesNotMatch(lines.join('\n'), /progress remains/);
+  } finally { fx.store.sync = sync; }
 });

@@ -9,9 +9,15 @@ import { join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 const { AutobiographicalStrategy, ContextManager } = await import(pathToFileURL(resolve(process.argv[2] ?? 'dist/src/index.js')));
 const smoke = process.argv.includes('--smoke');
+const sizes = process.argv.find(arg => arg.startsWith('--sizes='))?.slice(8).split(',').map(Number)
+  ?? (smoke ? [32] : [32, 256, 1024]);
+const modes = process.argv.find(arg => arg.startsWith('--modes='))?.slice(8).split(',')
+  ?? ['raw', 'compressed', 'adaptive'];
+assert.ok(sizes.length && sizes.every(size => Number.isSafeInteger(size) && size > 0), 'positive integer sizes required');
+assert.ok(modes.length && modes.every(mode => ['raw', 'compressed', 'adaptive'].includes(mode)), 'unknown benchmark mode');
 const median = xs => [...xs].sort((a,b) => a-b)[Math.floor(xs.length / 2)];
-for (const size of smoke ? [32] : [32, 256, 1024]) {
-  for (const mode of ['raw', 'compressed', 'adaptive']) {
+for (const size of sizes) {
+  for (const mode of modes) {
     const dir = mkdtempSync(join(tmpdir(), 'ob-'));
     let providerCalls = 0, cappedForSendCalls = 0, buildPickerCalls = 0;
     const strategy = new AutobiographicalStrategy({
@@ -35,7 +41,7 @@ for (const size of smoke ? [32] : [32, 256, 1024]) {
       usage: { inputTokens: 500, outputTokens: 20 },
     }) };
     const manager = await ContextManager.open({ path: dir, strategy, membrane });
-    const budget = { maxTokens: 1000000, reserveForResponse: 100 };
+    const budget = { maxTokens: Math.max(1000000, size * 250), reserveForResponse: 100 };
     try {
       const adds = [];
       for (let i = 0; i < size; i++) {
@@ -76,7 +82,7 @@ for (const size of smoke ? [32] : [32, 256, 1024]) {
       if (mode === 'adaptive') assert.ok(buildPickerCalls > 0);
       console.log(JSON.stringify({ mode, size, summaries, rendersSummary, providerCalls, cappedForSendCalls, buildPickerCalls,
         addMessageMedianMs: median(adds), compileMedianMs: median(compiles),
-        compressionMedianMs: compressions.length ? median(compressions) : null, reloadMs }));
+        compressionMedianMs: compressions.length ? median(compressions) : null, reloadMs, maxRssKiB: process.resourceUsage().maxRSS }));
     } finally { manager.close(); rmSync(dir, { recursive: true, force: true }); }
   }
 }

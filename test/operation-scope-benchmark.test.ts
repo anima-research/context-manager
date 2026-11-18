@@ -21,3 +21,12 @@ it('operation benchmark reaches real compressed selection, adaptive picker, prov
     if (row.mode === 'adaptive') assert.ok(row.buildPickerCalls > 0);
   }
 });
+
+it('operation benchmark honors explicit population and mode selection', () => {
+  const output = execFileSync(process.execPath, ['scripts/bench-operation-scope.mjs', 'dist/src/index.js', '--smoke', '--sizes=8', '--modes=raw'], {
+    encoding: 'utf8', timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
+  });
+  const rows = output.trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(rows.map(row => [row.mode, row.size]), [['raw', 8]]);
+  assert.ok(rows[0].maxRssKiB > 0);
+});

@@ -1687,7 +1687,7 @@ interface SerializedCompressionQuarantine {
   sentAlertKeys: string[];
 }
 
-type ChronicleWriter = 'setStateJson' | 'setState' | 'appendToStateJson' |
+type ChronicleWriter = 'sync' | 'setStateJson' | 'setState' | 'appendToStateJson' |
   'appendToStateJsonWithIdentity' | 'registerState' | 'editStateItem' | 'redactStateItems' | 'compactState';
 
 interface CompressionOperationBranch {
@@ -3022,7 +3022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // nor sync/postread may turn another branch's absence into an acknowledgement.
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
       requireReleaseBinding();
-      store.sync();
+      this.branchMutation(store, 'sync');
       requireReleaseBinding();
       const remaining = this.readCompressionQuarantineProjection(true);
       requireReleaseBinding();
@@ -5442,8 +5442,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The quarantine, read from the store. A ledger or legacy snapshot whose
    * value isn't a list holds no entry the strategy can use, so it's read as
    * holding nothing, as a ledger that isn't a list always was, and named
-   * (reportUnlistedQuarantineState). A ledger like that has lost the clears
-   * it held too, so the legacy snapshot it superseded isn't read beside it,
+   * (reportUnlistedQuarantineState) only when actually read. A checkpoint
+   * suppresses the superseded legacy snapshot read and its diagnostic. A
+   * non-list ledger has lost the clears it held too, so the legacy snapshot it superseded isn't read beside it,
    * as a checkpoint that holds no list replaces what came before it with
    * nothing (projectCompressionQuarantineEvents): its cleared records would
    * come back. A stored null reads as no value at all.
@@ -5548,7 +5549,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the gate is a CAP, not a wall: up to CHUNK_QUARANTINE_SHAPE_CAP
     // distinct quarantined shapes per chunk and request regime, then sticky
     // until success-clear or the paid-off sweep, which match by chunkSourceHash
-    // and so clear every shape of the span, or an operator's clear: of every
+    // and clear the observed generations for every shape of the span (a
+    // concurrently replaced generation stays held), or an operator's clear: of every
     // record, or of one by its key, which leaves the span's other shapes
     // counting toward the cap. A shape whose ledger entry is found unusable
     // is left out of the projection, and so stops counting too.
@@ -5642,7 +5644,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.requireBranchMutation('write', origin);
     authorize();
     if (store !== origin?.store) throw new Error('Writer target differs from branch operation origin');
-    return write ? Reflect.apply(write, store, args) : undefined;
+    if (typeof write !== 'function') throw new TypeError(`Chronicle writer ${method} is unavailable`);
+    return Reflect.apply(write, store, args);
   }
 
   private requireBranchMutation(entrypoint: string, source = this.branchOperations.identity ?? null): void {
@@ -5699,16 +5702,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private obsoleteHygieneSaidThrough = -1;
 
   /** No store text/payloads; repeated failures or stale work must not spam a load. */
-  private reportSkippedQuarantineHygiene(source: CompressionOperationBranch): void {
+  private reportSkippedQuarantineHygiene(source: CompressionOperationBranch, error?: unknown): void {
     if (this.compressionBranchGeneration !== source.strategyGeneration) {
       if (source.strategyGeneration <= this.obsoleteHygieneSaidThrough) return;
       this.obsoleteHygieneSaidThrough = source.strategyGeneration;
-      this.diag.warn('[compression-quarantine] obsolete checkpoint hygiene discarded after load replacement');
+      this.diag.warn(`[compression-quarantine] obsolete checkpoint hygiene stopped after load replacement; earlier writes may have landed; inspect original branch quarantine status and backing-store diagnostics before retrying (failure: ${quarantineFailureCategory(error)})`);
       return;
     }
     if (!this.branchOperations.isBindingCurrent() || this.quarantineHygieneSkipLogged) return;
     this.quarantineHygieneSkipLogged = true;
-    this.diag.warn('[compression-quarantine] checkpoint hygiene skipped or incomplete; ledger replay may grow (further skips suppressed until next load)');
+    this.diag.warn(`[compression-quarantine] checkpoint hygiene skipped or incomplete; earlier writes may have landed; inspect quarantine status and backing-store diagnostics before retrying (failure: ${quarantineFailureCategory(error)}); ledger replay may grow (further skips suppressed until next load)`);
   }
 
   private checkpointCompressionQuarantineIfNeeded(source: CompressionOperationBranch): void {
@@ -5760,7 +5763,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       this.branchMutation(this.store!, 'compactState', this.compressionRefusalQuarantineLedgerStateId);
     } catch (error) {
-      this.reportSkippedQuarantineHygiene(source);
+      this.reportSkippedQuarantineHygiene(source, error);
       throw error; // In particular, never acknowledge uncertain mutation hygiene.
     }
   }
@@ -5886,7 +5889,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * should route this empty notification under a DISTINCT alert kind so a
    * same-kind cooldown cannot swallow it. The alarm speaks of the quarantine
    * the strategy is reading: an episode follows the namespace and branch its
-   * alarm last sounded on, and only that quarantine reading empty ends it.
+   * alarm last sounded on, and only that named scope reading empty ends it.
+   * Backing-store identity is NOT tracked: replacing a store with another that
+   * has the same namespace/branch names can end the original store's episode
+   * or carry its waiver intent, without reading that original store.
    * Not called while the status can't be read (`unreadable`), or while the
    * strategy reads another branch or namespace whose quarantine is empty,
    * since neither says the episode's quarantine is; the stderr line says
@@ -6067,6 +6073,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // sweep sounds no alarm for the branch it swept.
     if (!this.isCompressionBranchCurrent(source)) return;
     const { status, error } = this.readCompressionQuarantineStatus(now);
+    if (!this.isCompressionBranchCurrent(source)) return;
     if (status.unreadable) {
       // A read that failed says nothing about the debt, so the episode, its
       // repeat clock and the handler stay as they were. Said once an
@@ -6079,6 +6086,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     const scope = { ns: this.ns, branch: this.store?.currentBranch().name ?? '' };
+    if (!this.isCompressionBranchCurrent(source)) return;
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
       // alarm, silence is ambiguous (debt paid? alarm path dead?). Fires
@@ -6197,7 +6205,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (match && !match.compressed) continue; // live debt — keep, klaxon
         const reason = match
           ? `span already compressed (${match.summaryId ?? 'summary'})`
-          : 'orphaned by chunk-boundary drift (no matching chunk record)';
+          : 'no matching chunk record; heuristic clear, live raw work is not ruled out';
         const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId, source);
         // A strategy detached, loaded again on another branch, or whose
         // branch moved, while a clear waited stops sweeping here: that clear
@@ -6286,7 +6294,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return Array.isArray(entry.sourceIds) ? paidOff(entry.sourceIds) : true;
       }, undefined, source);
     } catch (error) {
-      this.diag.warn(`[autobiographical] compression progress sweep failed (progress remains): ${describeCompressionFailure(error)}`);
+      this.diag.warn(`[autobiographical] compression progress sweep failed; write may have landed, inspect stored progress before retrying: ${describeCompressionFailure(error)}`);
     }
   }
 
@@ -6324,8 +6332,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!this.isCompressionBranchCurrent(source)) return;
         if (!cleared) continue;
         this.diag.error(
-          `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
-            `successfully under a newer request shape`,
+          `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk is covered by compression or an existing exact L1`,
         );
       }
     } catch (error) {
@@ -6783,7 +6790,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store || !this.isCompressionBranchCurrent(source)) return;
     const store = this.store;
     this.branchMutation(store, 'setStateJson', this.compressionFamilyProgressStateId, [...progress.values()]);
-    store.sync();
+    this.branchMutation(store, 'sync');
   }
 
   /**
@@ -8197,6 +8204,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
+    const store = this.store;
     // An answer, or a run decided, ends the entry's run of failures, wherever
     // the entry stands in the queue now.
     this.mergeFailureRuns.delete(mergeFailureKey(merge));
@@ -8215,11 +8223,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (merge.attempts >= limit) {
       this.dequeueMerge();
       this.quarantineMerge(merge, rejection, limit);
-      this.store?.sync();
+      this.branchMutation(store, 'sync');
       return;
     }
-    this.branchMutation(this.store, 'setStateJson', this.mergeQueueStateId, this.mergeQueue);
-    this.store?.sync();
+    this.branchMutation(store, 'setStateJson', this.mergeQueueStateId, this.mergeQueue);
+    this.branchMutation(store, 'sync');
     this.diag.warn(
       `[autobiographical] L${merge.level} merge attempt ${merge.attempts}/${limit} rejected ` +
         `(${rejection.outcome}${rejection.stopReason ? `, stop=${rejection.stopReason}` : ''}) — ` +

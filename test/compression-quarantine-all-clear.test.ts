@@ -9,7 +9,8 @@
  * leaves it out (naming it only when a string key is available), and a compression
  * or a clear no longer throws on it; a ledger or legacy snapshot that holds no
  * list is read as holding nothing, a checkpoint that holds none replaces what
- * came before it with nothing, and each is named.
+ * came before it with nothing, and each is named when actually read. A
+ * checkpoint suppresses the legacy snapshot read and its diagnostic.
  */
 import { after, afterEach, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
