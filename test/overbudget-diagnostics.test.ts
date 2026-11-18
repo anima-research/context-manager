@@ -640,12 +640,12 @@ describe('OverBudgetError diagnostics', () => {
     { ceiling: true, shadowCeiling: undefined, retry: true },
     { ceiling: false, shadowCeiling: undefined, retry: true },
   ]) {
-    it(`tracks kv-unified ceiling attribution (initial=${ceiling}, shadow=${shadowCeiling}, retry=${retry})`, async (t) => {
+    it(`forwards injected kv-unified ceiling diagnostics (initial=${ceiling}, shadow=${shadowCeiling}, retry=${retry})`, async (t) => {
       t.mock.method(console, 'warn', () => {});
       // Synthetic failure injection tests diagnostic plumbing, not ceiling reachability.
       // It throws before the real solver checks minimum-frontier feasibility.
-      // Unmocked, this fixture returns infeasible before searching (ceiling=false);
-      // it cannot demonstrate a real ceiling-fallback refusal.
+      // Without injection this particular fixture returns infeasible before
+      // search. The fractional-budget test below reaches a real ceiling.
       const originalSolve = ParetoKvUnifiedPolicySolver.prototype.solve;
       const outcomes: boolean[] = [];
       const solves = t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', function (this: ParetoKvUnifiedPolicySolver, options: ParetoSolveOptions) {
@@ -722,7 +722,7 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  it('refuses a fractional-budget real kv-unified ceiling fallback despite matching accounting', async (t) => {
+  it('refuses a real kv-unified ceiling fallback that fits the solve budget but exceeds the floored bound', async (t) => {
     t.mock.method(console, 'warn', () => {});
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
@@ -760,6 +760,8 @@ describe('OverBudgetError diagnostics', () => {
       const minimum = await refusal(manager, undefined, { maxTokens: 100, reserveForResponse: 0 });
       assert.equal(minimum.actual % 1, 0.25, 'provider-style fractional summary cost survives plan accounting');
       picks.length = 0;
+      // With no grace or request limit the fractional cut still fits the
+      // solve budget, but flooring the compile's rejection bound refuses it.
       const error = await refusal(manager, undefined, { maxTokens: minimum.actual + 0.25, reserveForResponse: 0 });
       assert.equal(error.actual, minimum.actual);
       assert.equal(error.budget, Math.floor(minimum.actual + 0.25));

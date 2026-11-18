@@ -22,7 +22,7 @@
 import { describe, it, before, after, beforeEach, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { SummaryEntry } from '../src/index.js';
@@ -73,6 +73,12 @@ class SpyStrategy extends AutobiographicalStrategy {
   /** A summary written as is, with no model call. */
   seed(entry: Omit<SummaryEntry, 'created'>): void {
     this.pushSummary({ ...entry, created: 0 });
+  }
+
+  seedProvisionalCalibration(multiplier: number): void {
+    this.store!.setStateJson(this.calibrationStateId, {
+      multiplier, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, provisional: true,
+    });
   }
 
   protected handleProducedOps(
@@ -220,16 +226,17 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     manager.close();
   });
 
-  it('warns when the exhausted shadow plan exceeds the rejection bound', async () => {
+  it('reports the shadow bound without predicting which compile gate refuses', async (t) => {
     // Everything fits in the recent window: the middle is empty, so the
     // shadow pick has nothing to fold and nothing to produce, yet head+tail
-    // alone exceed the target — the exact "exhausted" state that would
-    // hard-fail at descent time.
+    // alone exceed the target. A real compile at that target hits the
+    // reservation gate before the picker can run.
     const strategy = makeStrategy({
       recentWindowTokens: 100_000,
       productionBudgetTokens: 100,
     });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    t.after(() => manager.close());
     addConversation(manager, 10);
 
     const compiled = await manager.compile({ maxTokens: 50_000, reserveForResponse: 200 });
@@ -237,9 +244,36 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     const line = warnings.find((w) => w.includes('production target 100:'));
     assert.ok(line, `expected a shadow warning, got: ${JSON.stringify(warnings)}`);
     assert.match(line, /over its soft target of \d+, and no production was requested/);
-    assert.match(line, /this plan exceeds the 102-token rejection bound.*OverBudgetError/);
-    assert.doesNotMatch(line, /unreachable|no folds remain/);
-    manager.close();
+    assert.match(line, /this plan exceeds the 102-token rejection bound/);
+    await assert.rejects(manager.compile({ maxTokens: 300, reserveForResponse: 200 }),
+      (err: unknown) => err instanceof OverBudgetError && /^Head\/tail reservation exceeded budget/.test(err.message));
+    assert.deepEqual(strategy.pickerRunBudgets, [49_800, 100], 'the refusal ran no picker');
+    assert.doesNotMatch(line, /plan check|OverBudgetError|unreachable|no folds remain/);
+  });
+
+  it('labels the shadow warning from a provisional attempt that retries and fits', async (t) => {
+    const strategy = makeStrategy({
+      foldingStrategy: 'kv-stable',
+      recentWindowTokens: 0,
+      productionBudgetTokens: 750,
+      overBudgetGraceRatio: 0,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    t.after(() => manager.close());
+    const ids = Array.from({ length: 10 }, (_, i) =>
+      manager.addMessage('User', textBlock(`Turn ${i}. ` + 'word '.repeat(40))));
+    // Keep the history raw, but in the middle so the first attempt reaches
+    // the picker rather than refusing at the head/tail reservation.
+    manager.pinRange(ids[0]!, ids[ids.length - 1]!);
+    strategy.seedProvisionalCalibration(1.45);
+
+    const compiled = await manager.compile({ maxTokens: 800, reserveForResponse: 0 });
+    assert.ok(compiled.messages.length > 0, 'the retry renders');
+    assert.deepEqual(strategy.pickerRunBudgets, [800, 750, 800, 750], 'both attempts make a live and shadow pick');
+    assert.ok(warnings.some((w) => w.includes('DISCARDED provisional multiplier 1.45')));
+    const shadow = warnings.filter((w) => w.includes('production target 750:'));
+    assert.equal(shadow.length, 1, 'the retry no longer warns');
+    assert.match(shadow[0]!, /under provisional calibration \(multiplier 1\.45\).*exceeds the 750-token rejection bound/);
   });
 
   it('distinguishes a shadow plan at the rejection bound from one above it', async () => {
@@ -271,7 +305,7 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.equal(onLine.length, 1, `expected one line, got: ${JSON.stringify(onLine)}`);
     assert.ok(!onLine[0]!.includes('unreachable'), onLine[0]);
     assert.ok(onLine[0]!.includes(`plan for it is ${plan} tokens`), onLine[0]);
-    assert.ok(onLine[0]!.includes(`within the ${plan} tokens`), onLine[0]);
+    assert.ok(onLine[0]!.includes(`within the ${plan}-token rejection bound`), onLine[0]);
 
     const overLine = await planAt(target - 1);
     assert.equal(overLine.length, 1, `expected one line, got: ${JSON.stringify(overLine)}`);

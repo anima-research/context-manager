@@ -5,10 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { ContextEntry, ContextInjection, ContextLogView, MessageStoreView, RenderStats, SelectOptions, StoredMessage, TokenBudget } from '../src/types/index.js';
-import type { RequestOverhead, OverBudgetError } from '../src/index.js';
+import type { RequestOverhead } from '../src/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
-import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy, jsonTokenEstimator } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, jsonTokenEstimator } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'request-limit-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -417,6 +417,45 @@ describe('a request limit (SelectOptions.requestLimitTokens)', () => {
       cm.close();
     });
   }
+
+  it('enforces the request limit after a stock windowed passthrough dry select', async (t) => {
+    const strategy = new WindowedPassthroughStrategy();
+    const select = strategy.select.bind(strategy);
+    let selection: { entries: number; tokens: number } | undefined;
+    t.mock.method(strategy, 'select', (...args: Parameters<typeof select>) => {
+      const entries = select(...args);
+      selection = {
+        entries: entries.length,
+        tokens: entries.reduce((n, { content }) => n + args[0].estimateTokens({ content } as StoredMessage), 0),
+      };
+      return entries;
+    });
+    const cm = await ContextManager.open({ path: join(dir, 'windowed-dry-post-check'), strategy });
+    try {
+      cm.addMessage('User', [{ type: 'text', text: 'word '.repeat(100) }]);
+      const budget = { maxTokens: 1000, reserveForResponse: 0 };
+      const opts = { requestOverhead: {}, requestLimitTokens: 1 };
+      await assert.rejects(cm.compile(budget, undefined, { ...opts, dryRun: true }), (error: unknown) => {
+        assert.ok(error instanceof OverBudgetError);
+        assert.match(error.message, /^The compiled request would hold/);
+        assert.equal(error.budget, 1);
+        assert.ok(selection, 'the unmodified select returned before the manager rejected the compile');
+        assert.equal(selection.entries, 1);
+        assert.ok(selection.tokens > 1);
+        assert.equal(error.actual, selection.tokens);
+        return true;
+      });
+      assert.ok(selection);
+      const exact = selection.tokens;
+      selection = undefined;
+      await assert.rejects(cm.compile(budget, undefined, opts), OverBudgetError);
+      assert.equal(selection, undefined, 'the live select refused before returning entries');
+      const atLimit = await cm.compile(budget, undefined, { ...opts, dryRun: true, requestLimitTokens: exact });
+      assert.equal(atLimit.messages.length, 1);
+    } finally {
+      cm.close();
+    }
+  });
 
   it('the compile itself refuses a request past the limit from a strategy that doesn\'t keep to it, and lets one exactly at it through', async () => {
     const strategy = new SpiedPassthrough(true);

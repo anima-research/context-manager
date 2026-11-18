@@ -490,14 +490,15 @@ Given:
    persist the staged changes only once every later stage has succeeded,
    and never in a dry run, so neither a refused compile nor a dry run saves
    a level.
-6. If produced.length > 0: handleProducedOps to route into compression
+6. If not dry and produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the floored, grace-expanded input
    budget, capped by the remaining request allowance when a limit is set
-   (§13.2) — throw OverBudgetError in live and dry compilation alike. A provisional calibration multiplier above 1
-   may first be dropped and the selection retried at 1. previewContext reports
-   that retry (including entries and stats with render: true if it fits).
-   Only a final refusal returns fits: false without entries or stats.
+   (§13.2) — throw OverBudgetError from this attempt, dry or live. For an
+   eligible refusal, a provisional multiplier above 1 can be dropped and
+   selection retried at 1. previewContext reports the final outcome (including
+   entries and stats on a fitting render: true preview). A final budget
+   refusal reports fits: false without entries or stats; other errors propagate.
    (Rev 5.1: the throw no longer
    consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
@@ -846,9 +847,11 @@ and re-introducing one via the objective notation would repeat it.
 
     For example, at W = 782 with 20% grace, an 860-token plan compiled
     without a request limit (rejection budget 938). With
-    `requestLimitTokens = 1408`, empty request overhead, no response
-    reserve, and the provisional rate, the allowance was 782, so the plan
-    check refused the same plan at 782.
+    `requestLimitTokens = 1408`, empty request overhead, no message
+    injections, no response or stub reserve, and a provisional multiplier
+    of 1.00 against the calibration ceiling of 1.80, the allowance was
+    `floor(1408 × (1.00 / 1.80)) = 782`. The plan check refused the same
+    plan at 782.
 
 **Override rule (what replaces the emergency).** The trust region may be
 exceeded, same algorithm, same code path, when either:
@@ -1005,10 +1008,10 @@ solve(tree, F_prev, W, P):
 
 [strategy layer, after picker.run:]
   finalTokens > rejectionBudget  -- floored grace bound capped by request room (§13.2)
-      → OverBudgetError in live and dry compilation alike
-      → provisional calibration above 1 may retry at 1 first
-      → previewContext reports the retry if it fits (and can render it);
-        only final refusal reports fits: false without entries or stats
+      → OverBudgetError from this attempt, dry or live
+      → an eligible provisional-calibration retry runs at 1
+      → previewContext can render a fitting outcome; a final budget
+        refusal reports fits: false without entries or stats
 ```
 
 Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally

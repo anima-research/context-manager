@@ -2733,10 +2733,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `opts.excludePins` lists read as absent (an id no pin has is ignored),
    * optionally with a scoped config swap for knobs that are otherwise
    * recipe-and-restart only (tail, head window, chunk size, merge
-   * threshold, folding strategy...). Commits nothing: no resolution
-   * persistence, no compression enqueue, no transition bookkeeping, and no
-   * pin is removed or written; the pins it leaves out are left out of what
-   * the select reads, not of the strategy's list.
+   * threshold, folding strategy...). Does not persist resolutions, enqueue
+   * compression, or advance live transition bookkeeping. Dry floor-warning
+   * keys can persist (see `SelectOptions.dryRun`). Excluded pins are left
+   * out of what the select reads, not removed from the strategy's list.
    *
    * Budget refusals return `fits: false`, not rendered entries or stats,
    * even with `opts.render: true`. An over-budget adaptive plan is refused
@@ -2770,7 +2770,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The config swap below is this method's own to undo. What the dry select
     // leaves for observers (transition status, render stats, calibration),
     // select() puts back for every dry run, whichever of selectAdaptive's
-    // OverBudgetError sites throws; any throw is turned into a report below.
+    // OverBudgetError sites throws; only budget refusals become reports below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
@@ -9528,8 +9528,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.reportCeilingHits();
       return entries;
     }
-    // A dry run commits nothing, and that includes what a select leaves for
-    // the next one and for observers: the cache-marker baseline the next
+    // A dry run does not commit layout or compression work. Dry floor warning
+    // keys persist in their own lane (noteFloorFailure). What we restore for
+    // subsequent selects and observers includes the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
     // plan-vs-actual), calibration's estimate, arming, store view, load and
@@ -15761,8 +15762,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const liveKvStable = this._lastKvStable;
       const liveKvUnified = this._lastKvUnified;
       try {
-        // With the line a compile at prodBudget refuses above, as the live
-        // pick has its own, so the solver plans as that compile would.
+        // Give the shadow solver a rejection bound, but do not simulate
+        // the compile's reservation gates or rendering at that target.
         const prodLine = Math.min(Math.floor(prodBudget * (1 + overBudgetGraceRatio)), rejectionBudget);
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
@@ -15773,15 +15774,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
+          // This pick runs before the live plan gate, which can trigger a
+          // retry at multiplier 1. Describe the pricing of this attempt.
+          const calibration = this._calibrationProvisional !== null
+            ? `under provisional calibration (multiplier ${this._calibration}), ` : '';
           const plan =
-            `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
+            calibration + `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
             `${Math.floor(prodBudget * (1 - slack))}, and no production was requested`;
+          const boundStatus = shadowResult.finalTokens > prodLine ? 'exceeds' : 'is within';
           this.diag.warn(
-            shadowResult.finalTokens > prodLine
-              ? `autobio: production target ${prodBudget}: ${plan}; this plan exceeds the ` +
-                  `${prodLine}-token rejection bound and would fail the plan check with OverBudgetError`
-              : `autobio: production target ${prodBudget}: ${plan}, but the plan is within the ` +
-                  `${prodLine} tokens the plan check of a compile at that budget refuses above`,
+            `autobio: production target ${prodBudget}: ${plan}; this plan ${boundStatus} the ` +
+              `${prodLine}-token rejection bound`,
           );
         }
       } catch (err) {
@@ -15842,9 +15845,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Hard-fail whenever the picker's current plan exceeds the hard budget.
     // A `produce` op only schedules a missing summary; it does not make the
     // current raw plan feasible and must never authorize an inference.
-    // Dry selects take the same gates and retries as live compilation.
-    // previewContext converts the refusal into the plan report recorded above;
-    // neither previews nor dry compiles may emit an already-infeasible plan.
+    // This gate applies to dry and live attempts. selectPath and
+    // withRoomForStubs handle retries.
     if (!planFits) {
       // The plan's middle is what's over, priced as the plan priced it, so
       // the pins keeping raw tokens there are named. The refusals after the
