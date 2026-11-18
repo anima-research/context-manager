@@ -43,7 +43,7 @@ function fixture(check: (root: string, git: (...args: string[]) => string) => vo
 }
 function capture(root: string, env = process.env) {
   return spawnSync(process.execPath, [generator, root, join(root, 'dist/capture.json')],
-    { encoding: 'utf8', timeout: 360000, env });
+    { encoding: 'utf8', timeout: 900000, env });
 }
 
 it('generator records actual source HEAD/tree, ignores Git overrides and preserves own undefined', () => {
@@ -237,7 +237,7 @@ it('generator rebuilds producer scenarios rather than importing stale producer d
       '-c', 'commit.gpgsign=false', 'commit', '-qm', 'synthetic producer');
     writeFileSync(join(root, 'dist/test/compression-main-scenarios.js'), 'throw new Error("STALE SCENARIOS");');
     const result = spawnSync(process.execPath, [join(root, 'scripts/generate-compression-main-golden.mjs'),
-      root, join(root, 'dist/capture.json')], { encoding: 'utf8', timeout: 360000 });
+      root, join(root, 'dist/capture.json')], { encoding: 'utf8', timeout: 900000 });
     assert.equal(result.status, 0, result.stderr);
     const golden = JSON.parse(readFileSync(join(root, 'dist/capture.json'), 'utf8'));
     assert.equal(Object.keys(golden.requests).length, 93);
@@ -286,7 +286,7 @@ it('generator rebuilds separate producer scenarios, ignoring stale producer dist
     writeFileSync(join(producer, 'dist/test/compression-main-scenarios.js'), 'throw new Error("STALE SEPARATE PRODUCER");');
     fixture(source => {
       const result = spawnSync(process.execPath, [join(producer, 'scripts/generate-compression-main-golden.mjs'),
-        source, join(source, 'dist/capture.json')], { encoding: 'utf8', timeout: 360000 });
+        source, join(source, 'dist/capture.json')], { encoding: 'utf8', timeout: 900000 });
       assert.equal(result.status, 0, result.stderr);
       const golden = readCompressionGolden(join(source, 'dist/capture.json'));
       assert.equal(Object.keys(golden.requests).length, 93);

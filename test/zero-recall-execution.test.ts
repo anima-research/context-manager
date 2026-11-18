@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error']) {
+for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-collision', 'receipt-inside', 'receipt-existing', 'provider-error', 'receipt-dangling', 'wrong-chunk', 'unreadable', 'clear-error', 'close-error']) {
   test(`executing surgery CLI offline: ${scenario}`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ze-'));
     const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -47,7 +47,7 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
       const trace = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const sent = trace.filter(event => event.sent).map(event => event.sent);
       assert.equal(result.status, scenario === 'success' ? 0 : 1, result.stderr);
-      assert.equal(sent.length, ['success', 'repeat', 'provider-error'].includes(scenario) ? 1 : 0);
+      assert.equal(sent.length, ['success', 'repeat', 'provider-error', 'close-error'].includes(scenario) ? 1 : 0);
       if (scenario === 'unsafe' || scenario === 'opening-collision') {
         assert.match(result.stdout, scenario === 'unsafe' ? /Raw recall-shaped/ : /collides with compression opening/);
         assert.ok(!trace.some(event => event.fork || event.cleared), 'source safety precedes mutation');
@@ -84,6 +84,22 @@ for (const scenario of ['success', 'repeat', 'mismatch', 'unsafe', 'opening-coll
         assert.equal(receipt.call.transformedRequestSha256, receipt.call.transformedMessagesSha256);
         assert.notEqual(receipt.call.originalRequestSha256, receipt.call.transformedRequestSha256);
       }
+      assert.ok(trace.filter(event => event.closed).every(event => event.statusAtClose !== 'finished'));
+      if (scenario === 'close-error') {
+        assert.equal(receipt.status, 'uncertain');
+        assert.match(receipt.closeError, /durability is uncertain/);
+        assert.ok(!result.stdout.includes('"status": "finished"'));
+      }
+      if (scenario === 'success') {
+        assert.equal(receipt.status, 'finished');
+        assert.ok(result.stdout.includes('RECEIPT_SHA256 ' + hash(readFileSync(receiptPath, 'utf8'))));
+      }
+      if (scenario === 'clear-error') {
+        assert.ok(trace.some(event => event.fork));
+        assert.ok(trace.some(event => event.clearEntered === 'quarantined'));
+        assert.match(receipt.error.message, /clear failed/);
+      }
+      if (scenario === 'provider-error') assert.ok(!(result.stdout + result.stderr).includes('private source echoed'));
       if (scenario === 'repeat') assert.match(receipt.error.message, /ONE_CALL_CAP/);
       if (scenario === 'mismatch') assert.match(receipt.error.message, /differs from trusted/);
       if (scenario === 'provider-error') assert.equal(receipt.call.status, 'error');

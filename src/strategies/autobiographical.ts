@@ -1,4 +1,4 @@
-import { recallHeaderId, sentRecallHeaderIds } from '../recall-header.js';
+import { constructedRecallHeader, recallHeaderId, sentRecallHeaderIds } from '../recall-header.js';
 import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
@@ -1523,7 +1523,11 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
     dropped,
     unlisted,
   );
-  const hashes = new Set([...active.values()].map((entry) => entry.record.chunkSourceHash));
+  // Repair/rebuild model ordinary compression only. Surgery refusals must
+  // not suppress the future L1s ordinary tick can still produce.
+  const hashes = new Set([...active.values()]
+    .filter(({ record }) => record.normalizedConfig?.outcomeNamespace === undefined)
+    .map((entry) => entry.record.chunkSourceHash));
   return { holds: (messageIds) => hashes.has(sha256Json([...messageIds])), dropped: [...dropped], unlisted: [...unlisted] };
 }
 
@@ -2825,6 +2829,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : undefined;
       if (cleaned && Object.keys(cleaned).length > 0) {
         this.config = { ...savedConfig, ...cleaned };
+        for (const key of ['compressionInstructions', 'witnessedInstruction'] as const) {
+          if (!Object.hasOwn(this.config, key)) Object.defineProperty(this.config, key, {
+            value: undefined, enumerable: false, writable: true, configurable: true,
+          });
+        }
         // Both memoize config-derived values, so a swapped config must not see
         // a cache built under the old one.
         this._adaptivePicker = null;
@@ -4973,7 +4982,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const replacement = children.flatMap((child) => [
         {
           participant: 'Context Manager',
-          content: [{ type: 'text' as const, text: `[CM] Recall memory ${child.id}.` }],
+          content: [constructedRecallHeader(child.id)],
         },
         {
           participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
@@ -6930,7 +6939,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.config.compressionModel || !this.hostContext?.membrane) return 0;
     const store = this.hostContext?.messageStore;
     const tools = this.hostContext?.tools;
-    const quarantined = this.quarantinedChunkSources();
+    const quarantined = this.quarantinedChunkSources(this.compressionOutcomeNamespace());
     const heldSources = this.mergeHeldSourceIds();
     const blocked = store ? this.holdBlockedIds(store) : null;
     const deferredForTools: (chunk: Chunk) => boolean =
@@ -11505,7 +11514,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         llmMessages.push({
           participant: 'Context Manager',
-          content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
+          content: [constructedRecallHeader(s!.id)],
         });
         // Recall answers carry the summary's verbatim reasoning carriers
         // (signed thinking) when captured — validated 2026-07-16 on a
@@ -12013,7 +12022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      *  degraded path), whose count is the copy's, not the planned request's. */
     const countedStripped = new WeakSet<object>();
     const strippedErrors = new WeakSet<object>();
-    let loggedRequest = request;
+    let loggedRequest: NormalizedRequest | undefined;
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
@@ -13537,46 +13546,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
-      for (const trace of attemptTraces) {
-        logCompressionCall({
-          event: 'compression:attempt',
-          operation: 'compress_l1',
-          metadata: {
-            chunk_message_ids: chunk.messages.map((message) => message.id),
-            chunk_hash: quarantineRecord.chunkSourceHash,
-            model,
-            ...trace,
-          },
-        }, this.ns);
-      }
-      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
-        const loggedRecallIds = new Set(loggedRequest.messages.flatMap(sentRecallHeaderIds));
-        const loggedRecalls = [...this.persistedCanonicalSummariesById().values()]
-          .filter(summary => loggedRecallIds.has(summary.id));
-        const loggedRecallTokens = this.capRecallPairs(loggedRecalls, Infinity).keptTokens;
-        logCompressionCall({
-          operation: 'compress_l1',
-          // Summarize the last request actually dispatched, including opt-in
-          // authoring and carrier fallback, not the prepared recall-bearing plan.
-          system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
-          messages: summarizeTelemetryMessages(loggedRequest.messages),
-          metadata: {
-            chunk_message_ids: chunk.messages.map((m) => m.id),
-            chunk_size: chunk.messages.length,
-            prior_summary_count: priorSummaries.length,
-            prior_summary_count_kept: loggedRecalls.length,
-            prior_summary_tokens: loggedRecallTokens,
-            has_doc_context: docContext !== null,
-            doc_context: docContext,
-            target_tokens: targetTokens,
-            model,
-            latency_ms: Date.now() - callStart,
-            summary_id: logSummaryId,
-            ...(logWithdrawn ? { withdrawn: true } : {}),
-          },
-          response: summarizeTelemetryText(logResponse),
-          error: logError,
-        }, this.ns);
+      try {
+        for (const trace of attemptTraces) {
+          logCompressionCall({
+            event: 'compression:attempt',
+            operation: 'compress_l1',
+            metadata: {
+              chunk_message_ids: chunk.messages.map((message) => message.id),
+              chunk_hash: quarantineRecord.chunkSourceHash,
+              model,
+              ...trace,
+            },
+          }, this.ns);
+        }
+        if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && loggedRequest) {
+          const loggedRecallIds = new Set(loggedRequest.messages.flatMap(sentRecallHeaderIds));
+          const loggedRecalls = [...this.persistedCanonicalSummariesById().values()]
+            .filter(summary => loggedRecallIds.has(summary.id));
+          const loggedRecallTokens = this.capRecallPairs(loggedRecalls, Infinity).keptTokens;
+          logCompressionCall({
+            operation: 'compress_l1',
+            // Summarize the last request actually dispatched, including opt-in
+            // authoring and carrier fallback, not the prepared recall-bearing plan.
+            system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
+            messages: summarizeTelemetryMessages(loggedRequest.messages),
+            metadata: {
+              chunk_message_ids: chunk.messages.map((m) => m.id),
+              chunk_size: chunk.messages.length,
+              prior_summary_count: priorSummaries.length,
+              prior_summary_count_kept: loggedRecalls.length,
+              prior_summary_tokens: loggedRecallTokens,
+              has_doc_context: docContext !== null,
+              doc_context: docContext,
+              target_tokens: targetTokens,
+              model,
+              latency_ms: Date.now() - callStart,
+              summary_id: logSummaryId,
+              ...(logWithdrawn ? { withdrawn: true } : {}),
+            },
+            response: summarizeTelemetryText(logResponse),
+            error: logError,
+          }, this.ns);
+        }
+      } catch {
+        // Best-effort telemetry must never replace a result, discard or error,
+        // including when the store was closed while the provider was pending.
       }
     }
   }
@@ -14210,7 +14224,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of keptPriorSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
-        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
+        content: [constructedRecallHeader(s.id)],
       });
       // Carriers ride merge recall pairs too — see the L1 site rationale.
       llmMessages.push({
@@ -14274,7 +14288,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Emit the source itself as a recall pair, whatever its level.
         llmMessages.push({
           participant: 'Context Manager',
-          content: [{ type: 'text', text: `[CM] Recall memory ${src.id}.` }],
+          content: [constructedRecallHeader(src.id)],
         });
         llmMessages.push({
           participant,
@@ -14296,7 +14310,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!child) continue;
           llmMessages.push({
             participant: 'Context Manager',
-            content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
+            content: [constructedRecallHeader(child.id)],
           });
           // Carriers ride merge source expansions too — see the L1 site.
           llmMessages.push({
@@ -15023,7 +15037,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Until the host has declared its tools, tick defers a chunk it would
     // call the model for when its request carries tool blocks, or every such
     // chunk when the summarizer refuses requests without them.
-    const quarantined = this.quarantinedChunkSources();
+    const quarantined = this.quarantinedChunkSources(this.compressionOutcomeNamespace());
     const deferredForTools: (chunk: Chunk) => boolean =
       (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
@@ -15142,17 +15156,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The requests that leave held messages out (quarantinedMessageIds) leave
    * nothing out when this is undefined.
    */
-  private quarantinedChunkSources(): Map<string, readonly MessageId[] | undefined> | undefined {
+  private quarantinedChunkSources(outcomeNamespace?: string): Map<string, readonly MessageId[] | undefined> | undefined {
     let projection: Map<string, ActiveCompressionQuarantine>;
     try {
       projection = this.readCompressionQuarantineProjection();
     } catch {
       return undefined;
     }
+    // Request source selection always uses ordinary quarantine. Only queued
+    // outcome accounting passes the active authoring namespace explicitly.
     const sources = new Map<string, readonly MessageId[] | undefined>();
     for (const { record } of projection.values()) {
       if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION ||
-          record.normalizedConfig?.outcomeNamespace !== this.compressionOutcomeNamespace()) continue;
+          record.normalizedConfig?.outcomeNamespace !== outcomeNamespace) continue;
       const listed = isIdList(record.sourceIds) ? record.sourceIds : undefined;
       if (!sources.get(record.chunkSourceHash)) sources.set(record.chunkSourceHash, listed);
     }

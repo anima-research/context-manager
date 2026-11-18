@@ -42,3 +42,23 @@
   on recall-curve retries. Recall token totals include pair/envelope overhead on
   prose and no-tools retries, rather than only bare summary-body tokens.
 - Inherited instruction settings cannot supply templates or create witnessed conflicts.
+
+- One-shot receipts report `finished` only after store close succeeds. A failed
+  final sync reports `uncertain` with backup-restoration guidance. Receipt
+  digests hash the saved bytes rather than rereading a mutable destination path.
+- Surgery uses ordinary quarantine for head and raw-history selection; only its
+  own outcome records and queued-outcome accounting use the surgery namespace.
+- Compression-log preparation is best effort, including after store closure;
+  a pre-dispatch refusal no longer logs a planned request as sent.
+- The public `AutobiographicalStrategy.assertCompressionQuarantineChunk(key,
+  chunkIndex)` validates a quarantine key against a chunk and throws for an
+  unreadable ledger, missing chunk/key, or mismatched source identity.
+- `dump-compression-prompt` now uses the current default reading instruction,
+  changes its heading, and warns that this is approximate reconstruction:
+  custom instruction wording is not reconstructed.
+- Ordinary L1 `compress_l1` log `messages` and `system` payloads describe the
+  last dispatched attempt, including prose, no-tools, recall-curve and carrier
+  retries, not the original canonical plan.
+- Sent-recall telemetry tracks constructed header blocks, not raw Context Manager
+  quotes, without adding metadata to requests. Ordinary repair/rebuild ignores
+  surgery-only quarantine outcomes in both legacy snapshots and event ledgers.

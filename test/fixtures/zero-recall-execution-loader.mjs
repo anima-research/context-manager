@@ -21,7 +21,7 @@ export async function load(url, context, nextLoad) {
         const receipt = JSON.parse(readFileSync(process.env.SURGERY_RECEIPT, 'utf8'));
         if (receipt.status !== 'calling' || receipt.call.status !== 'started') throw new Error('missing pre-call receipt');
         appendFileSync(process.env.SURGERY_TRACE, JSON.stringify({ sent: request }) + '\\n');
-        if (process.env.SURGERY_CASE === 'provider-error') throw new Error('stub provider failure');
+        if (process.env.SURGERY_CASE === 'provider-error') throw new Error('private source echoed by provider');
         return { content: [{ type: 'text', text: 'summary' }], stopReason: 'end_turn' };
       }
     }
@@ -44,7 +44,7 @@ export async function load(url, context, nextLoad) {
           return new Map([['quarantined', { record: { chunkSourceHash: createHash('sha256').update(JSON.stringify(
             process.env.SURGERY_CASE === 'wrong-chunk' ? ['other'] : ['first', 'last'])).digest('hex') } }]]);
         };
-        strategy.clearCompressionRefusalQuarantine = async key => { if (process.env.SURGERY_CASE === 'clear-error') throw new Error('clear failed'); trace({ cleared: key }); };
+        strategy.clearCompressionRefusalQuarantine = async key => { trace({ clearEntered: key }); if (process.env.SURGERY_CASE === 'clear-error') throw new Error('clear failed'); trace({ cleared: key }); };
         let branch = { name: 'main' };
         return {
           getStrategy: () => strategy,
@@ -65,7 +65,11 @@ export async function load(url, context, nextLoad) {
             if (process.env.SURGERY_CASE === 'repeat') await membrane.complete(request, { formatter: { offline: true }, signal: new AbortController().signal });
             strategy.summaries.push({ id: 'new', sourceRange: { first: 'first', last: 'last' } });
           },
-          close: () => trace({ closed: true }),
+          close: () => {
+            const receipt = JSON.parse(readFileSync(process.env.SURGERY_RECEIPT, 'utf8'));
+            trace({ closed: true, statusAtClose: receipt.status });
+            if (process.env.SURGERY_CASE === 'close-error') throw new Error('sync failed');
+          },
         };
       }
     }

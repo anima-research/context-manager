@@ -1347,6 +1347,33 @@ AutobiographicalStrategy.prototype.migrateChunkRecords = function (store) {
     }
     const quarantined = dry();
     assert.match(quarantined.stdout, /partner stranded L1 x /, quarantined.stdout + quarantined.stderr);
+    // Surgery outcomes share the durable ledger but must not hold ordinary
+    // rebuild work. Exercise the public CLI with both supported storage forms.
+    const read = JsStore.open({ path: STORE });
+    const ordinary = (read.getStateJson('probe/autobio:compression-refusal-quarantine') as Array<{ key: string }>)[0]!;
+    read.close();
+    for (const form of ['legacy', 'ledger']) {
+      const write = (mixed: boolean) => {
+        const store = JsStore.open({ path: STORE });
+        try {
+          const surgery = { ...ordinary, key: 'surgery', normalizedConfig: { outcomeNamespace: 'zero-recall-surgery-v1' } };
+          store.setStateJson('probe/autobio:compression-refusal-quarantine', [
+            ...(form === 'legacy' ? [surgery] : []), ...(mixed ? [ordinary] : []),
+          ]);
+          store.setStateJson('probe/autobio:compression-refusal-quarantine-events', form === 'ledger'
+            ? [{ kind: 'exhausted', key: surgery.key, eventId: 'surgery-generation', record: surgery, outcomes: [], created: 1 }] : []);
+        } finally { store.close(); }
+      };
+      write(false);
+      const surgeryOnly = dry();
+      assert.equal(surgeryOnly.status, 0, surgeryOnly.stderr);
+      assert.equal(surgeryOnly.stdout, unquarantined.stdout, `${form}: surgery must not change the ordinary rebuild plan`);
+      write(true);
+      const mixed = dry();
+      assert.equal(mixed.status, 0, mixed.stderr);
+      assert.equal(mixed.stdout, quarantined.stdout, `${form}: surgery must not cancel an ordinary hold`);
+    }
+
   });
 
   test('says in the dry run how many chunk records the settling leaves out, as the loader does', async () => {

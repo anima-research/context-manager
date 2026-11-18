@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateCompressionInstructions } from '../src/index.js';
+import { resolveEffectiveConfig } from '../src/config-provenance.js';
 import { compressionInstruction } from '../src/compression-instructions.js';
 import type { CompressionInstructions, SummaryLevel, SummaryEntry } from '../src/index.js';
 import { Probe, KnowledgeProbe, run, custom, instruction, texts } from './compression-instructions-harness.js';
@@ -573,6 +574,15 @@ it('JSON __proto__ cannot inject inherited compression settings', () => {
   const options = JSON.parse('{"__proto__":{"compressionInstructions":{"templates":{"chunk":"Injected"}}}}');
   class Inspect extends Probe { settings() { return this.config.compressionInstructions; } }
   assert.equal(new Inspect(options).settings(), undefined);
+  for (const semantics of ['spread-fidelity', 'skip-nullish'] as const) {
+    const { effective, provenance } = resolveEffectiveConfig([{ source: 'caller', values: options }], semantics);
+    assert.equal(Object.getPrototypeOf(effective), Object.prototype);
+    assert.equal(Object.getPrototypeOf(provenance), Object.prototype);
+    assert.ok(Object.hasOwn(effective, '__proto__'));
+    assert.ok(Object.hasOwn(provenance, '__proto__'));
+    assert.deepEqual(effective['__proto__'], options['__proto__']);
+    assert.equal(provenance['__proto__'], 'caller');
+  }
 });
 
 it('absent instruction settings never probe an absent descriptor', () => {
@@ -672,5 +682,38 @@ it('inherited instruction options cannot supply templates or create conflicts', 
       if (descriptors[index]) Object.defineProperty(Object.prototype, key, descriptors[index]!);
       else Reflect.deleteProperty(Object.prototype, key);
     });
+  }
+});
+
+it('public preview overrides retain absent instruction shadows', async () => {
+  const { ContextManager } = await import('../src/index.js');
+  const dir = mkdtempSync(join(tmpdir(), 'ip-'));
+  const keys = ['compressionInstructions', 'witnessedInstruction'] as const;
+  const descriptors = keys.map(key => Object.getOwnPropertyDescriptor(Object.prototype, key));
+  class PreviewProbe extends Probe {
+    checked = false;
+    override select(...args: Parameters<Probe['select']>) {
+      assert.equal(this.config.compressionInstructions, undefined);
+      assert.equal(this.config.witnessedInstruction, undefined);
+      this.checked = true;
+      return super.select(...args);
+    }
+  }
+  const strategy = new PreviewProbe();
+  const manager = await ContextManager.open({ path: dir, strategy });
+  try {
+    for (const key of keys) Object.defineProperty(Object.prototype, key, {
+      value: key === 'compressionInstructions' ? { templates: { opening: 'polluted' } } : 'polluted',
+      configurable: true,
+    });
+    manager.previewContext({ maxTokens: 10000, reserveForResponse: 0 }, { headWindowTokens: 1 });
+    assert.equal(strategy.checked, true);
+  } finally {
+    keys.forEach((key, index) => {
+      if (descriptors[index]) Object.defineProperty(Object.prototype, key, descriptors[index]!);
+      else Reflect.deleteProperty(Object.prototype, key);
+    });
+    manager.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

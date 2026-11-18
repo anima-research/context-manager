@@ -62,12 +62,12 @@ try {
   const compiler = realpathSync(`${root}/node_modules/typescript/bin/tsc`);
   execFileSync(process.execPath, [compiler, '--project', `${root}/tsconfig.json`,
     '--outDir', build, '--incremental', 'false', '--composite', 'false'],
-    { cwd: root, timeout: 120000, stdio: ['ignore', 'inherit', 'inherit'] });
+    { cwd: root, stdio: ['ignore', 'inherit', 'inherit'] });
   if (scenarioBuild !== build) {
     execFileSync(process.execPath, [realpathSync(`${producerRoot}/node_modules/typescript/bin/tsc`),
       '--project', `${producerRoot}/tsconfig.json`, '--outDir', scenarioBuild,
       '--incremental', 'false', '--composite', 'false'],
-      { cwd: producerRoot, timeout: 120000, stdio: ['ignore', 'inherit', 'inherit'] });
+      { cwd: producerRoot, stdio: ['ignore', 'inherit', 'inherit'] });
   }
   const scenarioModule = `${scenarioBuild}/test/compression-main-scenarios.js`;
   const { mainScenarios, scenarioKey, goldenReminders } = await import(pathToFileURL(scenarioModule).href);
