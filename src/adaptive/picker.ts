@@ -110,9 +110,9 @@ export interface OverBudgetDiagnostics {
   /**
    * With `solver`: whether the plan is the minimum-token cut kv-unified takes
    * when its search passes `labelCeiling` (#252), rather than the cut its
-   * search chose. Absent under every other solver. True at this refusal
-   * means the plan's accounting disagreed with the solver's: a real ceiling
-   * fallback takes an already-feasible minimum cut.
+   * search chose. Absent under every other solver. The minimum cut fits the
+   * unfloored solve budget, but can still exceed the floored rejection bound
+   * with fractional costs and budgets, even if the two counts agree.
    */
   labelCeilingFallback?: boolean;
 }
@@ -504,8 +504,8 @@ export interface PickerResult {
   budgetMet: boolean;
   /** Solver-owned exhaustion (see FoldingSolution.exhausted): greedy =
    *  above soft target with no production requested after search (possibly
-   *  replaying a cheaper raw frontier); kv-stable = even
-   *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
+   *  replaying a cheaper raw frontier); kv-stable = the controller's ideal
+   *  exceeds pre-grace totalBudget (a dead-band hold is NOT exhausted).
    *  kv-unified = realizable frontier infeasible at pre-grace totalBudget,
    *  even when missing summaries are requested; this can still fit the
    *  grace-expanded hard rejection budget. Not proof compression cannot help.

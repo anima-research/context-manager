@@ -2865,22 +2865,16 @@ export interface AutobiographicalConfig {
   speculativeProduction?: boolean;
 
   /**
-   * Standing production target (tokens): keep the summary forest deep enough
-   * that a compile would fit under THIS budget, even while the live compile
-   * budget is higher. Each adaptive compile runs an extra shadow pick against
-   * this budget — pure CPU, no LLM call, no state commit — and enqueues the
-   * folds it demands through the normal drain queues. Once the forest has
-   * converged, the live budget can be lowered to the target in one move: no
-   * fold-storm, a single KV invalidation ("produce first, fold once").
-   * If the shadow pick runs out of folds and produce requests with its plan
-   * still over the target's soft line, the compile warns, giving the plan's
-   * size and the line above which the plan check of a compile at the target
-   * refuses it with OverBudgetError, and calls the target unreachable with
-   * the summaries the store has then only when the plan is over that line:
-   * the plan check refuses a compile at the target only while it is, though
-   * a later stage can refuse it as at any budget. Shadow demand is
-   * speculative and never bypasses the `l1HoldbackChunks` window. Must be
-   * positive; no effect unless lower than the live compile budget.
+   * Standing production target (tokens): prepare summaries for a lower live
+   * budget. Each adaptive live compile runs an extra shadow pick against this
+   * budget — pure CPU, no LLM call — and enqueues the folds it demands through
+   * the normal drain queues ("produce first, fold once").
+   * If the shadow pick reports exhaustion with no production requested, the
+   * warning reports the selected plan's size, its soft target, and whether
+   * that plan exceeds the rejection bound. This does not establish that another
+   * frontier cannot fit. Even a plan within the bound can fail a later check.
+   * Shadow demand is speculative and never bypasses the `l1HoldbackChunks`
+   * window. Must be positive; no effect unless lower than the live budget.
    */
   productionBudgetTokens?: number;
 

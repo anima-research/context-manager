@@ -1001,6 +1001,37 @@ describe('estimator calibration band', () => {
     first.internals.store!.setStateJson(first.internals.calibrationStateId, unstamped);
     first.cm.close();
     const reopened = await openSharded('picker', false);
+    const trackCalibration = ({ cm, strategy }: Awaited<ReturnType<typeof openSharded>>) => {
+      const state = strategy as unknown as Internals & {
+        _calibrationArmed: boolean;
+        _calibrationLoaded: boolean;
+        _calibrationReset: { discardedMultiplier: number; fromEpoch: number | null; at: number } | null;
+        _calibrationDeclared: boolean;
+        loadCalibration(store: MessageStoreView, options: { dryRun: boolean }): void;
+      };
+      const { messageStore } = cm as unknown as { messageStore: MessageStoreView };
+      state.loadCalibration(messageStore, { dryRun: true });
+      assert.equal(state._calibration, 1.45, 'premise: the provisional multiplier is already loaded');
+      assert.deepEqual(state._calibrationProvisional, { fromEpoch: null });
+      // Non-default marks ensure accidental resets are visible after the select.
+      state._calibrationReset = { discardedMultiplier: 1.6, fromEpoch: 0, at: 123 };
+      state._calibrationDeclared = true;
+      assert.equal(messageStore.getTokenCalibration!(), 1.45);
+      return () => structuredClone({
+        armed: state._calibrationArmed,
+        loaded: state._calibrationLoaded,
+        multiplier: state._calibration,
+        provisional: state._calibrationProvisional,
+        reset: state._calibrationReset,
+        declared: state._calibrationDeclared,
+        storeMultiplier: messageStore.getTokenCalibration!(),
+        persisted: state.store!.getStateJson(state.calibrationStateId),
+      });
+    };
+    const fittingCalibration = trackCalibration(reopened);
+    const beforeFit = fittingCalibration();
+    assert.equal(beforeFit.armed, false, 'premise: the reopened strategy has not armed a sample');
+    assert.equal(beforeFit.loaded, true, 'premise: the provisional record is loaded');
     const originalRun = Picker.prototype.run;
     const flags: boolean[] = [];
     const runs = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
@@ -1016,8 +1047,26 @@ describe('estimator calibration band', () => {
     assert.equal(dry.result.fits, true, 'the preview says what the real compile will do');
     assert.deepEqual([dry.result.stats!.calibration!.multiplier, dry.result.stats!.calibration!.reset?.discardedMultiplier], [1, 1.45]);
     assert.deepEqual(dry.lines, []);
-    assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), unstamped, 'a preview writes nothing');
-    assert.equal(reopened.internals._calibration, 1, 'put back');
+    assert.deepEqual(fittingCalibration(), beforeFit, 'a fitting retry restores all calibration state');
+
+    const retryError = new Error('non-budget failure in the retry');
+    const multipliers: number[] = [];
+    const exploding = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      multipliers.push(reopened.internals._calibration);
+      if (multipliers.length === 2) throw retryError;
+      return originalRun.call(this, inputs, budget);
+    });
+    try {
+      assert.throws(() => reopened.cm.previewContext(tight), (error) => error === retryError);
+      assert.deepEqual(multipliers, [1.45, 1], 'the error was raised after the preview dropped the multiplier');
+      assert.deepEqual(fittingCalibration(), beforeFit, 'the throwing preview restores all calibration state');
+      multipliers.length = 0;
+      await assert.rejects(reopened.cm.compile(tight, undefined, { dryRun: true }), (error) => error === retryError);
+      assert.deepEqual(multipliers, [1.45, 1], 'ordinary dry compile also reached the dropped-multiplier retry');
+      assert.deepEqual(fittingCalibration(), beforeFit, 'the throwing dry compile restores all calibration state');
+    } finally {
+      exploding.mock.restore();
+    }
     await reopened.cm.compile(tight);
     assert.equal(reopened.internals._calibration, 1);
     assert.equal(reopened.cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 1.45);
@@ -1030,23 +1079,7 @@ describe('estimator calibration band', () => {
     stillOver.internals.store!.setStateJson(stillOver.internals.calibrationStateId, unstamped);
     stillOver.cm.close();
     const stillOverReopened = await openSharded('picker-over', false);
-    const state = stillOverReopened.strategy as unknown as Internals & {
-      _calibrationReset: { discardedMultiplier: number; fromEpoch: number | null; at: number } | null;
-      _calibrationDeclared: boolean;
-      loadCalibration(store: unknown, options: { dryRun: boolean }): void;
-    };
-    state.loadCalibration((stillOverReopened.cm as unknown as { messageStore: MessageStoreView }).messageStore, { dryRun: true });
-    assert.equal(state._calibration, 1.45, 'premise: the provisional multiplier is already loaded');
-    state._calibrationReset = { discardedMultiplier: 1.6, fromEpoch: 0, at: 123 };
-    state._calibrationDeclared = true;
-    const calibrationState = () => structuredClone({
-      multiplier: state._calibration,
-      provisional: state._calibrationProvisional,
-      reset: state._calibrationReset,
-      declared: state._calibrationDeclared,
-      storeMultiplier: (stillOverReopened.cm as unknown as { messageStore: MessageStoreView }).messageStore.getTokenCalibration!(),
-      persisted: state.store!.getStateJson(state.calibrationStateId),
-    });
+    const calibrationState = trackCalibration(stillOverReopened);
     const beforeRefusal = calibrationState();
     flags.length = 0;
     t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {

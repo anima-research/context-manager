@@ -12,8 +12,8 @@
  *  - guards: no shadow pick when the target is unset, non-positive, or not
  *    below the live budget;
  *  - a throwing shadow pick never breaks the live compile;
- *  - an unreachable target (exhausted shadow with nothing to produce) warns
- *    loudly instead of failing silently at descent time;
+ *  - an exhausted shadow plan with no production requested warns and
+ *    says whether that plan exceeds the rejection bound;
  *  - speculative demand does not punch through the L1 holdback window;
  *  - `[kv-overlap]` reports the compile's own plan, once, and never the
  *    shadow pick's, which no compile renders.
@@ -220,7 +220,7 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     manager.close();
   });
 
-  it('an unreachable target warns on every compile instead of failing silently', async () => {
+  it('warns when the exhausted shadow plan exceeds the rejection bound', async () => {
     // Everything fits in the recent window: the middle is empty, so the
     // shadow pick has nothing to fold and nothing to produce, yet head+tail
     // alone exceed the target — the exact "exhausted" state that would
@@ -234,14 +234,15 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
 
     const compiled = await manager.compile({ maxTokens: 50_000, reserveForResponse: 200 });
     assert.ok(compiled.messages.length > 0, 'live compile must still succeed');
-    assert.ok(
-      warnings.some((w) => w.includes('unreachable')),
-      `expected an unreachable-target warning, got: ${JSON.stringify(warnings)}`,
-    );
+    const line = warnings.find((w) => w.includes('production target 100:'));
+    assert.ok(line, `expected a shadow warning, got: ${JSON.stringify(warnings)}`);
+    assert.match(line, /over its soft target of \d+, and no production was requested/);
+    assert.match(line, /this plan exceeds the 102-token rejection bound.*OverBudgetError/);
+    assert.doesNotMatch(line, /unreachable|no folds remain/);
     manager.close();
   });
 
-  it('a target whose exhausted plan is within the line its compile refuses above is not called unreachable', async () => {
+  it('distinguishes a shadow plan at the rejection bound from one above it', async () => {
     const grace = 0.02;
     const planAt = async (target: number): Promise<string[]> => {
       cleanup();
@@ -274,7 +275,8 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
 
     const overLine = await planAt(target - 1);
     assert.equal(overLine.length, 1, `expected one line, got: ${JSON.stringify(overLine)}`);
-    assert.ok(overLine[0]!.includes('unreachable'), overLine[0]);
+    assert.match(overLine[0]!, /this plan exceeds the \d+-token rejection bound/);
+    assert.doesNotMatch(overLine[0]!, /unreachable|no folds remain/);
   });
 
   it('speculative demand does not punch through the L1 holdback window', async () => {

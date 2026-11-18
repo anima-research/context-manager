@@ -198,9 +198,10 @@ export class KvUnifiedStrategy implements FoldingSolver {
     } catch (error) {
       // The ceiling bounds the search, not the compile (#252). Past it, the
       // compile takes the cut with the fewest tokens, which the solve's
-      // feasibility check computes before any search: it fits whenever the
-      // wall can be met. It becomes the carried layout, which the next
-      // compile's certificate or search judges as any other.
+      // feasibility check computes before search. It fits the solve budget;
+      // the compile checks its own rejection bound separately (it floors
+      // the bound, so a fractional cut can still fail). If accepted, it
+      // becomes the carried layout, judged as any other on the next compile.
       if (!(error instanceof SparseLabelCeilingError)) throw error;
       live = { ceiling: error.ceiling, labels: error.labelsCreated, engine: engineOf(options) };
       result = minimumTokenCut(inputs, forest, options);

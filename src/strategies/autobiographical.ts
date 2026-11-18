@@ -456,6 +456,9 @@ function compressionFailureKind(error: unknown): CompressionFailureKind {
 /** Longest failure text a compression log line carries. */
 const COMPRESSION_FAILURE_LOG_MAX_CHARS = 2_000;
 
+/** Bound each floor warning lane to 64 SHA-256 hex digests (4 KiB of ASCII key content). */
+const FLOOR_FAILURE_KEY_LIMIT = 64;
+
 /**
  * `text` when it fits; otherwise its head and tail around a marker stating
  * how many of how many characters were omitted, the whole within `max`.
@@ -6818,13 +6821,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Says once per cause until this lane's floor succeeds. Dry selects
-   *  (including leave probes) dedup independently and never read or write
-   *  live suppression. Numbers and long hexadecimal strings are normalized. */
+  /** Deduplicates causes until recovery or FIFO eviction in this lane.
+   *  Dry selects (including leave probes) dedup independently and never
+   *  read or write live suppression. Normalize variable IDs and numbers before
+   *  hashing so the retained key has fixed size without changing the log text. */
   private noteFloorFailure(cause: string): void {
-    const kind = cause.replace(/[0-9a-f]{8,}|\d+/gi, '#');
+    const kind = sha256Json(cause.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,}|\d+/gi, '#'));
     const failures = this._dryRunSelect ? this.dryFloorFailures : this.floorFailures;
     if (failures.has(kind)) return;
+    if (failures.size >= FLOOR_FAILURE_KEY_LIMIT) {
+      const oldest = failures.values().next();
+      if (!oldest.done) failures.delete(oldest.value);
+    }
     failures.add(kind);
     this.diag.warn(`[autobiographical] floor not computed (${this._dryRunSelect ? 'dry' : 'live'}), so floor= is left off the plan line until it is: ${cause}`);
   }
@@ -10556,9 +10564,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
   /** This select's floor and the budget its plan check refuses above (#415). */
   private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
-  /** Causes reported since the last successful live floor computation (floorTokens). */
+  /** Bounded, insertion-ordered keys for live floor warnings. Cleared by recovery. */
   private floorFailures = new Set<string>();
-  /** Independent causes reported since the last successful dry floor computation. */
+  /** Independent keys for dry floor warnings, with the same bound and reset policy. */
   private dryFloorFailures = new Set<string>();
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
@@ -15745,10 +15753,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Standing production target (productionBudgetTokens): run a SHADOW pick
     // against the production budget on the same inputs. Pure CPU — no LLM
     // call, no state commit; only its produce ops are enqueued, speculatively,
-    // so the drain keeps the forest deep enough to lower the live budget to
-    // this level at any time without a fold-storm or an OverBudget dead end.
-    // The guarantee holds only while the target is reachable at all — the
-    // exhausted branch below is the standing check for that.
+    // so the drain can prepare the forest for a lower live budget. The
+    // exhausted branch reports what this solver picked, not a proof that
+    // no other frontier could meet the production budget.
     const prodBudget = this.config.productionBudgetTokens;
     if (!dryRun && prodBudget !== undefined && prodBudget > 0 && prodBudget < totalBudget) {
       const liveKvStable = this._lastKvStable;
@@ -15771,9 +15778,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `${Math.floor(prodBudget * (1 - slack))}, and no production was requested`;
           this.diag.warn(
             shadowResult.finalTokens > prodLine
-              ? `autobio: production target ${prodBudget} unreachable with the summaries the store has ` +
-                  `now: ${plan}; the plan check of a compile at that budget refuses a plan over ` +
-                  `${prodLine} tokens with OverBudgetError`
+              ? `autobio: production target ${prodBudget}: ${plan}; this plan exceeds the ` +
+                  `${prodLine}-token rejection bound and would fail the plan check with OverBudgetError`
               : `autobio: production target ${prodBudget}: ${plan}, but the plan is within the ` +
                   `${prodLine} tokens the plan check of a compile at that budget refuses above`,
           );

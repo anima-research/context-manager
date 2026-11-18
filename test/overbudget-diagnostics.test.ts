@@ -111,11 +111,12 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
    * An L1 with a reasoning carrier, as a compression that captured its response writes one: its `tokens` is the
    * provider's measurement, far above what its blocks estimate, so a `carrierPolicy: 'full'` render is priced at it.
    */
-  seedCarrierL1(id: string, sourceIds: string[], tokens: number, text = 'a short memory', responseContent?: ContentBlock[]): void {
+  seedCarrierL1(id: string, sourceIds: string[], tokens: number, text = 'a short memory', responseContent?: ContentBlock[], parent?: string): void {
     this.pushSummary({
       id, level: 1, sourceLevel: 0, sourceIds,
       sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
       content: text, tokens, created: 0,
+      ...(parent ? { mergedInto: parent } : {}),
       responseContent: responseContent ?? [
         { type: 'thinking', thinking: 'brief', signature: 'zz-sig' },
         { type: 'text', text },
@@ -721,11 +722,11 @@ describe('OverBudgetError diagnostics', () => {
     });
   }
 
-  it('refuses a fractional-budget real kv-unified cut despite matching accounting', async (t) => {
+  it('refuses a fractional-budget real kv-unified ceiling fallback despite matching accounting', async (t) => {
     t.mock.method(console, 'warn', () => {});
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-unified', headWindowTokens: 0, recentWindowTokens: 0,
-      carrierPolicy: 'full', overBudgetGraceRatio: 0, autoTickOnNewMessage: false, speculativeProduction: false,
+      carrierPolicy: 'full', summaryContextLabel: '', overBudgetGraceRatio: 0, autoTickOnNewMessage: false, speculativeProduction: false,
       kvUnified: {
         policy: {
           alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
@@ -733,7 +734,8 @@ describe('OverBudgetError diagnostics', () => {
           continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
           continuityStableHalfLife: 10, continuityStableFloor: 0.25,
         },
-        tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+        tokenBucketSize: 1, continuityBucketSize: 0.01, fidelityBucketSize: 0.01, labelCeiling: 1, adoptEpsilon: 0,
+        engine: 'dag', hysteresisCertificate: false,
         treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
       },
     });
@@ -748,7 +750,13 @@ describe('OverBudgetError diagnostics', () => {
     await withManager(strategy, async (manager) => {
       const ids = Array.from({ length: 12 }, (_, i) =>
         manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(100) }]));
-      strategy.seedCarrierL1('L1-fractional', ids.slice(0, -1), 100.25);
+      // Both levels fit the unfloored solve budget: the deeper cut saves a
+      // quarter token, while the two L1s preserve more fidelity. Keeping both
+      // trade-offs forces a real search past the one-label ceiling.
+      const parent = 'L2-fractional';
+      strategy.seedCarrierL1('L1-a', ids.slice(0, 5), 60.25, undefined, undefined, parent);
+      strategy.seedCarrierL1('L1-b', ids.slice(5, -1), 60.25, undefined, undefined, parent);
+      strategy.seedCarrierL2(parent, ['L1-a', 'L1-b'], 120.25);
       const minimum = await refusal(manager, undefined, { maxTokens: 100, reserveForResponse: 0 });
       assert.equal(minimum.actual % 1, 0.25, 'provider-style fractional summary cost survives plan accounting');
       picks.length = 0;
@@ -757,7 +765,8 @@ describe('OverBudgetError diagnostics', () => {
       assert.equal(error.budget, Math.floor(minimum.actual + 0.25));
       assert.deepEqual(picks, [{ cost: error.actual, budget: error.actual + 0.25, exhausted: false }]);
       assert.equal(error.diagnostics.pickerExhausted, false);
-      assert.equal(error.diagnostics.labelCeilingFallback, false);
+      assert.equal(error.diagnostics.labelCeilingFallback, true);
+      assert.equal(minimum.diagnostics.labelCeilingFallback, false, 'the infeasible solve returned before search');
     });
   });
 

@@ -57,7 +57,8 @@ export const PRICE = { miss: 1.0, cacheRead: 0.1, cacheWrite: 1.25 } as const;
 export const MAX_FOLD_LEVEL = 8;
 
 export interface ControlOptions {
-  /** Physical context window — the ONLY hard wall. */
+  /** Controller window bound W; in kv-stable this is the pre-grace total budget,
+   *  not the compile's rejection budget. */
   windowTokens: number;
   /** Operating budget B (< W). High-watermark HW defaults to this. */
   budgetTokens: number;
@@ -105,7 +106,7 @@ export interface ControlStep {
   perturbation: number;
   /** True when the controller folded this turn (a perturbation event). */
   folded: boolean;
-  /** True when even full folding could not fit under W (terminal). */
+  /** The adopted ideal cut exceeded the controller's W; not a refusal or a minimum-cut certificate. */
   escalated: boolean;
   deepestLevel: number;
 }
@@ -1008,14 +1009,13 @@ export interface ControlPlanParams {
   expandAtTokens?: number;
   /** The attractor both fold and un-fold aim for (soft target). */
   targetTokens: number;
-  /** Hard wall W — the only hard constraint (§13.2). */
+  /** Controller window bound W (§13.2); the compile checks its own rejection bound. */
   windowTokens: number;
   /** Trust region P on per-turn perturbation, in tokens the provider would
    *  re-read (exact `kvCost`, not a spatial gate). Within P the solver adopts
    *  the ideal cut outright; beyond it it adopts the ideal's newest changes
-   *  only (suffix adoption) unless an override fires (§13.4). Default =
-   *  windowTokens (a rendered layout never exceeds W, so the default trust
-   *  region never binds). */
+   *  only (suffix adoption) unless an override fires (§13.4). Defaults to
+   *  windowTokens, enough to cover the full cost of a plan that fits under W. */
   reachTokens?: number;
   /** Never override P for quality while preparing a future window. If the
    * smallest realizable change exceeds P, hold and report a pace floor. */
@@ -1090,7 +1090,7 @@ export interface ControlPlan {
   folded: boolean;
   /** An un-fold (raise toward raw, to use budget headroom) happened this turn. */
   expanded: boolean;
-  /** Even full folding could not fit under W (terminal — production problem). */
+  /** The adopted ideal cut exceeds windowTokens (kv-stable's pre-grace total budget). */
   escalated: boolean;
   /** Exact prefix-invalidation cost of this plan vs the carried frontier:
    *  tokens the provider will re-read for this plan's choices (0 on a
@@ -1601,7 +1601,8 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
     // Plan this turn's frontier via the shared controller policy (the same code
     // KvStableStrategy runs): carry F_prev, hold the flat zone raw, fold to LW
     // when over HW, and un-fold to LW when under it — both reach-bounded, with
-    // [LW, HW] a no-op dead band; never past the hard wall W.
+    // [LW, HW] a no-op dead band. An adopted ideal over W is reported as
+    // escalated; the replay does not apply the compile's rejection check.
     const plan = planControlledFrontier(inputs, tree, {
       previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
       windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,

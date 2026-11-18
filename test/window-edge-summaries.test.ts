@@ -475,10 +475,12 @@ describe('a live select with those summaries left out that fails after its dry r
     try {
       await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
       assert.deepStrictEqual(warningModes, ['dry', 'live'], 'the probe does not silence the first live warning');
+      assert.ok(modes.includes('leave:dry') && modes.includes('leave:live'), 'both lanes ran on the first compile');
+      modes.length = 0;
       await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.ok(modes.includes('leave:dry'), 'premise: the second leave probe attempted the floor');
+      assert.ok(modes.includes('leave:live'), 'premise: the second live leave run attempted the floor too');
       assert.deepStrictEqual(warningModes, ['dry', 'live'], 'subsequent probes and live runs each dedup');
-      assert.ok(modes.includes('leave:dry'), 'premise: the leave probe computed the floor');
-      assert.ok(modes.includes('leave:live'), 'premise: the live leave run computed the floor too');
       assert.strictEqual(lines.filter((l) => l.includes('floor not computed')).length, 2, 'one dry warning and one live warning');
     } finally {
       await manager.close();
