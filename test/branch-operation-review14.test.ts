@@ -103,6 +103,7 @@ it('post-write presentation protocol failure is contained and the stored message
     inside(fx.manager).diag = { error() { diagnostics++; }, warn() {} };
     armed = true;
     const id = fx.manager.addMessage('user', [{ type: 'text', text: 'stored exactly once' }]);
+    assert.ok(replacement, 'post-write protocol lookup must start the replacement race');
     await replacement;
     assert.ok(id);
     assert.equal(fx.manager.getAllMessages().length, 1);

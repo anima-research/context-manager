@@ -8,6 +8,8 @@ import { JsStore } from '@animalabs/chronicle';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '../src/index.js';
 import type { StrategyContext } from '../src/types/index.js';
 
+import { observeDrainCompletion } from './_harness/drain-completion.js';
+
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 function barrier() { let release!: () => void; const wait = new Promise<void>(r => { release = r; }); return { wait, release }; }
 class Probe extends AutobiographicalStrategy {
@@ -29,15 +31,17 @@ it('terminal drain catch never looks up a failed branch and tolerates a throwing
   const fx = await fixture();
   const branch = fx.store.currentBranch.bind(fx.store);
   let failures = 0;
+  const completions: Promise<unknown>[] = [];
   try {
     inside(fx.raw).compressionQueue = [{}];
     Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => {
       fx.store.currentBranch = () => { throw new Error('store unavailable'); };
-      return Promise.reject(new Error('tick failed'));
+      return observeDrainCompletion(Promise.reject(new Error('tick failed')), completions);
     } });
     inside(fx.raw).diag = { error() { failures++; throw new Error('sink unavailable'); } };
     inside(fx.raw).driveSpeculativeDrain({});
-    await turn();
+    assert.ok(completions.length > 0, 'drain installed its terminal continuation');
+    await Promise.all(completions);
     assert.equal(failures, 1, 'original failure must reach diagnostics without querying currentBranch');
   } finally { fx.store.currentBranch = branch; fx.close(); }
 });
@@ -48,6 +52,7 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
     let replacement: Promise<void> | undefined;
     let handed = 0;
     let warnings = 0;
+    const completions: Promise<unknown>[] = [];
     try {
       fx.raw.setLoadRepairHandler(() => { handed++; });
       inside(fx.raw).diag = { warn() { warnings++; }, error() { warnings++; } };
@@ -64,7 +69,7 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
         } finally { globalThis.queueMicrotask = enqueue; }
       } else if (site === 'drain') {
         inside(fx.raw).compressionQueue = [{}];
-        Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => { entered = true; return pause.wait; } });
+        Object.defineProperty(fx.raw, 'tick', { configurable: true, value: () => { entered = true; return observeDrainCompletion(pause.wait, completions); } });
         inside(fx.raw).driveSpeculativeDrain({});
       } else {
         Object.defineProperty(fx.raw, 'sweepPaidOffQuarantineRecords', { configurable: true, value: () => { entered = true; return pause.wait; } });
@@ -76,7 +81,10 @@ for (const site of ['repair', 'tick', 'alarm', 'drain'] as const) {
       pause.release();
       if (repairCallback) assert.doesNotThrow(repairCallback, 'scheduled repair callback cannot throw into the host');
       await pending;
-      await turn();
+      if (site === 'drain') {
+        assert.ok(completions.length > 0, 'drain completion must be observable');
+        await Promise.all(completions);
+      }
       assert.equal(handed, 0);
       assert.equal(warnings, 0, 'stale work must stop, not trip guarded mirrors and reach diagnostics');
     } finally { pause.release(); setup.release(); await replacement; fx.close(); }

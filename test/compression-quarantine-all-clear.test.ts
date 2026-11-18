@@ -318,7 +318,9 @@ describe('the compression-quarantine all-clear requires an empty read under the 
       later(INTERVAL);
       await fx.strategy.alarm();
     });
-    assert.equal(outage.lines.length, 2, outage.lines.join('\n'));
+    assert.equal(outage.lines.filter(line => line.includes('quarantine status unreadable')).length, 2, outage.lines.join('\n'));
+    assert.equal(outage.lines.filter(line => line.includes('paid-off sweep skipped')).length, 2, 'each due maintenance attempt is diagnosed independently');
+    assert.ok(!outage.lines.some(allClear));
     assert.deepEqual(outage.handled, []);
 
     projection.readCompressionQuarantineProjection = read;

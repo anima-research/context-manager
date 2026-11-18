@@ -7,7 +7,7 @@ import { AutobiographicalStrategy } from '../src/strategies/autobiographical.js'
 import { ContextManager } from '../src/context-manager.js';
 import { BranchOperationScope, callStrategy, registerUnfencedStrategy } from '../src/branch-operation-scope.js';
 
-it('ordinary add fence work stays bounded as record and message history grows', async () => {
+it('ordinary add fence work stays bounded as record and message history grows', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'oc-'));
   const strategy = new AutobiographicalStrategy({
     autoTickOnNewMessage: false, compressionModel: 'offline', targetChunkTokens: 200,
@@ -28,6 +28,7 @@ it('ordinary add fence work stays bounded as record and message history grows', 
       manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `MSG-${i} ${'word '.repeat(110)}` }]);
       if (i === 1024 || i === 4096) samples.push({ contexts, mirrors });
     }
+    t.diagnostic(`fence samples at 1024/4096 messages: ${JSON.stringify(samples)}`);
     assert.ok((strategy as any).chunkRecords.length >= 1024, 'real persisted chunk history reached');
     for (const sample of samples) {
       assert.ok(sample.contexts > 0 && sample.mirrors > 0, 'fence probes actually ran');

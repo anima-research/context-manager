@@ -180,7 +180,7 @@ describe('compression lifecycle: persisted state', () => {
     await manager.tick();
     assert.equal(first.getCompressionQuarantineStatus().count, 1, 'premise: the refused chunk is quarantined');
     manager.close();
-    const second = new AutobiographicalStrategy(config({ compressionRefusalCurveFallbacks: 0, summaryTargetTokens: 1500 }));
+    const second = new AutobiographicalStrategy(config({ compressionRefusalCurveFallbacks: 0, summaryTargetTokens: 1500, quarantineAlarmIntervalMs: 3_600_000 }));
     manager = await ContextManager.open({ path, strategy: second, membrane: membraneOf().membrane });
     const store = manager.getStore();
     const append = store.appendToStateJsonWithIdentity.bind(store);
@@ -195,6 +195,11 @@ describe('compression lifecycle: persisted state', () => {
     await manager.tick();
     assert.equal(faults, 1, 'premise: the clear after the chunk compressed failed');
     assert.equal(second.getCompressionQuarantineStatus().count, 1, 'premise: the record stands beside its compressed chunk record');
+    await manager.tick();
+    assert.equal(second.getCompressionQuarantineStatus().count, 1, 'maintenance attempts are paced, not retried on every tick');
+    const now = Date.now();
+    const clock = mock.method(Date, 'now', () => now + 3_600_000);
+    t.after(() => clock.mock.restore());
     await manager.tick();
     assert.equal(second.getCompressionQuarantineStatus().count, 0);
     manager.close();

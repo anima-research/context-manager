@@ -283,7 +283,7 @@ arbitrary old work in a new manager operation merely to bypass its refusal.
 Lifecycle methods, including subclass overrides, are supported only through
 ContextManager. Direct lifecycle calls are unsupported, not guaranteed to be
 side-effect-free refusals: a direct arrow `initialize` that calls
-`super.initialize` can invalidate the current load before throwing. Recover by
+`super.initialize` may invalidate the active load even when they throw. Recover by
 reinitializing through `ContextManager.setStrategy`, not by retrying the direct
 call. Other direct
 instance-function overrides do not acquire a fresh scope automatically;

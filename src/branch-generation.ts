@@ -16,7 +16,8 @@ export function observeStoreBranch(store: JsStore): StoreBranchGeneration {
     const name = store.currentBranch().name;
     const reentered = branchGenerations.get(store);
     if (reentered !== previous && reentered) {
-      if (reentered.name === name) return reentered;
+      // The outer name may have been captured before the nested hook moved
+      // the store again, even when it matches the nested record. Read again.
       continue;
     }
     if (previous?.name === name) return previous;
@@ -31,7 +32,7 @@ export function markStoreBranchSwitch(store: JsStore): StoreBranchGeneration {
   const previous = branchGenerations.get(store);
   const name = store.currentBranch().name;
   const reentered = branchGenerations.get(store);
-  if (reentered !== previous && reentered) return reentered.name === name ? reentered : observeStoreBranch(store);
+  if (reentered !== previous && reentered) return observeStoreBranch(store);
   const current = { name, generation: (previous?.generation ?? -1) + 1 };
   branchGenerations.set(store, current);
   return current;

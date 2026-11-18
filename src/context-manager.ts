@@ -2806,9 +2806,25 @@ export class ContextManager {
   }
 
   private async selectBranch(name: string, created: boolean): Promise<void> {
+    // A rejected native selection leaves the loaded branch usable. Once the
+    // switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
     this.store.switchBranch(name);
-    const requested = markStoreBranchSwitch(this.store);
-    await this.initializeStrategy(requested, { branch: requested.name, created });
+    const attempt = ++this.initializationAttempt;
+    this.initializedAttempt = null;
+    let requested: StoreBranchGeneration;
+    try {
+      requested = markStoreBranchSwitch(this.store);
+    } catch (cause) {
+      throw new Error(
+        `Branch selection ${name}${created ? ' (created)' : ''} uncertain: earlier effects may have completed; ` +
+        `inspect the store and selected branch before retrying; recover with switchBranch() or setStrategy(): ` +
+        `${cause instanceof Error ? cause.message : String(cause)}`, { cause },
+      );
+    }
+    if (attempt !== this.initializationAttempt || requested.name !== name) {
+      throw new InitializationSupersededError({ branch: name, created });
+    }
+    await this.initializeStrategy(requested, { branch: name, created });
   }
 
   /**
@@ -5143,12 +5159,15 @@ export class ContextManager {
     // The strategy, initialization and branch the calls are made under, and
     // the window the rows entered, before any hook runs.
     let scope: ReturnType<ContextManager['hookScope']>;
-    let legacy: boolean;
+    let legacy: boolean | undefined;
     try {
-      scope = this.hookScope();
       legacy = this.windowIndex.mode() === 'legacy';
+      scope = this.hookScope();
     } catch (err) {
-      // The rows are already stored. Observation failure is not an add failure.
+      // The rows are already stored. Observation failure is not an add failure,
+      // but it is not delivery either. Retain them without immediately retrying
+      // the same failed observation; the next notification/open can redeliver.
+      this.waitToBeHeard(rows, legacy ?? true);
       terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
       return;
     }

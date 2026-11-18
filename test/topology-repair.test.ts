@@ -1366,7 +1366,9 @@ AutobiographicalStrategy.prototype.migrateChunkRecords = function (store) {
     } finally {
       store.close();
     }
-    const dry = spawnSync(process.execPath, [CLI, STORE, '--namespace', 'probe', '--mode', 'rebuild'], { encoding: 'utf8' });
+    const dry = spawnSync(process.execPath, ['--import', new URL('./_harness/refuse-legacy-quarantine-read.js', import.meta.url).href, CLI, STORE, '--namespace', 'probe', '--mode', 'rebuild'], { encoding: 'utf8' });
+    assert.match(dry.stderr, /legacy-read-trap-installed/);
+    assert.doesNotMatch(dry.stderr, /forbidden-legacy-snapshot-read/);
     assert.match(dry.stderr, /holds what the strategy reads as no entry: no list in the ledger;/, dry.stderr);
     assert.doesNotMatch(dry.stderr, /q-legacy|legacy snapshot/, 'obsolete legacy state is neither read nor diagnosed');
   });

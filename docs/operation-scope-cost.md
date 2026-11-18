@@ -267,3 +267,21 @@ The exhaustive reentry initializer trace pins retain their lengths (378 and
 406); one duplicate chunk-key return is replaced by the persistence-capability
 check when constructing the partition. All replay modes and preservation
 assertions remain enabled.
+
+## Round 17 audit (2026-11-18)
+
+The round-15b response's description of its numbers as covering "this submitted
+error-recovery source" was false: its recorded autobiographical blob differs
+from the reviewed head. That unprovided intermediate patch is **not a
+reproducible head qualification**. The old table is retained only as historical
+reported measurements, not evidence of this head's latency or an approved
+budget. No new wall-time benchmark or production qualification is claimed here.
+
+The round-16 insertion fix is already in starting tip
+`3258da9412a5fc680b44d564638360475ed3b42d` (tree equal to published `16f62d80`).
+Rebuilding that exact tip and running the ordinary-add counter regression with
+only sample printing added measured **178 context resolutions / 63 mirror
+checks** after **both 1,024 and 4,096 messages**. The earlier response's 177/62
+was false. These are not the 183/62 counts from the earlier round-16 source
+snapshot above. The safety fence remains enabled without reload; the insertion
+fix bounds its repeated history-walk work rather than bypassing authorization.

@@ -11,7 +11,7 @@ import {
   type CompressionQuarantineReleaseSelection,
 } from '../src/index.js';
 import { markStoreBranchSwitch } from '../src/branch-generation.js';
-import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
+import { compressionQuarantineHolds, withCompressionStateLock } from '../src/strategies/autobiographical.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, CompressionQuarantineStatus } from '../src/types/index.js';
 
@@ -52,6 +52,16 @@ class Probe extends AutobiographicalStrategy {
     };
     return native.durableQuarantineFor(native.readCompressionQuarantineProjection(), record);
   }
+}
+function openEpisode(strategy: Probe): () => void {
+  const raw = strategy as any;
+  raw.quarantineAlarmActive = true;
+  raw.quarantineAlarmOperatorWaived = false;
+  raw.quarantineAlarmScope = { ns: 'default', branch: 'main' };
+  const before = { active: raw.quarantineAlarmActive, waived: raw.quarantineAlarmOperatorWaived,
+    scope: structuredClone(raw.quarantineAlarmScope), lastAt: raw.quarantineAlarmLastAt };
+  return () => assert.deepEqual({ active: raw.quarantineAlarmActive, waived: raw.quarantineAlarmOperatorWaived,
+    scope: raw.quarantineAlarmScope, lastAt: raw.quarantineAlarmLastAt }, before, 'refused release cannot change episode intent');
 }
 function inspect(strategy: Probe, options?: { key?: string; limit?: number }) {
   const result = strategy.inspectCompressionRefusalQuarantine(options);
@@ -198,18 +208,22 @@ describe('metadata-only keyed L1 quarantine capability', () => {
 
   it('rejects omitted/empty/all/prefix/wildcard release selectors; exact absent keys mean not-held', async (t) => {
     const fx = await fixture(t, 'invalid');
+    const episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     const before = bytes(fx.path);
     for (const key of [undefined, '', 'all', '*', selected.key.slice(0, 12), `${selected.key}*`, ['x']]) {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, key } as never), { status: 'invalidSelection' });
+      episode();
     }
     for (const value of [undefined, null, {}, { ...selected, expectedGeneration: '' }, { ...selected, expectedBinding: null }]) {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(value as never), { status: 'invalidSelection' });
+      episode();
     }
     for (const options of [{ key: '*' }, { limit: 0 }, { limit: 101 }, { limit: 1.1 }, null, []]) {
       assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(options as never), { status: 'invalidSelection' });
     }
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, key: hash('absent') }), { status: 'not-held' });
+    episode();
     assert.deepEqual(inspect(fx.strategy, { key: hash('absent') }).records, []);
     assert.deepEqual(bytes(fx.path), before);
   });
@@ -232,12 +246,15 @@ describe('metadata-only keyed L1 quarantine capability', () => {
     const legacy = inspect(fx.strategy).records[0]!;
     assert.equal(legacy.generation, null);
     assert.equal(legacy.selectable, false);
+    const episode = openEpisode(fx.strategy);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, expectedGeneration: `legacy:${selected.key}` }), { status: 'unsupported' });
+    episode();
     assert.deepEqual(bytes(fx.path), before);
   });
 
   it('reports unreadable rather than empty on malformed or failed loaded-state reads, and writes nothing', async (t) => {
     const fx = await fixture(t, 'unreadable');
+    const episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     for (const ledger of [{ bad: 'not-a-list' }, [null], [{ kind: 'checkpoint', active: null }],
       [{ ...fx.event, eventId: '' }], [{ ...fx.event, outcomes: [null] }], [{ ...fx.event, outcomes: null }],
@@ -247,6 +264,7 @@ describe('metadata-only keyed L1 quarantine capability', () => {
       const before = bytes(fx.path);
       assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'ledger-entry' });
+      episode();
       assert.deepEqual(bytes(fx.path), before);
     }
     const get = fx.store.getStateJson.bind(fx.store);
@@ -257,12 +275,14 @@ describe('metadata-only keyed L1 quarantine capability', () => {
     const beforeReadFailure = bytes(fx.path);
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'store-read' });
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'store-read' });
+    episode();
     assert.deepEqual(bytes(fx.path), beforeReadFailure);
     read.mock.restore();
     fx.strategy.detach();
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'branchUnavailable' });
+      episode();
     });
     assert.deepEqual(new Probe(config).inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
   });
@@ -301,51 +321,62 @@ describe('one-key native compare-and-release', () => {
 
   it('rejects replaced generation with identical visible contents and same-key ABA release/recreate', async (t) => {
     const fx = await fixture(t, 'aba');
+    let episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     fx.append({ ...fx.event, eventId: 'replacement-generation' });
     const before = bytes(fx.path);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'stale' });
+    episode();
     assert.deepEqual(bytes(fx.path), before);
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy))).status, 'released');
     await fx.strategy.exhaust(fx.event.record);
+    episode = openEpisode(fx.strategy);
     assert.notEqual(selection(fx.strategy).expectedGeneration, selected.expectedGeneration);
     const recreated = bytes(fx.path);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'stale' });
+    episode();
     assert.deepEqual(bytes(fx.path), recreated);
   });
 
   it('fences namespace/branch/load but NOT ordinary append; a reinitialize invalidates the old load', async (t) => {
     const fx = await fixture(t, 'binding');
+    let episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     for (const field of ['namespace', 'branch', 'loadId'] as const) {
       await noWrites(fx, async () => {
         assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, expectedBinding: { ...selected.expectedBinding, [field]: 'wrong' } }), { status: 'stale' });
+        episode();
       });
     }
     fx.manager.addMessage('User', [{ type: 'text', text: 'ordinary append' }]);
     assert.deepEqual(inspect(fx.strategy).binding, selected.expectedBinding);
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
     await fx.strategy.exhaust(fx.event.record);
+    episode = openEpisode(fx.strategy);
     const priorLoad = selection(fx.strategy);
     await fx.manager.setStrategy(fx.strategy);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(priorLoad), { status: 'stale' });
+      episode();
     });
     const current = selection(fx.strategy);
     const first = fx.manager.currentBranch().name;
     await fx.manager.switchBranch(fx.manager.branchAt(fx.chunk.messages[0]!.id, 'other'));
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(current), { status: 'stale' });
+      episode();
     });
     await fx.manager.switchBranch(first);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(current), { status: 'stale' });
+      episode();
     });
     const onMain = selection(fx.strategy);
     await fx.strategy.initialize({ ...fx.ctx, namespace: 'other-namespace' });
     const before = bytes(fx.path);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(onMain), { status: 'stale' });
+      episode();
     });
     assert.deepEqual(bytes(fx.path), before, 'namespace replacement cannot write through the old selection');
   });
@@ -932,21 +963,30 @@ describe('Anima Review regressions', () => {
     const fx = await fixture(t, 'review-historical');
     const event = historical.events.find((entry: Event) => entry.kind === 'exhausted');
     assert.equal('sourceIds' in event.record, false);
-    for (const ledger of [historical.events, historical.checkpoint, [
-      { ...event, kind: 'claim', eventId: 'historical-claim' },
-      { kind: 'exhausted', key: event.key, targetClaimId: 'historical-claim', outcomes: event.outcomes },
-    ]]) {
+    for (const ledger of [historical.events, historical.checkpoint]) {
       fx.store.setStateJson(fx.strategy.ledgerId, ledger);
       const selected = selection(fx.strategy);
       assert.equal(selected.key, event.key);
-      assert.equal(selected.expectedGeneration, ledger[0].kind === 'claim' ? 'historical-claim' : event.eventId);
+      assert.equal(selected.expectedGeneration, event.eventId);
+      assert.equal((fx.strategy.gate(event.record) as any)?.record.key, event.key, 'tolerant native gate retains the historical hold');
       assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
+      assert.equal(fx.strategy.gate(event.record), undefined);
     }
+    const claims: Event[] = JSON.parse(readFileSync('test/fixtures/quarantine-legacy-claim.json', 'utf8'));
+    const claim = claims.find(entry => entry.kind === 'claim')!;
+    fx.store.setStateJson(fx.strategy.ledgerId, claims);
+    assert.equal(selection(fx.strategy).expectedGeneration, claim.eventId);
+    assert.equal((fx.strategy.gate(claim.record) as any)?.record.key, claim.key);
+    assert.equal(inspect(fx.strategy).records[0]!.selectable, false, 'the real older claim writer had no trustworthy familyKey');
+    const snapshot: Event[] = JSON.parse(readFileSync('test/fixtures/quarantine-legacy-snapshot.json', 'utf8'));
     fx.store.setStateJson(fx.strategy.ledgerId, []);
-    fx.store.setStateJson(fx.strategy.legacyId, [event.record]);
+    fx.store.setStateJson(fx.strategy.legacyId, snapshot);
     const legacy = inspect(fx.strategy).records[0]!;
+    assert.equal(legacy.key, snapshot[0]!.key);
     assert.equal(legacy.generation, null);
     assert.equal(legacy.selectable, false);
+    assert.equal((fx.strategy.gate(snapshot[0]) as any)?.record.key, snapshot[0]!.key);
+
   });
 
   it('2 ignores superseded damaged legacy snapshots, but still validates checkpoints', async (t) => {
@@ -1682,4 +1722,50 @@ it('a progress sweep acknowledges a landed write when sync fails', async (t) => 
     assert.match(lines.join('\n'), /write may have landed.*inspect.*progress/);
     assert.doesNotMatch(lines.join('\n'), /progress remains/);
   } finally { fx.store.sync = sync; }
+});
+
+
+describe('review 16 held native lock', () => {
+  for (const competing of ['exhaustion', 'load-change'] as const) {
+    it(`25 holds the actual lock across ${competing}`, async (t) => {
+      const fx = await fixture(t, `r16-held-${competing}`), selected = selection(fx.strategy);
+      let unlock!: () => void, entered!: () => void;
+      const held = new Promise<void>(resolve => { unlock = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const holder = withCompressionStateLock(fx.store, 'main', fx.strategy.ledgerId, async () => { entered(); await held; });
+      await started;
+      const before = bytes(fx.path);
+      let probes = 0;
+      const impl = fx.strategy as any, read = impl.readCompressionQuarantineProjection;
+      const hook = mock.method(impl, 'readCompressionQuarantineProjection', (...args: any[]) => { probes++; return read.apply(impl, args); });
+      let pending: Promise<unknown> | undefined;
+      try {
+        if (competing === 'exhaustion') {
+          // The under-lock span callback is an observable acquisition seam.
+          let checked = 0;
+          pending = impl.exhaustCompressionRequestFamily(native(fx.strategy).captureCompressionBranch(), fx.event.record,
+            fx.event.outcomes, () => true, () => { checked++; return true; });
+          // A queued operation may run microtasks but cannot reach its callback.
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(checked, 0, 'native exhaustion must wait for the shared lock');
+          assert.equal(probes, 0);
+          unlock(); await holder; await pending;
+          assert.equal(checked, 1);
+        } else {
+          pending = fx.strategy.releaseCompressionRefusalQuarantine(selected);
+          const generation = impl.compressionBranchGeneration;
+          const initialization = fx.manager.setStrategy(fx.strategy);
+          assert.notEqual(impl.compressionBranchGeneration, generation, 'load replacement starts while release is queued');
+          unlock(); await holder;
+          const result = await pending as { status: string };
+          assert.ok(['stale', 'branchUnavailable'].includes(result.status));
+          await initialization;
+          assert.equal(fx.ledger().some(event => event.kind === 'clear'), false, 'queued obsolete release writes no clear');
+          assert.equal(inspect(fx.strategy).records[0]!.generation, selected.expectedGeneration);
+
+        }
+        assert.ok(before.length > 0);
+      } finally { unlock(); await holder; await pending?.catch(() => {}); hook.mock.restore(); }
+    });
+  }
 });

@@ -28,7 +28,7 @@ for (const lane of ['compression', 'merge'] as const) {
       ? ['start', 'settle', 'pause'] as const : ['start', 'settle'] as const;
     for (const failureAt of failurePoints) {
       it(`${lane} joins work and releases its slot when branch reads fail at ${failureAt} (${outcome})`, async () => {
-        const fx = await fixture(), entered = barrier(), finish = barrier();
+        const fx = await fixture(), entered = barrier(), joined = barrier(), finish = barrier();
         const raw = inside(fx.strategy);
         const currentBranch = fx.store.currentBranch;
         const providerError = Object.assign(new Error('attempt failed after being held'), outcome === 'admission' ? { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' } : {});
@@ -57,14 +57,23 @@ for (const lane of ['compression', 'merge'] as const) {
           raw.compressionQueue = lane === 'compression' ? [0] : [];
           raw.mergeQueue = lane === 'merge' ? [{ level: 2, sourceIds: ['a', 'b'] }] : [];
           raw.config.hierarchical = true;
-          const work = async () => {
+          const work = () => {
             starts++;
             failObservation = failureAt === 'start';
             entered.release();
-            await finish.wait;
-            failObservation = failureAt !== 'pause';
-            if (outcome !== 'resolve') throw providerError;
-            return false;
+            // The lane calls work.then(transform), then must actually await
+            // that result. Signal that attachment instead of guessing how many
+            // microtasks a premature rejection needs to settle.
+            return { then(transform: (value: boolean) => unknown) {
+              return { then(resolve: (value: unknown) => void, reject: (error: unknown) => void) {
+                joined.release();
+                return finish.wait.then(() => {
+                  failObservation = failureAt !== 'pause';
+                  if (outcome !== 'resolve') throw providerError;
+                  return false;
+                }).then(transform).then(resolve, reject);
+              } };
+            } };
           };
           raw.compressChunkHierarchical = raw.executeMerge = work;
           fx.store.currentBranch = function () {
@@ -74,9 +83,7 @@ for (const lane of ['compression', 'merge'] as const) {
           pending = fx.strategy.tick({ membrane: {}, messageStore: {} } as StrategyContext);
           const observed = pending.then(() => { settled = true; }, error => { settled = true; observedFailure = error; });
           await Promise.race([entered.wait, observed.then(() => { throw observedFailure ?? new Error('tick ended before entering held work'); })]);
-          // These microtasks let a premature rejection settle, but completion is
-          // always observed below, not inferred from a fixed delay.
-          await Promise.resolve(); await Promise.resolve();
+          await Promise.race([joined.wait, observed.then(() => { throw observedFailure ?? new Error('tick ended before awaiting held work'); })]);
           assert.equal(starts, 1);
           assert.equal(settled, false, 'tick must remain joined to the held provider');
           assert.ok(raw.pendingCompression, 'the started work owns the pending slot');

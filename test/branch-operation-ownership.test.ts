@@ -128,17 +128,19 @@ it('release migration names host callback refusals, dispatch limits and the inte
   assert.match(breaking, /dispatcher/);
   assert.match(breaking, /runInAsyncScope/);
   const prose = (text: string) => text.replace(/\n\s*\*?\s*/g, ' ');
-  assert.match(prose(breaking), /are supported only through ContextManager/);
-  assert.match(prose(breaking), /can invalidate the current load before throwing/);
   const lifecyclePath = 'changelog.d/490-lifecycle-override-origins.fixed.md';
   const lifecycle = readFileSync(existsSync(lifecyclePath) ? lifecyclePath : 'CHANGELOG.md', 'utf8');
-  assert.match(prose(lifecycle), /are supported only through `ContextManager`/);
-  const types = prose(readFileSync('src/types/strategy.ts', 'utf8'));
-  assert.match(types, /Lifecycle methods, including subclass overrides, are supported only through ContextManager/);
-  assert.match(types, /can invalidate the current load before throwing/);
-  const guidance = prose(readFileSync('docs/keyed-compression-quarantine.md', 'utf8'));
-  assert.match(guidance, /Lifecycle methods, including subclass overrides, are supported only through ContextManager/);
-  assert.match(guidance, /can invalidate the current load before throwing/);
+  const types = readFileSync('src/types/strategy.ts', 'utf8');
+  const guidance = readFileSync('docs/keyed-compression-quarantine.md', 'utf8');
+  // Check the migration's concepts independently; equivalent wording in one
+  // document must not require synchronized literal prose in all the others.
+  for (const text of [breaking, lifecycle, types, guidance].map(prose)) {
+    assert.match(text, /lifecycle/i);
+    assert.match(text, /(?:supported only through|must be invoked via)\s+`?ContextManager/);
+    assert.match(text, /direct.{0,100}(?:unsupported|not supported)/i);
+    assert.match(text, /invalidat.{0,50}(?:load|generation)/i);
+    assert.match(text, /throw/i);
+  }
   assert.match(breaking, /abort listeners/);
   assert.match(breaking, /prototype/);
 });
