@@ -358,7 +358,7 @@ V2's agent-driven `unfold` violates monotonicity intentionally — the agent dec
 
 The strategy throws `OverBudgetError` when a budget check refuses the current context or plan against the **hard** budget (not just the soft target). This includes head/tail reservation, an over-budget plan, and emission overrunning the plan. The plan check tests the plan's size, not whether the picker has exhausted possible folds: a refused plan can still request missing summaries that compression may produce.
 
-The constructor's `stage` parameter defaults to the legacy `Adaptive picker exhausted` wording, not the current plan-check wording. The plan check supplies its own stage with the solver name and solver-reported/picker-derived exhaustion and label-ceiling fallback flags; these flags are diagnostics, not the refusal condition or proof that no further compression is possible. Emission sites supply their own stage too. When `clearedBy` includes `compression`, completing queued compression may clear the refusal.
+The constructor's `stage` parameter defaults to the legacy `Adaptive picker exhausted` wording, not the current plan-check wording. The plan check supplies its own stage with the solver name; exhaustion follows the token figures, and the label-ceiling fallback flag is printed only when true; these flags are diagnostics, not the refusal condition or proof that no further compression is possible. Emission sites supply their own stage too. When `clearedBy` includes `compression`, completing queued compression may clear the refusal.
 
 No silent degradation. No automatic tail-shrink or head-truncate. The host is in a better position than the strategy to decide what to do — raise the budget, switch to a larger-context model, drop the head/tail windows for this call, surface a "context too large" error to the user. The strategy's job is to fit when it can and report cleanly when it can't.
 
@@ -507,15 +507,16 @@ supplied, preserving solver-specific semantics (for example, kv-unified
 reports an infeasible frontier); otherwise it is derived as no production
 requests and applied tokens above the soft target. It does not generally
 mean nothing remains to fold, nor does it trigger this refusal. The message
-labels it `solver-reported/picker-derived exhausted` to make that scope explicit.
+labels it `exhausted`, without claiming a provenance for the normalized value.
 `labelCeilingFallback` reports a live kv-unified ceiling fallback, not a
-shadow solve's ceiling hit, and is false for other solvers. Refusals before
+shadow solve's ceiling hit, and is absent for other solvers. Refusals before
 the plan omit these fields. With the real solver, an infeasible minimum
 frontier returns before search; a search that hits the ceiling falls back
 to an already-feasible minimum cut. Thus a live ceiling fallback is not a
-reason for this plan-check refusal; a synthetic pre-feasibility exception
-can exercise forwarding the fallback flag on refusal, but does not show
-that combination is reachable in a real solve.
+reason for this plan-check refusal. A real kv-unified refusal here carries
+`exhausted=true`; a true fallback flag at this refusal means the plan's
+accounting disagreed with the solver's. A synthetic pre-feasibility exception
+exercises forwarding the flag, not reachability in a real solve.
 
 `moves` is the number of chunks whose resolution changed from the level
 they started the solve at. It replaced the op walk's `iterations` in

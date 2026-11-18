@@ -524,6 +524,39 @@ function checkBudget(error: OverBudgetError): void {
 }
 
 describe('OverBudgetError diagnostics', () => {
+  it('keeps the solver and token figures in 160/300-character head+tail excerpts (R1-1)', () => {
+    const error = new OverBudgetError({
+      stage: 'Adaptive plan check (kv-stable)',
+      actual: 140556,
+      budget: 136288,
+      diagnostics: {
+        solver: 'kv-stable', pickerExhausted: true,
+        headTokens: 754, tailTokens: 118230, middleTokens: 21572,
+        middleChunkCount: 496, middleCountUnit: 'picker-chunks',
+        deepestLevel: 3, deepestLevelKind: 'planned', deepestAvailableLevel: 3,
+        configuredBudget: 150000, reserveForResponse: 10000, inputBudget: 140000,
+        summaryCountsByLevel: { 1: 120, 2: 35, 3: 4 },
+        floorTokens: 140556, queuedReliefTokens: 0,
+      },
+    });
+    // agent-framework's boundFailureText algorithm for this ASCII fixture:
+    // reserve the omission marker, then keep three quarters head / one tail.
+    for (const max of [160, 300]) {
+      assert.ok(error.message.length > max, 'exercise truncation, not the identity path');
+      const markerLength = ` …[${error.message.length} of ${error.message.length} characters omitted]… `.length;
+      const budget = Math.max(0, max - markerLength);
+      const tailLength = Math.floor(budget / 4);
+      const headEnd = budget - tailLength;
+      const tailStart = error.message.length - tailLength;
+      const excerpt = `${error.message.slice(0, headEnd)} …[${tailStart - headEnd} of ${error.message.length} characters omitted]… ${error.message.slice(tailStart)}`;
+      assert.ok(excerpt.length <= max);
+      assert.match(excerpt, /^Adaptive plan check \(kv-stable\): 140556 tokens exceed hard budget 136288/);
+      if (max === 300) {
+        assert.match(excerpt, /head=754, tail=118230, middle=21572, middle picker chunks=496/);
+      }
+    }
+  });
+
   for (const adaptiveResolution of [true, false]) {
     it(`reports budget arithmetic and empty inventory for an early ${adaptiveResolution ? 'adaptive' : 'hierarchical'} refusal`, async () => {
       const strategy = new AutobiographicalStrategy({
@@ -582,14 +615,15 @@ describe('OverBudgetError diagnostics', () => {
         assert.equal(Reflect.get(error.diagnostics, 'solver'), 'diagnostic-fixture');
         // Explicit solver values take precedence even when contrary to the fallback.
         assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), expected);
-        assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), false);
+        assert.equal(Reflect.has(error.diagnostics, 'labelCeilingFallback'), false);
         assert.ok(
           error.message.startsWith(
-            `Adaptive plan check: diagnostic-fixture returned its plan (solver-reported/picker-derived exhausted=${expected}, label-ceiling fallback=false) but ${error.actual} tokens still exceed hard budget 100 (`,
+            `Adaptive plan check (diagnostic-fixture): ${error.actual} tokens exceed hard budget 100 (`,
           ),
           error.message,
         );
-        assert.doesNotMatch(error.message, /picker exhausted/);
+        assert.match(error.message, new RegExp(`, exhausted=${expected}\\)`));
+        assert.doesNotMatch(error.message, /picker exhausted|solver-reported|picker-derived|label-ceiling/);
       });
     });
   }
@@ -661,7 +695,10 @@ describe('OverBudgetError diagnostics', () => {
           assert.equal(Reflect.get(error.diagnostics, 'solver'), 'kv-unified');
           assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), !ceiling);
           assert.equal(Reflect.get(error.diagnostics, 'labelCeilingFallback'), !ceiling);
-          assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=${!ceiling}, label-ceiling fallback=${!ceiling}) but `));
+          assert.ok(error.message.startsWith(`Adaptive plan check (kv-unified): ${error.actual} tokens exceed hard budget ${error.budget} (`));
+          assert.match(error.message, new RegExp(`, exhausted=${!ceiling}`));
+          assert.equal(error.message.includes('label-ceiling fallback=true'), !ceiling);
+          assert.doesNotMatch(error.message, /label-ceiling fallback=false/);
           return;
         }
         assert.equal(solves.mock.callCount(), shadowCeiling === undefined ? 1 : 2, 'one live solve and, when configured, one shadow solve');
@@ -673,7 +710,10 @@ describe('OverBudgetError diagnostics', () => {
           assert.deepEqual(picks.map(pick => pick.exhausted), [ceiling, !ceiling], 'opposite live/shadow exhaustion');
         }
         assert.equal(Reflect.get(error.diagnostics, 'pickerExhausted'), liveExhausted, 'only the live pick supplies exhaustion');
-        assert.ok(error.message.startsWith(`Adaptive plan check: kv-unified returned its plan (solver-reported/picker-derived exhausted=${liveExhausted}, label-ceiling fallback=${ceiling}) but `));
+        assert.ok(error.message.startsWith(`Adaptive plan check (kv-unified): ${error.actual} tokens exceed hard budget ${error.budget} (`));
+        assert.match(error.message, new RegExp(`, exhausted=${liveExhausted}`));
+        assert.equal(error.message.includes('label-ceiling fallback=true'), ceiling);
+        assert.doesNotMatch(error.message, /label-ceiling fallback=false/);
       });
     });
   }
@@ -1033,7 +1073,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.updateHotContextSettings({ tailTokens: 1 });
       const next = await refusal(manager);
       assert.doesNotMatch(next.message, /^Head\/tail reservation exceeded budget/, 'the raw windows now fit');
-      assert.match(next.message, /^Adaptive plan check: /, 'the next refusal is the picker\'s, with no summaries to fold through');
+      assert.match(next.message, /^Adaptive plan check \([^)]+\): /, 'the next refusal is the picker\'s, with no summaries to fold through');
     });
   });
 
@@ -1174,7 +1214,7 @@ describe('OverBudgetError.clearedBy', () => {
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const error = await refusal(manager);
-        assert.match(error.message, /^Adaptive plan check: /);
+        assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
         assert.deepEqual(error.clearedBy, expected);
       });
     });
@@ -1267,7 +1307,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.deepEqual(preview.clearedBy, running ? ['compression'] : []);
         // The live compile refuses the same plan at the picker's gate, with the same list.
         const live = await refusal(manager);
-        assert.match(live.message, /^Adaptive plan check: /);
+        assert.match(live.message, /^Adaptive plan check \([^)]+\): /);
         assert.deepEqual(live.clearedBy, running ? ['compression'] : []);
       });
     });
@@ -1300,7 +1340,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.equal(preview.fits, false);
       assert.deepEqual(preview.clearedBy, ['compression']);
       const live = await refusal(manager);
-      assert.match(live.message, /^Adaptive plan check: /);
+      assert.match(live.message, /^Adaptive plan check \([^)]+\): /);
       assert.deepEqual(live.clearedBy, ['compression']);
       // The preview's numbers are that refusal's too, not the later stage's.
       assert.equal(preview.finalTokens, live.actual);
@@ -2243,7 +2283,7 @@ describe('OverBudgetError.clearedBy', () => {
         // chunk is partly covered, none exactly.
         queued.forEach((ids, i) => strategy.seedL1(`L1-part-${i}`, [ids[0]!]));
         const error = await refusal(manager);
-        assert.match(error.message, adaptiveResolution ? /^Adaptive plan check: / : /^Hierarchical emission overran the budget/);
+        assert.match(error.message, adaptiveResolution ? /^Adaptive plan check \([^)]+\): / : /^Hierarchical emission overran the budget/);
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
         assert.deepEqual(error.clearedBy, []);
         // Tick refuses each one without compressing it: no model call, and
@@ -2362,7 +2402,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
       const error = await refusal(manager);
-      assert.match(error.message, /^Adaptive plan check: /);
+      assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
       assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
       assert.deepEqual(error.clearedBy, []);
       // The premise: the picker folds each message through the same L1 before and after adoption.
@@ -2370,7 +2410,7 @@ describe('OverBudgetError.clearedBy', () => {
       const runs = strategy.pickerL1s.length;
       await adoptAll(manager, strategy);
       const after = await refusal(manager);
-      assert.match(after.message, /^Adaptive plan check: /);
+      assert.match(after.message, /^Adaptive plan check \([^)]+\): /);
       assert.ok(strategy.pickerL1s.length > runs, 'the picker ran again after the adoptions');
       assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
       assert.deepEqual(strategy.pickerL1s.at(-1), before);
@@ -2396,7 +2436,7 @@ describe('OverBudgetError.clearedBy', () => {
       queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
       assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory, so the picker can fold none of them');
       const error = await refusal(manager);
-      assert.match(error.message, /^Adaptive plan check: /);
+      assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
       assert.deepEqual(error.clearedBy, ['compression']);
       await adoptAll(manager, strategy);
       assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
@@ -2624,7 +2664,7 @@ describe('OverBudgetError.clearedBy', () => {
           error = caught;
         }
         assert.ok(error, 'compile should refuse');
-        assert.match(error.message, /^Adaptive plan check: /);
+        assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
         assert.deepEqual(error.clearedBy, lateHold ? [] : ['compression']);
         if (lateHold) manager.releaseCompression([ids[3]]);
       });
@@ -2736,7 +2776,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(queued.length, 3, 'three chunks of four are queued');
         if (pinned) pinChunks(manager, queued);
         const error = await refusal(manager);
-        assert.match(error.message, /^Adaptive plan check: /);
+        assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the chunks stay queued, pinned or not');
         assert.deepEqual(error.clearedBy, pinned ? [] : ['compression']);
         // The premise: their L1s, as compression writes them, make the plan smaller only where no pin keeps every message raw.
@@ -2756,7 +2796,7 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       pinChunks(manager, queued, 1);
       const error = await refusal(manager);
-      assert.match(error.message, /^Adaptive plan check: /);
+      assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
       assert.deepEqual(error.clearedBy, ['compression']);
       queued.forEach((ids, i) => strategy.seedShortL1(`L1-partly-${i}`, ids));
       const after = await refusal(manager);
@@ -2792,7 +2832,7 @@ describe('OverBudgetError.clearedBy', () => {
           );
           strategy.overstate = false;
           assert.ok(error instanceof OverBudgetError);
-          assert.match(error.message, /^Adaptive plan check: /);
+          assert.match(error.message, /^Adaptive plan check \([^)]+\): /);
           assert.deepEqual(strategy.queuedChunkIds(), queued, 'the chunks stay queued');
           const { indices, headEnd, recentStart } = strategy.placement(inWindow);
           const inside = indices.filter((i) => (where === 'head' ? i < headEnd : i >= recentStart)).length;

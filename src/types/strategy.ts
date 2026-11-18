@@ -949,8 +949,14 @@ export interface PreviewResult {
   requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
-  /** True when the picker could not fold any further, and when the request
-   *  limit leaves the window no room at any fold. */
+  /** The plan's exhaustion flag (see `OverBudgetDiagnostics.pickerExhausted`
+   *  for the picker normalization) when reporting a plan, including one
+   *  already over budget, or a tool-pairing stub refusal after a fitting plan.
+   *  Otherwise a refusal reports true: both before planning, where no solver
+   *  ran, and after a fitting plan, including a late emission refusal even
+   *  when the solver reported false. A stub refusal without a plan also
+   *  reports true. Not proof that nothing can be folded: read `clearedBy`
+   *  and `producedCount` for compression work. */
   exhausted: boolean;
   /**
    * When the layout doesn't fit: what clears that refusal besides a larger

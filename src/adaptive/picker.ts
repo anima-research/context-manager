@@ -57,7 +57,7 @@ export interface OverBudgetDiagnostics {
    * `tokens` is the raw tokens they keep there together, estimated as the
    * plan prices them, and each pin gives its own; a message two pins cover
    * counts once in `tokens` and toward each pin. Set only by the refusal of a
-   * plan whose middle is over the budget ("Adaptive plan check: …");
+   * plan whose middle is over the budget ("Adaptive plan check (…): …");
    * every other refusal leaves it out, as does that one when no pin keeps
    * any.
    */
@@ -94,7 +94,7 @@ export interface OverBudgetDiagnostics {
   requestAllowanceTokens?: number;
   /**
    * Set only by the refusal of an adaptive plan over the budget ("Adaptive
-   * plan check: …"), which tests the plan's size and not whether the solver
+   * plan check (…): …"), which tests the plan's size and not whether the solver
    * could fold further (#496): the folding solver that planned (`kv-unified`,
    * `kv-stable`, …).
    */
@@ -110,7 +110,9 @@ export interface OverBudgetDiagnostics {
   /**
    * With `solver`: whether the plan is the minimum-token cut kv-unified takes
    * when its search passes `labelCeiling` (#252), rather than the cut its
-   * search chose. False under every other solver.
+   * search chose. Absent under every other solver. True at this refusal
+   * means the plan's accounting disagreed with the solver's: a real ceiling
+   * fallback takes an already-feasible minimum cut.
    */
   labelCeilingFallback?: boolean;
 }
@@ -312,7 +314,9 @@ export class OverBudgetError extends Error {
       ? 'fold plan=not computed'
       : `${depthLabel}=L${opts.diagnostics.deepestLevel}`;
     super(
-      `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
+      (opts.diagnostics.solver === undefined
+        ? `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}`
+        : `${opts.stage ?? `Adaptive plan check (${opts.diagnostics.solver})`}: ${opts.actual} tokens exceed hard budget ${opts.budget}`) +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
         ` middle=${opts.diagnostics.middleTokens}${middleCount}, ${depth}` +
         (opts.diagnostics.deepestAvailableLevel === undefined ? '' :
@@ -328,6 +332,8 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         (opts.diagnostics.requestLimitTokens === undefined ? '' : `, request limit=${opts.diagnostics.requestLimitTokens}`) +
         (opts.diagnostics.requestAllowanceTokens === undefined ? '' : `, request allowance=${opts.diagnostics.requestAllowanceTokens}`) +
+        (opts.diagnostics.pickerExhausted === undefined ? '' : `, exhausted=${opts.diagnostics.pickerExhausted}`) +
+        (opts.diagnostics.labelCeilingFallback === true ? ', label-ceiling fallback=true' : '') +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across

@@ -933,7 +933,7 @@ describe('estimator calibration band', () => {
     // The picker's over-budget throw is dry-run-guarded (a preview reports
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
-    // signature ("Adaptive plan check: ...") is this path. It needs the
+    // signature ("Adaptive plan check (…): ...") is this path. It needs the
     // picker over and the emitter under, so that the picker's refusal is the
     // only one the preview can fall back at. The strategy's own prices don't
     // give that for a body of text, since the middle counts a body's raw
@@ -989,7 +989,7 @@ describe('estimator calibration band', () => {
     control.cm.close();
     const controlReopened = await openSharded('picker-control', false);
     assert.equal(controlReopened.cm.previewContext(tight)!.fits, false);
-    await assert.rejects(controlReopened.cm.compile(tight), /Adaptive plan check: /);
+    await assert.rejects(controlReopened.cm.compile(tight), /Adaptive plan check \([^)]+\): /);
     controlReopened.cm.close();
 
     const first = await openSharded('picker', true);

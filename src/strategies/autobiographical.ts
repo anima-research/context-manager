@@ -15844,22 +15844,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const rawPins = this.rawPinsDiagnostics(store, middlePrice);
       // What was tested is the plan's size, not `result.exhausted`: a solver
       // can return a plan over the budget while it still has folds to ask
-      // for. Report the normalized flag as solver-reported/picker-derived,
+      // for. Report the normalized exhaustion flag,
       // not a claim that nothing remains to fold (#496). The fallback flag
       // identifies a live ceiling fallback (#252), not a reason for refusal.
       // The shadow pick above put the live pick's strategy back.
       const solver = picker.solverName;
-      const labelCeilingFallback = solver === 'kv-unified' && this._lastKvUnified?.lastTimings?.ceiling?.live !== undefined;
+      const labelCeilingFallback = solver === 'kv-unified'
+        ? this._lastKvUnified?.lastTimings?.ceiling?.live !== undefined : undefined;
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
         clearedBy: planClearedBy(),
-        stage: `Adaptive plan check: ${solver} returned its plan` +
-          ` (solver-reported/picker-derived exhausted=${result.exhausted}, label-ceiling fallback=${labelCeilingFallback})`,
+        stage: `Adaptive plan check (${solver})`,
         diagnostics: {
           solver,
           pickerExhausted: result.exhausted,
-          labelCeilingFallback,
+          ...(labelCeilingFallback === undefined ? {} : { labelCeilingFallback }),
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
           headTokens,

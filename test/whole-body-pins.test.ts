@@ -569,7 +569,7 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       strategy.resetHeadWindow(all.at(-1)!.id);
       cm.pinRange(all.at(-3)!.id, all.at(-3)!.id);
       const refusal = await refusalOf(cm, 30_000);
-      assert.match(refusal.message, /^Adaptive plan check: /);
+      assert.match(refusal.message, /^Adaptive plan check \([^)]+\): /);
       assert.deepStrictEqual(refusal.diagnostics.rawPins?.pins.map((p) => p.pinId), [mark]);
       await cm.close();
     });
@@ -660,7 +660,7 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       const { cm, b } = await markedAfterSummaries(dir, 'kv-stable');
       cm.markDocument(b, { level: 1 });
       const refusal = await refusalOf(cm, 10_000);
-      assert.match(refusal.message, /^Adaptive plan check: /, 'the plan\'s refusal, the one that names pins');
+      assert.match(refusal.message, /^Adaptive plan check \([^)]+\): /, 'the plan\'s refusal, the one that names pins');
       assert.strictEqual(refusal.diagnostics.rawPins, undefined);
       assert.ok(refusal.message.endsWith(')'), refusal.message);
       await cm.close();
