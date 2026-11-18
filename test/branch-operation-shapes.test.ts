@@ -250,3 +250,57 @@ it('a captured writer guard cannot authorize a different invocation binding', ()
   const authorize = callStrategy(target, 'tick', () => scope.writerGuard());
   callStrategy(target, 'tick', () => assert.throws(authorize, /stale branch/));
 });
+
+it('guarded mirror access is local: no fallible store lookup on the hot field path', () => {
+  const identity = { load: 1 };
+  let checks = 0;
+  const scope = new BranchOperationScope(() => identity, () => { checks++; return true; }, () => 0);
+  const target = { mirror: 1 };
+  scope.install(target, new Set(), new Set());
+  callStrategy(target, 'tick', () => {
+    const before = checks;
+    for (let i = 0; i < 100; i++) target.mirror++;
+    assert.equal(checks, before, 'field access must check epoch/generation, not query a host store');
+  });
+});
+
+it('nested boundary resolutions retain an ancestor owner origin', async () => {
+  const identity = { load: 1 };
+  const aScope = new BranchOperationScope(() => identity, () => true, () => 0);
+  const bScope = new BranchOperationScope(() => identity, () => true, () => 0);
+  const a = { mirror: 0 }, b = {};
+  aScope.install(a, new Set(), new Set()); bScope.install(b, new Set(), new Set());
+  let continueWork!: () => void;
+  const pause = new Promise<void>(r => { continueWork = r; });
+  let pending: Promise<void> | undefined;
+  const bProxy = new Proxy(b, { get(target, key, receiver) {
+    if (typeof key === 'symbol') {
+      pending = pause.then(() => { a.mirror++; });
+      void pending.catch(() => {});
+    }
+    return Reflect.get(target, key, receiver);
+  } });
+  const aProxy = new Proxy(a, { get(target, key, receiver) {
+    if (typeof key === 'symbol') callStrategy(bProxy, 'tick', () => {});
+    return Reflect.get(target, key, receiver);
+  } });
+  callStrategy(aProxy, 'tick', () => {});
+  callStrategy(a, 'initialize', () => {});
+  continueWork();
+  await assert.rejects(pending!, /stale branch/);
+  assert.equal(a.mirror, 0);
+});
+
+it('initialization detaches discarded order caches without traversing old history', () => {
+  const scope = new BranchOperationScope(() => ({ load: 1 }), () => true, () => 0);
+  class OldOrder extends Map<string, number> {
+    [Symbol.iterator](): MapIterator<[string, number]> { throw new Error('history traversed'); }
+  }
+  const old = new OldOrder([['a', 1]]);
+  const target = { order: old, source: ['a'] };
+  (scope.install as Function)(target, new Set(), new Set(), new Set(['order', 'source']));
+  callStrategy(target, 'initialize', () => scope.isolateMirrors());
+  assert.equal(target.order.size, 0);
+  assert.deepEqual(target.source, []);
+  assert.equal(old.get('a'), 1, 'old captured shell remains intact');
+});

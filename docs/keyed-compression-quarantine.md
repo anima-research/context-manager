@@ -237,3 +237,26 @@ use its existing local authorization policy. AF alignment must be proposed
 separately if its public API/dependency profile cannot expose that instance;
 no dependency floor or release version is invented here. There is no new
 shared HTTP/WebUI/MCP/model-tool mutation surface in this library change.
+
+### Callback ownership and operation scope
+
+AsyncLocalStorage follows the invocation tree, not who wrote a callback. A host
+callback invoked during a strategy operation, and timers, microtasks, promises
+or abort listeners it creates, inherit that operation's load and lifecycle epoch.
+A later direct strategy call from that tree is **not a fresh host operation**:
+a replacement initialize or detach makes guarded reads and writes throw a
+`StaleBranchOperationError`. Awaited work can reject; scheduled callbacks and
+abort listeners must catch stale refusals themselves, since they have no caller
+promise for the library to handle. Do not let such exceptions escape an event
+callback. Only library-owned continuations have library-owned catch boundaries.
+
+For an intentional fresh operation, enqueue intent to a host-owned dispatcher
+created outside strategy callbacks, or use a manager entrypoint (manager calls
+create new origins). Do not wrap arbitrary old work in a new manager operation
+merely to bypass its stale refusal. Direct instance-function overrides do not
+acquire a fresh scope automatically; prototype entrypoints retain inherited scope.
+
+Alarm episodes identify namespace and branch only, not backing stores. Reusing a
+strategy on a different backing store with the same names can end the previous
+episode; this is not evidence that the original store was checked. Stable backing
+store identity and checkpoint retry/reuse policy remain separate contract choices.

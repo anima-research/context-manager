@@ -200,6 +200,15 @@ function countDrives(strategy: AutobiographicalStrategy) {
   return counts;
 }
 
+/** Track actual tick completion, including the in-flight tick when a stale
+ * continuation now correctly stops BEFORE arming another timer. */
+function watchTicks(strategy: AutobiographicalStrategy): Promise<void>[] {
+  const ticks: Promise<void>[] = [];
+  const tick = strategy.tick.bind(strategy);
+  strategy.tick = (ctx) => { const pending = tick(ctx); ticks.push(pending); return pending; };
+  return ticks;
+}
+
 /** Count the compressions and merges the strategy starts, and the
  *  compressions that have settled. Nothing awaits between a compression's
  *  start and its wait on identical work in flight, so one that has started
@@ -369,6 +378,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     const replaced = newStrategy(true);
     const drives = countDrives(replaced);
+    const ticks = watchTicks(replaced);
     const manager = await ContextManager.open({ store, strategy: replaced, membrane: membrane as never });
     try {
       seed(manager);
@@ -376,12 +386,14 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       const drivesBefore = drives.drives;
 
       await manager.setStrategy(new PassthroughStrategy());
-      // The drain re-arms after the tick it was running; wait for that timer,
-      // not one that ran while the messages went in. A drive it makes happens
-      // before its run is counted.
-      const ranBefore = timers.counts.ran;
+      // Wait for every started tick, not for an obsolete timer that must no
+      // longer be armed. Then flush the drain's completion microtask.
+      assert.ok(ticks.length > 0, 'the provider belongs to a tracked tick');
+      const armedBefore = timers.counts.armed;
       calls[0].release();
-      await waitFor(() => timers.counts.ran > ranBefore);
+      await Promise.all(ticks);
+      await settle(0);
+      assert.strictEqual(timers.counts.armed, armedBefore, 'obsolete completion must not re-arm the drain');
 
       assert.strictEqual(drives.drives, drivesBefore, "the replaced strategy's drain was driven again after the swap");
       assert.strictEqual(calls.length, 1, `the replaced strategy's drain called the provider ${calls.length - 1} more time(s)`);
@@ -425,6 +437,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     const strategy = newStrategy(true);
     const drives = countDrives(strategy);
+    const ticks = watchTicks(strategy);
     const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
     let closed = false;
     try {
@@ -435,12 +448,14 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       manager.close();
       closed = true;
       assert.strictEqual(store.isClosed(), false, 'the app still owns its store');
-      // The drain re-arms after the tick it was running; wait for that timer,
-      // not one that ran while the messages went in. A drive it makes happens
-      // before its run is counted.
-      const ranBefore = timers.counts.ran;
+      // Wait for every started tick, not for an obsolete timer that must no
+      // longer be armed. Then flush the drain's completion microtask.
+      assert.ok(ticks.length > 0, 'the provider belongs to a tracked tick');
+      const armedBefore = timers.counts.armed;
       calls[0].release();
-      await waitFor(() => timers.counts.ran > ranBefore);
+      await Promise.all(ticks);
+      await settle(0);
+      assert.strictEqual(timers.counts.armed, armedBefore, 'obsolete completion must not re-arm the drain');
 
       assert.strictEqual(drives.drives, drivesBefore, "the closed manager's strategy was driven again after close()");
       assert.strictEqual(calls.length, 1, `the closed manager's strategy called the provider ${calls.length - 1} more time(s)`);

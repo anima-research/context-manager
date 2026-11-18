@@ -1,7 +1,9 @@
 - Autobiographical and Knowledge strategy operations now retain an immutable
   store/namespace/branch/load identity through synchronous reentrancy, promises,
-  and scheduled continuations using Node's `AsyncLocalStorage` (Node ≥22.12;
-  no browser build is provided). A reentrant `initialize()` runs in a separate
+  and scheduled continuations using `node:async_hooks` `AsyncLocalStorage`
+  (Node ≥22.12, also required by the published Bun source export; Bun must
+  implement Node-compatible propagation and class-field initialization; no
+  browser build is provided). A reentrant `initialize()` runs in a separate
   scope; it cannot authorize the interrupted operation's writes or mirror
   updates. Stale operations may now reject earlier with a stale-branch error
   instead of continuing until the next explicit branch check. This is not a

@@ -1,4 +1,5 @@
-import { BranchOperationScope } from '../branch-operation-scope.js';
+import { terminalCatch } from '../terminal-catch.js';
+import { BranchOperationScope, StaleBranchOperationError } from '../branch-operation-scope.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
@@ -1642,11 +1643,10 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
   const dropped = new Set<string>();
   const unlisted = new Set<string>();
   const hasCheckpoint = Array.isArray(ledger) && ledger.some((event) => event?.kind === 'checkpoint');
-  legacy = hasCheckpoint ? undefined : typeof legacy === 'function' ? legacy() : legacy;
   const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
+  legacy = hasCheckpoint || ledgerHoldsNoList ? undefined : typeof legacy === 'function' ? legacy() : legacy;
   if (ledgerHoldsNoList) unlisted.add('the ledger');
   if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
-  if (ledgerHoldsNoList && Array.isArray(legacy)) for (const record of legacy) if (isUsableQuarantineRecord(record)) dropped.add(record.key);
   const active = projectCompressionQuarantineEvents(
     Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
     !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
@@ -2746,8 +2746,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.branchOperations.install(this, new Set([
       'branchOperations', 'compressionBranchGeneration', 'loadedBranchIdentity',
       'initializingBranchIdentity', 'store', 'ns', 'callsOut', 'compressionPause', 'config',
-      'configProvenance', 'unreportedEffectiveConfig', 'diag', 'nativeFormatter',
-    ]), new Set(['kvUnifiedReuse']));
+      'configProvenance', 'unreportedEffectiveConfig', 'diag', 'nativeFormatter', 'obsoleteHygieneSaidThrough', 'previewBaseConfig',
+    ]), new Set(['kvUnifiedReuse']), new Set(['_storeOrder', '_storeOrderSource']));
   }
 
   /**
@@ -2822,7 +2822,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const source = this.requireLoadedBranch('clearCompressionRefusalQuarantine');
     await this.clearObservedCompressionQuarantine(key, undefined, source);
     if (!this.isCompressionBranchCurrent(source)) {
-      throw new Error('Compression quarantine clear refused stale branch-scoped mutation');
+      throw new Error('Compression quarantine clear uncertain: branch/load changed; earlier writes may have completed');
     }
   }
 
@@ -3027,6 +3027,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  private previewBaseConfig: AutobiographicalConfig | null = null;
+
   /**
    * Non-committing "what would the context look like at these settings".
    * On the hierarchical path, which has no fold plan to preview, it throws
@@ -3075,6 +3077,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // select() puts back for every dry run, whichever of selectAdaptive's
     // OverBudgetError sites throws; any throw is turned into a report below.
     const savedConfig = this.config;
+    this.previewBaseConfig = savedConfig;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
     this._lastPreview = undefined;
@@ -3157,12 +3160,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       };
     } finally {
-      this.config = savedConfig;
-      this._adaptivePicker = savedPicker;
-      this._cachedHeadStartIndex = savedHeadCache;
-      this.previewPins = null;
-      this._lastPreview = undefined;
-      this._previewInFlight = false;
+      if (this.branchOperations.isBindingCurrent()) {
+        this.config = savedConfig;
+        this.previewBaseConfig = null;
+        this._adaptivePicker = savedPicker;
+        this._cachedHeadStartIndex = savedHeadCache;
+        this.previewPins = null;
+        this._lastPreview = undefined;
+        this._previewInFlight = false;
+      }
     }
   }
 
@@ -3469,6 +3475,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let completed = false;
       try {
         this.branchOperations.isolateMirrors();
+        if (this.previewBaseConfig) this.config = this.previewBaseConfig;
+        this.previewBaseConfig = null;
         this.reportEffectiveConfigOnce(namespace);
         this.reportImageLimitsWarningOnce();
 
@@ -3560,6 +3568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // the exact store branch generation observed at entry.
         this.loadedBranchIdentity = identity;
         completed = true;
+        this.scheduleLoadRepairs();
       } finally {
         if (this.branchOperations.isCurrent() && this.compressionBranchGeneration === sourceBranch.strategyGeneration) {
           this.initializingBranchIdentity = null;
@@ -3646,6 +3655,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Drop every branch-derived mirror without touching durable state. */
   private clearBranchMirrors(): void {
+    this._previewInFlight = false;
+    this.previewPins = null;
+    this._lastPreview = undefined;
+    this._dryRunSelect = false;
+    this.thinkingBound = false;
+    this.selectPricing = null;
+    this.acrossMode = 'take';
+    this._toolPruningInUse = null;
     this.chunks = [];
     this.pendingCompression = null;
     this.pendingCompressionWork = null;
@@ -5562,13 +5579,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private isBranchIdentityCurrent(identity: LoadedBranchIdentity | null): boolean {
+    if (!this.branchOperations.isBindingCurrent()) return false;
     // The strategy's own generation is compared first, so once it is
     // detached or reinitialized no check reads the store, which its manager
     // may have closed by then.
     if (!identity || !this.store || this.compressionBranchGeneration !== identity.strategyGeneration) return false;
     const store = this.store;
     const observed = observeStoreBranch(store);
-    return this.compressionBranchGeneration === identity.strategyGeneration &&
+    return this.branchOperations.isBindingCurrent() && this.compressionBranchGeneration === identity.strategyGeneration &&
       this.store === store && store === identity.store &&
       this.ns === identity.namespace &&
       observed.name === identity.name &&
@@ -5631,11 +5649,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private isCompressionBranchCurrent(source: CompressionOperationBranch): boolean {
+    if (!this.branchOperations.isBindingCurrent()) return false;
     // Generation first, as in isBranchIdentityCurrent.
     if (!this.store || this.compressionBranchGeneration !== source.strategyGeneration) return false;
     const store = this.store;
     const observed = observeStoreBranch(store);
-    return this.compressionBranchGeneration === source.strategyGeneration &&
+    return this.branchOperations.isBindingCurrent() && this.compressionBranchGeneration === source.strategyGeneration &&
       this.store === store &&
       observed.name === source.name &&
       observed.generation === source.generation;
@@ -5669,14 +5688,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private quarantineHygieneSkipLogged = false;
+  private obsoleteHygieneSaidThrough = -1;
 
   /** No store text/payloads; repeated failures or stale work must not spam a load. */
   private reportSkippedQuarantineHygiene(source: CompressionOperationBranch): void {
     if (this.compressionBranchGeneration !== source.strategyGeneration) {
+      if (source.strategyGeneration <= this.obsoleteHygieneSaidThrough) return;
+      this.obsoleteHygieneSaidThrough = source.strategyGeneration;
       this.diag.warn('[compression-quarantine] obsolete checkpoint hygiene discarded after load replacement');
       return;
     }
-    if (this.quarantineHygieneSkipLogged) return;
+    if (!this.branchOperations.isBindingCurrent() || this.quarantineHygieneSkipLogged) return;
     this.quarantineHygieneSkipLogged = true;
     this.diag.warn('[compression-quarantine] checkpoint hygiene skipped or incomplete; ledger replay may grow (further skips suppressed until next load)');
   }
@@ -5685,10 +5707,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       // Obsolete work must not consume the current load's failure warning,
       // especially when no checkpoint was due for the old invocation.
-      if (!this.store || !this.isCompressionBranchCurrent(source)) {
-        this.reportSkippedQuarantineHygiene(source);
-        return;
-      }
+      if (!this.store || !this.isCompressionBranchCurrent(source)) return;
       const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
       if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
       let projection: Map<string, ActiveCompressionQuarantine>;
@@ -5830,8 +5849,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private quarantineAlarmOperatorWaived = false;
   /**
    * The quarantine the open episode's alarm last sounded on, by namespace and
-   * branch: its all-clear is said only when that quarantine reads empty. Not
-   * by store object, which reopening the same store replaces.
+   * branch only, not backing store. A different store with the same names can
+   * end it without checking the original store; reopening also replaces handles.
    */
   private quarantineAlarmScope: { ns: string; branch: string } | null = null;
   /** When the alarm last said the status couldn't be read, on a clock of its own so the alarm's repeat keeps its time. */
@@ -5919,11 +5938,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private deliverLoadRepair(report: LoadRepairReport): void {
     this.latestLoadRepair = report;
     this.heldLoadRepairs.push(report);
-    if (this.onLoadRepair) {
+    this.scheduleLoadRepairs();
+  }
+
+  private scheduleLoadRepairs(): void {
+    if (this.onLoadRepair && this.heldLoadRepairs.length > 0) {
       const origin = this.branchOperations.identity;
       queueMicrotask(() => {
-        if (origin && !this.isBranchIdentityCurrent(origin)) return;
-        this.handHeldLoadRepairs();
+        try {
+          if (!this.branchOperations.isCurrent() || (origin && !this.isBranchIdentityCurrent(origin))) return;
+          this.handHeldLoadRepairs();
+        } catch (error) { terminalCatch((err) => this.diag.warn('[autobiographical] load-repair delivery failed:', err))(error); }
       });
     }
   }
@@ -5939,9 +5964,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private handLoadRepair(fn: (report: LoadRepairReport) => unknown, report: LoadRepairReport): void {
-    const failed = (error: unknown): void => this.diag.warn(
+    const failed = terminalCatch((error: unknown): void => this.diag.warn(
       `[autobiographical] the load-repair handler failed on the report for ${report.stateId} on branch ${report.branch} at sequence ${report.sequenceBefore}:`, error,
-    );
+    ));
     try {
       // Promise.resolve adopts a promise from another realm or a library's
       // thenable as well as this realm's, and passes anything else through.
@@ -6909,7 +6934,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           Math.abs(last - statedUntil) <= AutobiographicalStrategy.COMPRESSION_ADMISSION_DEADLINE_SLACK_MS)
       );
       pause.admissionDeadline = statedUntil;
-      this.compressionPause = pause;
+      if (!this.isCompressionBranchCurrent(source)) return;
+    this.compressionPause = pause;
       if (sameHold) return;
       const deadline = statedUntil === null
         ? 'it gave no deadline'
@@ -6954,6 +6980,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       reason,
       latest: { subject, failureClass: compressionFailureClass(error) },
     };
+    if (!this.isCompressionBranchCurrent(source)) return;
     this.compressionPause = pause;
     const sourceLabel = pauseSource(pause);
     this.diag.warn(
@@ -9223,7 +9250,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // (empty queues, the cap holding production while a hold blocks the
         // head merge, no membrane) doesn't advance the counter, so this still
         // stops cleanly (no runaway recursion).
-        if (this.isBranchIdentityCurrent(drainIdentity) && this._drainProgress === progressBefore) return;
+        if (!this.isBranchIdentityCurrent(drainIdentity) || this._drainProgress === progressBefore) return;
         // Recurse to drain more — via the MACROTASK queue (setTimeout 0),
         // never queueMicrotask. Microtasks run before the event loop returns
         // to I/O, so a microtask-chained drain strings its ticks' synchronous
@@ -9251,16 +9278,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (this.loadedBranchIdentity !== drainIdentity || !this.isLoadedBranchCurrent()) return;
             this.driveSpeculativeDrain(ctx);
           } catch (err) {
-            this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
+            terminalCatch((error) => this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(error)}`))(err);
           }
         }, 0);
       })
-      .catch((err) => {
+      .catch(terminalCatch((err) => {
         // A host's withdrawal, or its cancellation of a call, stops the drain
         // quietly: the host asked for it.
-        if (compressionFailureKind(err) === 'abort' || !this.isBranchIdentityCurrent(drainIdentity)) return;
+        if (err instanceof StaleBranchOperationError || compressionFailureKind(err) === 'abort') return;
         this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
-      });
+      }));
   }
 
   /**
@@ -9440,7 +9467,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         await compression;
       } catch (error) {
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
-          if (isCompressionWithdrawn(error)) throw error;
+          // Explicit no-call deferrals are control flow, not failed work to
+          // report after its branch has gone away. Real failures still reject.
+          if (!(error instanceof StaleBranchOperationError) && !isNoCallDeferral(error)) throw error;
           return;
         }
         // A failure that did not decide the chunk (transient, a deferral by
@@ -9646,7 +9675,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       } catch (error) {
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
-          if (isCompressionWithdrawn(error)) throw error;
+          if (!(error instanceof StaleBranchOperationError) &&
+              !(error instanceof MergeHoldDiscard) && !isAdmissionDeferral(error)) throw error;
           return;
         }
         // Withdrawn by the host, or its call cancelled by the host: no
@@ -9941,12 +9971,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
-        this._prevCacheKeys = prevCacheKeys;
+        if (this.branchOperations.isBindingCurrent()) this._prevCacheKeys = prevCacheKeys;
         throw err;
       } finally {
-        this.thinkingBound = false;
-        this.selectPricing = null;
-        if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
+        if (this.branchOperations.isBindingCurrent()) {
+          this.thinkingBound = false;
+          this.selectPricing = null;
+          if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
+        }
       }
       // Only a render this select returns says the ceiling line: one it
       // refused threw above, and a dry select never comes here. Every select
@@ -9990,11 +10022,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
-      this._dryRunSelect = false;
-      if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
-      restore();
-      this.thinkingBound = false;
-      this.selectPricing = null;
+      if (this.branchOperations.isBindingCurrent()) {
+        this._dryRunSelect = false;
+        if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
+        restore();
+        this.thinkingBound = false;
+        this.selectPricing = null;
+      }
     }
   }
 
@@ -10107,7 +10141,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         return select(dry);
       } finally {
-        this.acrossMode = 'take';
+        if (this.branchOperations.isBindingCurrent()) this.acrossMode = 'take';
       }
     };
     try {
@@ -10126,9 +10160,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       probe = run('leave', true);
       if ((this._lastPreview as PreviewResult | undefined)?.fits === false) failed = 'its plan is over the budget';
     } catch (err) {
+      if (!this.branchOperations.isBindingCurrent()) throw err;
       failed = describeFailure(err);
     } finally {
-      this._dryRunSelect = dryBefore;
+      if (this.branchOperations.isBindingCurrent()) this._dryRunSelect = dryBefore;
     }
     if (dryRun && failed === undefined) return probe!;
     restore();
@@ -16230,8 +16265,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // The shadow pick is not a compile. Put back the strategy instances
         // behind the live pick: _lastKvStable for §13.4 observability, and
         // _lastKvUnified for the live solve's timings on [plan-vs-actual].
-        this._lastKvStable = liveKvStable;
-        this._lastKvUnified = liveKvUnified;
+        if (this.branchOperations.isBindingCurrent()) {
+          this._lastKvStable = liveKvStable;
+          this._lastKvUnified = liveKvUnified;
+        }
       }
     }
 
@@ -18979,7 +19016,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       return this.selectHierarchicalBound(store, budget);
     } finally {
-      this._storeView = bound;
+      if (this.branchOperations.isBindingCurrent()) this._storeView = bound;
     }
   }
 
@@ -22532,7 +22569,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       return fn();
     } finally {
-      this._toolPruningInUse = held;
+      if (this.branchOperations.isBindingCurrent()) this._toolPruningInUse = held;
     }
   }
 
@@ -23336,8 +23373,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return first === undefined ? null : rendered.get(first) ?? null;
       });
     } finally {
-      this._dryRunSelect = false;
-      restore();
+      if (this.branchOperations.isBindingCurrent()) {
+        this._dryRunSelect = false;
+        restore();
+      }
     }
   }
 }

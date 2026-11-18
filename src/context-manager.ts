@@ -1,3 +1,4 @@
+import { terminalCatch } from './terminal-catch.js';
 import { callStrategy } from './branch-operation-scope.js';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
@@ -3814,7 +3815,11 @@ export class ContextManager {
   private detachStrategy(strategy: ContextStrategy): void {
     // The manager lets go either way: a replacement still initializes and
     // close() still closes the store.
-    const failed = (err: unknown) => this.diag.error('Strategy detach failed:', callStrategy(strategy, 'name', (strategy) => strategy.name), err);
+    const failed = terminalCatch((err: unknown) => {
+      let name = '<unavailable>';
+      try { name = callStrategy(strategy, 'name', (strategy) => strategy.name); } catch { /* diagnostic only */ }
+      this.diag.error('Strategy detach failed:', name, err);
+    });
     try {
       // detach() is synchronous by contract. A promise or other thenable one
       // returns anyway isn't awaited, and its rejection is logged rather than
@@ -4451,10 +4456,10 @@ export class ContextManager {
     // what a later call that goes ahead does: it stores a second transition.
     // After a close(), or while a strategy initializes, a later call refuses
     // at once.
-    const refuse = (reason: string, where: string): Error =>
+    const refuse = (reason: string, where: string, finalResetUncertain = false): Error =>
       new Error(
         `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} ` +
-          `${where}, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds ` +
+          `${where}, and ${finalResetUncertain ? 'the final head-window reset failed or is uncertain' : "the head window wasn't reset"}. A later resetHeadWindow() that goes ahead adds ` +
           'another transition message.',
       );
     const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -4575,7 +4580,11 @@ export class ContextManager {
     }
 
     // Reset head window to start from this message
-    callStrategy(resettable, 'resetHeadWindow', (strategy) => strategy.resetHeadWindow(msgId));
+    try {
+      callStrategy(resettable, 'resetHeadWindow', (strategy) => strategy.resetHeadWindow(msgId));
+    } catch (error) {
+      throw refuse(reasonOf(error), whereNow('stored and maybe presented'), true);
+    }
 
     return summary;
   }
@@ -5114,7 +5123,7 @@ export class ContextManager {
     if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return;
     const ctx = this.createStrategyContext();
     if (presented) {
-      const failed = (err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag);
+      const failed = terminalCatch((err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag));
       try {
         Promise.resolve(callStrategy(strategy, 'onPresented', (strategy) => strategy.onPresented!(rows, ctx))).catch(failed);
       } catch (err) {
@@ -5157,8 +5166,8 @@ export class ContextManager {
         return;
       }
       const message = rows[i]!;
-      const failed = (err: unknown) =>
-        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
+      const failed = terminalCatch((err: unknown) =>
+        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag));
       try {
         Promise.resolve(callStrategy(strategy, 'onNewMessage', (strategy) => strategy.onNewMessage!(message, ctx))).catch(failed);
       } catch (err) {
@@ -5279,7 +5288,7 @@ export class ContextManager {
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
     const ids = left.map((l) => l.id);
     const ctx = this.createStrategyContext();
-    const failed = (err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag);
+    const failed = terminalCatch((err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag));
     try {
       Promise.resolve(callStrategy(strategy, 'onRetracted', (strategy) => strategy.onRetracted!(rows, ctx, { ...info, ids }))).catch(failed);
     } catch (err) {

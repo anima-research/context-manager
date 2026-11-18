@@ -4,6 +4,5 @@
   authorization rather than acknowledging an unapplied clear. Obsolete hygiene
   does not consume a replacement load's warning. Carrier fallback stops when
   progress persistence loses its source branch.
-- Capability detection accepts callable strategies, non-list ledgers do not read
-  superseded legacy snapshots, and quarantine alarms no longer claim retained
-  records alone prove raw debt.
+- Non-list ledgers do not read superseded legacy snapshots, and quarantine
+  alarms no longer claim retained records alone prove raw debt.

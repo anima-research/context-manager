@@ -25,3 +25,8 @@
   error described in the historical changelog. Maintenance warnings describe
   an unspecified failure, not necessarily a store failure; success-clear
   warnings ask for inspection rather than promising an unscheduled reread.
+- Alarm text formerly saying `their spans stay raw and WILL eventually exhaust
+  the context budget` now says retained quarantine records are not proof of raw
+  debt and requests inspection. Former `paid-off sweep failed` and
+  `success-clear failed` maintenance lines now report incomplete maintenance or
+  a landed clear with uncertain hygiene; inspect before retrying.

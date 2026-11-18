@@ -3,7 +3,8 @@
  * and a host routes it to its operators, so it isn't said while the
  * quarantine the alarm last sounded on may still hold records: not when the
  * status read fails, and not while the strategy reads another branch or
- * namespace. A ledger entry with no usable record or generation holds no
+ * namespace. Scope is names only: a different backing store with the same
+ * names can end the episode, without checking the original store. A ledger entry with no usable record or generation holds no
  * chunk back, so the projection leaves it out and names it, and a compression
  * or a clear no longer throws on it; a ledger or legacy snapshot that holds no
  * list is read as holding nothing, a checkpoint that holds none replaces what
@@ -106,7 +107,7 @@ const allClear = (line: string) => line.includes('alarm stands down');
 const ALL_CLEAR = '[compression-quarantine] quarantine empty; coverage and debt payment not established; alarm stands down ns=default';
 const outcome = { outcome: 'refusal' };
 
-describe('the compression-quarantine all-clear is said only when the quarantine the alarm last sounded on is empty', () => {
+describe('the compression-quarantine all-clear requires an empty read under the episode namespace/branch names', () => {
   // The alarm reads Date.now(); a skew moves it past its interval without waiting.
   const realNow = Date.now;
   let skew = 0;

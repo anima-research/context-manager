@@ -242,13 +242,24 @@ for (const shape of ['accessor', 'proxy-get'] as const) {
         // adopt/discard checks run as well. The real base frontier is empty.
         const value = Reflect.get(raw, member);
         const watched = watch(raw, shape, member, value, () => {
+          if (solve === 'reuse' && (member === 'adoptRenderingFrontier' || member === 'discardRenderingFrontier')) {
+            assert.equal(raw.getSummary('absent'), null, 'watcher must fire on the committed child load');
+          }
           pending = (async () => { await pause.wait; raw.commit(); })();
           void pending.catch(() => {});
         });
+        const postInit = solve === 'reuse' && (member === 'adoptRenderingFrontier' || member === 'discardRenderingFrontier');
+        if (postInit) {
+          const initialize = raw.initialize;
+          Object.defineProperty(raw, 'initialize', { configurable: true, value: async (...args: Parameters<typeof initialize>) => {
+            await initialize.apply(raw, args);
+            watched.arm(); // Not the pre-initialization capability check.
+          } });
+        }
         const fx = await fixture(parent);
         let child: ContextManager | undefined;
         try {
-          watched.arm();
+          if (!postInit) watched.arm();
           child = await fx.manager.derive({ branch: 'child', strategy: watched.strategy, solve });
           assert.ok(pending, 'derived strategy lookup must run');
           watched.disable();

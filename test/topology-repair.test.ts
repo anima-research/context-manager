@@ -1356,7 +1356,7 @@ AutobiographicalStrategy.prototype.migrateChunkRecords = function (store) {
     assert.match(dry.stdout, /settling the store as the loader does: left out 1 chunk record\(s\) with no id or no message ids/, dry.stdout + dry.stderr);
   });
 
-  test('names a legacy quarantine snapshot passed over beside a ledger that holds no list', async () => {
+  test('names a non-list ledger without reading its obsolete legacy quarantine snapshot', async () => {
     wipe();
     await fixtureStore(STORE, 12, [l1('L1-7', 0, 3), l1('L1-8', 4, 7), l1('L1-9', 8, 11)], [rec('c-7', 0, 3, 'L1-7'), rec('c-8', 4, 7, 'L1-8'), rec('c-9', 8, 11, 'L1-9')]);
     const store = JsStore.open({ path: STORE });
@@ -1367,7 +1367,8 @@ AutobiographicalStrategy.prototype.migrateChunkRecords = function (store) {
       store.close();
     }
     const dry = spawnSync(process.execPath, [CLI, STORE, '--namespace', 'probe', '--mode', 'rebuild'], { encoding: 'utf8' });
-    assert.match(dry.stderr, /holds what the strategy reads as no entry: entries left out \[q-legacy\]; no list in the ledger;/, dry.stderr);
+    assert.match(dry.stderr, /holds what the strategy reads as no entry: no list in the ledger;/, dry.stderr);
+    assert.doesNotMatch(dry.stderr, /q-legacy|legacy snapshot/, 'obsolete legacy state is neither read nor diagnosed');
   });
 
   test('names what the compression quarantine\'s stored state holds that the strategy reads as no entry, and a summaries state that is no list holds nothing', async () => {

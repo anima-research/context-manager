@@ -2,7 +2,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 /** Internal control-flow error: obsolete work must not touch a replacement load. */
 export class StaleBranchOperationError extends Error {
-  constructor() { super('AutobiographicalStrategy refused stale branch-scoped mutation'); }
+  constructor() {
+    super('AutobiographicalStrategy refused stale branch-scoped continuation; earlier writes may have completed');
+    this.name = 'StaleBranchOperationError';
+  }
 }
 
 /** Internal manager boundary; a forwarding strategy Proxy preserves this slot. */
@@ -69,7 +72,9 @@ export class BranchOperationScope<Identity extends object> {
     const resolution = boundaryResolution.getStore();
     if (resolution?.resolving || resolution?.failed) throw new StaleBranchOperationError();
     const own = this.storage.getStore();
-    const origin = resolution?.origin;
+    let pending = resolution;
+    while (pending && pending.origin?.owner !== this) pending = pending.parent;
+    const origin = pending?.origin;
     // Symbol-trap work may inherit the old caller's instance storage. Use the
     // resolved invocation instead, but do not replace a genuinely nested scope.
     if (origin?.owner === this && (!own || own === origin.displaced)) {
@@ -147,10 +152,20 @@ export class BranchOperationScope<Identity extends object> {
     if (!this.isCurrent()) throw new StaleBranchOperationError();
   }
 
+  /** Cheap, non-reentrant epoch/generation check, also used by currency probes. */
+  isBindingCurrent(): boolean {
+    const scope = this.context();
+    return !scope || (scope.epoch === this.lifecycleEpoch && scope.binding.generation === this.generation());
+  }
+
+  private assertBindingCurrent(): void {
+    if (!this.isBindingCurrent()) throw new StaleBranchOperationError();
+  }
+
   isCurrent(): boolean {
     const scope = this.context();
-    return !scope || (scope.epoch === this.lifecycleEpoch && scope.binding.generation === this.generation() &&
-      (!scope.binding.identity || this.current(scope.binding.identity)));
+    return this.isBindingCurrent() && (!scope?.binding.identity || this.current(scope.binding.identity)) &&
+      this.isBindingCurrent();
   }
 
   /** Detach collection shells before initialization clears/reloads them. */
@@ -159,7 +174,8 @@ export class BranchOperationScope<Identity extends object> {
     for (const isolate of this.isolateFields) isolate();
   }
 
-  install(target: object, sharedFields: ReadonlySet<string>, objectMirrors: ReadonlySet<string>): void {
+  install(target: object, sharedFields: ReadonlySet<string>, objectMirrors: ReadonlySet<string>,
+    discardedMirrors: ReadonlySet<string> = new Set()): void {
     const scope = this;
     Object.defineProperty(target, strategyOperationBoundary, {
       value: <T>(key: PropertyKey, work: () => T) => scope.invoke(key, work),
@@ -216,7 +232,11 @@ export class BranchOperationScope<Identity extends object> {
       if (!('value' in descriptor) || !descriptor.writable || typeof descriptor.value === 'function') continue;
       let value = descriptor.value;
       this.isolateFields.push(() => {
-        if (value instanceof Map) value = new Map(value);
+        // Caches immediately reset by initialization need a new shell, not a
+        // history-sized copy. Old operations retain their previously captured shell.
+        if (discardedMirrors.has(key)) {
+          value = Array.isArray(value) ? [] : new Map();
+        } else if (value instanceof Map) value = new Map(value);
         else if (value instanceof Set) value = new Set(value);
         else if (value instanceof WeakMap) value = new WeakMap();
         else if (value instanceof WeakSet) value = new WeakSet();
@@ -226,8 +246,8 @@ export class BranchOperationScope<Identity extends object> {
       Object.defineProperty(target, key, {
         configurable: descriptor.configurable,
         enumerable: descriptor.enumerable,
-        get() { if (key !== 'store' && key !== 'ns') scope.assertCurrent(); return value; },
-        set(next) { scope.assertCurrent(); value = next; },
+        get() { if (key !== 'store' && key !== 'ns') scope.assertBindingCurrent(); return value; },
+        set(next) { scope.assertBindingCurrent(); value = next; },
       });
     }
   }

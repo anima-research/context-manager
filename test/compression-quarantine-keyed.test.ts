@@ -1088,7 +1088,7 @@ describe('Anima Review regressions', () => {
     const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
     try {
       native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source);
-      assert.equal(lines.filter((line) => line.includes('obsolete checkpoint hygiene')).length, 1);
+      assert.equal(lines.filter((line) => line.includes('obsolete checkpoint hygiene')).length, 0);
       assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 0, 'obsolete work must not use the current load warning');
       pad(fx);
       const compact = mock.method(fx.store, 'compactState', () => { throw new Error('checkpoint failed'); });
@@ -1530,7 +1530,7 @@ describe('round 10 operation source capture', () => {
           const source = impl.captureCompressionBranch();
           assert.equal(impl.isCompressionBranchCurrent(source), false);
         }
-        if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /reinitialization|stale branch/);
+        if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /clear uncertain: branch\/load changed; earlier writes may have completed/);
         if (operation === 'progress-sweep') impl.sweepPaidOffCompressionProgress(fx.ctx);
         if (operation === 'quarantine-sweep') await impl.sweepPaidOffQuarantineRecords();
         if (operation === 'mutation-guard') assert.throws(() => impl.requireBranchMutation('test'), /stale branch/);
