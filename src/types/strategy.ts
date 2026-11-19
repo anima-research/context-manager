@@ -303,17 +303,11 @@ export interface ContextStrategy {
 
   /**
    * Initialize the strategy with context.
-   * Lifecycle methods, including subclass overrides, are supported only through
-   * ContextManager. Called when strategy is set on ContextManager.
-   * Direct calls are unsupported, not side-effect-free refusals: a direct arrow
-   * override calling super.initialize can invalidate the current load before
-   * throwing. Recover through ContextManager.setStrategy.
+   * Called when strategy is set on ContextManager.
    */
   initialize?(ctx: StrategyContext): Promise<void>;
 
   /**
-   * Lifecycle methods, including subclass overrides, are supported only through
-   * ContextManager; direct calls are unsupported and may have partial effects.
    * The manager is done with this strategy: setStrategy() replaced it, the
    * manager closed, or the open() that was initializing it failed. The
    * strategy stops the work it still has running for that manager, so it
@@ -535,7 +529,9 @@ export interface ContextStrategy {
    * is after a message is added to the store, inside the write that stored
    * it, so its synchronous part normally runs before addMessage returns.
    * If the adapter cannot read its scope or window mode, the rows remain
-   * pending in this manager until a later notification; close discards them.
+   * pending in memory on this manager until a later notification; close
+   * discards them. The failure is logged once per episode, and
+   * `ContextManager.stats().pendingStrategyNotifications` counts what waits.
    * Once a host
    * presents rows on the branch, it is from presentRows, once per row
    * presented, in window order, and no longer at the add: a row stored and

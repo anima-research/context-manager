@@ -4,8 +4,6 @@ import { existsSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { ContextManager } from '../src/index.js';
-import type { JsStore } from '@animalabs/chronicle';
-import { observeStoreBranch } from '../src/branch-generation.js';
 import { AutobiographicalStrategy, type Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext } from '../src/types/index.js';
 import type { SummaryEntry } from '../src/types/strategy.js';
@@ -15,15 +13,9 @@ import { mergeRunsByLevel, queuedMergeRuns, runGroups, runsAtLevel, strandedIn }
 class Probe extends AutobiographicalStrategy {
   constructor(config: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
     super(config);
-    // Pure merge-planning fixture: bind the no-op store as an actual origin,
-    // rather than bypassing authorization with no loaded identity. Real async
-    // replacement/writer behavior is covered by branch-operation-shapes/reentry.
-    this.store = {
-      getStateJson: () => null, setStateJson: () => {}, currentBranch: () => ({ name: 'main' }),
-    } as unknown as JsStore;
-    (this as unknown as { loadedBranchIdentity: object }).loadedBranchIdentity = Object.freeze({
-      store: this.store, namespace: this.ns, ...observeStoreBranch(this.store), strategyGeneration: 0,
-    });
+    (this as unknown as { requireBranchMutation: () => void }).requireBranchMutation = () => {};
+    (this as unknown as { requireLoadedBranch: () => void }).requireLoadedBranch = () => {};
+    (this as unknown as { store: unknown }).store = { getStateJson: () => null, setStateJson: () => {}, currentBranch: () => ({ name: 'main' }) };
   }
   quarantineGroup(key: string, sourceIds: string[], lastOutcome = 'refusal'): void {
     (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set(key, { key, level: 2, sourceIds, attempts: 3, lastOutcome, quarantinedAt: 1 });

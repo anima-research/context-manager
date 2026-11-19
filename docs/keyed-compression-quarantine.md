@@ -46,15 +46,13 @@ strategy: that legacy library method accepts an omitted key meaning all.
 `inspectCompressionRefusalQuarantine({ key?, limit? })` is synchronous and
 metadata-only. It uses the existing native projection without a maintenance
 tick, paid-off sweep, repair, provider request, or journal write. Calling it
-before initialization, after detach, after an uninitialized branch change, or
-from an obsolete inherited async scope returns `branchUnavailable`. A
-failed/malformed read returns `unreadable`,
+before initialization, after detach, or after an uninitialized branch change
+returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
 not an empty list, with coarse `reason: 'store-read'` (the store threw) or
 `'ledger-entry'` (stored data failed validation). Store error text is never
 returned; unexpected projection/programmer errors propagate. Inspection
-validates replay-relevant fields since the latest checkpoint, not every event
-field (for example, an alert event missing its ID can be ignored). An `ok`
-result is not a full ledger-integrity certification. Inspection never rewrites events.
+conservatively refuses damaged events since the latest checkpoint and never
+rewrites them.
 A later native hygiene pass can checkpoint the tolerant projection that the
 gate enforces, removing ignored damage; damage in a retained hold may still
 fail strict inspection afterwards. A checkpoint supersedes preceding active state and the legacy snapshot;
@@ -91,6 +89,18 @@ as a repair fallback: it can waive holds while leaving inspection unreadable.
   (including away-and-back) or strategy replacement invalidates it. As with
   native branch fencing, an unobserved direct store switch away-and-back
   outside ContextManager is not detected; use the manager lifecycle.
+- **Raw store-handle switches are outside the guard.** The binding checks see
+  switches the manager makes (`switchBranch`, `fork`, `setStrategy`, `close`)
+  and a branch change their own branch reads observe. A switch of the raw
+  store handle that the manager does not track is not covered: for example a
+  store adapter whose `currentBranch()` moves the handle to another branch and
+  returns the branch it read before moving, then moves back. A progress write
+  or tombstone can then land on the other branch while every check passes.
+  Release still never reports `released` while the reread of the bound branch
+  shows the selected generation, but neither `released` nor an uncertain
+  failure says that no other branch was written. Hosts that switch the raw
+  handle themselves must do it through the manager, or not while a
+  quarantine call is running.
 - Source ids are recorded membership if present, otherwise an exact hash
   match to a loaded chunk, otherwise `null`/`membership: 'unknown'`.
   `loadedChunkMatch` separately says whether an exact chunk is loaded now;
@@ -143,12 +153,12 @@ pretending configuration is actual use or correlating an unrelated call.
 
 | Result | Meaning / host action |
 | --- | --- |
-| `released` | Exact key/generation was cleared under the native lock; includes key, generation, and observed `remainingRecords`. Record the acknowledgement; no inference of coverage or provider work. |
-| `stale` | The call has a current committed load, but the submitted branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
+| `released` | Exact key/generation was cleared under the native lock, and the strict reread of the bound branch no longer shows that generation; includes key, generation, and observed `remainingRecords`. Record the acknowledgement; no inference of coverage or provider work. |
+| `stale` | Branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
 | `not-held` | No active record for this full key under the matched binding. No mutation. This is **not** acknowledgement of an earlier uncertain operation. |
 | `unsupported` | Selected lineage has no trustworthy native generation. No mutation, no fallback writer or legacy clear. Capability absent is also unsupported at the host boundary. |
 | `unreadable` | Authoritative projection could not be read/validated before writes. Coarse `reason` distinguishes `store-read` from `ledger-entry`, without store error text. No mutation. Surface failure, not an empty quarantine. `ledger-entry` can persist below 256 events; restart and clear-all are not repair operations. |
-| `branchUnavailable` | The call is in an obsolete async scope, the strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle or dispatch outside the obsolete scope as appropriate. Do not retry against another instance. |
+| `branchUnavailable` | Strategy has no current committed load, or branch currency cannot be established. No mutation. Resolve lifecycle rather than retrying against another instance. |
 | `invalidSelection` | Missing/empty/partial/wildcard/all key, absent generation/binding, or invalid inspect bounds. No clear-all interpretation. |
 | Rejected promise / exception | Unexpected projection or mutation-path failure, potentially before any write or after a landed write. Preserve intent as **uncertain**. Do not fabricate `released` from a missing key or automatically resend. |
 
@@ -163,7 +173,9 @@ newly serialized. Hosts must retain the native single-writer ownership model.
 On a match the operation first forgets **all progress for that family**,
 then appends one native targeted `clear` event with additive
 `reason: 'operator-waiver'`, runs native checkpoint hygiene under the same lock,
-syncs and strictly rereads before acknowledging. Old event
+syncs and strictly rereads before acknowledging. If that reread still shows
+the selected generation active, the call throws (uncertain) rather than
+returning `released`. Old event
 readers ignore the extra reason and use the unchanged target identity. There
 is no registration/strategy/schema or dependency change. Normal future native
 checkpoints can discard tombstones: this is not a permanent operation ledger.
@@ -192,9 +204,7 @@ Changing the global model affects other normal compression too.
 
 The next ordinary alarm check on the same live, already-open episode retains
 siblings with matching persisted raw chunk records and eventually reports the
-observed record count when tick runs after its existing interval. There is no
-independent alarm timer: a stopped tick loop emits no repeat alarms, and an
-unreadable status suppresses the normal status notification. The existing sweep treats a
+observed record count on its existing interval. The existing sweep treats a
 missing chunk record as orphanhood and may clear a sibling even if its source
 span remains raw; the raw-span alarm is not guaranteed in that case. When a
 waiver-request episode reads empty it ends once,
@@ -240,82 +250,3 @@ use its existing local authorization policy. AF alignment must be proposed
 separately if its public API/dependency profile cannot expose that instance;
 no dependency floor or release version is invented here. There is no new
 shared HTTP/WebUI/MCP/model-tool mutation surface in this library change.
-
-### Callback ownership and operation scope
-
-The fence covers library invocations and continuations that preserve their
-AsyncLocalStorage context. It is **not a sandbox for host-scheduled work**.
-Timers (including intervals), microtasks and promises created in a strategy
-callback normally inherit that invocation's load and lifecycle epoch, so later
-direct strategy access can be refused after initialize or detach. The callback's
-own continuation after `await manager.fork(...)` or
-`await manager.switchBranch(...)` also retains its old origin: no timer or
-separately scheduled promise is needed, and awaiting the lifecycle call does not
-rebind subsequent strategy access to the new load. Use a fresh manager entrypoint
-or the host dispatcher described below for intentional new-load work. In contrast,
-event and abort listeners run in the **dispatching context, not the registration
-context**. A host-owned emitter, scheduler or AsyncResource can therefore lose
-or replace the origin; the library cannot infer it from callback ownership.
-Do not rely on this fence to authorize arbitrary host callbacks. Library-owned
-provider cancellation explicitly dispatches abort in the cancelled call's origin,
-so that its listeners do not inherit the replacement initializer's holder; this
-does not bind externally dispatched signals or unrelated host events.
-
-Host callback owners must catch refusals locally (and handle rejected promises),
-and cancel obsolete timers/intervals on lifecycle changes. No caller promise
-exists for the library to catch a thrown timer/listener exception. Only
-library-owned continuations have library-owned catch boundaries. A stale refusal
-may be an error named `StaleBranchOperationError`, but that constructor is internal
-and **not exported**: do not import it for `instanceof`. Some public mutation
-methods reject with an ordinary reinitialization/uncertain-outcome error instead;
-health methods can return `unknown`, `unreadable` or `branchUnavailable`. Handle
-each method's result contract, not just an exception name. Earlier writes may
-have completed; a refusal is not a rollback receipt. `getCompressionDebt()` keeps
-its never-throw contract even for inherited stale intervals, returning `unknown`
-without changing the replacement load's diagnostic state. This covers the
-report body, not synchronous reentry while a proxy resolves the private boundary
-symbol: that wrapper can throw before the method runs. Defer such instrumentation.
-
-For an intentional fresh operation that ContextManager exposes, use its
-entrypoint (manager calls create new origins). A host-owned queue must actually
-execute outside the obsolete async context: a startup-created `f => setImmediate(f)` still inherits
-its caller's context. An `AsyncResource` created outside callbacks and used via
-`runInAsyncScope` can provide host-owned dispatch. ContextManager has no
-quarantine inspect/clear/release or debt/stranded-health entrypoints. For
-these operations, use that host-owned dispatch scope and call the current
-strategy directly. Awaiting a manager lifecycle call or fetching the strategy
-with `getStrategy()` does not change the caller's origin.
-
-For example, if an alarm callback inspects and then the manager switches away
-and back, an inherited continuation or timer gets `branchUnavailable` on both
-inspection and release, even with the original branch loaded again. From the
-startup-created dispatcher, inspection returns `ok` with a new binding (if
-readable), while release using the old binding returns `stale`. A same-instance
-reinitialization has the same effect. Do not use release to probe an old intent:
-after an uncertain clear or release, select or reinitialize the original branch
-through the manager, inspect from the fresh dispatcher, and obtain new intent
-before submitting any mutation. An absent hold is not an acknowledgement.
-
-For health reads in that dispatcher, call the current strategy's
-`getCompressionDebt()` or `getStrandedSummaries()` directly. A stale-origin
-`failure: 'report'` is not a configuration-fault diagnosis and uses one-line
-fresh-scope guidance rather than the normal Cause/Effect/Fix format. Do not wrap
-arbitrary old work in a new manager operation merely to bypass its refusal.
-Lifecycle methods, including subclass overrides, are supported only through
-ContextManager. Direct lifecycle calls are unsupported, not guaranteed to be
-side-effect-free refusals: a direct arrow `initialize` that calls
-`super.initialize` may invalidate the active load even when they throw. Recover by
-reinitializing through `ContextManager.setStrategy`, not by retrying the direct
-call. Other direct
-instance-function overrides do not acquire a fresh scope automatically;
-prototype entrypoints retain inherited scope. Subclasses must not redeclare
-loaded mirrors as fields, which would replace their guarded accessors.
-Alarm episodes identify namespace and branch only, not backing stores. Reusing a
-strategy on a different backing store with the same names can end the previous
-episode; this is not evidence that the original store was checked. Stable backing
-store identity and checkpoint retry/reuse policy remain separate contract choices.
-
-Same-instance reloads that interrupt selection may lose the marker metadata
-for a retained previous cache-key list, reducing warm-prefix reuse. The list
-can also reflect a superseded dry selection. Neither is proof that the
-previous request was sent.

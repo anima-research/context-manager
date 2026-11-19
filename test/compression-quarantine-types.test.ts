@@ -39,3 +39,11 @@ it('F9 recognizes only the optional two-method capability at runtime', () => {
   assert.equal('initialize' in onlyTwo, false);
   assert.equal(isKeyedCompressionQuarantineStrategy({ inspectCompressionRefusalQuarantine() {} }), false);
 });
+
+it('the capability guard accepts a callable strategy object with both methods', () => {
+  const callable = Object.assign(() => {}, {
+    inspectCompressionRefusalQuarantine() {}, releaseCompressionRefusalQuarantine() {},
+  });
+  assert.equal(isKeyedCompressionQuarantineStrategy(callable), true);
+  assert.equal(isKeyedCompressionQuarantineStrategy(Object.assign(() => {}, { inspectCompressionRefusalQuarantine() {} })), false);
+});

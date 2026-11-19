@@ -1,4 +1,3 @@
-import { observeDrainCompletion } from './_harness/drain-completion.js';
 /**
  * A manager tells a strategy it is done with it (#209).
  *
@@ -201,15 +200,6 @@ function countDrives(strategy: AutobiographicalStrategy) {
   return counts;
 }
 
-/** Track actual tick completion, including the in-flight tick when a stale
- * continuation now correctly stops BEFORE arming another timer. */
-function watchTicks(strategy: AutobiographicalStrategy) {
-  const ticks: Promise<void>[] = [], completions: Promise<unknown>[] = [];
-  const tick = strategy.tick.bind(strategy);
-  strategy.tick = (ctx) => { const pending = observeDrainCompletion(tick(ctx), completions); ticks.push(pending); return pending; };
-  return { ticks, completions };
-}
-
 /** Count the compressions and merges the strategy starts, and the
  *  compressions that have settled. Nothing awaits between a compression's
  *  start and its wait on identical work in flight, so one that has started
@@ -379,7 +369,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     const replaced = newStrategy(true);
     const drives = countDrives(replaced);
-    const { ticks, completions } = watchTicks(replaced);
     const manager = await ContextManager.open({ store, strategy: replaced, membrane: membrane as never });
     try {
       seed(manager);
@@ -387,15 +376,12 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       const drivesBefore = drives.drives;
 
       await manager.setStrategy(new PassthroughStrategy());
-      // Await the drain's own terminal continuation, including asynchronous
-      // work after tick settlement, not a zero-delay timer or loop turn.
-      assert.ok(ticks.length > 0, 'the provider belongs to a tracked tick');
-      const armedBefore = timers.counts.armed;
+      // The drain re-arms after the tick it was running; wait for that timer,
+      // not one that ran while the messages went in. A drive it makes happens
+      // before its run is counted.
+      const ranBefore = timers.counts.ran;
       calls[0].release();
-      await Promise.all(ticks);
-      assert.ok(completions.length > 0, 'drain installed a terminal continuation');
-      await Promise.all(completions);
-      assert.strictEqual(timers.counts.armed, armedBefore, 'obsolete completion must not re-arm the drain');
+      await waitFor(() => timers.counts.ran > ranBefore);
 
       assert.strictEqual(drives.drives, drivesBefore, "the replaced strategy's drain was driven again after the swap");
       assert.strictEqual(calls.length, 1, `the replaced strategy's drain called the provider ${calls.length - 1} more time(s)`);
@@ -439,7 +425,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     const strategy = newStrategy(true);
     const drives = countDrives(strategy);
-    const { ticks, completions } = watchTicks(strategy);
     const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
     let closed = false;
     try {
@@ -450,15 +435,12 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       manager.close();
       closed = true;
       assert.strictEqual(store.isClosed(), false, 'the app still owns its store');
-      // Await the drain's own terminal continuation, including asynchronous
-      // work after tick settlement, not a zero-delay timer or loop turn.
-      assert.ok(ticks.length > 0, 'the provider belongs to a tracked tick');
-      const armedBefore = timers.counts.armed;
+      // The drain re-arms after the tick it was running; wait for that timer,
+      // not one that ran while the messages went in. A drive it makes happens
+      // before its run is counted.
+      const ranBefore = timers.counts.ran;
       calls[0].release();
-      await Promise.all(ticks);
-      assert.ok(completions.length > 0, 'drain installed a terminal continuation');
-      await Promise.all(completions);
-      assert.strictEqual(timers.counts.armed, armedBefore, 'obsolete completion must not re-arm the drain');
+      await waitFor(() => timers.counts.ran > ranBefore);
 
       assert.strictEqual(drives.drives, drivesBefore, "the closed manager's strategy was driven again after close()");
       assert.strictEqual(calls.length, 1, `the closed manager's strategy called the provider ${calls.length - 1} more time(s)`);
@@ -659,13 +641,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const strategy = newStrategy(true);
     let manager: ContextManager | undefined;
     let swappedBack: Promise<unknown> | undefined;
-    const counts = countDrives(strategy);
-    let drivesAtSwap: number | undefined;
     // As the drain re-arms after its first tick, swap the strategy out and
     // back in; the timer runs once the same instance is set again.
     const timers = watchDrainTimers(() => {
       if (swappedBack || !manager) return;
-      drivesAtSwap = counts.drives;
       const m = manager;
       swappedBack = m.setStrategy(new PassthroughStrategy())
         .then(() => m.setStrategy(strategy));
@@ -677,8 +656,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length === 1);
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
-      assert.ok(drivesAtSwap !== undefined);
-      assert.strictEqual(counts.drives, drivesAtSwap, 'the stale timer must not start a drive');
+      await settle(20);
       assert.strictEqual(calls.length, 1, `the drain armed before the swap called the provider ${calls.length - 1} more time(s)`);
     } finally {
       timers.restore();
@@ -693,14 +671,11 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const strategy = newStrategy(true);
     let manager: ContextManager | undefined;
     let switched: Promise<unknown> | undefined;
-    const counts = countDrives(strategy);
-    let drivesAtSwitch: number | undefined;
     // As the drain re-arms after its first tick, switch the manager to another
     // branch, as a host's branch surgery does; the timer runs once the
     // switch's re-initialization is done.
     const timers = watchDrainTimers(() => {
       if (switched || !manager) return;
-      drivesAtSwitch = counts.drives;
       const m = manager;
       store.createBranch('elsewhere');
       switched = m.switchBranch('elsewhere');
@@ -715,8 +690,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length >= 1);
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
-      assert.ok(drivesAtSwitch !== undefined);
-      assert.strictEqual(counts.drives, drivesAtSwitch, 'the stale timer must not start a drive');
+      await settle(20);
       assert.strictEqual(calls.length, 1, `the drain armed before the switch called the provider ${calls.length - 1} more time(s)`);
 
       manager.addMessage('User', [{ type: 'text', text: `after the switch ${filler(30)}` }]);

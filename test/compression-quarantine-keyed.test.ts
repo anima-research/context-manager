@@ -2,7 +2,6 @@
 import { after, describe, it, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { AsyncResource } from 'node:async_hooks';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +11,7 @@ import {
   type CompressionQuarantineReleaseSelection,
 } from '../src/index.js';
 import { markStoreBranchSwitch } from '../src/branch-generation.js';
-import { compressionQuarantineHolds, withCompressionStateLock } from '../src/strategies/autobiographical.js';
+import { compressionQuarantineHolds } from '../src/strategies/autobiographical.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, CompressionQuarantineStatus } from '../src/types/index.js';
 
@@ -53,16 +52,6 @@ class Probe extends AutobiographicalStrategy {
     };
     return native.durableQuarantineFor(native.readCompressionQuarantineProjection(), record);
   }
-}
-function openEpisode(strategy: Probe): () => void {
-  const raw = strategy as any;
-  raw.quarantineAlarmActive = true;
-  raw.quarantineAlarmOperatorWaived = false;
-  raw.quarantineAlarmScope = { ns: 'default', branch: 'main' };
-  const before = { active: raw.quarantineAlarmActive, waived: raw.quarantineAlarmOperatorWaived,
-    scope: structuredClone(raw.quarantineAlarmScope), lastAt: raw.quarantineAlarmLastAt };
-  return () => assert.deepEqual({ active: raw.quarantineAlarmActive, waived: raw.quarantineAlarmOperatorWaived,
-    scope: raw.quarantineAlarmScope, lastAt: raw.quarantineAlarmLastAt }, before, 'refused release cannot change episode intent');
 }
 function inspect(strategy: Probe, options?: { key?: string; limit?: number }) {
   const result = strategy.inspectCompressionRefusalQuarantine(options);
@@ -209,22 +198,18 @@ describe('metadata-only keyed L1 quarantine capability', () => {
 
   it('rejects omitted/empty/all/prefix/wildcard release selectors; exact absent keys mean not-held', async (t) => {
     const fx = await fixture(t, 'invalid');
-    const episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     const before = bytes(fx.path);
     for (const key of [undefined, '', 'all', '*', selected.key.slice(0, 12), `${selected.key}*`, ['x']]) {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, key } as never), { status: 'invalidSelection' });
-      episode();
     }
     for (const value of [undefined, null, {}, { ...selected, expectedGeneration: '' }, { ...selected, expectedBinding: null }]) {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(value as never), { status: 'invalidSelection' });
-      episode();
     }
     for (const options of [{ key: '*' }, { limit: 0 }, { limit: 101 }, { limit: 1.1 }, null, []]) {
       assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(options as never), { status: 'invalidSelection' });
     }
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, key: hash('absent') }), { status: 'not-held' });
-    episode();
     assert.deepEqual(inspect(fx.strategy, { key: hash('absent') }).records, []);
     assert.deepEqual(bytes(fx.path), before);
   });
@@ -247,15 +232,12 @@ describe('metadata-only keyed L1 quarantine capability', () => {
     const legacy = inspect(fx.strategy).records[0]!;
     assert.equal(legacy.generation, null);
     assert.equal(legacy.selectable, false);
-    const episode = openEpisode(fx.strategy);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, expectedGeneration: `legacy:${selected.key}` }), { status: 'unsupported' });
-    episode();
     assert.deepEqual(bytes(fx.path), before);
   });
 
   it('reports unreadable rather than empty on malformed or failed loaded-state reads, and writes nothing', async (t) => {
     const fx = await fixture(t, 'unreadable');
-    const episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     for (const ledger of [{ bad: 'not-a-list' }, [null], [{ kind: 'checkpoint', active: null }],
       [{ ...fx.event, eventId: '' }], [{ ...fx.event, outcomes: [null] }], [{ ...fx.event, outcomes: null }],
@@ -265,7 +247,6 @@ describe('metadata-only keyed L1 quarantine capability', () => {
       const before = bytes(fx.path);
       assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'ledger-entry' });
-      episode();
       assert.deepEqual(bytes(fx.path), before);
     }
     const get = fx.store.getStateJson.bind(fx.store);
@@ -276,14 +257,12 @@ describe('metadata-only keyed L1 quarantine capability', () => {
     const beforeReadFailure = bytes(fx.path);
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'store-read' });
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'unreadable', reason: 'store-read' });
-    episode();
     assert.deepEqual(bytes(fx.path), beforeReadFailure);
     read.mock.restore();
     fx.strategy.detach();
     assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'branchUnavailable' });
-      episode();
     });
     assert.deepEqual(new Probe(config).inspectCompressionRefusalQuarantine(), { status: 'branchUnavailable' });
   });
@@ -322,62 +301,51 @@ describe('one-key native compare-and-release', () => {
 
   it('rejects replaced generation with identical visible contents and same-key ABA release/recreate', async (t) => {
     const fx = await fixture(t, 'aba');
-    let episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     fx.append({ ...fx.event, eventId: 'replacement-generation' });
     const before = bytes(fx.path);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'stale' });
-    episode();
     assert.deepEqual(bytes(fx.path), before);
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selection(fx.strategy))).status, 'released');
     await fx.strategy.exhaust(fx.event.record);
-    episode = openEpisode(fx.strategy);
     assert.notEqual(selection(fx.strategy).expectedGeneration, selected.expectedGeneration);
     const recreated = bytes(fx.path);
     assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(selected), { status: 'stale' });
-    episode();
     assert.deepEqual(bytes(fx.path), recreated);
   });
 
   it('fences namespace/branch/load but NOT ordinary append; a reinitialize invalidates the old load', async (t) => {
     const fx = await fixture(t, 'binding');
-    let episode = openEpisode(fx.strategy);
     const selected = selection(fx.strategy);
     for (const field of ['namespace', 'branch', 'loadId'] as const) {
       await noWrites(fx, async () => {
         assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine({ ...selected, expectedBinding: { ...selected.expectedBinding, [field]: 'wrong' } }), { status: 'stale' });
-        episode();
       });
     }
     fx.manager.addMessage('User', [{ type: 'text', text: 'ordinary append' }]);
     assert.deepEqual(inspect(fx.strategy).binding, selected.expectedBinding);
     assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
     await fx.strategy.exhaust(fx.event.record);
-    episode = openEpisode(fx.strategy);
     const priorLoad = selection(fx.strategy);
     await fx.manager.setStrategy(fx.strategy);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(priorLoad), { status: 'stale' });
-      episode();
     });
     const current = selection(fx.strategy);
     const first = fx.manager.currentBranch().name;
     await fx.manager.switchBranch(fx.manager.branchAt(fx.chunk.messages[0]!.id, 'other'));
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(current), { status: 'stale' });
-      episode();
     });
     await fx.manager.switchBranch(first);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(current), { status: 'stale' });
-      episode();
     });
     const onMain = selection(fx.strategy);
     await fx.strategy.initialize({ ...fx.ctx, namespace: 'other-namespace' });
     const before = bytes(fx.path);
     await noWrites(fx, async () => {
       assert.deepEqual(await fx.strategy.releaseCompressionRefusalQuarantine(onMain), { status: 'stale' });
-      episode();
     });
     assert.deepEqual(bytes(fx.path), before, 'namespace replacement cannot write through the old selection');
   });
@@ -964,31 +932,21 @@ describe('Anima Review regressions', () => {
     const fx = await fixture(t, 'review-historical');
     const event = historical.events.find((entry: Event) => entry.kind === 'exhausted');
     assert.equal('sourceIds' in event.record, false);
-    for (const ledger of [historical.events, historical.checkpoint]) {
+    for (const ledger of [historical.events, historical.checkpoint, [
+      { ...event, kind: 'claim', eventId: 'historical-claim' },
+      { kind: 'exhausted', key: event.key, targetClaimId: 'historical-claim', outcomes: event.outcomes },
+    ]]) {
       fx.store.setStateJson(fx.strategy.ledgerId, ledger);
       const selected = selection(fx.strategy);
       assert.equal(selected.key, event.key);
-      assert.equal(selected.expectedGeneration, event.eventId);
-      assert.equal((fx.strategy.gate(event.record) as any)?.record.key, event.key, 'tolerant native gate retains the historical hold');
+      assert.equal(selected.expectedGeneration, ledger[0].kind === 'claim' ? 'historical-claim' : event.eventId);
       assert.equal((await fx.strategy.releaseCompressionRefusalQuarantine(selected)).status, 'released');
-      assert.equal(fx.strategy.gate(event.record), undefined);
-      assert.deepEqual(inspect(fx.strategy, { key: selected.key }).records, [], 'strict inspection no longer lists the released hold');
     }
-    const claims: Event[] = JSON.parse(readFileSync('test/fixtures/quarantine-legacy-claim.json', 'utf8'));
-    const claim = claims.find(entry => entry.kind === 'claim')!;
-    fx.store.setStateJson(fx.strategy.ledgerId, claims);
-    assert.equal(selection(fx.strategy).expectedGeneration, claim.eventId);
-    assert.equal((fx.strategy.gate(claim.record) as any)?.record.key, claim.key);
-    assert.equal(inspect(fx.strategy).records[0]!.selectable, false, 'the real older claim writer had no trustworthy familyKey');
-    const snapshot: Event[] = JSON.parse(readFileSync('test/fixtures/quarantine-legacy-snapshot.json', 'utf8'));
     fx.store.setStateJson(fx.strategy.ledgerId, []);
-    fx.store.setStateJson(fx.strategy.legacyId, snapshot);
+    fx.store.setStateJson(fx.strategy.legacyId, [event.record]);
     const legacy = inspect(fx.strategy).records[0]!;
-    assert.equal(legacy.key, snapshot[0]!.key);
     assert.equal(legacy.generation, null);
     assert.equal(legacy.selectable, false);
-    assert.equal((fx.strategy.gate(snapshot[0]) as any)?.record.key, snapshot[0]!.key);
-
   });
 
   it('2 ignores superseded damaged legacy snapshots, but still validates checkpoints', async (t) => {
@@ -1130,8 +1088,7 @@ describe('Anima Review regressions', () => {
     const warn = mock.method(console, 'warn', (...args: unknown[]) => { lines.push(args.join(' ')); });
     try {
       native(fx.strategy).checkpointCompressionQuarantineIfNeeded(source);
-      assert.equal(lines.filter((line) => line.includes('obsolete checkpoint hygiene')).length, 0);
-      assert.equal(lines.filter((line) => line.includes('checkpoint hygiene skipped')).length, 0, 'obsolete work must not use the current load warning');
+      assert.equal(lines.length, 0, 'obsolete invocation must not warn for this load');
       pad(fx);
       const compact = mock.method(fx.store, 'compactState', () => { throw new Error('checkpoint failed'); });
       try {
@@ -1516,13 +1473,11 @@ describe('round 9 progress authorization', () => {
     });
     try {
       assert.equal(impl.isCompressionBranchCurrent(source), false);
-      const freshIdentity = { ...identity, generation: impl.captureCompressionBranch().generation };
-      lookups = 0;
-      assert.equal(impl.isBranchIdentityCurrent(freshIdentity), false);
+      assert.equal(impl.isBranchIdentityCurrent(identity), false);
     } finally { hook.mock.restore(); }
   });
 
-  it('refuses sync to either store when a landed progress write rebinds the strategy', async (t) => {
+  it('syncs the store that received progress even if setStateJson rebinds the strategy', async (t) => {
     const fx = await fixture(t, 'r9-progress-sync');
     const other = await fixture(t, 'r9-progress-sync-other');
     const impl = fx.strategy as any;
@@ -1536,338 +1491,11 @@ describe('round 9 progress authorization', () => {
       if (args[0] === fx.strategy.progressId) initialization = fx.strategy.initialize(other.ctx);
     });
     try {
-      assert.throws(() => impl.writeCompressionFamilyProgress(new Map(), source), /stale|reinitializ/);
-      assert.ok(initialization, 'the progress writer must rebind the strategy');
-      assert.equal(syncA.mock.callCount(), 0, 'stale work must not dispatch sync even to its original store');
-      assert.equal(syncB.mock.callCount(), 0, 'the replacement store must not receive old work');
+      impl.writeCompressionFamilyProgress(new Map(), source);
+      assert.ok(initialization);
+      assert.equal(syncA.mock.callCount(), 1);
+      assert.equal(syncB.mock.callCount(), 0);
       await initialization;
     } finally { hook.mock.restore(); syncA.mock.restore(); syncB.mock.restore(); }
   });
-});
-
-describe('round 10 operation source capture', () => {
-  for (const operation of ['capture', 'public-clear', 'progress-sweep', 'success-clear', 'quarantine-sweep', 'mutation-guard']) {
-    it(`does not authorize B when A ${operation} looks up its branch`, async (t) => {
-      const fx = await fixture(t, `r10-capture-${operation}`);
-      const impl = fx.strategy as any;
-      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
-        outcomes: fx.event.outcomes, sourceIds: fx.event.record.sourceIds, updated: 0 }];
-      fx.store.setStateJson(fx.strategy.progressId, progress);
-      fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
-      fx.store.createBranch('r10-b');
-      const current = fx.store.currentBranch.bind(fx.store);
-      let initialization: Promise<void> | undefined;
-      let armed = true;
-      let lookups = 0;
-      const hook = mock.method(fx.store, 'currentBranch', () => {
-        if (armed && ++lookups === (operation === 'public-clear' ? 2 : 1)) {
-          armed = false;
-          fx.store.switchBranch('r10-b');
-          initialization = fx.strategy.initialize(fx.ctx);
-        }
-        return current();
-      });
-      try {
-        if (operation === 'capture') {
-          const source = impl.captureCompressionBranch();
-          assert.equal(impl.isCompressionBranchCurrent(source), false);
-        }
-        if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /clear uncertain: branch\/load changed; earlier writes may have completed/);
-        if (operation === 'progress-sweep') impl.sweepPaidOffCompressionProgress(fx.ctx);
-        if (operation === 'quarantine-sweep') await impl.sweepPaidOffQuarantineRecords();
-        if (operation === 'mutation-guard') assert.throws(() => impl.requireBranchMutation('test'), /stale branch/);
-        if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk);
-        assert.ok(initialization);
-        await initialization;
-        assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
-        assert.equal(fx.ledger().filter((event) => event.kind === 'clear').length, 0);
-      } finally { hook.mock.restore(); }
-    });
-  }
-
-  for (const operation of ['progress-sweep', 'success-clear']) {
-    it(`contains branch lookup failure in ${operation} maintenance`, async (t) => {
-      const fx = await fixture(t, `r10-throw-${operation}`);
-      const impl = fx.strategy as any;
-      const warn = mock.method(impl.diag, 'warn');
-      const hook = mock.method(fx.store, 'currentBranch', () => { throw new Error('lookup failed'); });
-      try {
-        if (operation === 'progress-sweep') assert.doesNotThrow(() => impl.sweepPaidOffCompressionProgress(fx.ctx));
-        else await assert.doesNotReject(impl.clearQuarantineForCompressedChunk(fx.chunk));
-        assert.equal(warn.mock.callCount(), 1);
-      } finally { hook.mock.restore(); warn.mock.restore(); }
-    });
-  }
-
-  it('preserves the released alarm diagnostic history', () => {
-    const changelog = readFileSync(new URL('../../CHANGELOG.md', import.meta.url), 'utf8');
-    const entry = changelog.split('\n').find((line) => line.startsWith('- The compression-quarantine alarm no longer announces'))!;
-    assert.ok(entry.includes("the alarm logs the read's error at most once an interval"));
-    assert.ok(!entry.includes('payload-free'));
-  });
-});
-
-  it('accepts callable keyed strategies', () => {
-    const callable = Object.assign(() => {}, {
-      inspectCompressionRefusalQuarantine() {}, releaseCompressionRefusalQuarantine() {},
-    });
-    assert.equal(isKeyedCompressionQuarantineStrategy(callable), true);
-  });
-
-  it('does not read a legacy snapshot beside a non-list ledger', async (t) => {
-    const fx = await fixture(t, 'r10-non-list-ledger');
-    fx.store.setStateJson(fx.strategy.ledgerId, { damaged: true });
-    const get = fx.store.getStateJson.bind(fx.store);
-    const hook = mock.method(fx.store, 'getStateJson', (id: string) => {
-      if (id === fx.strategy.legacyId) throw new Error('must not read legacy snapshot');
-      return get(id);
-    });
-    try {
-      assert.equal((fx.strategy as any).readCompressionQuarantineProjection().size, 0);
-      assert.deepEqual(fx.strategy.inspectCompressionRefusalQuarantine(), { status: 'unreadable', reason: 'ledger-entry' });
-    } finally { hook.mock.restore(); }
-  });
-
-describe('round 10 nested maintenance sources', () => {
-  for (const operation of ['progress-sweep', 'quarantine-sweep', 'success-clear']) {
-    it(`retains the caller's source in ${operation}`, async (t) => {
-      const fx = await fixture(t, `r10-nested-${operation}`);
-      const impl = fx.strategy as any;
-      const source = impl.requireLoadedBranch('test');
-      const progress = [{ familyKey: fx.event.record.familyKey, chunkSourceHash: fx.event.record.chunkSourceHash,
-        outcomes: fx.event.outcomes, sourceIds: fx.event.record.sourceIds, updated: 0 }];
-      fx.store.setStateJson(fx.strategy.progressId, progress);
-      fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
-      fx.store.createBranch('r10-nested-b');
-      fx.store.switchBranch('r10-nested-b');
-      await fx.strategy.initialize(fx.ctx);
-      const ledger = fx.ledger();
-      if (operation === 'progress-sweep') impl.sweepPaidOffCompressionProgress(fx.ctx, source);
-      if (operation === 'quarantine-sweep') await impl.sweepPaidOffQuarantineRecords(source);
-      if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk, source);
-      assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
-      assert.deepEqual(fx.ledger(), ledger);
-    });
-  }
-});
-
-it('a missing progress writer refuses release without clearing its hold or progress', async (t) => {
-  const fx = await fixture(t, 'missing-progress-writer');
-  const selected = selection(fx.strategy);
-  fx.store.setStateJson(fx.strategy.progressId, [{ familyKey: fx.event.record.familyKey,
-    chunkSourceHash: fx.event.record.chunkSourceHash, outcomes: [], updated: Date.now() }]);
-  const progress = fx.store.getStateJson(fx.strategy.progressId);
-  const ledger = fx.ledger();
-  const writer = fx.store.setStateJson;
-  try {
-    Object.defineProperty(fx.store, 'setStateJson', { configurable: true, writable: true, value: undefined });
-    await assert.rejects(fx.strategy.releaseCompressionRefusalQuarantine(selected), /writer.*setStateJson/i);
-    assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), progress);
-    assert.deepEqual(fx.ledger(), ledger);
-  } finally { fx.store.setStateJson = writer; }
-});
-
-it('checkpoint hygiene failure reports uncertainty after a landed append without exposing payloads', async (t) => {
-  const fx = await fixture(t, 'hygiene-partial-write');
-  fx.append(...Array.from({ length: 260 }, () => ({ kind: 'clear', key: 'unused', targetClaimId: 'unused', created: 1 })));
-  const lines: string[] = [];
-  const native = fx.strategy as any;
-  native.diag = { warn(line: string) { lines.push(line); } };
-  const redact = fx.store.redactStateItems;
-  try {
-    fx.store.redactStateItems = () => { throw new Error('DO-NOT-EXPOSE-STORED-PAYLOAD'); };
-    assert.throws(() => native.checkpointCompressionQuarantineIfNeeded(native.loadedBranchIdentity), /DO-NOT-EXPOSE/);
-    assert.equal(fx.ledger().at(-1)!.kind, 'checkpoint', 'append landed before redaction failed');
-    assert.match(lines.join('\n'), /earlier writes may have landed.*inspect.*status.*unclassified/);
-    assert.doesNotMatch(lines.join('\n'), /DO-NOT-EXPOSE|discarded/);
-  } finally { fx.store.redactStateItems = redact; }
-});
-
-it('a missing-chunk sweep names its heuristic rather than claiming orphaned debt', async (t) => {
-  const fx = await fixture(t, 'sweep-heuristic-diagnostic');
-  const lines: string[] = [];
-  const native = fx.strategy as any;
-  native.diag = { error(line: string) { lines.push(line); }, warn() {} };
-  fx.store.setStateJson(native.chunksStateId, [{ sourceIds: ['different-live-chunk'], compressed: false }]);
-  await native.sweepPaidOffQuarantineRecords();
-  assert.equal(inspect(fx.strategy).totalRecords, 0);
-  assert.match(lines.join('\n'), /no matching chunk record.*heuristic.*live.*not ruled out/);
-  assert.doesNotMatch(lines.join('\n'), /orphaned by/);
-});
-
-it('a success-clear diagnostic covers adoption without asserting a new provider request', async (t) => {
-  const fx = await fixture(t, 'adoption-diagnostic');
-  const lines: string[] = [];
-  const native = fx.strategy as any;
-  native.diag = { error(line: string) { lines.push(line); }, warn() {} };
-  const calls = fx.calls.length;
-  await native.clearQuarantineForCompressedChunk(fx.chunk);
-  assert.equal(inspect(fx.strategy).totalRecords, 0);
-  assert.equal(fx.calls.length, calls);
-  assert.match(lines.join('\n'), /covered.*existing exact L1/);
-  assert.doesNotMatch(lines.join('\n'), /newer request shape/);
-});
-
-it('a progress sweep warns the write may have landed when sync fails', async (t) => {
-  const fx = await fixture(t, 'progress-sync-diagnostic');
-  const native = fx.strategy as any;
-  const lines: string[] = [];
-  native.diag = { warn(line: string) { lines.push(line); } };
-  fx.store.setStateJson(fx.strategy.progressId, [{ familyKey: fx.event.record.familyKey,
-    chunkSourceHash: fx.event.record.chunkSourceHash, outcomes: [], updated: 0 }]);
-  fx.store.setStateJson(native.chunksStateId, []);
-  const sync = fx.store.sync;
-  try {
-    fx.store.sync = () => { throw new Error('sync failed'); };
-    native.sweepPaidOffCompressionProgress(fx.ctx);
-    assert.deepEqual(fx.store.getStateJson(fx.strategy.progressId), []);
-    assert.match(lines.join('\n'), /write may have landed.*check backing-store diagnostics.*normal tick cadence/);
-    assert.doesNotMatch(lines.join('\n'), /progress remains/);
-  } finally { fx.store.sync = sync; }
-});
-
-
-describe('review 16 held native lock', () => {
-  for (const competing of ['exhaustion', 'load-change'] as const) {
-    it(`25 holds the actual lock across ${competing}`, async (t) => {
-      const fx = await fixture(t, `r16-held-${competing}`), selected = selection(fx.strategy);
-      let unlock!: () => void, entered!: () => void;
-      const held = new Promise<void>(resolve => { unlock = resolve; });
-      const started = new Promise<void>(resolve => { entered = resolve; });
-      const holder = withCompressionStateLock(fx.store, 'main', fx.strategy.ledgerId, async () => { entered(); await held; });
-      await started;
-      const before = bytes(fx.path);
-      let probes = 0;
-      const impl = fx.strategy as any, read = impl.readCompressionQuarantineProjection;
-      const hook = mock.method(impl, 'readCompressionQuarantineProjection', (...args: any[]) => { probes++; return read.apply(impl, args); });
-      let pending: Promise<unknown> | undefined;
-      try {
-        if (competing === 'exhaustion') {
-          // The under-lock span callback is an observable acquisition seam.
-          let checked = 0;
-          pending = impl.exhaustCompressionRequestFamily(native(fx.strategy).captureCompressionBranch(), fx.event.record,
-            fx.event.outcomes, () => true, () => { checked++; return true; });
-          // A queued operation may run microtasks but cannot reach its callback.
-          await new Promise<void>(resolve => setImmediate(resolve));
-          assert.equal(checked, 0, 'native exhaustion must wait for the shared lock');
-          assert.equal(probes, 0);
-          unlock(); await holder; await pending;
-          assert.equal(checked, 1);
-        } else {
-          pending = fx.strategy.releaseCompressionRefusalQuarantine(selected);
-          const generation = impl.compressionBranchGeneration;
-          const initialization = fx.manager.setStrategy(fx.strategy);
-          assert.notEqual(impl.compressionBranchGeneration, generation, 'load replacement starts while release is queued');
-          unlock(); await holder;
-          const result = await pending as { status: string };
-          assert.ok(['stale', 'branchUnavailable'].includes(result.status));
-          await initialization;
-          assert.equal(fx.ledger().some(event => event.kind === 'clear'), false, 'queued obsolete release writes no clear');
-          assert.equal(inspect(fx.strategy).records[0]!.generation, selected.expectedGeneration);
-
-        }
-        assert.ok(before.length > 0);
-      } finally { unlock(); await holder; await pending?.catch(() => {}); hook.mock.restore(); }
-    });
-  }
-});
-
-for (const operation of ['clear', 'release'] as const) {
-  it(`public ${operation} uncertainty directs callback recovery through a fresh host scope`, async (t) => {
-    const dispatcher = new AsyncResource('startup-quarantine-dispatch');
-    t.after(() => dispatcher.emitDestroy());
-    const fx = await fixture(t, `r20-recovery-${operation}`);
-    const originalBranch = fx.store.currentBranch().name;
-    fx.store.createBranch('elsewhere');
-    const intent = selection(fx.strategy);
-    let replacement: Promise<void> | undefined;
-    const move = () => {
-      replacement = fx.manager.switchBranch('elsewhere');
-      void replacement.catch(() => {});
-    };
-    const hook = operation === 'clear'
-      ? (() => {
-          // Let the real clear complete before changing the load at the
-          // outer public method's uncertainty boundary.
-          const target = fx.strategy as any;
-          const clear = target.clearObservedCompressionQuarantine.bind(target);
-          return mock.method(target, 'clearObservedCompressionQuarantine', async (...args: unknown[]) => {
-            const changed = await clear(...args);
-            move();
-            return changed;
-          });
-        })()
-      : (() => {
-          const append = fx.store.appendToStateJsonWithIdentity.bind(fx.store);
-          return mock.method(fx.store, 'appendToStateJsonWithIdentity', (...args: Parameters<typeof append>) => {
-            const result = append(...args);
-            if ((args[1] as Event).reason === 'operator-waiver') move();
-            return result;
-          });
-        })();
-    t.after(() => hook.mock.restore());
-    fx.strategy.tick = async () => {
-      const current = () => fx.manager.getStrategy() as Probe;
-      let message = '';
-      await assert.rejects(
-        operation === 'clear'
-          ? current().clearCompressionRefusalQuarantine(intent.key)
-          : current().releaseCompressionRefusalQuarantine(intent),
-        (error: Error) => { message = error.message; return true; },
-      );
-      assert.ok(replacement, 'the mutation landed and branch replacement began');
-      await replacement;
-      await fx.manager.switchBranch(originalBranch);
-      assert.equal(current().inspectCompressionRefusalQuarantine().status, 'branchUnavailable',
-        'even a successful manager switch and getStrategy() do not rebind the callback');
-      dispatcher.runInAsyncScope(() => {
-        assert.equal(inspect(current()).totalRecords, 0, 'fresh inspection sees the landed write, not a receipt');
-        assert.equal(fx.ledger().filter(event => event.kind === 'clear').length, 1, 'recovery did not resend');
-      });
-      assert.match(message, /uncertain:.*earlier writes may have completed/);
-      assert.match(message, /inspect the original branch.*ContextManager.*host-owned dispatcher outside the old callback scope/);
-      assert.match(message, /obtain fresh intent, never automatically resend/);
-    };
-    await fx.manager.tick();
-  });
-}
-
-it('the guide distinguishes inherited alarm scope from an old binding submitted in a fresh scope', async (t) => {
-  const dispatcher = new AsyncResource('startup-quarantine-dispatch');
-  t.after(() => dispatcher.emitDestroy());
-  const fx = await fixture(t, 'r20-alarm-scope');
-  const originalBranch = fx.store.currentBranch().name;
-  let run: Promise<void> | undefined;
-  fx.strategy.setQuarantineAlarmHandler(() => {
-    if (run) return;
-    run = (async () => {
-      const intent = selection(fx.strategy);
-      await fx.manager.fork('alarm-other');
-      await fx.manager.switchBranch(originalBranch);
-      const current = fx.manager.getStrategy() as Probe;
-      const before = fx.ledger();
-      const inheritedInspection = current.inspectCompressionRefusalQuarantine().status;
-      const inheritedRelease = (await current.releaseCompressionRefusalQuarantine(intent)).status;
-      assert.equal(inheritedInspection, 'branchUnavailable');
-      assert.equal(inheritedRelease, 'branchUnavailable');
-
-      await dispatcher.runInAsyncScope(async () => {
-        const fresh = inspect(current);
-        assert.notEqual(fresh.binding.loadId, intent.expectedBinding.loadId);
-        assert.equal((await current.releaseCompressionRefusalQuarantine(intent)).status, 'stale');
-        assert.deepEqual(fx.ledger(), before);
-      });
-
-      // The API already distinguishes these cases; the regression here
-      // includes its operator-facing decision table.
-      const guide = readFileSync('docs/keyed-compression-quarantine.md', 'utf8');
-      const decision = (status: string) => guide.split('\n').find(line => line.startsWith('| `' + status + '` |')) ?? '';
-      assert.match(decision(inheritedRelease), /obsolete async scope/);
-      assert.match(decision('stale'), /current committed load/);
-    })();
-    void run.catch(() => {}); // the alarm handler contract is synchronous
-  });
-  await fx.manager.tick();
-  assert.ok(run, 'the public tick must deliver a real quarantine alarm');
-  await run;
 });

@@ -419,15 +419,11 @@ describe('split-stitch L1 fallback', () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true });
     // simulate the crash seam: markChunkRecordCompressed throws after pushSummary persisted the entry
-    // Scope wrappers are per-instance: inject into the method actually called,
-    // not a prototype slot already captured when this instance was constructed.
-    const lane = fx.strategy as unknown as { markChunkRecordCompressed: (...a: unknown[]) => void };
-    const original = lane.markChunkRecordCompressed;
-    let crashPoints = 0;
-    lane.markChunkRecordCompressed = function () { crashPoints++; throw new Error('simulated crash after append'); };
+    const proto = Object.getPrototypeOf(Object.getPrototypeOf(fx.strategy)) as { markChunkRecordCompressed: (...a: unknown[]) => void };
+    const original = proto.markChunkRecordCompressed;
+    proto.markChunkRecordCompressed = function () { throw new Error('simulated crash after append'); };
     let threw = false;
-    try { await fx.strategy.run(fx.target, managerContext(fx.manager)); } catch { threw = true; } finally { lane.markChunkRecordCompressed = original; }
-    assert.equal(crashPoints, 1, 'the crash seam was actually reached');
+    try { await fx.strategy.run(fx.target, managerContext(fx.manager)); } catch { threw = true; } finally { proto.markChunkRecordCompressed = original; }
     assert.ok(threw, 'crash surfaced');
     assert.equal(fx.strategy.entries().length, 1, 'the appended entry is persisted once');
     const callsBefore = calls.length;

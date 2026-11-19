@@ -1,1 +1,0 @@
-- Topology repair no longer reads or warns about a legacy snapshot superseded by a checkpoint.

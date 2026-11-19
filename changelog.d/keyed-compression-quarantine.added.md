@@ -6,22 +6,27 @@
   and the `KeyedCompressionQuarantineStrategy`, `CompressionQuarantineBinding`,
   `CompressionQuarantineRecordView`, `CompressionQuarantineInspection`,
   `CompressionQuarantineReleaseSelection` and `CompressionQuarantineReleaseResult`
-  types.
-  Inspection validates native digest metadata, reports coarse unreadable reasons
-  without store error text, and includes per-record current-config shape-cap
-  participation and same-regime counts. Unexpected projection errors propagate.
-  Selected waivers require a valid native family digest, compare and clear under
-  one native lock, and run lossless checkpoint hygiene before acknowledgement;
-  branch/load binding is rechecked before progress mutation and after reentrant
-  reads, hygiene, sync and postread; later failures remain uncertain. Capability
-  detection narrows only to the two checked methods. A waiver is not coverage or a promise of a provider
-  attempt; legacy optional-key clearing remains available.
-- Inspection reports `branchUnavailable` when branch lookup fails, consistently
-  with release. Historical source-only cap accounting is not a prediction of
-  today's prepared request hash; short damaged ledgers have no immediate repair
-  through inspection or release.
-- Quarantine inspection and keyed release ignore history superseded by a checkpoint even before redaction, while resolving earlier legacy claims referenced by later exhaustion events.
-- Inspection rejects reentrant branch changes during projection reads. Obsolete
-  checkpoint work does not consume the current load's failure warning.
-- Keyed release reclassifies a lost load after projection reads before returning
-  selection results or entering its uncertain mutation path.
+  types. The capability guard accepts ordinary or callable objects that have
+  both methods, and narrows only to those two methods.
+  - Inspection validates native digest metadata, reports coarse unreadable
+    reasons without store error text, and includes per-record current-config
+    shape-cap participation and same-regime counts. Historical source-only cap
+    accounting is not a prediction of today's prepared request hash.
+    Unexpected projection errors propagate.
+  - Inspection and release ignore history superseded by a checkpoint, even
+    before redaction, while resolving earlier legacy claims referenced by later
+    exhaustion events. Both report `branchUnavailable` when the branch lookup
+    fails, and both report a load lost during their projection reads rather
+    than returning results from it.
+  - A selected waiver requires a valid native family digest, compares and
+    clears under one native lock, and runs lossless checkpoint hygiene before
+    acknowledging. The branch/load binding is rechecked before progress
+    mutation and after reentrant reads, hygiene, sync and the post-read, and
+    `released` is returned only when the post-read no longer shows the
+    selected generation; a failure after mutation is reported as uncertain.
+    Raw store-handle switches the manager does not track (for example inside
+    a store adapter's own branch read) are outside this guard: writes can land
+    on another branch, so no result says other branches are untouched. A waiver is not coverage
+    or a promise of a provider attempt. Short damaged ledgers have no immediate
+    repair through inspection or release. The existing optional-key
+    `clearCompressionRefusalQuarantine` remains available.

@@ -9,7 +9,6 @@ import type {
   StoredMessage,
   SelectOptions,
 } from '../types/index.js';
-import { registerUnfencedStrategy } from '../branch-operation-scope.js';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { roomUnderRequestLimit } from '../request-limit.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
@@ -21,10 +20,6 @@ import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
  */
 export class PassthroughStrategy implements ContextStrategy {
   readonly name = 'passthrough';
-
-  constructor() {
-    if (new.target === PassthroughStrategy) registerUnfencedStrategy(this);
-  }
   /**
    * Renders history raw; when it cannot all fit, the oldest is not rendered,
    * but for its system changes, and when those alone, or those and the

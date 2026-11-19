@@ -50,9 +50,6 @@ export const MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID = 'mint-preimage-envelopes';
 
 const MINT_PREIMAGE_ENVELOPE_VERSION = 1;
 
-// Reads use the real store; strategy-owned writes must use its origin gateway.
-type PreimageWriter = Pick<JsStore, 'storeBlob' | 'registerState' | 'treeSet'>;
-
 interface Base64Whitespace {
   at: number;
   text: string;
@@ -353,7 +350,7 @@ function parseBase64EncodingForm(
 }
 
 function buildPreimageEnvelope(
-  store: PreimageWriter,
+  store: JsStore,
   requestJson: string,
 ): MintPreimageEnvelope | null {
   const json = new JsonSpanParser(requestJson).parse();
@@ -521,7 +518,7 @@ function readEnvelope(store: JsStore, requestHash: string): MintPreimageEnvelope
   }
 }
 
-function storeEnvelope(store: PreimageWriter, envelope: MintPreimageEnvelope, requestHash: string): void {
+function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHash: string): void {
   const bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
   const blobHash = store.storeBlob(bytes, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
   registerStateIfAbsent(store, { id: MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID, strategy: 'tree' });
@@ -555,8 +552,6 @@ export function persistMintRequestPreimage(
   requestHash: string,
   /** Where its lines go: the minting strategy's, which name its namespace (#239). */
   log: Diagnostics = console,
-  /** Internal strategy integration: every mutation, including blob/slot creation. */
-  writer: PreimageWriter = store,
 ): void {
   try {
     const requestJson = JSON.stringify(request);
@@ -569,11 +564,11 @@ export function persistMintRequestPreimage(
           'under the STORED key only',
       );
     }
-    const envelope = buildPreimageEnvelope(writer, requestJson);
+    const envelope = buildPreimageEnvelope(store, requestJson);
     if (envelope !== null) {
       const materialized = materializeEnvelope(store, envelope);
       if (materialized !== null && materialized.equals(preimage)) {
-        storeEnvelope(writer, envelope, trueHash);
+        storeEnvelope(store, envelope, trueHash);
         return;
       }
       log.error(
@@ -581,7 +576,7 @@ export function persistMintRequestPreimage(
           'storing the whole request instead',
       );
     }
-    writer.storeBlob(preimage, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
+    store.storeBlob(preimage, MINT_REQUEST_PREIMAGE_CONTENT_TYPE);
   } catch (error) {
     log.error(`[mint-preimage] failed to persist request preimage ${requestHash}:`, error);
   }

@@ -180,8 +180,6 @@ with `||` gets one more run for each of its lines' lowest releases other than
 the range's own, with every other dependency at its lowest
 (`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
 aren't tested in crossed combinations.
-Branch-boundary regressions also run on latest Node and in a separate pinned
-Bun 1.4.4 source-test job. These supplement the Node-floor full suite.
 Every other leg, on ubuntu and macos, installs with `npm ci`, packs
 the package, installs the tarball into an empty project and imports it. The
 lockfile is committed and strict: `npm install` on npm >= 11 will quietly

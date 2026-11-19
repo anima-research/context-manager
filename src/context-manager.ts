@@ -1,5 +1,4 @@
 import { terminalCatch } from './terminal-catch.js';
-import { callStrategy } from './branch-operation-scope.js';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type {
@@ -673,6 +672,8 @@ export class ContextManager {
    * however often a row entered, it is heard once if the window holds it.
    */
   private presentedUnheard = new Map<MessageId, boolean>();
+  /** From a failed onNewMessage adapter scope/mode observation until one succeeds: its failure is logged once (tellPresented). */
+  private presentationObservationFailing = false;
   /**
    * Calls of onRetracted made while the strategy wasn't initialized, in
    * order, for it to hear once it is (notifyRetracted). Each keeps its rows'
@@ -1085,10 +1086,9 @@ export class ContextManager {
         content: ContentBlock[]
       ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
     };
-    const decision = callStrategy(strategyAny, 'chunkIngressMessage', (strategy) =>
-      typeof strategy.chunkIngressMessage === 'function' ? strategy.chunkIngressMessage(participant, content) : null);
-    if (decision) {
-      if (decision.shards.length > 1) {
+    if (typeof strategyAny.chunkIngressMessage === 'function') {
+      const decision = strategyAny.chunkIngressMessage(participant, content);
+      if (decision && decision.shards.length > 1) {
         // Every shard declares its group's size, so a group an interrupted
         // write left short reads as partial, not whole (compile provenance).
         // That needs indices exactly 0..n-1: refuse anything else before
@@ -1648,14 +1648,14 @@ export class ContextManager {
    * ready rather than dropped.
    */
   private notifyHoldsReleased(): void {
-    if (this.closed) return;
+    if (!this.strategy.onCompressionHoldsReleased || this.closed) return;
     if (this.initializedAttempt !== this.initializationAttempt) {
       this.holdReleaseNotifyPending = true;
       return;
     }
     this.holdReleaseNotifyPending = false;
     try {
-      callStrategy(this.strategy, 'onCompressionHoldsReleased', (strategy) => strategy.onCompressionHoldsReleased?.(this.createStrategyContext()));
+      this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
     } catch (err) {
       // Holds are already gone; the strategy's next rebuild (addMessage,
       // compile) re-queues the work.
@@ -2963,10 +2963,9 @@ export class ContextManager {
     // else everything under its namespace prefix (`{namespace}/autobio:*`,
     // `{namespace}/windowed:anchor`, ...). A manifest lets a strategy leave
     // its work queues and failure ledgers behind.
-    const manifest = callStrategy(this.strategy, 'derivationManifest', (strategy) =>
-      isDerivationManifestStrategy(strategy)
-        ? strategy.derivationManifest(this.strategyNamespace, options.inherit ?? {})
-        : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] });
+    const manifest = isDerivationManifestStrategy(this.strategy)
+      ? this.strategy.derivationManifest(this.strategyNamespace, options.inherit ?? {})
+      : { stateIds: [], statePrefixes: [`${this.strategyNamespace}/`] };
     const filter = {
       stateIds: [...new Set([...stateIds, ...manifest.stateIds])],
       statePrefixes: [...manifest.statePrefixes],
@@ -2975,9 +2974,8 @@ export class ContextManager {
     // ---- Synchronous from here to the seeded stores: the checkpoint is ----
     // ---- this manager's state at one instant, with no turn in between. ----
     const frontier =
-      solve === 'reuse' && atHead
-        ? callStrategy(this.strategy, 'exportRenderingFrontier', (strategy) =>
-          isRenderingFrontierStrategy(strategy) ? strategy.exportRenderingFrontier() : undefined)
+      solve === 'reuse' && atHead && isRenderingFrontierStrategy(this.strategy)
+        ? this.strategy.exportRenderingFrontier()
         : undefined;
 
     const branch = options.branch;
@@ -3037,21 +3035,17 @@ export class ContextManager {
         },
       };
 
-      if (frontier !== undefined) {
-        callStrategy(derived.strategy, 'prepareFromRenderingFrontier', (strategy) => {
-          if (isRenderingFrontierStrategy(strategy)) strategy.prepareFromRenderingFrontier?.(frontier);
-        });
+      if (frontier !== undefined && isRenderingFrontierStrategy(derived.strategy)) {
+        derived.strategy.prepareFromRenderingFrontier?.(frontier);
       }
       await derived.initializeStrategy(observeStoreBranch(view));
 
-      if (solve === 'fresh') {
-        callStrategy(derived.strategy, 'discardRenderingFrontier', (strategy) => {
-          if (isRenderingFrontierStrategy(strategy)) strategy.discardRenderingFrontier();
-        });
-      } else if (frontier !== undefined) {
-        callStrategy(derived.strategy, 'adoptRenderingFrontier', (strategy) => {
-          if (isRenderingFrontierStrategy(strategy)) strategy.adoptRenderingFrontier(frontier);
-        });
+      if (isRenderingFrontierStrategy(derived.strategy)) {
+        if (solve === 'fresh') {
+          derived.strategy.discardRenderingFrontier();
+        } else if (frontier !== undefined) {
+          derived.strategy.adoptRenderingFrontier(frontier);
+        }
       }
       return derived;
     } catch (error) {
@@ -3155,7 +3149,7 @@ export class ContextManager {
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
-    return callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness()).ready;
+    return this.strategy.checkReadiness().ready;
   }
 
   /**
@@ -3163,7 +3157,7 @@ export class ContextManager {
    */
   getPendingWork(): PendingWork | null {
     this.requireInitialized('getPendingWork');
-    const state = callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness());
+    const state = this.strategy.checkReadiness();
     if (state.ready) {
       return null;
     }
@@ -3181,7 +3175,7 @@ export class ContextManager {
    */
   getWaitingWork(): WaitingWork | null {
     this.requireInitialized('getWaitingWork');
-    const state = callStrategy(this.strategy, 'checkReadiness', (strategy) => strategy.checkReadiness());
+    const state = this.strategy.checkReadiness();
     if (state.waitingOn === undefined) return null;
     return { waitingOn: state.waitingOn, description: state.waitingDescription ?? 'Background work waits on the host' };
   }
@@ -3256,11 +3250,10 @@ export class ContextManager {
       selectOpts = rest;
     }
     selectOpts = this.withThinkingStanding(selectOpts, false);
-    const entries = callStrategy(this.strategy, 'select', (strategy) => strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts));
-    const selectionCause = callStrategy(this.strategy, 'takeSelectionCause', (strategy) => strategy.takeSelectionCause?.());
+    const entries = this.strategy.select(view, this.contextLog.createView(), effectiveBudget, selectOpts);
+    const selectionCause = this.strategy.takeSelectionCause?.();
     // Read now, before anything else selects: these are this select's own.
-    const renderStats = callStrategy(this.strategy, 'getLastSelectStats', (strategy) =>
-      isRenderStatsCapable(strategy) ? strategy.getLastSelectStats?.() ?? null : null);
+    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
     if (opts?.requestLimitTokens !== undefined) {
       this.refuseOverRequestLimit(opts, effectiveBudget, entries, renderStats, view, messageInjections);
@@ -3350,7 +3343,7 @@ export class ContextManager {
         branch,
         messages: messageSources,
         layout,
-        strategy: callStrategy(this.strategy, 'name', (strategy) => strategy.name),
+        strategy: this.strategy.name,
         // Only a layout is ever accepted, so only then ask where the journal stands.
         ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
@@ -3372,7 +3365,7 @@ export class ContextManager {
           );
           if (binding.leftOut.length > 0) {
             try {
-              callStrategy(this.strategy, 'noteThinkingLeftOut', (strategy) => strategy.noteThinkingLeftOut?.(binding.leftOut));
+              this.strategy.noteThinkingLeftOut?.(binding.leftOut);
             } catch (err) {
               this.diag.error('[context-manager] the strategy failed to take note of thinking left out:', describeThrown(err));
             }
@@ -3549,7 +3542,7 @@ export class ContextManager {
     sameHeadAssumed: boolean,
     whatever = false,
   ): T | undefined {
-    if (opts?.thinkingBinding?.binds === true && (whatever || callStrategy(this.strategy, 'readsThinkingStanding', (strategy) => strategy.readsThinkingStanding?.()) === true)) {
+    if (opts?.thinkingBinding?.binds === true && (whatever || this.strategy.readsThinkingStanding?.() === true)) {
       return { ...opts, thinkingStanding: this.thinkingStandingFor(opts as SelectOptions, sameHeadAssumed) };
     }
     if (opts?.thinkingStanding === undefined) return opts;
@@ -3599,11 +3592,11 @@ export class ContextManager {
     injected: ContentBlock[][],
     cause: string | undefined,
   ): RenderedLayout | null {
-    if (!callStrategy(this.strategy, 'renderedForms', (strategy) => strategy.renderedForms)) return null;
+    if (!this.strategy.renderedForms) return null;
     const summaryIds = new Set<string>();
     for (const entry of entries) for (const s of entry.summaries ?? []) summaryIds.add(s.id);
     const summaryInfo = summaryIds.size > 0
-      ? callStrategy(this.strategy, 'describeRenderedSummaries', (strategy) => strategy.describeRenderedSummaries?.([...summaryIds])) ?? new Map<string, RenderedSummaryInfo>()
+      ? this.strategy.describeRenderedSummaries?.([...summaryIds]) ?? new Map<string, RenderedSummaryInfo>()
       : new Map<string, RenderedSummaryInfo>();
     const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
     if (undescribed.length > 0) {
@@ -3611,7 +3604,7 @@ export class ContextManager {
       if (fresh.length > 0) {
         for (const id of fresh) this.undescribedSummariesReported.add(id);
         this.diag.warn(
-          `[context-manager] ${callStrategy(this.strategy, 'name', (strategy) => strategy.name)} rendered summaries it cannot describe ` +
+          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
           `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
           'no rendered layout is reported for a compile that renders them',
         );
@@ -3763,8 +3756,7 @@ export class ContextManager {
    * report its rendered layout at all.
    */
   describeRenderedForms(): { strategy: string; forms: ReadonlyArray<'raw' | 'summary' | 'omitted'> | null } {
-    return callStrategy(this.strategy, 'renderedForms', (strategy) =>
-      ({ strategy: strategy.name, forms: strategy.renderedForms ?? null }));
+    return { strategy: this.strategy.name, forms: this.strategy.renderedForms ?? null };
   }
 
   /**
@@ -3837,14 +3829,14 @@ export class ContextManager {
     // close() still closes the store.
     const failed = terminalCatch((err: unknown) => {
       let name = '<unavailable>';
-      try { name = callStrategy(strategy, 'name', (strategy) => strategy.name); } catch { /* diagnostic only */ }
+      try { name = strategy.name; } catch { /* diagnostic only */ }
       this.diag.error('Strategy detach failed:', name, err);
     });
     try {
       // detach() is synchronous by contract. A promise or other thenable one
       // returns anyway isn't awaited, and its rejection is logged rather than
       // left unhandled.
-      const returned = callStrategy(strategy, 'detach', (strategy) => strategy.detach?.()) as unknown;
+      const returned = strategy.detach?.() as unknown;
       if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
         Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
       }
@@ -3900,8 +3892,8 @@ export class ContextManager {
           'give each message by the id addMessage returned for it',
       );
     }
-    return callStrategy(this.strategy, 'renderAsNewest', (strategy) =>
-      typeof strategy.renderAsNewest === 'function' ? strategy.renderAsNewest(this.strategyMessageView(), ids) : undefined);
+    if (typeof this.strategy.renderAsNewest !== 'function') return undefined;
+    return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
   }
 
   /**
@@ -4128,21 +4120,17 @@ export class ContextManager {
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
     this.requireInitialized('getHotContextSettings');
-    return callStrategy(this.strategy, 'getHotContextSettings', (strategy) => {
-      if (!isHotConfigurableStrategy(strategy)) return null;
-      return strategy.getHotContextSettings();
-    });
+    if (!isHotConfigurableStrategy(this.strategy)) return null;
+    return this.strategy.getHotContextSettings();
   }
 
   /** Update only settings the active strategy explicitly declares hot-safe. */
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
     this.requireInitialized('updateHotContextSettings');
-    return callStrategy(this.strategy, 'updateHotContextSettings', (strategy) => {
-      if (!isHotConfigurableStrategy(strategy)) {
-        throw new Error('Active strategy does not support live context settings');
-      }
-      return strategy.updateHotContextSettings(update);
-    });
+    if (!isHotConfigurableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support live context settings');
+    }
+    return this.strategy.updateHotContextSettings(update);
   }
 
   /**
@@ -4181,17 +4169,15 @@ export class ContextManager {
         opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
       ) => PreviewResult | null;
     };
+    if (typeof s.previewContext !== 'function') return null;
     try {
-      return callStrategy(s, 'previewContext', (strategy) => {
-        if (typeof strategy.previewContext !== 'function') return null;
-        return strategy.previewContext(
-          this.strategyMessageView(),
-          this.contextLog.createView(),
-          budget,
-          overrides,
-          this.withThinkingStanding(opts, true, true),
-        );
-      });
+      return s.previewContext(
+        this.strategyMessageView(),
+        this.contextLog.createView(),
+        budget,
+        overrides,
+        this.withThinkingStanding(opts, true, true),
+      );
     } catch (err) {
       if (err instanceof NoFoldPlanToPreviewError) return null;
       throw err;
@@ -4240,12 +4226,10 @@ export class ContextManager {
    */
   pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
     this.requireInitialized('pinRange');
-    return callStrategy(this.strategy, 'pinRange', (strategy) => {
-      if (!isPinnableStrategy(strategy)) {
-        throw new Error('Active strategy does not support pins');
-      }
-      return strategy.pinRange(firstMessageId, lastMessageId, opts);
-    });
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.pinRange(firstMessageId, lastMessageId, opts);
   }
 
   /**
@@ -4284,32 +4268,26 @@ export class ContextManager {
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
     this.requireInitialized('markDocument');
-    return callStrategy(this.strategy, 'markDocument', (strategy) => {
-      if (!isPinnableStrategy(strategy)) {
-        throw new Error('Active strategy does not support documents');
-      }
-      return strategy.markDocument(messageId, opts);
-    });
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support documents');
+    }
+    return this.strategy.markDocument(messageId, opts);
   }
 
   /** Remove a pin or document mark. Returns true if removed. */
   unpin(pinId: string): boolean {
     this.requireInitialized('unpin');
-    return callStrategy(this.strategy, 'unpin', (strategy) => {
-      if (!isPinnableStrategy(strategy)) {
-        throw new Error('Active strategy does not support pins');
-      }
-      return strategy.unpin(pinId);
-    });
+    if (!isPinnableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support pins');
+    }
+    return this.strategy.unpin(pinId);
   }
 
   /** List all current pins. Returns empty array if strategy is not pinnable. */
   listPins(): ReadonlyArray<ProtectedRange> {
     this.requireInitialized('listPins');
-    return callStrategy(this.strategy, 'listPins', (strategy) => {
-      if (!isPinnableStrategy(strategy)) return [];
-      return strategy.listPins();
-    });
+    if (!isPinnableStrategy(this.strategy)) return [];
+    return this.strategy.listPins();
   }
 
   // ==========================================================================
@@ -4325,19 +4303,15 @@ export class ContextManager {
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
     this.requireInitialized('searchSummaries');
-    return callStrategy(this.strategy, 'searchSummaries', (strategy) => {
-      if (!isSearchableStrategy(strategy)) return [];
-      return strategy.searchSummaries(query);
-    });
+    if (!isSearchableStrategy(this.strategy)) return [];
+    return this.strategy.searchSummaries(query);
   }
 
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
     this.requireInitialized('getSummary');
-    return callStrategy(this.strategy, 'getSummary', (strategy) => {
-      if (!isSearchableStrategy(strategy)) return null;
-      return strategy.getSummary(id);
-    });
+    if (!isSearchableStrategy(this.strategy)) return null;
+    return this.strategy.getSummary(id);
   }
 
   /**
@@ -4354,10 +4328,8 @@ export class ContextManager {
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
     this.requireInitialized('getSummariesInRange');
-    return callStrategy(this.strategy, 'listSummariesInRange', (strategy) => {
-      if (!isSummaryOverviewStrategy(strategy)) return [];
-      return strategy.listSummariesInRange(this.strategyMessageView(), opts);
-    });
+    if (!isSummaryOverviewStrategy(this.strategy)) return [];
+    return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
   }
 
   /**
@@ -4366,8 +4338,7 @@ export class ContextManager {
    */
   getMaxSummaryLevel(): number {
     this.requireInitialized('getMaxSummaryLevel');
-    return callStrategy(this.strategy, 'getMaxSummaryLevel', (strategy) =>
-      isSummaryOverviewStrategy(strategy) ? strategy.getMaxSummaryLevel() : 0);
+    return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
   /**
@@ -4384,10 +4355,8 @@ export class ContextManager {
    */
   getRenderStats(): RenderStats | null {
     this.requireInitialized('getRenderStats');
-    return callStrategy(this.strategy, 'getRenderStats', (strategy) => {
-      if (!isRenderStatsCapable(strategy)) return null;
-      return strategy.getRenderStats(this.strategyMessageView());
-    });
+    if (!isRenderStatsCapable(this.strategy)) return null;
+    return this.strategy.getRenderStats(this.strategyMessageView());
   }
 
   /**
@@ -4437,17 +4406,14 @@ export class ContextManager {
    */
   async resetHeadWindow(transitionText?: string, options?: { metadata?: MessageMetadata }): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
-    const resettable = callStrategy(this.strategy, 'resetHeadWindow', (strategy) => {
-      if (!isResettableStrategy(strategy)) {
-        throw new Error('Active strategy does not support head window reset');
-      }
-      return strategy;
-    });
+    if (!isResettableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support head window reset');
+    }
 
     const ctx = this.createStrategyContext();
 
     // Generate transition summary if not provided
-    const summary = transitionText ?? await callStrategy(resettable, 'generateTransitionSummary', (strategy) => strategy.generateTransitionSummary(ctx));
+    const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
     this.requireInitialized('resetHeadWindow', attempt);
 
     // The branch the add stores the transition on, for whereNow below, and
@@ -4476,14 +4442,13 @@ export class ContextManager {
     // what a later call that goes ahead does: it stores a second transition.
     // After a close(), or while a strategy initializes, a later call refuses
     // at once.
-    const refuse = (reason: string, where: string, finalResetUncertain = false, cause?: unknown): Error =>
+    const refuse = (reason: string, where: string): Error =>
       new Error(
         `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} ` +
-          `${where}, and ${finalResetUncertain ? 'the final head-window reset failed or is uncertain' : "the head window wasn't reset"}. A later resetHeadWindow() that goes ahead adds ` +
+          `${where}, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds ` +
           'another transition message.',
-        { cause },
       );
-    const reasonOf = describeThrown;
+    const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
     // How much of the transition's body the window holds: every shard,
     // some, or none. A listener of a sharded transition's first shard can
     // present that shard before the rest is stored. One the record no
@@ -4601,11 +4566,7 @@ export class ContextManager {
     }
 
     // Reset head window to start from this message
-    try {
-      callStrategy(resettable, 'resetHeadWindow', (strategy) => strategy.resetHeadWindow(msgId));
-    } catch (error) {
-      throw refuse(reasonOf(error), whereNow('stored and maybe presented'), true, error);
-    }
+    this.strategy.resetHeadWindow(msgId);
 
     return summary;
   }
@@ -4623,13 +4584,10 @@ export class ContextManager {
    */
   async generateTransitionSummary(): Promise<string> {
     const attempt = this.requireInitialized('generateTransitionSummary');
-    const resettable = callStrategy(this.strategy, 'resetHeadWindow', (strategy) => {
-      if (!isResettableStrategy(strategy)) {
-        throw new Error('Active strategy does not support head window reset');
-      }
-      return strategy;
-    });
-    const summary = await callStrategy(resettable, 'generateTransitionSummary', (strategy) => strategy.generateTransitionSummary(this.createStrategyContext()));
+    if (!isResettableStrategy(this.strategy)) {
+      throw new Error('Active strategy does not support head window reset');
+    }
+    const summary = await this.strategy.generateTransitionSummary(this.createStrategyContext());
     this.requireInitialized('generateTransitionSummary', attempt);
     return summary;
   }
@@ -4641,7 +4599,9 @@ export class ContextManager {
   async tick(): Promise<void> {
     this.requireInitialized('tick');
     this.expireCompressionHolds();
-    await callStrategy(this.strategy, 'tick', (strategy) => strategy.tick?.(this.createStrategyContext()));
+    if (this.strategy.tick) {
+      await this.strategy.tick(this.createStrategyContext());
+    }
   }
 
   // ==========================================================================
@@ -4657,19 +4617,16 @@ export class ContextManager {
     const strategy = this.strategy;
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
-    try {
-      const initialization = callStrategy(strategy, 'initialize', (strategy) => {
-        const initialize = strategy.initialize;
-        // Preserve synchronous completion when no initializer is installed.
-        return initialize ? { returned: initialize.call(strategy, this.createStrategyContext()) } : null;
-      });
-      if (initialization) await initialization.returned;
-    } catch (error) {
-      // An initialize() that rejects after close() or a replacement let go
-      // of the strategy is detached again too, as below; its own error is
-      // the one the caller sees.
-      if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
-      throw error;
+    if (strategy.initialize) {
+      try {
+        await strategy.initialize(this.createStrategyContext());
+      } catch (error) {
+        // An initialize() that rejects after close() or a replacement let go
+        // of the strategy is detached again too, as below; its own error is
+        // the one the caller sees.
+        if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
+        throw error;
+      }
     }
     // close() ran while the strategy initialized: the call that started this
     // fails rather than leave a closed manager's strategy marked initialized.
@@ -5057,10 +5014,12 @@ export class ContextManager {
    * rejection. It can also return no promise, which isn't a failure. Either
    * way the rows stay stored and in the window, as do a sharded body's
    * remaining shards, and the strategy isn't offered them again. Only the
-   * strategy's member lookups and call, plus the legacy adapter's mode/scope
-   * observation, are caught. Failed adapter observations leave rows pending;
-   * the manager's other work, including creating the strategy context, still fails
-   * an add, as onMessage's note says. A presentRows or retractRows, whose window
+   * strategy's member lookups and call, plus the onNewMessage adapter's
+   * mode/scope observation, are caught. A failed adapter observation leaves
+   * the rows pending in memory on this manager until a later notification
+   * (close discards them), logged once per failure episode and counted by
+   * stats(); the manager's other work, including creating the strategy
+   * context, still fails an add, as onMessage's note says. A presentRows or retractRows, whose window
    * write has landed by then, logs it instead, and the rows wait to be
    * heard at the strategy's next notification (tellPresentation). The
    * log is logThrown's, which survives a thrown value that can't be
@@ -5135,25 +5094,30 @@ export class ContextManager {
     }
   }
 
-  /** Make notifyPresented's call now; false means observation failed and rows remain pending. */
+  /**
+   * Make notifyPresented's call of the initialized strategy, now. False means
+   * the onNewMessage adapter couldn't observe its scope or window mode, no hook
+   * ran, and the rows remain pending (a first delivery queues them itself; a
+   * drain restores its own waiting map).
+   */
   private tellPresented(rows: readonly StoredMessage[], enteredLegacy: boolean | ReadonlyMap<MessageId, boolean>): boolean {
     if (rows.length === 0 || this.closed) return true;
     const strategy = this.strategy;
-    let presented: boolean;
+    let onPresented: ContextStrategy['onPresented'];
     try {
-      presented = callStrategy(strategy, 'onPresented', (strategy) => Boolean(strategy.onPresented));
-      if (!presented && !callStrategy(strategy, 'onNewMessage', (strategy) => Boolean(strategy.onNewMessage))) return true;
+      onPresented = strategy.onPresented;
+      if (!onPresented && !strategy.onNewMessage) return true;
     } catch (err) {
-      // Strategy-owned member/protocol lookups are hook work too. The rows
-      // are already stored; don't fail the add and invite a duplicate retry.
+      // A strategy's member lookup is hook work too. The rows are already
+      // stored; don't fail the add and invite a duplicate retry.
       terminalCatch((error: unknown) => logThrown(`Strategy presentation hook lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
       return true;
     }
     const ctx = this.createStrategyContext();
-    if (presented) {
+    if (onPresented) {
       const failed = terminalCatch((err: unknown) => logThrown(`Strategy onPresented failed for ${describeRows(rows)}:`, err, this.diag));
       try {
-        Promise.resolve(callStrategy(strategy, 'onPresented', (strategy) => strategy.onPresented!(rows, ctx))).catch(failed);
+        Promise.resolve(onPresented.call(strategy, rows, ctx)).catch(failed);
       } catch (err) {
         failed(err);
       }
@@ -5162,7 +5126,7 @@ export class ContextManager {
     // The strategy, initialization and branch the calls are made under, and
     // the window the rows entered, before any hook runs.
     let scope: ReturnType<ContextManager['hookScope']>;
-    let legacy: boolean | undefined;
+    let legacy: boolean;
     try {
       legacy = this.windowIndex.mode() === 'legacy';
       scope = this.hookScope();
@@ -5171,8 +5135,33 @@ export class ContextManager {
       // formatting can reenter with another notification. waitToBeHeard
       // skips closed managers. A retry drain restores its own waiting map.
       if (typeof enteredLegacy === 'boolean') this.waitToBeHeard(rows, enteredLegacy);
-      terminalCatch((error: unknown) => logThrown(`Strategy presentation scope lookup failed for ${describeRows(rows)}:`, error, this.diag))(err);
+      // One line per failure episode, not per add: the pending count is on
+      // stats(), and the recovery is logged once the observation succeeds.
+      if (!this.presentationObservationFailing) {
+        this.presentationObservationFailing = true;
+        terminalCatch((error: unknown) => logThrown(
+          `Strategy presentation scope lookup failed for ${describeRows(rows)}; these and later rows wait in memory on this manager until a later notification finds the scope readable (close discards them; stats().pendingStrategyNotifications counts them):`,
+          error, this.diag))(err);
+      }
       return false;
+    }
+    if (this.presentationObservationFailing) {
+      this.presentationObservationFailing = false;
+      terminalCatch(() => this.diag.warn('[context-manager] strategy presentation scope lookup recovered; pending rows are delivered now'))(undefined);
+      // The log sink is host code too: after a close() there nothing is
+      // delivered, and after any other change of scope the rows wait as
+      // they do behind a hook that made it (below).
+      if (this.closed) return true;
+      let unchanged: boolean;
+      try {
+        unchanged = this.inHookScope(scope);
+      } catch {
+        unchanged = false;
+      }
+      if (!unchanged) {
+        this.deferPresented(rows, enteredLegacy);
+        return true;
+      }
     }
     // Whether a presented row is in the window still: a hook can take it
     // out. A read that throws can't tell, so the row waits, as below.
@@ -5208,7 +5197,7 @@ export class ContextManager {
       const failed = terminalCatch((err: unknown) =>
         logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag));
       try {
-        Promise.resolve(callStrategy(strategy, 'onNewMessage', (strategy) => strategy.onNewMessage!(message, ctx))).catch(failed);
+        Promise.resolve(strategy.onNewMessage!(message, ctx)).catch(failed);
       } catch (err) {
         failed(err);
       }
@@ -5329,17 +5318,19 @@ export class ContextManager {
     if (left.length === 0 || this.closed) return;
     const strategy = this.strategy;
     const failed = terminalCatch((err: unknown) => logThrown(`Strategy onRetracted failed for ${describeLeft(left)}:`, err, this.diag));
+    let onRetracted: ContextStrategy['onRetracted'];
     try {
-      if (!callStrategy(strategy, 'onRetracted', (strategy) => Boolean(strategy.onRetracted))) return;
+      onRetracted = strategy.onRetracted;
     } catch (err) {
       failed(err);
       return;
     }
+    if (!onRetracted) return;
     const rows = left.flatMap((l) => (l.row ? [l.row] : []));
     const ids = left.map((l) => l.id);
     const ctx = this.createStrategyContext();
     try {
-      Promise.resolve(callStrategy(strategy, 'onRetracted', (strategy) => strategy.onRetracted!(rows, ctx, { ...info, ids }))).catch(failed);
+      Promise.resolve(onRetracted.call(strategy, rows, ctx, { ...info, ids })).catch(failed);
     } catch (err) {
       failed(err);
     }
@@ -5556,18 +5547,25 @@ export class ContextManager {
     try {
       if (this.tellPresented(rows, waiting)) return true;
       // Observation failed before any hook ran. Restore the original per-row
-      // provenance, not just the mode observed during this delivery attempt.
-      for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
+      // provenance, not just the mode observed during this delivery attempt,
+      // unless the failing observation closed the manager: close drops them.
+      this.restorePresentedUnheard(waiting);
       return false;
     } catch (err) {
       // The manager's own work before the strategy's call failed, so no
-      // hook ran: the rows wait again.
-      for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
+      // hook ran: the rows wait again (not after a close).
+      this.restorePresentedUnheard(waiting);
       logThrown('[context-manager] telling the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
       return false;
     } finally {
       this.drainingPresented = false;
     }
+  }
+
+  /** Put a drain's rows back to wait, with their provenance; nothing after close(). */
+  private restorePresentedUnheard(waiting: ReadonlyMap<MessageId, boolean>): void {
+    if (this.closed) return;
+    for (const [id, legacy] of waiting) this.presentedUnheard.set(id, legacy || this.presentedUnheard.get(id) === true);
   }
 
   private handleMessageEdit(messageId: MessageId, newContent: ContentBlock[]): void {
@@ -5738,11 +5736,24 @@ export class ContextManager {
     messageCount: number;
     contextEntryCount: number;
     branches: number;
+    /**
+     * Strategy notifications this manager holds in memory, not yet heard:
+     * `presented` rows and `retracted` calls. They wait for the next
+     * notification (close discards them). `presentationScopeFailing` is true
+     * from a failed onNewMessage adapter scope/mode observation until one
+     * succeeds, so a host can see an adapter that is stuck rather than idle.
+     */
+    pendingStrategyNotifications: { presented: number; retracted: number; presentationScopeFailing: boolean };
   } {
     return {
       messageCount: this.messageStore.length(),
       contextEntryCount: this.contextLog.length(),
       branches: this.listBranches().length,
+      pendingStrategyNotifications: {
+        presented: this.presentedUnheard.size,
+        retracted: this.retractedUnheard.length,
+        presentationScopeFailing: this.presentationObservationFailing,
+      },
     };
   }
 }

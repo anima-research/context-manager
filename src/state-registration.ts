@@ -24,7 +24,7 @@ export function isStateExistsFor(error: unknown, stateId: string): boolean {
  * registered the slot.
  */
 export function registerStateIfAbsent(
-  store: Pick<JsStore, 'registerState'>,
+  store: JsStore,
   registration: Parameters<JsStore['registerState']>[0],
 ): boolean {
   try {

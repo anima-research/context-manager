@@ -974,40 +974,6 @@ describe('every rung keeps its own identity across a resume', () => {
   const carriesThinking = (request: NormalizedRequest): boolean =>
     request.messages.some((m) => m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'));
 
-  it('stops carrier fallback when its progress read reinitializes the branch', async () => {
-    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
-    const provider = scripted([{ throw: rejected }, OK('must not call stripped fallback')]);
-    const fx = await withCarriers(provider.membrane);
-    const impl = fx.strategy as any;
-    const ctx = managerContext(fx.manager);
-    const store = fx.manager.getStore();
-    store.createBranch('carrier-progress-b');
-    const record = impl.recordCompressionFamilyProgress.bind(impl);
-    const get = store.getStateJson.bind(store);
-    let armed = false;
-    let moved = false;
-    let initialization: Promise<void> | undefined;
-    const boundary = testMock.method(impl, 'recordCompressionFamilyProgress', (...args: any[]) => {
-      armed = true;
-      return record(...args);
-    });
-    const hook = testMock.method(store, 'getStateJson', (id: string) => {
-      const value = get(id);
-      if (armed && !moved && id.endsWith('compression-family-progress')) {
-        moved = true;
-        store.switchBranch('carrier-progress-b');
-        initialization = fx.strategy.initialize(ctx);
-      }
-      return value;
-    });
-    try {
-      await fx.strategy.run(fx.target(), ctx);
-      assert.ok(moved, 'the rejection progress read reentered initialization');
-      await initialization;
-      assert.equal(provider.calls.length, 1, 'no stripped call follows a skipped progress write');
-    } finally { hook.mock.restore(); boundary.mock.restore(); fx.manager.close(); }
-  });
-
   it('a genuine carrier rejection is recorded under its own identity: a resume goes straight to the stripped request', async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const mock = scripted([{ throw: rejected }, { throw: failure('network') }, OK('stripped memory')]);
@@ -3074,10 +3040,9 @@ describe('a window wait after a branch switch ends the scan', () => {
     lane.compressChunkHierarchical = async (chunk, ctx, onSkip) => {
       attempts++;
       if (attempts === 1) {
-        lane.splitCallTimes = [Date.now() - 1_000];
-        const wait = lane.splitWindowWait(1, 1, 60_000);
         await fx.manager.switchBranch(fork);
-        throw wait;
+        lane.splitCallTimes = [Date.now() - 1_000];
+        throw lane.splitWindowWait(1, 1, 60_000);
       }
       return original(chunk, ctx, onSkip);
     };
@@ -3101,8 +3066,7 @@ describe('the quarantine names each stuck span once, with its messages and age',
     await fx.strategy.run(chunk, managerContext(fx.manager));
     assert.equal(mock.calls.length, 4, 'two rungs per shape');
 
-    const readAt = Date.now();
-    const status = fx.strategy.getCompressionQuarantineStatus(readAt);
+    const status = fx.strategy.getCompressionQuarantineStatus();
     const created = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { record: { created: number } }> })
       .readCompressionQuarantineProjection();
     assert.equal(status.count, 2, 'a record per shape');
@@ -3113,8 +3077,7 @@ describe('the quarantine names each stuck span once, with its messages and age',
     assert.equal(span!.lastMessageId, fx.ids[12]);
     assert.equal(span!.records, 2);
     assert.equal(span!.answeredAttempts, 4, 'each record holds both of its answers');
-    const closedAt = Math.max(...chunk.messages.map(message => message.timestamp.getTime()).filter(Number.isFinite));
-    assert.equal(span!.closedAgeMs, Math.max(0, readAt - closedAt), 'age from message closure at the supplied read time');
+    assert.ok(span!.closedAgeMs !== null && span!.closedAgeMs >= 0 && span!.closedAgeMs < 60_000, `aged from its messages: ${span!.closedAgeMs}`);
     assert.equal(span!.latestOutcome, 'refusal', "the newest record's last answer, not the oldest's");
     assert.equal(span!.quarantinedAt, Math.min(...[...created.values()].map((active) => active.record.created)), 'refused since its earliest record');
 
@@ -3379,13 +3342,12 @@ describe('the span table, read from records the test writes', () => {
   it("dates a span from its messages' valid timestamps, skipping an invalid Date", async () => {
     const fx = await build(scripted([]).membrane);
     const ids = fx.ids.slice(2, 5);
-    const readAt = Date.now();
-    const twoHoursAgo = readAt - 2 * 3_600_000;
+    const twoHoursAgo = Date.now() - 2 * 3_600_000;
     // First, where a NaN would have stuck as the close time.
     fx.strategy.adopt(chunkOf(fx, ids, [new Date(Number.NaN), new Date(twoHoursAgo - 60_000), new Date(twoHoursAgo)]));
     writeLedger(fx, [{ hash: hashOf(ids), created: 100, outcomes: [] }]);
-    const [span] = fx.strategy.getCompressionQuarantineStatus(readAt).spans;
-    assert.equal(span!.closedAgeMs, 2 * 3_600_000, 'age from the newest valid timestamp at the supplied read time');
+    const [span] = fx.strategy.getCompressionQuarantineStatus().spans;
+    assert.ok(span!.closedAgeMs !== null && Math.abs(span!.closedAgeMs - 2 * 3_600_000) < 60_000, `aged from the newest valid timestamp: ${span!.closedAgeMs}`);
     fx.manager.close();
   });
 

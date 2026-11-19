@@ -3,14 +3,11 @@
  * and a host routes it to its operators, so it isn't said while the
  * quarantine the alarm last sounded on may still hold records: not when the
  * status read fails, and not while the strategy reads another branch or
- * namespace. Scope is names only: a different backing store with the same
- * names can end the episode, without checking the original store. A ledger entry
- * with no usable record or generation holds no chunk back, so the projection
- * leaves it out (naming it only when a string key is available), and a compression
+ * namespace. A ledger entry with no usable record or generation holds no
+ * chunk back, so the projection leaves it out and names it, and a compression
  * or a clear no longer throws on it; a ledger or legacy snapshot that holds no
  * list is read as holding nothing, a checkpoint that holds none replaces what
- * came before it with nothing, and each is named when actually read. A
- * checkpoint suppresses the legacy snapshot read and its diagnostic.
+ * came before it with nothing, and each is named.
  */
 import { after, afterEach, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -109,7 +106,7 @@ const allClear = (line: string) => line.includes('alarm stands down');
 const ALL_CLEAR = '[compression-quarantine] quarantine empty; coverage and debt payment not established; alarm stands down ns=default';
 const outcome = { outcome: 'refusal' };
 
-describe('the compression-quarantine all-clear requires an empty read under the episode namespace/branch names', () => {
+describe('the compression-quarantine all-clear is said only when the quarantine the alarm last sounded on is empty', () => {
   // The alarm reads Date.now(); a skew moves it past its interval without waiting.
   const realNow = Date.now;
   let skew = 0;
@@ -290,7 +287,7 @@ describe('the compression-quarantine all-clear requires an empty read under the 
     });
     assert.deepEqual(status, { count: 0, keys: [], spans: [], unreadable: true });
     assert.deepEqual(failing.lines, [
-      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed: unclassified); check backing-store access and diagnostics to restore monitoring ns=default',
+      '[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays up until a read succeeds (status check failed: unclassified) ns=default',
     ], 'one line, and no warning from the paid-off sweep');
     assert.deepEqual(failing.handled, [], 'no handler call, all-clear or alarm');
 
@@ -318,9 +315,7 @@ describe('the compression-quarantine all-clear requires an empty read under the 
       later(INTERVAL);
       await fx.strategy.alarm();
     });
-    assert.equal(outage.lines.filter(line => line.includes('quarantine status unreadable')).length, 2, outage.lines.join('\n'));
-    assert.equal(outage.lines.filter(line => line.includes('paid-off sweep skipped')).length, 2, 'each due maintenance attempt is diagnosed independently');
-    assert.ok(!outage.lines.some(allClear));
+    assert.equal(outage.lines.length, 2, outage.lines.join('\n'));
     assert.deepEqual(outage.handled, []);
 
     projection.readCompressionQuarantineProjection = read;

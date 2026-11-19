@@ -1638,20 +1638,11 @@ describe('compression refusal recall curves', () => {
       fx.strategy.setTickWork([fx.target], []);
       await fx.strategy.run(fx.target, ctx);
       fx.strategy.setTickWork([fx.target], [0]);
-      let switched!: () => void;
-      const branchReady = new Promise<void>((resolve) => { switched = resolve; });
-      // Register outside the old tick's async scope: this is NEW B work, not
-      // A's afterCompression continuation writing into B after its fork.
-      const newBranchWork = branchReady.then(() => {
-        fx.strategy.setTickWork([fx.target], [], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
-      });
       fx.strategy.afterCompression(async () => {
         await fx.manager.fork('after-quarantine-skip');
-        switched();
-        await newBranchWork;
+        fx.strategy.setTickWork([fx.target], [], [{ level: 3, sourceIds: fx.parents.map((p) => p.id) }]);
       });
       await fx.strategy.tick(ctx);
-      await newBranchWork;
       assert.equal(fx.manager.currentBranch().name, 'after-quarantine-skip');
       assert.equal(mock.calls.length, 1, 'old branch work must not consume the new branch merge queue');
       assert.equal(fx.strategy.mergeQueueView().length, 1);
