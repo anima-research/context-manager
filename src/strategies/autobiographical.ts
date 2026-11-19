@@ -2796,17 +2796,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * drop would otherwise leave them).
    */
   async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
-    await this.clearObservedCompressionQuarantine(key);
+    const source = this.requireLoadedBranch('clearCompressionRefusalQuarantine');
+    await this.clearObservedCompressionQuarantine(key, undefined, source);
   }
 
-  // Internal decisions retain the generation observed before any earlier await.
-  private async clearObservedCompressionQuarantine(key?: string, expectedGeneration?: string): Promise<boolean> {
-    this.requireLoadedBranch('clearCompressionRefusalQuarantine');
-    if (!this.store || !this.loadedBranchIdentity) return false;
-    // Bind to the load requireLoadedBranch just validated, not to a fresh
-    // observation: a reentrant branch read could otherwise authorize the
-    // branch it switched to.
-    const sourceBranch = compressionBranchOf(this.loadedBranchIdentity);
+  // Internal decisions retain both the load and the hold generation they observed.
+  private async clearObservedCompressionQuarantine(
+    key: string | undefined,
+    expectedGeneration: string | undefined,
+    sourceBranch: CompressionOperationBranch,
+  ): Promise<boolean> {
+    const store = this.store;
+    if (!store || this.compressionBranchGeneration !== sourceBranch.strategyGeneration) return false;
     // Capture exhaustion identities at invocation. A delayed clear can
     // tombstone only those exact generations; it cannot erase a newer one.
     const observed = this.readCompressionQuarantineProjection();
@@ -2818,7 +2819,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? [{ key, generationId: observed.get(key)!.generationId }]
         : [];
     return withCompressionStateLock(
-      this.store,
+      store,
       sourceBranch.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
@@ -3450,6 +3451,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.windowLengthLooked = undefined;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
+    if (this.compressionBranchGeneration !== sourceBranch.strategyGeneration) return;
     this.initializingBranchIdentity = {
       store: ctx.store,
       namespace: ctx.namespace,
@@ -5515,11 +5517,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private captureCompressionBranch(): CompressionOperationBranch {
     if (!this.store) throw new Error('Compression store is not initialized');
+    const strategyGeneration = this.compressionBranchGeneration;
     const observed = observeStoreBranch(this.store);
     return {
       name: observed.name,
       generation: observed.generation,
-      strategyGeneration: this.compressionBranchGeneration,
+      strategyGeneration,
     };
   }
 
@@ -5543,7 +5546,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Fail closed rather than using mirrors loaded from another generation. */
   private requireLoadedBranch(entrypoint: string): CompressionOperationBranch {
-    if (!this.isLoadedBranchCurrent()) {
+    const identity = this.loadedBranchIdentity;
+    if (!identity || !this.isBranchIdentityCurrent(identity)) {
       // An entrypoint racing a still-current initializer must not clear the
       // initializer's partial mirrors out from under it; it simply cannot use
       // them until the identity is committed.
@@ -5556,7 +5560,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `AutobiographicalStrategy.${entrypoint} requires reinitialization for the current branch generation`,
       );
     }
-    return this.captureCompressionBranch();
+    return identity;
   }
 
   private requireBranchMutation(entrypoint: string): void {
@@ -6062,8 +6066,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    retried NOR success-cleared), clear.
    */
   private async sweepPaidOffQuarantineRecords(): Promise<void> {
-    if (!this.store) return;
     const identity = this.loadedBranchIdentity;
+    if (!this.store || !identity) return;
     let projection: Map<string, ActiveCompressionQuarantine>;
     try {
       projection = this.readCompressionQuarantineProjection();
@@ -6087,7 +6091,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const reason = match
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
-        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId);
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId, identity);
         // A strategy detached, loaded again on another branch, or whose
         // branch moved, while a clear waited stops sweeping here: that clear
         // may have written nothing, the chunk records read above are another
@@ -6107,11 +6111,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * state (it can be off, and an active alarm would otherwise sweep on every
    * tick), and a slot with no progress costs one small read.
    */
-  private sweepCompressionProgressIfDue(ctx: StrategyContext): void {
+  private sweepCompressionProgressIfDue(ctx: StrategyContext, source: CompressionOperationBranch): void {
     const now = Date.now();
     if (now - this.compressionProgressSweptAt < AutobiographicalStrategy.COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS) return;
     this.compressionProgressSweptAt = now;
-    this.sweepPaidOffCompressionProgress(ctx);
+    this.sweepPaidOffCompressionProgress(ctx, source);
   }
 
   /**
@@ -6129,9 +6133,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    live progress would pay its answered rungs again. An entry that
    *    doesn't carry its span's ids keeps the old rule: dropped.
    */
-  private sweepPaidOffCompressionProgress(ctx: StrategyContext): void {
+  private sweepPaidOffCompressionProgress(ctx: StrategyContext, source: CompressionOperationBranch): void {
     if (!this.store) return;
-    const source = this.captureCompressionBranch();
     try {
       const progress = this.readCompressionFamilyProgress();
       if (progress.size === 0) return;
@@ -6187,29 +6190,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * span are cleared. Failures are logged, never thrown: clearing is
    * hygiene, not a correctness dependency.
    */
-  private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
+  private async clearQuarantineForCompressedChunk(chunk: Chunk, source: CompressionOperationBranch): Promise<void> {
     if (!this.store) return;
-    const identity = this.loadedBranchIdentity;
-    const source = this.captureCompressionBranch();
     // The span is covered: no family of it needs ladder progress any more.
     const chunkHash = sha256Json(chunk.messages.map((message) => message.id));
     try {
       this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash, undefined, source);
     } catch (error) {
-      this.diag.warn(`[autobiographical] could not drop compression progress for a compressed chunk: ${describeCompressionFailure(error)}`);
+      this.diag.warn(`[autobiographical] could not drop compression progress for a compressed chunk (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
-    if (this.loadedBranchIdentity !== identity || !this.isCompressionBranchCurrent(source)) return;
     try {
-      const hash = chunkHash;
+      if (!this.isCompressionBranchCurrent(source)) return;
       const projection = this.readCompressionQuarantineProjection();
-      if (this.loadedBranchIdentity !== identity || !this.isCompressionBranchCurrent(source)) return;
+      if (!this.isCompressionBranchCurrent(source)) return;
       for (const [key, active] of projection) {
-        if (active.record.chunkSourceHash !== hash) continue;
-        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId);
+        if (active.record.chunkSourceHash !== chunkHash) continue;
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId, source);
         // As in the paid-off sweep: a strategy detached, loaded again on
         // another branch, or whose branch moved while a clear waited stops
         // here, since that clear may have written nothing.
-        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
+        if (!this.isCompressionBranchCurrent(source)) return;
         if (!cleared) continue;
         this.diag.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
@@ -9250,7 +9250,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     await this.soundQuarantineAlarmIfNeeded();
     // Detached, or the branch moved, during the sweep: nothing more to do.
     if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-    this.sweepCompressionProgressIfDue(ctx);
+    this.sweepCompressionProgressIfDue(ctx, sourceBranch);
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
@@ -11348,7 +11348,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The span is covered: its ladder progress and quarantine debt are paid
       // off, as at a mint (the paid-off sweep judges by the persisted mark,
       // which a store without chunk persistence doesn't keep).
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       return;
     }
 
@@ -11379,7 +11379,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `is fully covered by existing L1s under different boundaries — dropped, not re-compressed.`,
       );
       chunk.compressed = true;
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       return;
     }
 
@@ -11447,7 +11447,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._compressionCount++;
       // The span is covered, so its progress and quarantine debt are paid
       // off. A stub made no call, so it is no landing (noteCompressionLanded).
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
@@ -13645,7 +13645,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         chunk.summaryId = postExisting.id;
         // Adoption covers the span just as a fresh summary does — pay off
         // any quarantine debt (see the success path below).
-        await this.clearQuarantineForCompressedChunk(chunk);
+        await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
         return;
       }
 
@@ -13727,7 +13727,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
       // stale records alarm forever and bury the real alarms.
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       if (successfulTrace) successfulTrace.persisted = true;
       if (successfulTrace?.expandedParentId) {
         logCompressionCall({

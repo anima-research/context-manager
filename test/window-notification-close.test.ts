@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, PassthroughStrategy } from '../src/index.js';
+import { ContextManager, PassthroughStrategy, type ContextStrategy } from '../src/index.js';
 
 for (const operation of ['presentRows', 'retractRows', 'removeMessage', 'retractRemoved'] as const) {
   it(`${operation} does not requeue its first notification when building the hook context closes the manager`, async (t) => {
@@ -66,5 +66,53 @@ for (const operation of ['presentRows', 'retractRows', 'removeMessage', 'retract
       store.close();
       rmSync(path, { recursive: true, force: true });
     }
+  });
+}
+
+for (const closeAt of ['drain hook', 'retry scope lookup'] as const) {
+  it(`close in a retraction ${closeAt} leaves no pending retractions`, async (t) => {
+    const path = mkdtempSync(join(tmpdir(), 'retraction-drain-close-'));
+    const store = JsStore.openOrCreate({ path });
+    const manager = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+    t.after(() => { manager.close(); store.close(); rmSync(path, { recursive: true, force: true }); });
+    const ids = ['one', 'two'].map(text => manager.addMessage('User', [{ type: 'text', text }]));
+    manager.presentRows(ids);
+    let finish!: () => void;
+    const initializing = new Promise<void>((resolve) => { finish = resolve; });
+    const heard: string[] = [];
+    const strategy: ContextStrategy = {
+      name: 'close-during-retraction',
+      select: () => [],
+      checkReadiness: () => ({ ready: true }),
+      initialize: () => initializing,
+      async onRetracted(rows) {
+        heard.push(...rows.map(row => row.id));
+        manager.close();
+      },
+    };
+    const setting = manager.setStrategy(strategy);
+    try {
+      manager.retractRows([ids[0]!]);
+      assert.equal(manager.stats().pendingStrategyNotifications.retracted, 1);
+      if (closeAt === 'retry scope lookup') {
+        t.mock.method(manager as unknown as { hookScope(): unknown }, 'hookScope', () => {
+          manager.close();
+          throw new Error('closed during retry scope lookup');
+        });
+      }
+      manager.retractRows([ids[1]!]);
+      if (closeAt === 'drain hook') {
+        assert.equal(manager.stats().pendingStrategyNotifications.retracted, 2);
+      } else {
+        assert.equal(manager.isClosed(), true);
+      }
+    } finally {
+      finish();
+      if (closeAt === 'retry scope lookup') await assert.rejects(setting, /closed/i);
+      else await setting;
+    }
+    assert.equal(manager.isClosed(), true);
+    assert.deepEqual(heard, closeAt === 'drain hook' ? [ids[0]] : []);
+    assert.equal(manager.stats().pendingStrategyNotifications.retracted, 0);
   });
 }

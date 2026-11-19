@@ -5135,14 +5135,10 @@ export class ContextManager {
       // formatting can reenter with another notification. waitToBeHeard
       // skips closed managers. A retry drain restores its own waiting map.
       if (typeof enteredLegacy === 'boolean') this.waitToBeHeard(rows, enteredLegacy);
-      // One line per failure episode, not per add: the pending count is on
-      // stats(), and the recovery is logged once the observation succeeds.
-      if (!this.presentationObservationFailing) {
-        this.presentationObservationFailing = true;
-        terminalCatch((error: unknown) => logThrown(
-          `Strategy presentation scope lookup failed for ${describeRows(rows)}; these and later rows wait in memory on this manager until a later notification finds the scope readable (close discards them; stats().pendingStrategyNotifications counts them):`,
-          error, this.diag))(err);
-      }
+      this.reportPresentationObservationFailure(
+        () => `Strategy presentation scope lookup failed for ${describeRows(rows)}; these and later rows wait in memory on this manager until a later notification finds the scope readable (close discards them; stats().pendingStrategyNotifications counts them):`,
+        err,
+      );
       return false;
     }
     if (this.presentationObservationFailing) {
@@ -5203,6 +5199,13 @@ export class ContextManager {
       }
     }
     return true;
+  }
+
+  /** A failed window read in the retry drain belongs to the same lookup episode. */
+  private reportPresentationObservationFailure(message: () => string, error: unknown): void {
+    if (this.presentationObservationFailing) return;
+    this.presentationObservationFailing = true;
+    terminalCatch((err: unknown) => logThrown(message(), err, this.diag))(error);
   }
 
   /**
@@ -5300,7 +5303,9 @@ export class ContextManager {
     // moved the store's branch itself, it is made for the rows that left
     // the window of the branch the store is on (deferRetracted).
     const scope = this.retryScope();
-    if (this.callWaits()) {
+    const waits = this.callWaits();
+    if (this.closed) return;
+    if (waits) {
       // A row the store holds is read when the call is made; one a removal
       // took is kept, since the store no longer has it to give.
       this.retractedUnheard.push({ left: left.map(({ id, row, ordinal, by }) => (info.removed && row ? { id, row, ordinal, by } : { id, ordinal, by })), info });
@@ -5506,7 +5511,7 @@ export class ContextManager {
     } finally {
       this.drainingRetracted = false;
       // What wasn't made waits, ahead of any call made while these were.
-      if (i < queued.length) this.retractedUnheard = [...queued.slice(i), ...this.retractedUnheard];
+      if (!this.closed && i < queued.length) this.retractedUnheard = [...queued.slice(i), ...this.retractedUnheard];
     }
   }
 
@@ -5539,7 +5544,10 @@ export class ContextManager {
         .getAll()
         .filter((m) => unheard.has(m.id));
     } catch (err) {
-      logThrown('[context-manager] reading the window to tell the strategy of rows presented while it initialized failed; it is told at its next notification:', err, this.diag);
+      this.reportPresentationObservationFailure(
+        () => 'Strategy presentation scope lookup failed while reading the retry window; pending rows wait for the next notification (close discards them; stats().pendingStrategyNotifications counts them):',
+        err,
+      );
       return false;
     }
     this.presentedUnheard = new Map();
@@ -5740,8 +5748,8 @@ export class ContextManager {
      * Strategy notifications this manager holds in memory, not yet heard:
      * `presented` rows and `retracted` calls. They wait for the next
      * notification (close discards them). `presentationScopeFailing` is true
-     * from a failed onNewMessage adapter scope/mode observation until one
-     * succeeds, so a host can see an adapter that is stuck rather than idle.
+     * after a failed onNewMessage adapter scope/mode observation or retry
+     * window read, until an onNewMessage adapter observation succeeds.
      */
     pendingStrategyNotifications: { presented: number; retracted: number; presentationScopeFailing: boolean };
   } {

@@ -1109,7 +1109,7 @@ describe('Anima Review regressions', () => {
     const compact = mock.method(fx.store, 'compactState', () => { throw Object.assign(new Error('/private/store SECRET-payload'), { code: 'EACCES' }); });
     try {
       if (sweep) await impl.sweepPaidOffQuarantineRecords();
-      else await impl.clearQuarantineForCompressedChunk(fx.chunk);
+      else await impl.clearQuarantineForCompressedChunk(fx.chunk, impl.captureCompressionBranch());
       assert.equal(inspect(fx.strategy).totalRecords, 0, 'clear landed before maintenance threw');
       assert.ok(lines.some((line) => line.includes('clear may have landed')));
       assert.ok(lines.some((line) => line.includes('maintenance failed: EACCES')));
@@ -1210,7 +1210,7 @@ describe('Anima Review regressions', () => {
       if (sweep) {
         fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.chunk.messages.map((m) => m.id), compressed: true }]);
         await impl.sweepPaidOffQuarantineRecords();
-      } else await impl.clearQuarantineForCompressedChunk(fx.chunk);
+      } else await impl.clearQuarantineForCompressedChunk(fx.chunk, impl.captureCompressionBranch());
     } finally { hook.mock.restore(); }
     assert.equal(replaced, true);
     const remaining = inspect(fx.strategy).records;
@@ -1445,8 +1445,8 @@ describe('round 9 progress authorization', () => {
       const append = mock.method(fx.store, 'appendToStateJsonWithIdentity');
       try {
         if (operation === 'public-clear') await assert.rejects(fx.strategy.clearCompressionRefusalQuarantine(), /stale branch/);
-        if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk);
-        if (operation === 'sweep') impl.sweepPaidOffCompressionProgress(fx.ctx);
+        if (operation === 'success-clear') await impl.clearQuarantineForCompressedChunk(fx.chunk, source);
+        if (operation === 'sweep') impl.sweepPaidOffCompressionProgress(fx.ctx, source);
         if (operation === 'record') impl.recordCompressionFamilyProgress(source, fx.event.record, fx.event.outcomes, undefined, undefined, []);
         if (operation === 'exhaust') await assert.rejects(impl.exhaustCompressionRequestFamily(source, fx.event.record, [], () => true, () => true), /stale branch/);
         assert.ok(moved);
@@ -1497,5 +1497,92 @@ describe('round 9 progress authorization', () => {
       assert.equal(syncB.mock.callCount(), 0);
       await initialization;
     } finally { hook.mock.restore(); syncA.mock.restore(); syncB.mock.restore(); }
+  });
+});
+
+describe('quarantine cleanup carries its original load', () => {
+  it('a branch capture cannot adopt a newer strategy generation from its own store read', async (t) => {
+    const fx = await fixture(t, 'capture-reentered-load');
+    const impl = fx.strategy as any;
+    const current = fx.store.currentBranch.bind(fx.store);
+    let initialization: Promise<void> | undefined;
+    const branch = mock.method(fx.store, 'currentBranch', () => {
+      branch.mock.restore();
+      initialization = fx.strategy.initialize(fx.ctx);
+      return current();
+    });
+    const source = impl.captureCompressionBranch();
+    assert.ok(initialization, 'the capture reentered initialization on the same branch');
+    await initialization;
+    assert.equal(impl.isCompressionBranchCurrent(source), false);
+  });
+
+  it('a paid-off sweep cannot clear a fork that inherited the hold but not its coverage', async (t) => {
+    const fx = await fixture(t, 'sweep-fork-inherits-hold');
+    const impl = fx.strategy as any;
+    const branch = fx.store.currentBranch().name;
+    fx.store.createBranchAt('raw-fork', branch, fx.store.currentSequence());
+    fx.store.setStateJson(impl.chunksStateId, [{ sourceIds: fx.event.record.sourceIds, compressed: true }]);
+    const clear = impl.clearObservedCompressionQuarantine.bind(impl);
+    const boundary = mock.method(impl, 'clearObservedCompressionQuarantine', async (...args: unknown[]) => {
+      // Move after the paid-off decision, before the clear takes the lock.
+      await fx.manager.switchBranch('raw-fork');
+      return clear(...args);
+    });
+    await impl.sweepPaidOffQuarantineRecords();
+    assert.equal(boundary.mock.callCount(), 1, 'the sweep found coverage on the original branch');
+    assert.equal(inspect(fx.strategy).records[0]?.generation, fx.event.eventId);
+  });
+
+  it('a successful compression cannot clear an inherited hold after its load changes', async (t) => {
+    const fx = await fixture(t, 'success-fork-inherits-hold');
+    const impl = fx.strategy as any;
+    const branch = fx.store.currentBranch().name;
+    fx.store.createBranchAt('raw-fork', branch, fx.store.currentSequence());
+    // Use a different request shape so the existing hold does not gate success.
+    fx.strategy.setRegime(true);
+    fx.answer('end_turn');
+    const clear = impl.clearQuarantineForCompressedChunk.bind(impl);
+    const boundary = mock.method(impl, 'clearQuarantineForCompressedChunk', async (...args: unknown[]) => {
+      assert.equal(fx.chunk.compressed, true, 'the original span is covered');
+      await fx.manager.switchBranch('raw-fork');
+      return clear(...args);
+    });
+    await fx.strategy.run(fx.chunk, fx.ctx);
+    assert.equal(boundary.mock.callCount(), 1);
+    assert.equal(inspect(fx.strategy).records[0]?.generation, fx.event.eventId);
+  });
+
+  it('success-clear handles branch observation failure after progress cleanup', async (t) => {
+    const fx = await fixture(t, 'success-branch-unstable');
+    const impl = fx.strategy as any;
+    const source = impl.captureCompressionBranch();
+    const current = fx.store.currentBranch.bind(fx.store);
+    const forget = impl.forgetCompressionFamilyProgress.bind(impl);
+    let armed = false;
+    let nested = false;
+    let reentries = 0;
+    mock.method(impl, 'forgetCompressionFamilyProgress', (...args: unknown[]) => {
+      forget(...args);
+      armed = true;
+    });
+    const branch = mock.method(fx.store, 'currentBranch', () => {
+      if (armed && !nested) {
+        reentries++;
+        nested = true;
+        try { markStoreBranchSwitch(fx.store); } finally { nested = false; }
+      }
+      return current();
+    });
+    const warn = mock.method(console, 'warn', (..._args: unknown[]) => {});
+    try {
+      await assert.doesNotReject(impl.clearQuarantineForCompressedChunk(fx.chunk, source));
+      assert.equal(reentries, 2, 'neither branch observation attempt stabilized');
+      assert.ok(warn.mock.calls.some(({ arguments: args }) => String(args[0]).includes('success-clear incomplete')));
+    } finally {
+      branch.mock.restore();
+      warn.mock.restore();
+    }
+    assert.equal(fx.ledger().some(({ kind }) => kind === 'clear'), false);
   });
 });

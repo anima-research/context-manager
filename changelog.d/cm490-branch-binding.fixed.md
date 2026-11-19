@@ -17,6 +17,7 @@
   instead of looping.
 - A notification whose hook context can't be built because the manager closed
   is no longer queued after close, and its log line says the manager is closed
-  rather than promising a later delivery. A strategy-detach diagnostic whose
+  rather than promising a later delivery. A retraction retry that encounters
+  close also discards undelivered work instead of requeuing it. A strategy-detach diagnostic whose
   strategy name or log sink throws no longer escapes as an unhandled
   rejection.

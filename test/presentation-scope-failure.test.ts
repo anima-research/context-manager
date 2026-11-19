@@ -42,6 +42,35 @@ async function legacyFixture() {
   return { manager, raw, heard, lines, close() { manager.close(); rmSync(path, { recursive: true, force: true }); } };
 }
 
+it('retry window-read failures share the presentation lookup failure episode', async (t) => {
+  const fx = await legacyFixture();
+  try {
+    const firstScope = t.mock.method(fx.raw, 'hookScope', () => { throw new Error('scope unavailable'); });
+    const add = (text: string) => fx.manager.addMessage('User', [{ type: 'text', text }]);
+    const first = add('one');
+    assert.equal(fx.manager.stats().pendingStrategyNotifications.presented, 1);
+    firstScope.mock.restore();
+
+    const mode = fx.raw.windowIndex.mode;
+    const window = t.mock.method(fx.raw.windowIndex, 'mode', function (this: unknown) {
+      if (new Error().stack!.includes('deliverPresentedUnheard')) throw new Error('retry window unavailable');
+      return mode.call(this);
+    });
+    const second = add('two'), third = add('three');
+    assert.equal(window.mock.calls.filter((call: { error?: unknown }) => call.error !== undefined).length, 2);
+    assert.deepEqual(fx.heard, []);
+    assert.equal(fx.manager.stats().pendingStrategyNotifications.presented, 3);
+    assert.equal(fx.lines.length, 1, 'the retry read failures did not log again');
+
+    window.mock.restore();
+    const fourth = add('four');
+    assert.deepEqual(fx.heard, [first, second, third, fourth]);
+    assert.equal(fx.lines.length, 2);
+    assert.match(fx.lines[1]!, /lookup recovered/);
+    assert.equal(fx.manager.stats().pendingStrategyNotifications.presentationScopeFailing, false);
+  } finally { fx.close(); }
+});
+
 it('a stored legacy presentation is deferred when scope observation fails, and the failed drain stops', async () => {
   const fx = await fixture(); const manager = inside(fx.manager); let heard = 0;
   try {

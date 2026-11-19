@@ -13,9 +13,11 @@
   Callbacks add optional `clearReason: 'quarantine-empty' |
   'operator-waiver-requested'` only at episode end; existing fields remain
   compatible. Empty quarantine is not evidence of coverage or paid debt.
-- Native paid-off and success-clear loops retain each observed exhaustion
-  generation across earlier asynchronous clears, leaving replacement holds
-  for a fresh decision. These automatic clears now use a private generation-bound
+- Native paid-off and success-clear loops retain the load that decided coverage
+  and each observed exhaustion generation across earlier asynchronous clears,
+  leaving replacement holds for a fresh decision. Success-clear logs branch-read
+  failures as maintenance failures rather than rejecting on them.
+  These automatic clears now use a private generation-bound
   helper rather than the public `clearCompressionRefusalQuarantine` method;
   overrides/wrappers of that public method no longer intercept automatic clears.
   Checkpoints supersede legacy snapshots even when the

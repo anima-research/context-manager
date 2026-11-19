@@ -4,7 +4,8 @@
   The rows wait in memory, on this manager, until a later notification finds
   the scope readable, and are then delivered once each, in order; close
   discards them. Each notification makes one attempt, and the failure is
-  logged once per failure episode, with one line when it recovers. A
+  logged once per failure episode, including window reads in the presentation
+  retry drain, with one recovery line on a successful adapter observation. A
   strategy member lookup (`onPresented`, `onNewMessage`, `onRetracted`) that
   throws is logged as a hook failure rather than failing the stored operation.
   `stats()` adds `pendingStrategyNotifications: { presented, retracted,
