@@ -1,6 +1,6 @@
-- **Hosts matching adaptive plan-check refusal text:** replace matches on
-  “Adaptive picker exhausted” or “still exceed” for this refusal with the
-  prefix `Adaptive plan check (` (#496). Prefer `instanceof OverBudgetError`
+- **Hosts matching adaptive plan-check refusal text or relying on dry compile
+  outcomes:** replace matches on “Adaptive picker exhausted” or “still exceed”
+  for this refusal with the prefix `Adaptive plan check (` (#496). Prefer `instanceof OverBudgetError`
   with `diagnostics.solver !== undefined` for plan checks, and the class alone
   for budget refusals generally. Other refusals keep their text and diagnostics;
   keep any existing non-plan matches. The error class, `budget`, `actual`,
@@ -16,12 +16,16 @@
     with zero grace and no request limit, a 100.25-token cut can fit a
     100.5-token solve budget but exceed the floored rejection bound of 100,
     yielding a true fallback flag with false exhaustion.
-  - An over-budget adaptive dry plan used to refuse at emission with an
-    estimator-drift label and the emitted prefix's figures (#300). It now
-    refuses at the plan check with the plan's figures and solver diagnostics.
-    Match the plan-check prefix instead of the drift label for this case.
-    `previewContext` reports `fits: false` without `entries` or `stats` on a
-    final budget refusal, even with `render: true`.
+  - Dry compiles used to bypass the adaptive plan check. With an over-budget
+    plan, a dry compile could succeed if the emitted context fit, refuse at
+    emission with an estimator-drift label (#300), or refuse at a different
+    gate, such as tool-pairing repair. A dry compile can now refuse at the
+    plan check with the plan's token figures and solver diagnostics instead.
+    Catch `OverBudgetError` from dry compiles even if those calls previously
+    succeeded, or use `previewContext` and inspect `fits`. If matching refusal
+    text, handle the plan-check prefix as well as any still-applicable non-plan
+    matches. On a final budget refusal, `previewContext` reports `fits: false`
+    without `entries` or `stats`, even with `render: true`.
   - A dry plan-check refusal can now trigger a provisional-calibration retry
     at multiplier 1. If the retry passes the remaining gates, the dry compile
     returns normally; otherwise the final refusal stands. Without an
