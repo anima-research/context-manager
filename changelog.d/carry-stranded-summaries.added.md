@@ -46,11 +46,12 @@
     what a compile sends. A carried L1 no longer counts toward
     `maxSpeculativeL1s`, as one a merge took doesn't.
   - A store that holds carried entries needs a context-manager that knows
-    them. An earlier release reads each as an ordinary summary of its level:
-    it renders the entry in place of the summary it carries and counts it as
-    a deeper fold of those messages, so going back to one changes what a
-    compile sends. Turning the option off does not: the entries stay, and
-    are read as above.
+    them. An earlier release reads each as an ordinary summary of its level,
+    a deeper fold of those messages: it lists the entry, and can render it
+    under its own id and level, where the summary it carries stood, and
+    kv-stable re-plans around the new level. So going back to one can change
+    what a compile sends. Turning the option off does not: the entries stay,
+    and are read as above.
   - `getStrandedSummaries()` no longer lists a summary the next merge check
     carries when the option is set. It reads the store as it stands, in one
     pass: a summary that check reaches only after carrying another beside it
@@ -64,7 +65,8 @@
     compresses the chunks that wait before it carries or merges, and the
     preview doesn't project the L1s they land: read as a drain it counts
     those chunks (`chunksWaiting`, and a `provisional` line in the text
-    output), and its steps hold only once they have landed.
+    output), and its steps are provisional until they have landed. Preview
+    again then.
   - `repair-topology`, `audit-topology` and the planner
     (`RepairRunsConfig.carryStrandedSummaries`) take the setting as
     `--carry-stranded-summaries`. A rebuild planned with it projects the
