@@ -854,8 +854,9 @@ itself the main hazard; do not design from those numbers. After rev 6:
 
     system+deep-band | mid-history | historyEnd | end
 
-- **CM owns all four slots.** Membrane's unconditional system marker becomes
-  config (`cacheMarkers: 'cm-owned'`), and CM places the first marker after
+- **CM owns all four slots,** less any the caller declares it places outside
+  the messages (`kvUnified.callerCacheMarkers`). Membrane's unconditional
+  system marker becomes config (`cacheMarkers: 'cm-owned'`), and CM places the first marker after
   the last node of the production-complete/stable prefix (§5A.4) — which contains the
   system and tools blocks by construction. Caveat recorded: with the system
   slot moved, an idle expiry kills the tools entry together with the window;
@@ -1035,7 +1036,7 @@ Bedrock return equivalent receipts for equivalent normalized requests.
 | `kvUnifiedAdoptEpsilon` | 0.005·W | recipe | anti-cycle margin |
 | `kvUnified.policy.rewriteLambda` | 0 (off) | recipe | linear price of cache churn, per `cacheScale`, in place of the quadratic cache policy (§3.2) |
 | `kvUnified.thinkingLambda` / `kvUnified.thinkingHalfLifeTokens` | 0 (off) / 50,000 | recipe | points per token of thinking a change would drop on a model that binds it, and the half-life of its weight (§3.2) |
-| `cacheMarkers` | `membrane-system` | recipe | `cm-owned` hands all four slots to CM (§5A.3) |
+| `cacheMarkers` | `membrane-system` | recipe | `cm-owned` hands all four slots to CM, less any the caller declares (§5A.3) |
 | W (`contextBudgetTokens`) | existing | existing | the wall |
 
 Retired when active: `foldDepthCap` path, `compressionSlackRatio`,
