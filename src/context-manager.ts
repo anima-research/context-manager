@@ -4583,7 +4583,7 @@ export class ContextManager {
     return this.externalMemoryStrategy('exportMemoryRequest').exportMemoryRequest(target, this.createStrategyContext());
   }
 
-  /** Install `body` as the summary of a work item `exportMemoryRequest` gave, if the strategy would still do that work. */
+  /** Install `body` as the summary of a work item `exportMemoryRequest` gave, if the strategy would still do that work from the same request. */
   importExternalMemory(
     item: MemoryWorkItem,
     body: string,

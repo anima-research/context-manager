@@ -10,8 +10,12 @@
     skip, queuing the merge beside it) is refused, and the change isn't
     made.
   - `import` installs a text as the summary of that work, and only while the
-    strategy would still do the same work: the tree's shape stays the
-    strategy's. The text takes the place of the provider's answer, so the
+    strategy would still do the same work and builds the same request for
+    it (the descriptor carries the request's sha256): the tree's shape stays
+    the strategy's, and a text written for a request whose history or
+    recalled memories have changed since is refused. A dry run builds the
+    request and makes the same checks. The text takes the place of the
+    provider's answer, so the
     summary is written as a native one is (lineage, its sources' parent, the
     chunk record, tokens stamped from the text, the quarantine of its chunk
     or merge paid off). It carries no reasoning.

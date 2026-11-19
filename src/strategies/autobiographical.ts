@@ -14721,7 +14721,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summaries).
    */
   private externalWorkFor(target: MemoryWorkTarget, ctx: StrategyContext): {
-    item: MemoryWorkItem;
+    item: Omit<MemoryWorkItem, 'requestHash'>;
     mergeRecordKey?: string;
     run: (ctx: StrategyContext) => Promise<void>;
   } {
@@ -14829,19 +14829,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new CompressionWithdrawn('request exported, not sent');
     });
     if (!request) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
-    return { item: work.item, request };
+    return { item: { ...work.item, requestHash: sha256Json(request) }, request };
   }
 
   /**
    * Install `body` as the summary of `item`, a work item exportMemoryRequest
-   * gave. Refused unless the strategy would do that same work now: the
-   * same level, sources in the same order and range. The text takes the
-   * place of the provider's answer to the work's first request, so the
-   * summary is written as a native one is: its lineage, its sources'
-   * parent, its chunk record, its token stamp from the text (no usage comes
-   * with it), and the quarantine of its chunk or merge paid off. It carries
-   * no reasoning, `external` says who supplied it, and its provenance names
-   * no model. Without `apply` the work is checked and nothing is written.
+   * gave. Refused unless the strategy would do that same work now, the
+   * same level, sources in the same order and range, and builds for it the
+   * request it built then (`item.requestHash`): a text written for a request
+   * whose history, recall or settings have changed since isn't its answer.
+   * The text takes the place of the provider's answer to that request, the
+   * first the work sends, so the summary is written as a native one is: its
+   * lineage, its sources' parent, its chunk record, its token stamp from the
+   * text (no usage comes with it), and the quarantine of its chunk or merge
+   * paid off. It carries no reasoning, `external` says who supplied it, and
+   * its provenance names no model. Without `apply` the work is run to its
+   * request as exportMemoryRequest runs it, the same checks are made, and
+   * nothing is written.
    */
   async importExternalMemory(
     item: MemoryWorkItem,
@@ -14863,19 +14867,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
     if (body.trim().length === 0) throw new Error('the memory text is empty');
-    if (!options.apply) return { item: now, applied: false, tokens: Math.ceil(body.length / 3) };
 
     const before = new Set(this.summaries.map((s) => s.id));
-    let answered = false;
-    await this.runExternalWork(work, ctx, { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) }, async () => {
+    const stamp = options.apply ? { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) } : undefined;
+    /** The first request the work sends now, hashed as the export hashed its own. */
+    let requestHash: string | undefined;
+    await this.runExternalWork(work, ctx, stamp, async (request) => {
       // One answer: a text the strategy turns down must not answer its next request too.
-      if (answered) throw new CompressionWithdrawn('external memory text already given');
-      answered = true;
+      if (requestHash !== undefined) throw new CompressionWithdrawn('external memory text already given');
+      requestHash = sha256Json(request);
+      if (requestHash !== item.requestHash) throw new CompressionWithdrawn('not the request the text was written for');
+      if (!stamp) throw new CompressionWithdrawn('dry run: the text is not given');
       return { content: [{ type: 'text', text: body }], stopReason: 'end_turn', usage: { inputTokens: 0, outputTokens: 0 } } as unknown as NormalizedResponse;
     });
+    if (requestHash === undefined) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
+    if (requestHash !== item.requestHash) {
+      throw new Error(
+        `the request the strategy builds for this work now (sha256 ${requestHash}) is not the one exported ` +
+          `(${item.requestHash ?? 'none recorded'}): what it shows has changed since; export its request again`,
+      );
+    }
+    const described = { ...now, requestHash };
+    if (!stamp) return { item: described, applied: false, tokens: Math.ceil(body.length / 3) };
     const entry = this.summaries.find((s) => !before.has(s.id) && s.external !== undefined);
     if (!entry) throw new Error('the strategy did not store the text; its warnings say why');
-    return { item: now, applied: true, tokens: entry.tokens, summaryId: entry.id };
+    return { item: described, applied: true, tokens: entry.tokens, summaryId: entry.id };
   }
 
   /**

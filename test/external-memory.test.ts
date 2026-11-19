@@ -145,7 +145,11 @@ describe('external-memory', () => {
     const before = memory(path);
     const { file, item, request } = await exported(path, ['--level', '2']);
     assert.equal(memory(path), before, 'an export writes nothing to the memory');
-    assert.deepEqual(item, { level: 2, sourceLevel: 1, sourceIds: own.sourceIds, sourceRange: own.sourceRange }, 'the work is the merge the strategy does itself');
+    assert.deepEqual(
+      item,
+      { level: 2, sourceLevel: 1, sourceIds: own.sourceIds, sourceRange: own.sourceRange, requestHash: sha256(JSON.stringify(request)) },
+      'the work is the merge the strategy does itself, with the hash of its request',
+    );
     assert.match(said(request), /raw-0 POISON/, 'the request holds the history under the sources');
     assert.equal((request as { config?: { model?: string } }).config?.model, MODEL, 'as the strategy hands it to membrane');
 
@@ -225,6 +229,37 @@ describe('external-memory', () => {
     assert.equal(memory(path), merged, 'nothing is written');
   });
 
+  it('refuses a text written for a request the strategy no longer builds for the same work', async () => {
+    const path = await residentStore();
+    // The resident's first merge stands, and the next merge's request recalls it.
+    await asResident(path, answers, (manager) => manager.tick());
+    const first = summariesOf(path).find((s) => s.level === 2)!;
+    assert.ok(first, 'setup: the resident merged once');
+    const { file, item, request } = await exported(path, ['--level', '2']);
+    assert.ok(!item.sourceIds.some((id) => first.sourceIds.includes(id)), 'setup: the work is the next merge');
+    assert.ok(said(request).includes(first.content), 'setup: its request recalls the first merge');
+
+    // The recalled memory's text changes: the work is the same, and its request isn't.
+    const edited = await run(['edit', path, '--namespace', NS, '--id', first.id, '--body-file', bodyFile('The first stretch, rewritten.'), '--by', 'operator', '--apply']);
+    assert.equal(edited.code, 0, edited.stderr);
+    const before = memory(path);
+    const importArgs = ['import', path, '--namespace', NS, '--descriptor', file, '--body-file', bodyFile(BODY), '--by', 'operator'];
+    for (const args of [importArgs, [...importArgs, '--apply']]) {
+      const stale = await run(args);
+      assert.equal(stale.code, 1, `${args.includes('--apply') ? 'applied' : 'dry run'}: ${stale.stdout}`);
+      assert.match(stale.stderr, /is not the one exported/);
+      assert.equal(memory(path), before, 'nothing is written');
+    }
+
+    // Exported again it is the same work with another request, which the text can answer.
+    const again = await exported(path, ['--level', '2']);
+    assert.deepEqual(again.item.sourceIds, item.sourceIds);
+    assert.notEqual(again.item.requestHash, item.requestHash);
+    const applied = await run(['import', path, '--namespace', NS, '--descriptor', again.file, '--body-file', bodyFile(BODY), '--by', 'operator', '--apply']);
+    assert.equal(applied.code, 0, applied.stderr);
+    assert.equal(summariesOf(path).find((s) => s.content === BODY)?.level, 2);
+  });
+
   it('installs the text of a quarantined merge, and its quarantine is paid off', async () => {
     const path = await residentStore();
     await asResident(path, refuses, async (manager, strategy) => {
@@ -283,6 +318,7 @@ describe('external-memory', () => {
     assert.deepEqual(item, {
       level: 1, sourceLevel: 0, sourceIds: record.sourceIds,
       sourceRange: { first: record.sourceIds[0], last: record.sourceIds[record.sourceIds.length - 1] }, chunkRecordId: record.id,
+      requestHash: sha256(JSON.stringify(request)),
     });
     assert.match(said(request), /POISON/, 'the request is the chunk\'s compression');
     const refused = read(path, (store) => store.getStateJson(`${NS}/autobio:compression-refusal-quarantine-events`) as Array<{ kind: string; record?: { canonicalRequestHash: string } }>)

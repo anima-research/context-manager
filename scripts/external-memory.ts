@@ -24,8 +24,8 @@
  * export-request writes one JSON file to --out and nothing to the store's
  * memory:
  *   - `workItem`: the work, as `import` requires it back (level, ordered
- *     source ids, source level, the message id range, and for an L1 its
- *     chunk record);
+ *     source ids, source level, the message id range, for an L1 its chunk
+ *     record, and the sha256 of the request);
  *   - `request`: the request the strategy would send for it now, as it hands
  *     it to membrane (system, messages by participant, tools, model
  *     settings), to give to whatever writes the text instead;
@@ -42,7 +42,11 @@
  *
  * import installs the text of --body-file as the summary of the work in
  * --descriptor (the file export-request wrote). It is refused unless the
- * strategy, under the same settings, would do that same work now. The text
+ * strategy, under the same settings, would do that same work now and builds
+ * the same request for it: a text written for a request whose history or
+ * recalled memories have changed since (another import or an edit landed,
+ * the resident ran) isn't its answer, and the request is exported again.
+ * A dry run builds the request and makes the same checks. The text
  * takes the place of the provider's answer, so the summary is written as a
  * native one is, its sources parented, its chunk record marked and the
  * quarantine of its chunk or merge paid off, and the merge check runs after

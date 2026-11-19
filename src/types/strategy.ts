@@ -3074,9 +3074,10 @@ export interface ExternalMemoryProvenance {
 
 /**
  * One piece of compression work as the strategy holds it: the summary it
- * would write. `exportMemoryRequest` returns it beside the request, and
- * `importExternalMemory` takes it back and installs a text only while the
- * strategy would still produce the same work.
+ * would write, and the request it builds for it. `exportMemoryRequest`
+ * returns it beside the request, and `importExternalMemory` takes it back
+ * and installs a text only while the strategy would still produce the same
+ * work from the same request.
  */
 export interface MemoryWorkItem {
   /** Level of the summary the work writes. */
@@ -3089,6 +3090,13 @@ export interface MemoryWorkItem {
   sourceRange: { first: string; last: string };
   /** For an L1: the chunk record the work compresses. */
   chunkRecordId?: string;
+  /**
+   * sha256 (hex) of the JSON of the request exported with the work, the
+   * first the strategy would send for it: the hash a native summary's
+   * `provenance.requestHash` carries. A text is installed only as the
+   * answer to this request.
+   */
+  requestHash: string;
 }
 
 /** Which work: the merge the strategy would do next into `level`, or the L1 of a chunk record. */

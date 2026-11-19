@@ -202,7 +202,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const out: ExportFile = { workItem: item, settings, request };
         writeFileSync(options.get('--out')!, JSON.stringify(out, null, 2));
         console.log(`work: ${describe(item)}`);
-        console.log(`request: ${request.messages.length} message(s), sha256 ${sha256(JSON.stringify(request))}`);
+        console.log(`request: ${request.messages.length} message(s), sha256 ${item.requestHash}`);
         console.log(`wrote ${options.get('--out')}: workItem, settings and request. Nothing was written to the store's memory.`);
         return 0;
       }
@@ -213,8 +213,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         console.log(`text: ${body.length} chars, sha256 ${sha256(body)}, by ${by.by}`);
         console.log(result.applied
           ? `APPLIED: stored as ${result.summaryId}, ${result.tokens} tokens.`
-          : `DRY RUN: the strategy would do this work now, and the text would be stored as its summary (~${result.tokens} tokens). ` +
-            'Nothing written; run again with --apply.');
+          : `DRY RUN: the strategy would do this work now, from the request exported (sha256 ${result.item.requestHash}), and the ` +
+            `text would be stored as its summary (~${result.tokens} tokens). Nothing written; run again with --apply.`);
         return 0;
       }
 
