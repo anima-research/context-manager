@@ -2,8 +2,11 @@
  * A store adapter that moves the raw store handle from inside its own
  * branch read, a switch the manager does not track. These pin what the
  * keyed release and the legacy clear still promise there: no acknowledgement
- * the bound branch's reread contradicts, and no write authorized by a branch
- * the operation never validated. Synthetic stores only.
+ * that the release's own post-write reread contradicts, and no write
+ * authorized by a branch the operation never validated. The reread reads the
+ * branch the handle is on, so an adapter that also redirects the reread could
+ * still get `released` while the bound branch holds the generation; neither
+ * test redirects the reread. Synthetic stores only.
  */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -64,8 +67,10 @@ it('release is not acknowledged when its tombstone landed on a branch the adapte
     const main = fx.strategy.inspectCompressionRefusalQuarantine();
     assert.equal(main.status, 'ok');
     const stillHeld = main.status === 'ok' && main.records.some((held) => held.key === record.key && held.generation === record.generation);
-    // The contract: never `released` while the bound branch still holds the
-    // selected generation. (Where the tombstone lands is outside the guard.)
+    // Here the reread runs on main (the adapter moved the handle back), so a
+    // `released` that main contradicts would be a false acknowledgement. An
+    // adapter that redirected the reread too is not covered, and where the
+    // tombstone lands is outside the guard.
     if (result !== undefined) {
       assert.equal(result.status, 'released');
       assert.equal(stillHeld, false, 'released was acknowledged while main still held the generation');

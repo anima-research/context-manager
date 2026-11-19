@@ -25,8 +25,10 @@
     `released` is returned only when the post-read no longer shows the
     selected generation; a failure after mutation is reported as uncertain.
     Raw store-handle switches the manager does not track (for example inside
-    a store adapter's own branch read) are outside this guard: writes can land
-    on another branch, so no result says other branches are untouched. A waiver is not coverage
-    or a promise of a provider attempt. Short damaged ledgers have no immediate
+    a store adapter's own branch read) are outside this guard: writes and the
+    post-read can land on another branch, so no result says other branches
+    are untouched, and with such an adapter `released` does not prove the
+    bound branch was cleared. A waiver is not coverage or a promise of a
+    provider attempt. Short damaged ledgers have no immediate
     repair through inspection or release. The existing optional-key
     `clearCompressionRefusalQuarantine` remains available.

@@ -51,8 +51,13 @@ returns `branchUnavailable`. A failed/malformed read returns `unreadable`,
 not an empty list, with coarse `reason: 'store-read'` (the store threw) or
 `'ledger-entry'` (stored data failed validation). Store error text is never
 returned; unexpected projection/programmer errors propagate. Inspection
-conservatively refuses damaged events since the latest checkpoint and never
-rewrites them.
+refuses events since the latest checkpoint whose replay-relevant fields are
+damaged (a non-string key, an unusable target generation, an unusable claim or
+exhaustion record) and never rewrites them. It does not validate every field:
+a clear or alert event whose key matches no active hold is skipped, so a clear
+whose key was damaged to another string is ignored, and an `alert_pending`
+without an event id is ignored. `ok` is not an integrity certificate for the
+ledger.
 A later native hygiene pass can checkpoint the tolerant projection that the
 gate enforces, removing ignored damage; damage in a retained hold may still
 fail strict inspection afterwards. A checkpoint supersedes preceding active state and the legacy snapshot;
@@ -95,12 +100,14 @@ as a repair fallback: it can waive holds while leaving inspection unreadable.
   store handle that the manager does not track is not covered: for example a
   store adapter whose `currentBranch()` moves the handle to another branch and
   returns the branch it read before moving, then moves back. A progress write
-  or tombstone can then land on the other branch while every check passes.
-  Release still never reports `released` while the reread of the bound branch
-  shows the selected generation, but neither `released` nor an uncertain
-  failure says that no other branch was written. Hosts that switch the raw
-  handle themselves must do it through the manager, or not while a
-  quarantine call is running.
+  or tombstone can then land on the other branch while every check passes,
+  and the post-write reread can be redirected the same way: it reads whatever
+  branch the handle is on, not necessarily the bound branch. With such an
+  adapter `released` says only that the reread it was given no longer showed
+  the selected generation; it does not prove the bound branch was cleared, and
+  neither `released` nor an uncertain failure says that no other branch was
+  written. Hosts that switch the raw handle themselves must do it through the
+  manager, or not while a quarantine call is running.
 - Source ids are recorded membership if present, otherwise an exact hash
   match to a loaded chunk, otherwise `null`/`membership: 'unknown'`.
   `loadedChunkMatch` separately says whether an exact chunk is loaded now;
@@ -153,7 +160,7 @@ pretending configuration is actual use or correlating an unrelated call.
 
 | Result | Meaning / host action |
 | --- | --- |
-| `released` | Exact key/generation was cleared under the native lock, and the strict reread of the bound branch no longer shows that generation; includes key, generation, and observed `remainingRecords`. Record the acknowledgement; no inference of coverage or provider work. |
+| `released` | Exact key/generation was cleared under the native lock, and the strict reread no longer shows that generation (the reread reads the branch the store handle is on; an adapter that hides raw handle switches can redirect it, see above); includes key, generation, and observed `remainingRecords`. Record the acknowledgement; no inference of coverage or provider work. |
 | `stale` | Branch/namespace/load binding or active generation differs. No mutation. Reinspect and obtain new intent, never auto-reselect. |
 | `not-held` | No active record for this full key under the matched binding. No mutation. This is **not** acknowledgement of an earlier uncertain operation. |
 | `unsupported` | Selected lineage has no trustworthy native generation. No mutation, no fallback writer or legacy clear. Capability absent is also unsupported at the host boundary. |

@@ -1,9 +1,11 @@
 - Compression-quarantine appends, family-progress writes and checkpoint
   hygiene stay bound to the branch the caller checked, across reentrant store
-  reads, so stale work can no longer write an old branch's holds or progress
-  into a branch that is initializing. Progress sync stays on the store that
-  received the write, and branch guards recheck the strategy generation after
-  reentrant branch lookups. No new locks or cross-process guarantees.
+  reads and branch changes the manager tracks or its branch reads observe, so
+  stale work can no longer write an old branch's holds or progress into a
+  branch that is initializing. A store adapter that hides raw handle switches
+  can still redirect those writes and the release's post-write reread.
+  Progress sync stays on the store that received the write, and branch guards
+  recheck the strategy generation after reentrant branch lookups. No new locks or cross-process guarantees.
 - Topology repair no longer reads or warns about a legacy quarantine snapshot
   that a checkpoint superseded, or one beside a ledger that holds no list.
 - `switchBranch()` and `fork()` invalidate the loaded strategy as soon as the
