@@ -92,6 +92,13 @@ export interface OverBudgetDiagnostics {
    */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /**
+   * Present, and true, where the request limit, not the budget, is the bound
+   * this refusal measured against: what the limit left the window was below
+   * the budget's hard bound, or the limit refused the request outright. A
+   * refusal under a limit without it is the budget's.
+   */
+  requestLimitBound?: true;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
@@ -270,6 +277,9 @@ export class OverBudgetError extends Error {
      *  sites pass their own so a planner/emitter drift refusal doesn't
      *  masquerade as picker exhaustion (it cost a debugging session once). */
     stage?: string;
+    /** What the request is priced at under a request limit, named last in
+     *  the message's list, before any pins and the remedy that ends it. */
+    pricedAt?: string;
   }) {
     const countLabels = {
       'picker-chunks': 'middle picker chunks',
@@ -305,6 +315,7 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         (opts.diagnostics.requestLimitTokens === undefined ? '' : `, request limit=${opts.diagnostics.requestLimitTokens}`) +
         (opts.diagnostics.requestAllowanceTokens === undefined ? '' : `, request allowance=${opts.diagnostics.requestAllowanceTokens}`) +
+        (opts.pricedAt === undefined ? '' : `, priced at ${opts.pricedAt}`) +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across

@@ -1,7 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type { RequestOverhead, SelectOptions } from './types/strategy.js';
 import type { StoredMessage } from './types/index.js';
-import { OverBudgetError } from './adaptive/picker.js';
+import { OverBudgetError, type OverBudgetDiagnostics } from './adaptive/picker.js';
 
 export function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
   const content: ContentBlock[] = [];
@@ -24,10 +24,7 @@ export function refuseUnreadableRequestLimit(opts: Pick<SelectOptions, 'requestL
 
 export type RequestBesidesWindow = { limit: number; reserve: number; overhead: number; injected: number };
 
-const ceilingNote = (ceiling: number | undefined) =>
-  ceiling === undefined ? '' : ` (those two priced at the calibration's ceiling of ${ceiling}, since the multiplier is provisional)`;
-
-export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowance: number; ceiling?: number }): OverBudgetError {
+export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowance: number; pricedAt?: string }): OverBudgetError {
   const besides = parts.reserve + parts.overhead + parts.injected;
   const error = new OverBudgetError({
     budget: parts.limit,
@@ -35,12 +32,12 @@ export function noRoomUnderRequestLimit(parts: RequestBesidesWindow & { allowanc
     stage: 'Request limit',
     diagnostics: {
       headTokens: 0, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned',
-      requestLimitTokens: parts.limit, requestAllowanceTokens: parts.allowance,
+      requestLimitTokens: parts.limit, requestAllowanceTokens: parts.allowance, requestLimitBound: true,
     },
   });
   error.message = `The request limit of ${parts.limit} tokens leaves the window no room: the reply's reserve of ` +
     `${parts.reserve}, the request overhead of ${parts.overhead} and the message injections of ${parts.injected}` +
-    `${ceilingNote(parts.ceiling)} come to ${besides}`;
+    `${parts.pricedAt === undefined ? '' : ` (those two priced at ${parts.pricedAt})`} come to ${besides}`;
   return error;
 }
 
@@ -53,6 +50,7 @@ export function overRequestLimit(parts: RequestBesidesWindow & { window: number 
     diagnostics: {
       headTokens: 0, tailTokens: 0, middleTokens: parts.window, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned',
       requestLimitTokens: parts.limit, requestAllowanceTokens: parts.limit - parts.reserve - parts.overhead - parts.injected,
+      requestLimitBound: true,
     },
   });
   error.message = `The compiled request would hold ${total} tokens, over its limit of ${parts.limit}: the window ` +
@@ -61,18 +59,21 @@ export function overRequestLimit(parts: RequestBesidesWindow & { window: number 
   return error;
 }
 
+export type LimitBound = Required<Pick<OverBudgetDiagnostics, 'requestLimitTokens' | 'requestAllowanceTokens' | 'requestLimitBound'>>;
+
 export function roomUnderRequestLimit(
   store: { estimateTokens(message: StoredMessage): number },
   reserve: number,
   room: number,
   opts: SelectOptions | undefined,
-): number {
+): { room: number; limitBound?: LimitBound } {
   const limit = opts?.requestLimitTokens;
-  if (limit === undefined || !opts?.requestOverhead) return room;
+  if (limit === undefined || !opts?.requestOverhead) return { room };
   const price = (content: ContentBlock[]) => (content.length > 0 ? store.estimateTokens({ content } as unknown as StoredMessage) : 0);
   const overhead = price(requestOverheadContent(opts.requestOverhead));
   const injected = (opts.messageInjections ?? []).reduce((n, content) => n + price([...content]), 0);
   const allowance = Math.floor(limit - reserve - overhead - injected);
   if (allowance <= 0) throw noRoomUnderRequestLimit({ limit, reserve, overhead, injected, allowance });
-  return Math.min(room, allowance);
+  if (allowance >= room) return { room };
+  return { room: allowance, limitBound: { requestLimitTokens: limit, requestAllowanceTokens: allowance, requestLimitBound: true } };
 }
