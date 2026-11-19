@@ -4568,8 +4568,12 @@ export class ContextManager {
 
   // ==========================================================================
   // External memories: text written outside the strategy's compression calls
-  // (see AutobiographicalStrategy). For a resident that isn't running: none
-  // of these waits for, or holds off, compression in flight.
+  // (see AutobiographicalStrategy). For a resident that isn't running: call
+  // them only with no tick, compression or other such call in progress on
+  // this manager. None of them waits for, holds off or is kept apart from
+  // compression in flight, whose summaries would take the work's stamp, and
+  // none is checked again after a branch switch or a strategy replaced
+  // while it waited.
   // ==========================================================================
 
   private externalMemoryStrategy(operation: string): ExternalMemoryStrategy {

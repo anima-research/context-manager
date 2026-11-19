@@ -3129,7 +3129,9 @@ export interface SummaryTextEdit {
 
 /**
  * Strategy that takes memory text written outside its own compression calls.
- * Implemented by AutobiographicalStrategy and its subclasses.
+ * Implemented by AutobiographicalStrategy and its subclasses. The methods
+ * are for a strategy with no tick or other compression in progress: nothing
+ * keeps their work apart from compression running beside it.
  */
 export interface ExternalMemoryStrategy extends ContextStrategy {
   exportMemoryRequest(target: MemoryWorkTarget, ctx: StrategyContext): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }>;

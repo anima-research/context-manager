@@ -36,35 +36,39 @@
  *   the first queued merge into it that would still run; the group the merge
  *   check would queue now. `--chunk <id>` is the L1 of a chunk record no L1
  *   covers yet, quarantined or not. The request is the resident's only under
- *   its settings: --model and --participant, --recipe for its strategy
- *   options and system prompt, --tools-log for its tool definitions, all as
- *   drain-autobiographical reads them.
+ *   its settings: --model and --participant, --tools-log for its tool
+ *   definitions, and --recipe for its system prompt and for the strategy
+ *   options resident-settings.ts reads from `agent.strategy` (an option it
+ *   doesn't read keeps the strategy's default, whatever the recipe says),
+ *   all as drain-autobiographical reads them.
  *
  * import installs the text of --body-file as the summary of the work in
  * --descriptor (the file export-request wrote). It is refused unless the
  * strategy, under the same settings, would do that same work now and builds
  * the same request for it: a text written for a request whose history or
  * recalled memories have changed since (another import or an edit landed,
- * the resident ran) isn't its answer, and the request is exported again.
- * A dry run builds the request and makes the same checks. The text is
- * stored as the file holds it, less the whitespace that ends it (so for
- * `edit`): nothing is read out of it or stripped from it, and the line
- * printed gives the length and sha256 of what is stored. It
- * takes the place of the provider's answer, so the summary is written as a
- * native one is, its sources parented, its chunk record marked and the
- * quarantine of its chunk or merge paid off, and the merge check runs after
- * it as after any summary. It carries no reasoning and no `provenance`,
- * which records a model's answer: `external` ({ by, at, note, requestHash })
- * records who supplied it and the request it answers.
+ * the resident ran) isn't its answer, and the request is exported again. A
+ * dry run builds the request and makes the same checks. The text takes the
+ * place of the provider's answer, so the summary is written as a native one
+ * is, its sources parented, its chunk record marked and the quarantine of
+ * its chunk or merge paid off, and the merge check runs after it as after
+ * any summary. It carries no reasoning and no `provenance`, which records a
+ * model's answer: `external` ({ by, at, note, requestHash }) records who
+ * supplied it and the request it answers.
  *
  * edit replaces the text of one summary by id: lineage untouched, tokens
  * stamped from the new text, `external` ({ by, at, note }) set, and what
  * described the call that wrote the old text dropped (its verbatim response
  * blocks, its `provenance`, its split-stitch record). It prints the old
- * text's sha256 and length, and the summaries merged
- * over the old text, which it leaves as they are. The store's history keeps
- * the old text: the line printed after an applied edit names the sequence
- * to read the summaries state at (chronicle's getStateJsonAt).
+ * text's sha256 and length, and the summaries merged over the old text,
+ * which it leaves as they are. The store's history keeps the old text: the
+ * line printed after an applied edit names the sequence to read the
+ * summaries state at (chronicle's getStateJsonAt).
+ *
+ * For both, the text stored is the body file's, less the whitespace that
+ * ends it: nothing is read out of it or stripped from it (a model's answer
+ * loses a leading <thinking> wrapper; this text doesn't), and the line
+ * printed gives the length and sha256 of what is stored.
  *
  * The store is opened audit-only (no frontier chunking), under a lock, and
  * the open still writes what any audit-only open does (see `auditOnly`),

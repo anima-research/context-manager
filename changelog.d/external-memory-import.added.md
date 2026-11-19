@@ -37,5 +37,6 @@
   `editSummaryText`, over the strategy's methods of the same names
   (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,
   `MemoryWorkTarget`, `ExternalMemoryProvenance` and `SummaryTextEdit`. They
-  are for a resident that isn't running: none waits for compression in
-  flight.
+  are for a resident that isn't running, called with no tick or other
+  compression in progress on the manager: none waits for compression in
+  flight, or is kept apart from it.

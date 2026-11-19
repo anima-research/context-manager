@@ -32,7 +32,13 @@ const passthroughKeys = [
   'witnessedInstruction',
 ] as const;
 
-/** The strategy options of a resident with this recipe strategy, model and participant. */
+/**
+ * The strategy options offline tooling opens a store with, for a resident
+ * with this recipe strategy, model and participant: the recipe's options
+ * named in `passthroughKeys`, and the windows and thresholds below with the
+ * defaults given. An option of the recipe that isn't read here keeps the
+ * strategy's own default.
+ */
 export function residentStrategyOptions(
   recipeStrategy: Record<string, unknown>,
   model: string,
