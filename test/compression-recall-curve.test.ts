@@ -4471,6 +4471,7 @@ describe('tool-prose hoist admission', () => {
         assert.equal(fx.target.compressed, true);
         const memory = fx.strategy.summariesView().find(entry => entry.content.includes('first memory'));
         assert.ok(memory, 'the raw thinking-only fold does not prevent stitching');
+        // Pins existing extraction behavior; a future fix may remove non-leading thinking blocks.
         assert.equal(memory.content.includes(hidden), !thinkingFirst,
           'post-stitch extraction removes only a leading thinking block; fold acceptance is unchanged');
       } finally { fx.manager.close(); }
@@ -4707,21 +4708,23 @@ describe('tool-prose hoist admission', () => {
                 : [{ stop: 'refusal' }, finish];
               const control = flexibleMembrane(handlers);
               const probe = flexibleMembrane(handlers);
-              const a = await fixture(control.membrane, options(kind, budget));
-              const b = await fixture(probe.membrane, options(kind, budget));
-              if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
-              let diagnostics = 0;
-              const warnings: string[] = [];
+              let controlFixture: Fixture | undefined;
+              let probeFixture: Fixture | undefined;
               const warn = console.warn;
-              const seam = b.strategy as unknown as { compressionAdmissionTrace: (...args: unknown[]) => unknown };
-              assert.equal(Object.hasOwn(seam, 'compressionAdmissionTrace'), false, 'the seam is a prototype method');
-              const original = seam.compressionAdmissionTrace;
-              seam.compressionAdmissionTrace = function (...args) {
-                diagnostics++;
-                if (mode === 'diagnostic') throw new Error('diagnostic failed');
-                return original.apply(this, args);
-              };
               try {
+                const a = controlFixture = await fixture(control.membrane, options(kind, budget));
+                const b = probeFixture = await fixture(probe.membrane, options(kind, budget));
+                if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
+                let diagnostics = 0;
+                const warnings: string[] = [];
+                const seam = b.strategy as unknown as { compressionAdmissionTrace: (...args: unknown[]) => unknown };
+                assert.equal(Object.hasOwn(seam, 'compressionAdmissionTrace'), false, 'the seam is a prototype method');
+                const original = seam.compressionAdmissionTrace;
+                seam.compressionAdmissionTrace = function (...args) {
+                  diagnostics++;
+                  if (mode === 'diagnostic') throw new Error('diagnostic failed');
+                  return original.apply(this, args);
+                };
                 console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
                 delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
                 await seedFailureRun(a, control.membrane, kind);
@@ -4775,7 +4778,11 @@ describe('tool-prose hoist admission', () => {
                   assert.ok(warnings.some(w => w.includes(`compression log write failed: event=compression:curve-attempt rung=${label(kind)} chunk=`)));
                   assert.equal(warnings.some(w => w.includes('compression admission diagnostic failed:')), false);
                 } else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
-              } finally { console.warn = warn; a.manager.close(); b.manager.close(); }
+              } finally {
+                console.warn = warn;
+                controlFixture?.manager.close();
+                probeFixture?.manager.close();
+              }
             }
           }
         } finally {
@@ -4839,7 +4846,7 @@ describe('tool-prose hoist admission', () => {
     }
 
     for (const throwBeforeDispatch of [false, true]) {
-      it(throwBeforeDispatch ? 'a pre-dispatch stripped serializer failure cannot prevent dispatch'
+      it(throwBeforeDispatch ? 'a stripped retry does not serialize the stripped request before dispatch'
         : 'a successful stripped retry with logging off serializes only for its trace', async () => {
         const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
         const stringify = JSON.stringify;
@@ -5270,6 +5277,9 @@ describe('tool-prose hoist admission', () => {
             const expected = stopReason === 'refusal' ? 'refusal' : 'incomplete';
             assert.equal(trace.outcome, expected);
             assert.equal(exhaustedOutcomes(fx).find(o => o.curveLabel === retryLabel)?.outcome, expected);
+            const incomplete = logs.find(log => log.event === 'compression:canonical-incomplete')?.metadata;
+            assert.equal(incomplete?.curveLabel, 'canonical');
+            assert.equal(incomplete?.outcome, 'incomplete');
           } finally { fx.manager.close(); }
         });
       }

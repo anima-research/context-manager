@@ -1285,6 +1285,7 @@ describe('every rung keeps its own identity across a resume', () => {
       assert.equal(inspections, 8, 'each provider answer reached the failing local inspection');
       assert.equal(mock.calls.length, 9, 'one carrier rejection, then eight stripped answers');
       assert.ok(carriesThinking(mock.calls[0]!) && mock.calls.slice(1).every(request => !carriesThinking(request)));
+      // Pin current reuse accounting, not a guarantee that local failures should never accumulate.
       assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
         key: runKey(fx.target().messages, 'canonical', false), failures: 1,
       }], 'each reused carrier rejection restarts the shared unstripped run');

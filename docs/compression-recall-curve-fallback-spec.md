@@ -307,14 +307,21 @@ raw text the fold accepts, not text after summary extraction: empty raw text is 
 text is `success`, including `<thinking>hidden</thinking>` alone when wrapper
 recovery is disabled. That thinking-only part is accepted into the raw fold. This is existing fold behavior, not a change to
 acceptance; the stitched summary is still extracted before persistence.
-Failure-run reset ordering matches main: a carrier rejection's progress write
-precedes the unstripped-key reset; L1 lane resume precedes the answered request's
-reset; merge resume precedes the caller's reset on completion. Local failures
-still share provider-run identities, so a throwing resumed-warning sink after
-successful unstripped answers accumulates failures when other compression lands
-between retries and reaches the persistent bound. This diagnostic trace does not
-change that retry accounting. Split parts end only their part keys after resume;
-the enclosing split-stitch run ends on whole-fold completion, not a part's answer.
+Stripped-versus-unstripped attribution of counted failures is per attempt,
+independent of logging. The flag starts clear, is set at stripped dispatch,
+stays set through rejection handling, and clears when the stripped call
+answers. A counted failure uses the stripped run key only while the flag is
+set, which can include a local exception while handling the rejection. A
+counted local failure after the answer uses the rung's unstripped key.
+Deterministic provider rejections go straight to `noteOutcome`, ending the
+rung's failure runs, and aborts start none. This replaces the previous
+module-level map keyed by the thrown error for stripped attribution:
+concurrent attempts that share an error object no longer overwrite each other's
+stripped attribution, and primitive errors are attributed too. This can affect
+retry counts and when persistent failures contribute to quarantine. Attribution
+of the dispatched model is separate and still keyed by error object. Split
+parts end only their part keys after resume; the enclosing split-stitch run
+ends on whole-fold completion, not a part's answer.
 Canonical and plain-prose end-turn answers are not success until extraction
 succeeds; extraction errors are logged as `provider_error` / `malformed_content`.
 Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)
