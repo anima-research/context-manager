@@ -147,6 +147,7 @@ describe('the carry rule, in the merge check', () => {
       provenance: { stopReason: 'end_turn', requestHash: 'h-s', model: 'mock' },
     });
     p.check();
+    assert.deepEqual(p.carriedFrom('s').map((c) => c.level), [4, 5], 'premise: it is carried, so the loop below reads two entries');
     for (const carried of p.carriedFrom('s')) {
       assert.equal(carried.content, 'memory s');
       assert.deepEqual(carried.responseContent, responseContent);
@@ -258,12 +259,20 @@ describe('the carry rule, in the merge check', () => {
     p.check();
     assert.deepEqual(p.carriedFrom('s'), []);
 
-    const stale = new Probe({ carryStrandedSummaries: true }).lay([['A', 2, 4], ['s', 1, 2], ['B', 2, 4], ['n2', 2, 4], ['n1', 1, 2]]);
-    // Chunk records name every L1 but s: s is a generation another L1 replaced.
-    (stale as unknown as { chunks: unknown[] }).chunks = stale.all.filter((x) => x.level === 1 && x.id !== 's')
-      .map((l1) => ({ messages: l1.sourceIds.map((id) => ({ id })), compressed: true, summaryId: l1.id }));
-    stale.check();
-    assert.deepEqual(stale.carriedFrom('s'), []);
+    // s2 is a later L1 over s's two messages, and `owner` the L1 their chunk record names.
+    const generations = (owner: 's' | 's2'): Probe => {
+      const laid = new Probe({ carryStrandedSummaries: true }).lay([['A', 2, 4], ['s', 1, 2], ['B', 2, 4], ['n2', 2, 4], ['n1', 1, 2]]);
+      // Beside s in the list: with no store listing, the chunk records' order is the messages' order.
+      laid.all.splice(laid.all.indexOf(laid.get('s')) + 1, 0, { ...structuredClone(laid.get('s')), id: 's2', content: 'memory s2' });
+      (laid as unknown as { chunks: unknown[] }).chunks = laid.all.filter((x) => x.level === 1 && x.id !== (owner === 's' ? 's2' : 's'))
+        .map((l1) => ({ messages: l1.sourceIds.map((id) => ({ id })), compressed: true, summaryId: l1.id }));
+      laid.check();
+      return laid;
+    };
+    const stale = generations('s2');
+    assert.deepEqual(stale.carriedFrom('s2').map((c) => c.level), [2], 'premise: the span is placed, and the L1 its chunk record names is carried');
+    assert.deepEqual(stale.carriedFrom('s'), [], 'the generation that L1 replaced stands for no message, and is not');
+    assert.deepEqual(generations('s').carriedFrom('s').map((c) => c.level), [2], 'control: s is carried where the record names it');
   });
 
   it('carries nothing the store holds differently: a summary another instance sharing it has parented or dropped', () => {
@@ -401,7 +410,7 @@ async function opened(config: Record<string, unknown>, membrane: unknown, path =
   };
   const settle = async (): Promise<void> => {
     for (let guard = 0; guard < 50 && (lane.mergeQueue.length > 0 || lane.compressionQueue.length > 0 || lane.mergePicksWaiting); guard++) await manager.tick();
-    assert.deepEqual([lane.mergeQueue.length, lane.compressionQueue.length], [0, 0], 'premise: the queues ran dry');
+    assert.deepEqual([lane.mergeQueue.length, lane.compressionQueue.length, lane.mergePicksWaiting], [0, 0, false], 'premise: the queues ran dry, and no pick waits');
   };
   return { strategy, manager, lane, settle };
 }
@@ -736,6 +745,7 @@ describe('the preview, previewCarries()', () => {
     const lane = strategy as unknown as { summaries: SummaryEntry[]; mergeQueue: unknown[]; mergePicksWaiting: boolean };
     try {
       for (let guard = 0; guard < 50 && (lane.mergeQueue.length > 0 || lane.mergePicksWaiting); guard++) await manager.tick();
+      assert.deepEqual([lane.mergeQueue.length, lane.mergePicksWaiting], [0, false], 'premise: the drain ran dry');
       const actual = happened(before, lane.summaries);
       assert.deepEqual(named(steps, actual), actual);
       assert.equal(live.requests.length, 1);
@@ -821,6 +831,7 @@ describe('the rebuild plan and a drain, with the option on', () => {
     const lane = strategy as unknown as { summaries: SummaryEntry[]; mergeQueue: unknown[]; mergePicksWaiting: boolean };
     try {
       for (let guard = 0; guard < 50 && (lane.mergeQueue.length > 0 || lane.mergePicksWaiting); guard++) await manager.tick();
+      assert.deepEqual([lane.mergeQueue.length, lane.mergePicksWaiting], [0, false], 'premise: the drain ran dry');
       const top = lane.summaries.filter((x) => !x.mergedInto && !x.parentId);
       assert.deepEqual(top.map((x) => [x.level, x.sourceIds.length]), [[6, 3]], 'one L6 over A, what s became, and B');
       assert.equal(live.requests.length, 1);
