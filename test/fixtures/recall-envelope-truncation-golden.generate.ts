@@ -27,6 +27,29 @@
  * turn the old one left folded, cut the same way. The four hierarchical cases
  * are byte-identical.
  *
+ * It was captured again, on purpose, when the cap began keeping a message's
+ * head and tail around one marker naming the stored message or summary,
+ * found by the strategy's own estimate, and never cutting a message to
+ * something longer than its whole. Every cap here but
+ * `hierarchicalCombinedUncut`'s is smaller than that marker. So a raw turn the cap cuts, every one of the adaptive renders',
+ * renders as the marker alone, where it rendered its first characters and
+ * the old suffix. Every summary here, and every raw turn of the
+ * hierarchical renders, is no longer than its marker, so it renders whole,
+ * where it was cut. The adaptive renders fold differently, since a capped
+ * raw turn is priced as its marker: `adaptive` keeps 26 raw turns beside one
+ * recall pair, where it kept 22 beside two, and `adaptiveTightCap` keeps six
+ * raw turns beside two pairs, where it kept six beside four. The combined
+ * cases at caps of 12 and 1 are gone: with every summary whole they render
+ * as `hierarchicalCombinedUncut` does, and test/combined-recall-answer.test.ts
+ * pins the combined answer at a cap of 1, and its cuts with longer summaries.
+ * So since this capture no summary here is cut, and this golden no longer sees
+ * the envelope's cut-then-wrap order. test/combined-recall-answer.test.ts pins
+ * it: each long summary's head, marker and tail inside one whole envelope, on
+ * the positioned, combined and adaptive paths.
+ *
+ * `hierarchicalCombinedUncut` pins a combined answer the cap cuts nothing
+ * from.
+ *
  *   npm run build && node dist/test/fixtures/recall-envelope-truncation-golden.generate.js
  */
 

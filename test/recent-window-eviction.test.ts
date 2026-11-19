@@ -111,7 +111,7 @@ describe('Recent window newest-first eviction (postmortem bug A)', () => {
     manager.close();
   });
 
-  it('truncates a bloated combined-summaries answer entry to the configured cap', async () => {
+  it('cuts a bloated recall answer to the configured cap', async () => {
     cleanup();
 
     const MSG_CAP = 200; // tokens
@@ -160,8 +160,9 @@ describe('Recent window newest-first eviction (postmortem bug A)', () => {
       .map(b => b.text)
       .join('');
 
-    // truncateContent caps at maxTokens * 4 chars and appends a marker.
-    // Allow some slack for the marker text.
+    // The cut keeps a head and a tail that fit the cap with the marker, by the
+    // strategy's estimate of four characters a token per block, rounded up,
+    // so the answer's text is at most MSG_CAP * 4 characters. Allow some slack.
     const expectedMaxChars = MSG_CAP * 4 + 200;
     assert.ok(
       answerText.length <= expectedMaxChars,

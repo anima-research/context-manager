@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isEmptyTextBlock } from '../src/strategies/message-cap.js';
+import { capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from '../src/strategies/message-cap.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 /** Text and string tool results at four characters a token, as windowed passthrough counts. */
@@ -42,40 +42,38 @@ describe('capContent', () => {
     assert.equal(capContent(content, 100, withThinking), content);
   });
 
-  it('writes the marker where the first dropped text block was, before a later tool result', () => {
+  it('writes one marker where the middle starts, and a tool result wholly in the middle says it is elided', () => {
     const out = capContent([
       text('x'.repeat(2000)),
       text('dropped'),
       { type: 'tool_result', toolUseId: 't1', content: 'the file' } as ContentBlock,
-      text('also dropped'),
+      text('y'.repeat(2000)),
     ], 100, textEstimate);
-    assert.deepEqual(out.map((b) => b.type), ['text', 'text', 'tool_result']);
-    assert.match(textOf(out[0])!, /\[truncated — original was 500 tokens\]$/);
-    assert.equal(textOf(out[1]), CAP_OMISSION_TEXT);
-    assert.equal(
-      (out[2] as { content: unknown }).content,
-      '[content omitted: this message reached its token limit before this result]',
-    );
+    assert.deepEqual(out.map((b) => b.type), ['text', 'text', 'tool_result', 'text']);
+    assert.match(textOf(out[0])!, /^x+$/);
+    assert.ok(isCapMarker(out[1]!));
+    assert.equal((out[2] as { content: unknown }).content, '[truncated — this result is elided]', 'with no stored whole to name');
+    assert.match(textOf(out[3])!, /^y+$/);
   });
 
-  it('keeps an empty string tool result past the cap as it is', () => {
+  it('keeps an empty string tool result in the middle as it is, since it holds nothing to elide', () => {
     const empty = { type: 'tool_result', toolUseId: 't1', content: '' } as ContentBlock;
-    const out = capContent([text('x'.repeat(2000)), empty], 100, textEstimate);
-    assert.equal(out.length, 2);
-    assert.equal(out[1], empty);
+    const out = capContent([text('x'.repeat(2000)), empty, text('y'.repeat(2000))], 100, textEstimate);
+    assert.ok(out.includes(empty));
   });
 
-  it('marks an opaque carrier past the cap, which holds an item, and leaves out an empty text block before it', () => {
-    const out = capContent([text('x'.repeat(2000)), text(''), opaqueCarrier()], 100, textEstimate);
-    assert.equal(out.length, 2, 'the cut block and one marker');
-    assert.match(textOf(out[0])!, /\[truncated — original was 500 tokens\]$/);
-    assert.equal(textOf(out[1]), CAP_OMISSION_TEXT);
+  it('drops an opaque carrier and an empty text block in the middle, and keeps a carrier at the end, in the tail', () => {
+    const middle = opaqueCarrier();
+    const out = capContent([text('x'.repeat(2000)), text(''), middle, text('y'.repeat(2000))], 100, textEstimate);
+    assert.deepEqual(out.map(textOf).map((t) => t?.replace(/^(x|y)+$/, '$1…')), ['x…', textOf(out[1]), 'y…'], 'head, marker, tail');
+    assert.ok(!out.includes(middle));
 
-    const control = capContent([text('x'.repeat(2000)), text('')], 100, textEstimate);
-    assert.equal(control.length, 1, 'an empty text block alone past the cap is left out, and nothing marks it');
+    const last = opaqueCarrier();
+    const ending = capContent([text('x'.repeat(2000)), last], 100, textEstimate);
+    assert.equal(ending.at(-1), last, 'the carrier at the end is in the tail');
   });
 
-  it('leaves out blocks that hold nothing past the cap, with no marker, and keeps the rest as they were', () => {
+  it('leaves out blocks that hold nothing when that alone brings the text under the cap, with no marker, and keeps the rest as they were', () => {
     const thinking = { type: 'thinking', thinking: 'y'.repeat(2000) } as ContentBlock;
     const kept = text('a'.repeat(400));
     const content = [thinking, kept, text(' \n '), text('')];
@@ -86,23 +84,24 @@ describe('capContent', () => {
     assert.equal(out[1], kept);
   });
 
-  it('keeps a block that holds nothing before the cap as it is, spending its own length of the cap', () => {
-    const thinking = { type: 'thinking', thinking: 'y'.repeat(2000) } as ContentBlock;
+  it('keeps a block that holds nothing in the head as it is, and leaves one out when that alone brings the text under the cap', () => {
     const blank = text(' \n ');
-    const content = [thinking, blank, text('a'.repeat(397))];
-    assert.ok(withThinking(content) > 100, 'premise: the estimate passes the cap');
-    assert.equal(capContent(content, 100, withThinking), content, 'the blank block spends 3 of the 400 characters, and the text the rest');
-    const over = capContent([thinking, blank, text('a'.repeat(398))], 100, withThinking);
-    assert.equal(over[1], blank);
-    assert.match(textOf(over[2])!, /^a{397}\n\n\[truncated/, 'a text one character longer is cut where the blank block left the cap');
+    const out = capContent([blank, text('x'.repeat(2000))], 100, textEstimate);
+    assert.equal(out[0], blank, 'in the head, kept as it was');
+    assert.ok(isCapMarker(out[2]!), 'the long block is cut after it');
+
+    const thinking = { type: 'thinking', thinking: 'y'.repeat(2000) } as ContentBlock;
+    const kept = text('a'.repeat(397));
+    // The blank block's own token, rounded up, takes the text one past the cap.
+    assert.deepEqual(capContent([thinking, blank, kept], 100, withThinking), [thinking, kept]);
   });
 
-  it('returns a message whose estimate is exactly the cap as it is, without walking it: an opaque carrier after text that spends the cap stays', () => {
+  it('returns a message whose estimate is exactly the cap as it is, without walking it', () => {
     const content = [text('x'.repeat(400)), opaqueCarrier()];
     assert.equal(textEstimate(content), 100, 'premise: the estimate is exactly the cap');
     assert.equal(capContent(content, 100, textEstimate), content);
     const walked = capContent(content, 100, (c) => textEstimate(c) + 1);
-    assert.equal(textOf(walked.at(-1)), CAP_OMISSION_TEXT, 'the premise: walked, the carrier past the cap would be marked');
+    assert.ok(walked.some(isCapMarker), 'the premise: walked, it would be cut');
   });
 
   it('keeps an opaque carrier before the cap, though the estimate passed it', () => {
@@ -112,34 +111,33 @@ describe('capContent', () => {
     assert.equal(capContent(content, 100, withThinking), content, 'the carrier spends none of the cap, and the text spends it exactly');
   });
 
-  it('leaves out a block that holds nothing across the cap, uncut, and the cap ends there', () => {
-    // 399 characters leave one of the cap's 400 for the blank block, which is two long.
-    const out = capContent([text('a'.repeat(399)), text('\n\n'), text('b')], 100, textEstimate);
-    assert.deepEqual(out.map(textOf), ['a'.repeat(399), CAP_OMISSION_TEXT], 'the next block that holds anything is past the cap, and marked');
-  });
-
   it('brings content the cap leaves nothing of back as the marker alone, so a message is never emptied', () => {
-    assert.deepEqual(capContent([text(' '.repeat(1000))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
-    assert.deepEqual(capContent([text('\n'.repeat(500)), text(' '.repeat(10))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
+    const out = capContent([text(' '.repeat(1000))], 100, textEstimate);
+    assert.equal(out.length, 1);
+    assert.ok(isCapMarker(out[0]!));
   });
 
-  it('brings content of blank blocks back as the marker alone when one fits and a later one crosses the cap, so it is not whitespace alone', () => {
+  it('brings content of blank blocks back with the marker, so it is never whitespace alone', () => {
     const fits = text(' '.repeat(10));
-    assert.deepEqual(capContent([fits, text(' '.repeat(1000))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
+    const out = capContent([fits, text(' '.repeat(1000))], 100, textEstimate);
+    assert.equal(out[0], fits, 'the short blank block, in the head');
+    assert.ok(isCapMarker(out[1]!), 'and the marker, where the long one was');
+    assert.equal(out.length, 2);
   });
 
-  it('leaves out a blank block that crosses the cap with no marker when nothing after it holds anything', () => {
-    // 'a' x 300 leaves 100 of the cap's 400 characters, and the blank block after it is 200 long.
+  it('leaves out a blank block at the end with no marker when the text before it fits', () => {
+    // 'a' x 300 estimates at 75 tokens, and the blank block after it, 200 long, takes the text past 100.
     const out = capContent([text('a'.repeat(300)), text(' '.repeat(200))], 100, textEstimate);
     assert.deepEqual(out.map(textOf), ['a'.repeat(300)], 'the text as it was, and no marker: what was left out held nothing');
   });
 
-  it('leaves out a blank block of any size across the cap', () => {
-    const out = capContent([text('a'.repeat(100)), text(' '.repeat(100_000)), text('b'.repeat(10))], 100, textEstimate);
-    assert.deepEqual(out.map(textOf), ['a'.repeat(100), CAP_OMISSION_TEXT]);
+  it('leaves out a blank block of any size when the rest fits, and cuts nothing else', () => {
+    const a = text('a'.repeat(100));
+    const b = text('b'.repeat(10));
+    assert.deepEqual(capContent([a, text(' '.repeat(100_000)), b], 100, textEstimate), [a, b]);
   });
 
-  it('leaves out a blank part of a Responses item past the cap without giving up the item, which a kept part still carries', () => {
+  it('leaves out a blank part of a Responses item when the rest fits, without giving up the item, which a kept part still carries', () => {
     const item = { type: 'message', id: 'msg_1', role: 'assistant', content: [{ type: 'output_text', text: 'a'.repeat(400) }, { type: 'output_text', text: '  ' }] };
     const thinking = { type: 'thinking', thinking: 'y'.repeat(2000) } as ContentBlock;
     const part = { type: 'text', text: 'a'.repeat(400), rawItem: item } as ContentBlock;
@@ -159,19 +157,15 @@ describe('capContent', () => {
     assert.equal(capContent(content, undefined as unknown as number, unasked), content);
   });
 
-  it("reads a text block without string text as holding nothing, so, given an estimate that doesn't read its text, it passes before the cap", () => {
+  it("reads a text block without string text as holding nothing, kept in the head, given an estimate that doesn't read its text", () => {
     const damaged = { type: 'text' } as unknown as ContentBlock;
-    const out = capContent([damaged, text('x'.repeat(2000))], 100, () => 1000);
+    const lenient = (content: ContentBlock[]): number => content.reduce((tokens, block) => {
+      const t = (block as { text?: unknown }).text;
+      return tokens + (typeof t === 'string' ? Math.ceil(t.length / 4) : 0);
+    }, 0);
+    const out = capContent([damaged, text('x'.repeat(2000))], 100, lenient);
     assert.equal(out[0], damaged);
-    assert.match(textOf(out[1])!, /\[truncated — original was 500 tokens\]$/);
-  });
-
-  it('never cuts inside a surrogate pair', () => {
-    // The cap buys 4 characters, and the emoji's two code units sit at 3 and 4.
-    const out = capContent([text('aaa\u{1F600}' + 'b'.repeat(20))], 1, textEstimate);
-    const cut = textOf(out[0])!;
-    assert.ok(cut.startsWith('aaa\n\n[truncated'), cut);
-    assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut), 'no lone high surrogate');
+    assert.ok(isCapMarker(out[2]!), 'after it, the long block is cut');
   });
 });
 

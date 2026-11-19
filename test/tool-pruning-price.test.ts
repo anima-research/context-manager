@@ -99,8 +99,9 @@ describe('tool pruning, priced as sent', () => {
       const { cm, store } = await open({ ...selector, toolUseInputMaxTokens: 100 });
       const inputOf = (k: number) => ({ path: `f${k}`, body: `${k} ${PROSE}`, mode: 'w', owner: 'me', group: 'us', size: k, tag: 't' });
       cm.addMessage('u', text('write these'));
+      const callers: string[] = [];
       for (let k = 1; k <= 3; k++) {
-        cm.addMessage('a', [call(`w-${k}`, 'write', inputOf(k))]);
+        callers.push(cm.addMessage('a', [call(`w-${k}`, 'write', inputOf(k))]));
         cm.addMessage('u', [result(`w-${k}`, 'written')]);
       }
       cm.addMessage('a', text('ok'));
@@ -112,7 +113,8 @@ describe('tool pruning, priced as sent', () => {
         _truncated: true,
         _originalTokens: Math.ceil(JSON.stringify(inputOf(k)).length / 4),
         _keys: ['path', 'body', 'mode', 'owner', 'group'],
-      })), 'the input is truncated to its size and its first five keys');
+        _whole: `[truncated — this call's input, ${JSON.stringify(inputOf(k)).length} chars, is elided; the whole is stored message ${callers[k - 1]}, call w-${k}]`,
+      })), 'the input is truncated to its size, its first five keys and where its whole is');
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
       cm.close();
     });
@@ -132,23 +134,25 @@ describe('tool pruning, priced as sent', () => {
     });
 
     it(`${name}: replaces a result before the cap would cut it, and prices its marker`, async () => {
-      // Each result is about 2,500 tokens, over a cap of 500: the newest is
-      // cut, and the older ones are sent and priced as their markers. The
-      // first result's message also carries a note after it, which a cap
-      // taken before the replacement would have cut away with the result.
+      // Each result is past a cap of 500: the newest is cut, and the older
+      // ones are sent and priced as their markers. The first result's message
+      // also carries a note after it, about 375 tokens, which fits the cap
+      // beside the marker, and which a cap taken before the replacement would
+      // cut, since a 500-token cut keeps a tail of about 200 tokens.
+      const NOTE = 'a note after the result. '.repeat(60);
       const { cm, store } = await open({ ...selector, toolResultMaxLastN: 1, maxMessageTokens: 500 });
       cm.addMessage('u', text('look these up'));
       cm.addMessage('a', [call('call-1')]);
-      cm.addMessage('u', [result('call-1', `1 ${PROSE}`), { type: 'text', text: 'a note after the result' }]);
+      cm.addMessage('u', [result('call-1', `1 ${PROSE}`), { type: 'text', text: NOTE }]);
       lookups(cm, 2, 2);
       cm.addMessage('a', text('ok'));
       cm.addMessage('u', text('next'));
       const compiled = await cm.compile(BUDGET);
       assert.equal(resultOf(compiled, 'call-1'), MARKER);
-      assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'a note after the result')),
+      assert.ok(compiled.messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === NOTE)),
         'the note after the replaced result is sent whole');
       assert.equal(resultOf(compiled, 'call-2'), MARKER);
-      assert.match(resultOf(compiled, 'call-3')!, /truncated — original was/);
+      assert.match(resultOf(compiled, 'call-3')!, /\[truncated — chars \d+ to \d+ of \d+ elided here; the whole is stored message \S+\]/);
       assert.equal(estimateOf(cm), sentOf(store, compiled), 'the render stats count what goes out');
       cm.close();
     });
@@ -626,6 +630,9 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), false, 'not the earlier call it reuses the id of');
       const big = conversation(1, { body: 'x'.repeat(2_000) });
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 100 }), view(big)), true, 'an input over the cap');
+      const short = conversation(1, { body: 'x'.repeat(60) });
+      assert.equal(reprices(short, at({ toolUseInputMaxTokens: 10 }), view(short)), true,
+        'an input over the cap that is now sent whole, since its stub would be longer: the epoch is about what was sent then');
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 1_000 }), view(big)), false, 'an input under the cap');
     });
   });

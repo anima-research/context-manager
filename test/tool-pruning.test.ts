@@ -108,7 +108,7 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
     await manager.close();
   });
 
-  it('text past maxMessageTokens is dropped with one marker where it began', async () => {
+  it('text past maxMessageTokens keeps its head and tail around one marker, and short blocks at the end stay whole', async () => {
     const strategy = new AutobiographicalStrategy({
       headWindowTokens: 0,
       recentWindowTokens: 100_000,
@@ -118,16 +118,23 @@ describe('AutobiographicalStrategy — tool pruning (gap #4)', () => {
       path: TEST_STORE_PATH,
       strategy,
     });
-    manager.addMessage('user', [
+    const id = manager.addMessage('user', [
       { type: 'text', text: 'x'.repeat(2000) },
       { type: 'text', text: 'second' },
       { type: 'text', text: 'third' },
     ]);
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const texts = compiled.messages.flatMap(m => m.content).map(b => (b as { text?: string }).text);
-    assert.equal(texts.length, 2, 'the cut block and one marker for the two dropped ones');
-    assert.match(String(texts[0]), /\[truncated — original was 500 tokens\]$/);
-    assert.equal(texts[1], '[content omitted: this message reached its token limit]');
+    assert.equal(texts.length, 5, "the long block's head, the marker, its tail, and the two short blocks");
+    assert.match(String(texts[0]), /^x+$/);
+    const marker = /^\[truncated — chars (\d+) to (\d+) of 2011 elided here; the whole is stored message (\S+)\]$/.exec(String(texts[1]));
+    assert.ok(marker, String(texts[1]));
+    assert.equal(marker[3], id, 'the marker names the stored message');
+    const measured = 'x'.repeat(2000) + 'second' + 'third';
+    assert.equal(String(texts[0]) + measured.slice(Number(marker[1]), Number(marker[2])) + String(texts[2]) + 'second' + 'third', measured,
+      'the elided characters are the measured text between the two offsets');
+    assert.match(String(texts[2]), /^x+$/);
+    assert.deepEqual(texts.slice(3), ['second', 'third']);
     await manager.close();
   });
 

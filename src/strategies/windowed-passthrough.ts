@@ -1,6 +1,7 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { describeThrown } from '../describe-thrown.js';
 import type {
+  CapReadHint,
   ContextStrategy,
   ImageCeilings,
   StrategyContext,
@@ -23,7 +24,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { capContent, cappedPriceExtra } from './message-cap.js';
+import { capContent, capMeasuredTextOf, cappedPriceExtra, guardedHint, type CapClause } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
   DEFAULT_IMAGE_BYTE_CEILING,
@@ -68,14 +69,10 @@ export interface WindowedPassthroughOptions {
   anchorStateId?: string;
   /**
    * Per-message token ceiling. Applied HERE to text blocks and string
-   * tool-result content by the truncator the autobiographical strategy uses
-   * (`capContent`): a `[truncated — original was N tokens]` marker on the
-   * block it cuts, and one `[content omitted: this message reached its token
-   * limit]` block where the first text block it drops that held anything
-   * was. A text block that holds nothing (empty or only whitespace) stays as
-   * it is before the cap, and is left out across or past it, and a message
-   * of such blocks alone, one of which the cap leaves out, carries the
-   * omission block alone. It's surfaced as
+   * tool-result content by the cut the autobiographical strategy uses
+   * (`capContent`): a message over it keeps its head and its tail around one
+   * marker naming the characters it elided and the stored message that
+   * holds them, with `capReadHint`'s clause after it. It's surfaced as
    * `ContextStrategy.maxMessageTokens` so the framework's storage-time
    * tool-result clamp mirrors it. Side-process agents should mirror their
    * principal's value so the two see the same truncation policy. Images are
@@ -85,6 +82,9 @@ export interface WindowedPassthroughOptions {
    * budget is refused (see {@link OverBudgetError}).
    */
   maxMessageTokens?: number;
+  /** The host's clause for reading what `maxMessageTokens` leaves out, as
+   *  `AutobiographicalConfig.capReadHint` is. It must be pure. */
+  capReadHint?: CapReadHint;
   /**
    * Live-image policy, mirroring `AutobiographicalConfig`: an image, nested in
    * a tool result or not (see inline-images.ts), is
@@ -230,6 +230,7 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 0;
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
+  private readonly capReadHint?: CapReadHint;
   /** Renders the window raw; history before the anchor is not rendered, but for its system changes. */
   readonly renderedForms = ['raw', 'omitted'] as const;
 
@@ -279,6 +280,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   /** Its namespace, set in initialize(), which its stderr lines name (#239). */
   private ns = '';
   private readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
+  /** `capReadHint`'s clause for a marker, or none where it throws, which is said once. */
+  private readonly capClause: CapClause = guardedHint(() => this.capReadHint, (line, thrown) => this.diag.warn(line, thrown));
   /** The branch (name + generation) the in-memory state was loaded from. */
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
@@ -296,6 +299,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.reAnchorFraction = fraction;
     this.anchorStateIdOverride = options.anchorStateId;
     this.maxMessageTokens = options.maxMessageTokens;
+    this.capReadHint = options.capReadHint;
     this.configuredImageLimits = {
       maxLiveImages: options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0,
       maxLiveImageBytes: options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES,
@@ -705,8 +709,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // plus what the cut adds to it as the store estimates the content sent
     // (cappedPriceExtra). The cut changes text and string results alone,
     // and the store prices the text the cap keeps at its own rates, so the
-    // difference holds the kept text, the suffix, the omission notices and
-    // the marker, and the message's other blocks keep their price, its
+    // difference holds the kept head and tail, the marker and what a string
+    // result in the middle says, and the message's other blocks keep their price, its
     // images at the policy's. A message the truncator leaves whole renders
     // whole and is priced at its estimate after the policy, even past the
     // cap. The two estimates differ: the store's counts every block,
@@ -846,7 +850,21 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    *  cap: the content itself when no cap is set or nothing needs cutting. */
   private cappedContent(msg: StoredMessage): ContentBlock[] {
     const cap = this.maxMessageTokens ?? 0;
-    return cap <= 0 ? msg.content : truncateContent(msg.content, cap);
+    if (cap <= 0) return msg.content;
+    return capContent(msg.content, cap, estimateTextOnlyTokens, {
+      whole: { kind: 'message', id: msg.id },
+      hint: this.capClause,
+    });
+  }
+
+  /** See `ContextStrategy.capMeasuredText`: a message's text blocks and
+   *  string tool results as it's stored, which this strategy sends before
+   *  the cut. Null with `toolUseId`, since this strategy cuts no call's
+   *  input, so no marker it writes names one. */
+  capMeasuredText(store: MessageStoreView, at: { id: string; toolUseId?: string }): string | null {
+    if (at.toolUseId !== undefined) return null;
+    const msg = store.get(at.id as MessageId);
+    return msg ? capMeasuredTextOf(msg.content) : null;
   }
 
   /**
@@ -1148,17 +1166,4 @@ function estimateTextOnlyTokens(content: ContentBlock[]): number {
     }
   }
   return tokens;
-}
-
-/**
- * Cut a message's text and string tool-result content to `maxTokens`, with
- * the truncator the autobiographical strategy uses (`capContent`). This
- * strategy's estimate counts text and string tool results alone, where the
- * autobiographical one also counts thinking and tool calls. The estimate
- * only decides whether the truncator looks: it cuts by the characters of
- * text and string results, and returns the content itself when nothing
- * needs cutting, so the two strategies cap a message alike.
- */
-function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-  return capContent(content, maxTokens, estimateTextOnlyTokens);
 }
