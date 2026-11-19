@@ -1,0 +1,1 @@
+- If a newer initialization starts during branch reconciliation, `switchBranch()` and `fork()` report `InitializationSupersededError` with the original branch and creation flag instead of a branch-name mismatch.

@@ -2822,11 +2822,11 @@ export class ContextManager {
         `${cause instanceof Error ? cause.message : String(cause)}`, { cause },
       );
     }
-    if (requested.name !== name) {
-      throw new Error(`Branch selection requested ${name}, but reconciliation found ${requested.name}; no strategy initialization ran for this selection; recover with switchBranch() or setStrategy()`);
-    }
     if (attempt !== this.initializationAttempt) {
       throw new InitializationSupersededError({ branch: name, created });
+    }
+    if (requested.name !== name) {
+      throw new Error(`Branch selection requested ${name}, but reconciliation found ${requested.name}; no strategy initialization ran for this selection; recover with switchBranch() or setStrategy()`);
     }
     await this.initializeStrategy(requested, { branch: name, created });
   }
