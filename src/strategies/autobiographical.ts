@@ -1126,6 +1126,8 @@ interface CompressionRefusalNormalizedConfig {
   sourceOnlyFallbackRequestHash?: string;
   /** Normalized tool-prose hoist options; absent when the rung is off. */
   toolProseFallback?: ToolProseHoistOptions;
+  /** `compressionFallbackModel`; absent when the rung is off. */
+  fallbackModel?: string;
 }
 
 type CompressionAttemptOutcome =
@@ -1633,6 +1635,8 @@ interface CompressionAttemptTrace {
   errorType?: string;
   admittedTokens?: number;
   budgetTokens?: number;
+  /** The model the attempt was sent to, where it isn't the compression model (the fallback-model rung). */
+  model?: string;
 }
 
 /** What kv-unified's cache check rebuilt at a compile's solve, for the
@@ -2344,7 +2348,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -3662,7 +3666,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     const storedMergeRecords = Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [];
@@ -5198,7 +5202,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // keys in another order than toolProseHoistOptions builds them in
       // (0.5.1 and later keep the written order, chronicle #67).
       canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
+        canonicalJson(record.normalizedConfig.toolProseFallback ?? null) &&
+      // And for the fallback-model rung: naming a model, or another one, is a
+      // request-family change.
+      active.record.normalizedConfig?.fallbackModel === record.normalizedConfig.fallbackModel,
     );
     return projection.get(record.key)
       ?? sameRegime.find((active) => active.record.familyKey === record.familyKey)
@@ -6980,6 +6987,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Conditionally spread: with the rung off the record, its key and its
       // family stay byte-identical to what they were before the rung existed.
       ...(toolProseFallback ? { toolProseFallback } : {}),
+      ...(this.config.compressionFallbackModel ? { fallbackModel: this.config.compressionFallbackModel } : {}),
     };
     const familyKey = sha256Json({
       model,
@@ -7724,7 +7732,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
@@ -7740,10 +7748,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // an intervening rejection had a different stop reason (prevents the
     // raw→refusal→fallback→tool_use→raw oscillation).
     if (rejection.stopReason === 'refusal') merge.hadRefusal = true;
+    if (rejection.outcome !== 'refusal') merge.hadNonRefusal = true;
     const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     // Synced, like the transient path's run write: a crash must not undo the
     // attempt the policy counts, the run's end, or a quarantine.
     if (merge.attempts >= limit) {
+      // Fallback-model rung (compressionFallbackModel): every attempt the
+      // compression model made was refused, so the entry gets one more, which
+      // executeMerge sends as the first attempt's request with only the model
+      // changed. Whatever rejects that one quarantines the group.
+      if (this.config.compressionFallbackModel && !merge.fallbackModel && !merge.hadNonRefusal) {
+        merge.fallbackModel = true;
+        this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+        this.store?.sync();
+        return;
+      }
       this.dequeueMerge();
       this.quarantineMerge(merge, rejection, limit);
       this.store?.sync();
@@ -9155,8 +9174,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // entry wrote nothing.
       let merged = false;
       // executeMerge builds its request before its first await, so this is
-      // the model the call names.
-      const mergeModel = this.config.compressionModel;
+      // the model the call names: the fallback model on that rung.
+      const mergeFallbackModel = merge.fallbackModel === true ? this.config.compressionFallbackModel : undefined;
+      const mergeModel = mergeFallbackModel ?? this.config.compressionModel;
       const mergeMembrane = ctx.membrane;
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
       let mergeToolsDeferred = false;
@@ -9204,6 +9224,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // before the queued L1s, where it did (#415).
           this.diag.warn(
             `[autobiographical] L${merge.level} merge landed over ${merge.sourceIds.length} summaries` +
+              (mergeFallbackModel ? `, written by the fallback model ${mergeFallbackModel}` : '') +
               (mergeTurn ? `, ahead of queued L1 work (${mergeTurn})` : ''),
           );
         }
@@ -12783,6 +12804,66 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
           }
         }
+        // ---- fallback-model rung (compressionFallbackModel) ----
+        // Every rung that keeps the agent's own model writing the memory in
+        // full was refused: send the canonical request once more with only
+        // its model changed. Refusal-gated on the whole ladder so far: a rung
+        // that ended any other way (a provider error, a truncated or empty
+        // generation) keeps the ladder as it was. A recall variant or hoist
+        // that admission kept from being sent answered nothing, and the
+        // transport's rejection of reasoning carriers is followed by the same
+        // rung's stripped request, so neither stands in the way. Its answer is
+        // persisted as any rung's is; the entry's provenance names the model.
+        const fallbackModel = this.config.compressionFallbackModel;
+        if (
+          !fallbackResponse && fallbackModel && canonicalOutcome === 'refusal' &&
+          familyRecord.every((noted) =>
+            noted.outcome === 'refusal' || noted.outcome === 'admission_rejected' || noted.curveLabel.endsWith(':carrier-rejected'))
+        ) {
+          const curveLabel = 'fallback-model';
+          const fallbackModelRequest: NormalizedRequest = { ...request, config: { ...request.config, model: fallbackModel } };
+          const requestHash = sha256Json(fallbackModelRequest);
+          if (!knownOutcomes.has(`${curveLabel}\u0000${requestHash}`)) {
+            this.diag.warn(
+              `[autobiographical] L1 compression of chunk ${chunk.index} refused on every rung by ${model}: ` +
+                `sending the canonical request to compressionFallbackModel ${fallbackModel}`,
+            );
+          }
+          const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
+            fallbackModelRequest, curveLabel, canonicalRecallIds, canonicalRecallLevels, canonicalCoverageHash,
+          ));
+          let rungOutcome: string;
+          if (result.kind === 'decided') {
+            rungOutcome = result.outcome.outcome;
+          } else {
+            const trace = attemptTraces[attemptTraces.length - 1]!;
+            trace.model = fallbackModel;
+            const assessment = this.assessFallbackCompressionResponse(result.response);
+            if (assessment.outcome === 'valid') {
+              trace.outcome = 'success';
+              fallbackResponse = assessment.response;
+              response = assessment.response;
+              successfulTrace = trace;
+            } else {
+              trace.outcome = assessment.outcome;
+              noteOutcome({
+                curveLabel, requestHash, outcome: assessment.outcome,
+                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+              });
+            }
+            rungOutcome = trace.outcome;
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+          }
+          if (result.kind === 'answered' || !result.reused) {
+            this.diag.warn(`[autobiographical] fallback model ${fallbackModel} for chunk ${chunk.index}: ${rungOutcome}`);
+            logCompressionCall({
+              event: 'compression:fallback-model',
+              operation: 'compress_l1',
+              metadata: { quarantine_key: quarantineRecord.key, model, fallback_model: fallbackModel, requestHash, outcome: rungOutcome },
+            }, this.ns);
+          }
+        }
         // ---- split-stitch rung (compressionSplitFallback) ----
         // Last rung before quarantine. Observed 2026-09-05 (princess, Bedrock/Sonnet-4.5):
         // chunks refused whole in every presentation while sub-ranges folded cleanly; the
@@ -13143,10 +13224,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // source-only-final's, which can come after the canonical's incomplete
       // answer. The plain-prose retry below resends the canonical with one
       // more line, which mends neither a refusal nor a truncation, so it
-      // would be a burned call.
+      // would be a burned call. The same holds after the fallback-model rung,
+      // which follows the canonical's refusal.
       const toolProseWonTrace =
         successfulTrace?.curveLabel === 'tool-prose-hoist' ||
-        successfulTrace?.curveLabel === 'source-only-tool-prose-hoist'
+        successfulTrace?.curveLabel === 'source-only-tool-prose-hoist' ||
+        successfulTrace?.curveLabel === 'fallback-model'
           ? successfulTrace
           : undefined;
       const proseRequest = withPlainProseLine(request);
@@ -13329,7 +13412,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               provenance: {
                 stopReason: successfulTrace.stopReason ?? 'end_turn',
                 requestHash: successfulTrace.requestHash,
-                model,
+                // The fallback model, where its rung wrote the memory.
+                model: successfulTrace.model ?? model,
               },
             }
           : {}),
@@ -13367,7 +13451,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The L1 is pushed and its chunk record marked: it has landed, on the
       // branch that compressed it (noted before the await below, which a
       // branch switch may cross).
-      this.noteCompressionLanded(ctx.membrane, model);
+      this.noteCompressionLanded(ctx.membrane, successfulTrace?.model ?? model);
       // Success pays off quarantine debt recorded against this chunk under
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
@@ -13907,8 +13991,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
+    // The fallback-model rung (see recordMergeRejection) sends the request of
+    // a first attempt, so it counts as one for everything an attempt count
+    // changes below.
+    const fallbackModel = this.mergeQueue[0]?.sourceIds === sourceIds && this.mergeQueue[0]?.fallbackModel === true
+      ? this.config.compressionFallbackModel
+      : undefined;
     const mergeAttempts =
-      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
+      !fallbackModel && this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
     const mergeAttemptLimit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     const mergeSourceOnly = this.config.compressionMergeSourceOnly === true ||
       (this.config.compressionMergeSourceOnlyFallback === true &&
@@ -14159,6 +14249,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // fidelity loss only on the degraded retry, and the summaries shown are
     // the agent's own words, so nothing is falsified.
     const refusalFallback =
+      !fallbackModel &&
       this.mergeQueue[0]?.sourceIds === sourceIds &&
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       (this.mergeQueue[0]?.hadRefusal === true ||
@@ -14337,6 +14428,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // this merge is authored under — and a merge re-summarizes summaries,
     // so an omission here compounds upward through every level of the
     // pyramid.
+    const requestModel = fallbackModel ?? this.requireCompressionModel();
+    if (fallbackModel) {
+      this.diag.warn(
+        `[autobiographical] L${targetLevel} merge refused on every attempt by ${this.config.compressionModel}: ` +
+          `sending the first attempt's request to compressionFallbackModel ${fallbackModel}`,
+      );
+      logCompressionCall({
+        event: 'merge:fallback-model',
+        operation: `merge_l${targetLevel}`,
+        metadata: { target_level: targetLevel, source_ids: sourceIds, model: this.config.compressionModel, fallback_model: fallbackModel },
+      }, this.ns);
+    }
     const request: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than
@@ -14362,7 +14465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // must keep its pre-seam shape (canonical hash, quarantine identity).
       ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
-        model: this.requireCompressionModel(),
+        model: requestModel,
         // Generous output ceiling so a memory-write is never truncated mid-thought:
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
@@ -14514,7 +14617,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             stop_reason: stopReason ?? null,
             error_type: errorType ?? null,
             request_hash: requestHash,
-            model: this.requireCompressionModel(),
+            model: requestModel,
           },
         }, this.ns);
         throw new MergeDispositionRejection(
@@ -14579,7 +14682,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         provenance: {
           stopReason: 'end_turn',
           requestHash,
-          model: this.requireCompressionModel(),
+          // The fallback model, where its rung wrote the merge.
+          model: requestModel,
         },
       };
       logNewSummaryId = newEntry.id;
@@ -14606,7 +14710,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: `merge_l${targetLevel}`,
-          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length, summary_id: newEntry.id },
+          metadata: { model: requestModel, source_count: sourceIds.length, summary_id: newEntry.id },
         }, this.ns);
       }
 
@@ -14650,7 +14754,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           source_level: sources[0]?.level ?? null,
           source_level_shown: sourceLevelShown,
           target_tokens: targetTokens,
-          model: this.requireCompressionModel(),
+          model: requestModel,
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
           ...(logWithdrawn ? { withdrawn: true } : {}),

@@ -95,6 +95,7 @@ const passthroughKeys = [
   'compressionSplitPlaceholder',
   'compressionSplitMaxCallsPerChunk',
   'compressionSplitMaxCallsPer10Min',
+  'compressionFallbackModel',
   'compressionRecallBudgetTokens',
   'recoverLiteralThinkingWrappedCompression',
   'mergeHoldSummaryIds',
