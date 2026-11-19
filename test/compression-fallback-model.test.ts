@@ -325,6 +325,20 @@ describe('fallback-model rung: merges', () => {
     await fx.manager.close();
   });
 
+  it("the fallback model's call fails with an overload: the lane pauses on that model, and no tick calls it again inside the pause", async () => {
+    const overload = Object.assign(new Error('zz overloaded'), { type: 'server_error' });
+    const mock = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: overload }] });
+    const fx = await buildMerge(mock.membrane, { compressionFallbackModel: OTHER });
+    await fx.tick(3);
+    await assert.rejects(fx.tick(1), /zz overloaded/);
+    assert.deepEqual(mock.models(), [OWN, OWN, OWN, OTHER]);
+    await fx.tick(3);
+    assert.equal(mock.calls.length, 4, 'the backoff holds the lane: nothing is sent');
+    assert.match(fx.strategy.checkReadiness().description ?? '', /compression paused/, 'and readiness names the pause');
+    assert.equal(fx.strategy.queue().length, 1, 'the merge stays queued for the rung');
+    await fx.manager.close();
+  });
+
   it('option unset: quarantined at the limit with no extra call', async () => {
     const mock = byModel({ [OWN]: [REFUSAL] });
     const fx = await buildMerge(mock.membrane);

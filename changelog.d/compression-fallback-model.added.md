@@ -12,6 +12,10 @@
     provider error or a truncated or empty generation, the ladder runs as
     before, and an overload interrupts it as before. A recall variant that admission kept from
     being sent doesn't stand in the way.
+  - An overload of the fallback model, or any other failure of its call that
+    says nothing about the request, pauses the compression lane as the
+    compression model's does, for the lane's backoff and any wait the
+    provider stated, and the rung is asked again once the pause ends.
   - Its memory is stored as text alone: the reasoning blocks of its answer
     aren't kept (the entry has no `responseContent`), since a memory's
     reasoning is replayed to the agent's model and to the compression model,

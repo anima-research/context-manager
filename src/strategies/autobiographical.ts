@@ -1038,9 +1038,10 @@ interface CompressionFamilyProgress {
 /**
  * In-process pacing of the compression lane after a failure that says
  * nothing about the request (see compressionFailureKind). Scoped to the
- * membrane instance and compression model it was observed on: a different
- * provider or model ignores and clears it. A durable, restart-stable provider
- * deadline is the caller's (agent-framework's provider admission).
+ * membrane instance and model it was observed on, the compression model or
+ * the fallback-model rung's: a different provider or model ignores and clears
+ * it. A durable, restart-stable provider deadline is the caller's
+ * (agent-framework's provider admission).
  */
 interface CompressionLanePause {
   /** The lane's own backoff: 5 s doubling per failure, capped at 10 min. */
@@ -6352,14 +6353,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The compression lane's pause, if one binds this membrane and compression
-   * model now. A pause observed on another membrane instance or model says
-   * nothing about this one, so it is ignored and cleared.
+   * Whether `pause` is on a model the lane calls: the compression model, or
+   * the fallback-model rung's (`compressionFallbackModel`). A failed call to
+   * the fallback model paces the lane as the compression model's does, or
+   * each tick would send that rung's request again, inside the backoff and
+   * the provider's stated wait.
+   */
+  private pauseOnLaneModel(pause: CompressionLanePause): boolean {
+    const fallbackModel = this.config.compressionFallbackModel;
+    return pause.model === this.config.compressionModel || (!!fallbackModel && pause.model === fallbackModel);
+  }
+
+  /**
+   * The compression lane's pause, if one binds this membrane and a model the
+   * lane calls now (pauseOnLaneModel). A pause observed on another membrane
+   * instance or model says nothing about this one, so it is ignored and
+   * cleared.
    */
   private activeCompressionPause(ctx: StrategyContext): CompressionLanePause | null {
     const pause = this.compressionPause;
     if (!pause) return null;
-    if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
+    if (pause.membrane !== ctx.membrane || !this.pauseOnLaneModel(pause)) {
       this.compressionPause = null;
       return null;
     }
@@ -8197,11 +8211,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The pause binds the membrane instance and model of the call that
       // failed. Readiness has no context to name the membrane, so a pause
       // bound to another instance shows until the next tick drops it; one
-      // bound to another model doesn't show. It names what failed last and
-      // its class: how long compression has been behind is
-      // getCompressionDebt's oldest pending age.
+      // bound to a model the lane doesn't call (pauseOnLaneModel) doesn't
+      // show. It names what failed last and its class: how long compression
+      // has been behind is getCompressionDebt's oldest pending age.
       const pause = this.compressionPause &&
-        this.compressionPause.model === this.config.compressionModel &&
+        this.pauseOnLaneModel(this.compressionPause) &&
         Date.now() < pauseUntil(this.compressionPause)
         ? this.compressionPause
         : null;
