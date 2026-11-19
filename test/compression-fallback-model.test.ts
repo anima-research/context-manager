@@ -145,6 +145,8 @@ describe('fallback-model rung: L1', () => {
       assert.equal(rung[0]!.metadata?.model, OWN);
       assert.equal(rung[0]!.metadata?.fallback_model, OTHER);
       assert.equal(rung[0]!.metadata?.outcome, 'success');
+      const receipt = events().find((e) => e.event === undefined && e.metadata?.summary_id === entry.id);
+      assert.equal(receipt?.metadata?.model, OTHER, "the call's receipt names the model that wrote the summary, as the entry does");
       await fx.manager.close();
     });
   });

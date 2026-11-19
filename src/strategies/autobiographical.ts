@@ -13465,7 +13465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: 'compress_l1',
-          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length, summary_id: entry.id },
+          metadata: { model: successfulTrace?.model ?? model, chunk_size: chunk.messages.length, summary_id: entry.id },
         }, this.ns);
       }
       this._compressionCount++;
@@ -13582,7 +13582,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
-          model,
+          // The model whose answer the ladder took: the fallback model where
+          // its rung wrote the summary, as the entry's provenance says.
+          model: successfulTrace?.model ?? model,
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
           ...(logWithdrawn ? { withdrawn: true } : {}),

@@ -28,6 +28,7 @@
     merge quarantine is not retried by it: `clearMergeQuarantine` is.
   - It logs `compression:fallback-model` with the outcome for an L1, and
     `merge:fallback-model` when a merge's rung runs; each attempt's receipt
-    names the model it was sent to.
+    names the model it was sent to, and the receipt that carries the
+    summary's id names the model that wrote it.
   - The memory is then written in the agent's voice by another model, which
     this library never does unless told to: set it knowing that.
