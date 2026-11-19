@@ -2403,6 +2403,56 @@ export interface AutobiographicalConfig {
    */
   mergeHoldSummaryIds?: string[];
   /**
+   * Carry a summary no merge can take up a level, unchanged, until it stands
+   * beside summaries it can merge with. Default false: nothing changes
+   * unless this is set.
+   *
+   * Merges take only neighbours of one level, so a summary left between
+   * higher summaries (a merge-quarantined group cleared after its
+   * neighbours merged, a chunk that landed late, the end of a run before a
+   * hold) never folds deeper, and it parts the runs on its two sides. So
+   * does one left out of merges as too wide for its level
+   * (`mergeMaxSourceSpanMessages`). With this set, the merge check gives
+   * each such summary a parent one level up that is the same memory (its
+   * text, verbatim response blocks and token count), with no model call,
+   * marked `carriedFrom`. At the new level it joins a run and merges as any
+   * summary does, with an ordinary summarizer call over the run, or it is
+   * carried again. It stops at the level of the highest summary beside it.
+   *
+   * A summary is carried only when all of these hold:
+   * - it has no parent, is not in a queued merge, and is not held (an
+   *   operator hold, or the source of a quarantined merge);
+   * - no merge at its level can take it: it is alone in a run that is
+   *   neither the newest nor waiting, as `getStrandedSummaries` lists, or
+   *   its span is too wide for its level;
+   * - an unparented summary of a higher level stands strictly beside it, no
+   *   listed message between them;
+   * - nothing that held-up work could still fill stands between it and the
+   *   summaries beside it: no quarantined chunk, quarantined merge or hold
+   *   (the `beside` of a stranded summary is empty);
+   * - it is the one form of every message from its first to its last: a
+   *   summary with another's messages inside its span, or a superseded L1
+   *   generation, is never carried, so a level's wider span limit never
+   *   lets through what the limit exists to keep out.
+   *
+   * A resident's own merge check reads each level's last run as the newest,
+   * which waits to grow, so a summary alone in it is not carried there. A
+   * drain reads a run with a higher summary after it as one that can't grow
+   * (see `drain-autobiographical`), and carries it. Without speculative
+   * production the check reads L1 and L2 only, and carries only an L1.
+   *
+   * A compile never renders a carried entry: the selects read the summaries
+   * without them, the summary carried standing in the entry's place, so the
+   * agent's window is what it was before the carry until a merge over the
+   * entry lands, and then that merge's summary is the next level its
+   * messages fold to. `searchSummaries` and `listSummariesInRange` read
+   * them the same way. A summarizer request names a carried entry by its
+   * own id, as it names any summary of that level, and answers with the
+   * text of the summary it carries as that stands. `previewCarries` lists
+   * what the rule would do to a store as it stands.
+   */
+  carryStrandedSummaries?: boolean;
+  /**
    * Store-topology policy. On every load the summary archive is audited for
    * crossed ownership: a summary whose leaves are not contiguous among the
    * chunk-owned messages in view order, which is record order in legacy
@@ -2946,7 +2996,9 @@ export type LegacySummaryLevel = 1 | 2 | 3;
  * A summary entry in the hierarchical memory pyramid.
  * L1: compressed from raw message chunks.
  * L_{k>1}: merged from a run of L_{k-1}s: a group from the oldest end of
- * the newest run, or a group of two or more from an older run.
+ * the newest run, or a group of two or more from an older run. Or, marked
+ * `carriedFrom`, one L_{k-1} carried up a level unchanged
+ * (`carryStrandedSummaries`).
  */
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
@@ -2964,7 +3016,13 @@ export interface SummaryEntry {
    * Pre-adaptive code uses 0 | 1 | 2; new code may produce higher values.
    */
   sourceLevel: number;
-  /** IDs of source items (message IDs for L1, summary IDs for L_{k>1}) */
+  /**
+   * IDs of source items (message IDs for L1, summary IDs for L_{k>1}).
+   * `searchSummaries` and `listSummariesInRange` read the summaries past
+   * carried entries (`carriedFrom`): there a source that reached this
+   * summary through carried entries is named in their place, so it can sit
+   * below `sourceLevel`, and its parent more than one level above it.
+   */
   sourceIds: string[];
   /** Range of original message IDs covered */
   sourceRange: { first: string; last: string };
@@ -3050,6 +3108,23 @@ export interface SummaryEntry {
     /** Compression model that authored this summary. */
     model?: string;
   };
+  /**
+   * Set on an entry no summarizer call wrote: the id of the summary one
+   * level down that it carries up unchanged (`carryStrandedSummaries`), its
+   * one source. Its text, `responseContent`, `tokens`, `created` and
+   * `provenance` are that summary's own, copied when it was carried, so
+   * `provenance` names the request that authored the text, at the level it
+   * was written for. The copy is not kept in step with the summary: a
+   * compile and a summarizer request read the text from the summary carried
+   * as it stands, so a repair that rewrites a summary in place edits that
+   * summary, not the entries that carry it.
+   *
+   * The entry is a carry only while that summary is its one source. A
+   * topology repair can give it another (an adoption, a re-homed fragment)
+   * and leaves this field: it then reads as any summary of its level over
+   * the sources it lists.
+   */
+  carriedFrom?: string;
 }
 
 /**
