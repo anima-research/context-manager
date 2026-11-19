@@ -2620,8 +2620,11 @@ export interface AutobiographicalConfig {
    * and before quarantine, for an L1 and for a merge (after the merge's last
    * attempt), and only when every answer so far was a refusal: a provider
    * error, a truncated or empty generation, or an overload is handled as
-   * before. Its memory is stored as any other, and `provenance.model` on the
-   * entry names this model. If it refuses too, the split rung and quarantine
+   * before. Its memory is stored as text alone, without the reasoning blocks
+   * of its answer (`responseContent`), which a memory is otherwise replayed
+   * with: the agent's model and the compression model can't be given
+   * reasoning another model signed. `provenance.model` on the entry names
+   * this model. If it refuses too, the split rung and quarantine
    * follow as before. Setting or changing it is a new request regime for L1
    * compression, so already-quarantined chunks earn a fresh bounded attempt
    * without a manual clear; a quarantined merge still needs

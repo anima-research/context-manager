@@ -12,9 +12,12 @@
     provider error or a truncated or empty generation, the ladder runs as
     before, and an overload interrupts it as before. A recall variant that admission kept from
     being sent doesn't stand in the way.
-  - Its memory is stored as any other, response blocks included, and the
-    entry's existing `provenance.model` names the fallback model. If it
-    refuses too, the split rung (where on) and quarantine follow as before.
+  - Its memory is stored as text alone: the reasoning blocks of its answer
+    aren't kept (the entry has no `responseContent`), since a memory's
+    reasoning is replayed to the agent's model and to the compression model,
+    and neither can be given reasoning another model signed. The entry's
+    existing `provenance.model` names the fallback model. If it refuses too,
+    the split rung (where on) and quarantine follow as before.
   - Setting or changing it is a new request regime for L1 compression, so a
     chunk already in the compression quarantine gets a fresh bounded attempt,
     which runs the compression model's rungs again first. A merge in the

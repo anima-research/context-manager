@@ -132,7 +132,7 @@ describe('fallback-model rung: L1', () => {
       assert.deepEqual(entry.sourceRange, { first: fx.ids[0], last: fx.ids[3] });
       assert.equal(entry.content, 'memory by the other model');
       assert.equal(entry.tokens, 37, "stamped with the response's own output tokens");
-      assert.deepEqual(entry.responseContent, [THINKING, text('memory by the other model')], 'response blocks kept verbatim');
+      assert.equal(entry.responseContent, undefined, "text alone: the other model's signed reasoning is not kept for replay");
       assert.equal(entry.stitched, undefined);
       assert.equal(entry.provenance?.model, OTHER, 'the producing model is recorded');
       assert.equal(entry.provenance?.stopReason, 'end_turn');
@@ -277,7 +277,7 @@ async function buildMerge(membrane: unknown, options: Record<string, unknown> = 
 }
 
 describe('fallback-model rung: merges', () => {
-  it('own model refuses every attempt, the fallback answers: the merge is written as any other, with its model recorded', async () => {
+  it('own model refuses every attempt, the fallback answers: the merge is written as text alone, with its model recorded', async () => {
     await withCompressionLog(async (events) => {
       const mock = byModel({ [OWN]: [REFUSAL], [OTHER]: [ok('merged by the other model', [THINKING])] });
       const fx = await buildMerge(mock.membrane, { compressionFallbackModel: OTHER });
@@ -298,7 +298,7 @@ describe('fallback-model rung: merges', () => {
       assert.deepEqual(parent.sourceIds, fx.sourceIds);
       assert.deepEqual(parent.sourceRange, { first: fx.ids[0], last: fx.ids[3] });
       assert.equal(parent.tokens, 37);
-      assert.deepEqual(parent.responseContent, [THINKING, text('merged by the other model')]);
+      assert.equal(parent.responseContent, undefined, "text alone: the other model's signed reasoning is not kept for replay");
       assert.equal(parent.provenance?.model, OTHER);
       for (const id of fx.sourceIds) assert.equal(fx.strategy.entries().find((s) => s.id === id)!.mergedInto, parent.id);
       assert.equal(fx.strategy.queue().length, 0);

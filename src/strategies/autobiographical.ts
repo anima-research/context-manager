@@ -12813,7 +12813,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // that admission kept from being sent answered nothing, and the
         // transport's rejection of reasoning carriers is followed by the same
         // rung's stripped request, so neither stands in the way. Its answer is
-        // persisted as any rung's is; the entry's provenance names the model.
+        // persisted as any rung's is, but as text alone, without its reasoning
+        // blocks; the entry's provenance names the model.
         const fallbackModel = this.config.compressionFallbackModel;
         if (
           !fallbackResponse && fallbackModel && canonicalOutcome === 'refusal' &&
@@ -13280,7 +13281,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // A recovered answer has text blocks alone, so it stores no carrier, as
       // any text-only answer; replay reads its unwrapped `content`.
-      const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
+      // The fallback model's answer stores none either: a carrier is replayed
+      // to the agent's model in the live window and to the compression model
+      // in later recall, and neither can be given reasoning another model
+      // signed. Its `tokens` stays the provider's output count, an upper bound
+      // on the text replayed, as a stitched entry's is.
+      const responseContent = successfulTrace?.model !== undefined
+        ? undefined
+        : captureResponseContent(acceptedResponse?.content ?? []);
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -14633,8 +14641,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mergedText = mergeExtraction.text;
       const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
       // A recovered answer has text blocks alone, so it stores no carrier,
-      // as any text-only answer; replay reads its unwrapped `content`.
-      const responseContent = captureResponseContent(assessment.response.content);
+      // as any text-only answer; replay reads its unwrapped `content`. The
+      // fallback model's answer stores none either (see the L1 site).
+      const responseContent = fallbackModel ? undefined : captureResponseContent(assessment.response.content);
       logResponse = mergedText;
 
       // The disposition gate guarantees nonempty PRE-strip text; a
