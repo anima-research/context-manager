@@ -548,7 +548,9 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
           await reader.manager.compile(budget, undefined, { dryRun });
           assert.ok(attempt.mock.callCount() > calls, 'the floor was attempted');
         };
-        for (const text of causes) await failWith(text);
+        for (const text of causes.slice(0, -1)) await failWith(text);
+        await failWith(causes[0]!);
+        await failWith(causes.at(-1)!);
         assert.equal(floor.warnings.length - before, 65, 'all distinct causes warn');
         assert.equal(keys.size, 64, 'retention is capped');
         for (const key of keys) assert.match(key, /^[0-9a-f]{64}$/, 'only a fixed-size digest is retained');

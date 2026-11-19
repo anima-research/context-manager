@@ -781,7 +781,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
     }
 
-    // The progress clause above can leave the newest message over budget.
+    // Hard budget: the progress clause above can leave a single newest
+    // message larger than the usable budget. Refuse on a live select so the
+    // framework can run its over-budget breaker; a dry select skips this
+    // strategy refusal but not the manager's request-limit check.
+    // The anchor moves only for a compile that sends, below: a refused one
+    // leaves it where the last sent window started, so the turns that fit
+    // once the caller consolidates its changes are still in the window.
     if (total > maxTokens && !opts?.dryRun) {
       throw new OverBudgetError({
         budget: maxTokens,

@@ -16,6 +16,7 @@ import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@anim
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
+import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import { JsStore } from '@animalabs/chronicle';
 
@@ -930,6 +931,49 @@ describe('estimator calibration band', () => {
       learned.cm.close();
     }
   });
+
+  for (const method of ['renderAsNewest', 'previewContext'] as const) {
+    it(`keeps a dry calibration retry in the dry warning lane after a nested ${method}`, async (t) => {
+      const { cm, internals } = await openManager(`fallback-nested-${method}`, { recentWindowTokens: 1_000 });
+      try {
+        const raw = cm.previewContext(BUDGET)!.finalTokens;
+        const tight = { maxTokens: Math.ceil(raw * 1.2) + 500, reserveForResponse: 500 };
+        internals.store!.setStateJson(internals.calibrationStateId, { multiplier: 1.45, at: 1 });
+
+        const floor = t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+          throw new Error('test floor failure');
+        });
+        const warnings: string[] = [];
+        const id = cm.getAllMessages()[0]!.id;
+        let nestedSucceeded = false;
+        t.mock.method(console, 'warn', (...args: unknown[]) => {
+          const line = args.join(' ');
+          if (!line.includes('floor not computed')) return;
+          warnings.push(line);
+          if (warnings.length === 1) {
+            nestedSucceeded = method === 'previewContext'
+              ? cm.previewContext(BUDGET)?.fits === true
+              : Boolean(cm.renderAsNewest([id])?.[0]?.length);
+          }
+        });
+
+        const dry = await cm.compile(tight, undefined, { dryRun: true });
+        assert.ok(nestedSucceeded, `the warning handler completed ${method}`);
+        assert.equal(dry.renderStats!.calibration!.reset?.discardedMultiplier, 1.45);
+        if (method === 'renderAsNewest') {
+          assert.equal(floor.mock.callCount(), 2, 'both dry attempts hit the same floor failure');
+        }
+        assert.equal(warnings.length, 1, 'the retry deduplicates in the dry lane');
+        assert.match(warnings[0]!, /floor not computed \(dry\)/);
+
+        await cm.compile(tight);
+        assert.equal(warnings.length, 2, 'the dry compile did not suppress the first live warning');
+        assert.match(warnings[1]!, /floor not computed \(live\)/);
+      } finally {
+        cm.close();
+      }
+    });
+  }
 
   it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async (t) => {
     // The picker used to skip its over-budget throw in dry runs, so a preview

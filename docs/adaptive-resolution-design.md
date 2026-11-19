@@ -498,7 +498,8 @@ Given:
    eligible refusal, a provisional multiplier above 1 can be dropped and
    selection retried at 1. previewContext reports the final outcome (including
    entries and stats on a fitting render: true preview). A final budget
-   refusal reports fits: false without entries or stats; other errors propagate.
+   refusal reports fits: false without entries or stats; other errors that
+   escape final selection propagate.
    (Rev 5.1: the throw no longer
    consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
@@ -664,7 +665,7 @@ Implemented in PR #19 (`feat/adaptive-resolution`, anima-research/context-manage
 2. **Recall pair format consistency** — promoted to a design property in §3.9 (monotonic memory fading by construction).
 3. **Pins interaction** — pins always render raw; picker's `foldableMiddle()` excludes pinned chunks. If a pin pushes total over the hard budget, `OverBudgetError` fires (§3.10).
 4. **Branching semantics** — chunk state lives in branch-scoped Chronicle state slots (`autobio:resolutions`, `autobio:locks`); branching inherits the slots via Chronicle's copy-on-write. Verified by `test/adaptive/branching.test.ts`.
-5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `finalResolutions`, `produced`, `finalTokens`, `budgetMet`, `exhausted`, `moves`, `deadFrontierIds`, `unrealizable` for observability at the call site *(rev 5.1: `iterations`/`applied` died with the op walk — `moves` replaced them; see §5)*. A formal `RenderStats` extension is still pending.
+5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `finalResolutions`, `produced`, `finalTokens`, `budgetMet`, `exhausted`, `moves`, `deadFrontierIds`, `unrealizable` for observability at the call site *(rev 5.1: `iterations`/`applied` died with the op walk — `moves` replaced them; see §5)*. Render-time planner telemetry is exposed through `RenderStats.planVsActual`.
 
 **Note (rev 4.0):** the as-shipped solver has since evolved well past this PR #19 snapshot -- `best-fit` and `kv-stable` strategies, cache-as-reach-cap, bidirectional folding. See **section 12** for the current controller and its open calibration question.
 

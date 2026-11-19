@@ -9556,6 +9556,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
     const restore = this.saveDryRunState(store);
+    const dryBefore = this._dryRunSelect;
     this._dryRunSelect = true;
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
     this.selectPricing = pricing;
@@ -9564,7 +9565,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
-      this._dryRunSelect = false;
+      this._dryRunSelect = dryBefore;
       if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
       this.thinkingBound = false;
@@ -22860,6 +22861,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.requireLoadedBranch('renderAsNewest');
     const restore = this.saveDryRunState(store);
+    const dryBefore = this._dryRunSelect;
     this._dryRunSelect = true;
     try {
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
@@ -22902,7 +22904,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return first === undefined ? null : rendered.get(first) ?? null;
       });
     } finally {
-      this._dryRunSelect = false;
+      this._dryRunSelect = dryBefore;
       restore();
     }
   }

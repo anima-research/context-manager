@@ -749,7 +749,13 @@ export interface SelectOptions {
    * floor recovery, FIFO eviction, or branch initialization. This does not
    * read, suppress, or clear live warnings.
    *
-   * `ContextManager.compile` enforces `requestLimitTokens` even in dry mode.
+   * On a dry select, both passthrough strategies skip their own
+   * context-budget refusals. Passthrough can return just the system changes
+   * without the newest conversation message; windowed passthrough can
+   * return an over-budget window, including when it keeps the newest
+   * message to make progress. Neither gives a `previewContext` verdict.
+   * These exemptions do not bypass `ContextManager.compile`'s
+   * `requestLimitTokens` check.
    *
    * After validating options, the manager releases expired compression
    * holds before selecting, even in a dry compile. This can trigger a
@@ -884,16 +890,32 @@ export interface SelectOptions {
    * system-position injections passed to this compile appended: the compile
    * hands those back unchanged (`systemInjections`) and prices none of them.
    * AutobiographicalStrategy prices it, and the message injections, for
-   * `RenderStats.request`. */
+   * `RenderStats.request`, and selects exactly as it would without it,
+   * unless `requestLimitTokens` is given. An overhead whose tool definitions
+   * can't be serialised as JSON is refused before anything is selected. */
   requestOverhead?: RequestOverhead;
-  /**
-   * Limit on the estimated request total: selected context, message
-   * injections, `requestOverhead`, and `reserveForResponse`.
-   * `ContextManager.compile` rejects a non-positive or non-finite limit
-   * or missing `requestOverhead` with `TypeError` before selection.
-   * After selection it rejects totals above the limit with `OverBudgetError`,
-   * even in dry mode.
-   */
+  /** The most the whole request may hold, in tokens, as the provider limits
+   * it: the selected window, the message injections, `requestOverhead` and
+   * the budget's `reserveForResponse` together, with any tool-result stubs
+   * an AutobiographicalStrategy's pairing repair adds to the window. The
+   * stock strategies use the limit to constrain the window budget. A
+   * successful `ContextManager.compile` keeps the estimated sum within the
+   * limit, in the window's units at the compile's multiplier (for a
+   * strategy that doesn't calibrate, such as the passthrough strategies,
+   * as the store's estimator prices it), the strategy's over-budget grace
+   * included. While an AutobiographicalStrategy's multiplier is
+   * provisional, the estimate uses the calibration's ceiling, by scaling
+   * the price at the provisional multiplier. The store rounds each block's
+   * price at that multiplier by up to half a token, so at a true rate up
+   * to the ceiling the request can pass the limit by up to half a token
+   * a block, scaled by the ceiling over the multiplier. The stock
+   * strategies refuse with `OverBudgetError` if the limit leaves the
+   * window no room.
+   * It needs `requestOverhead`: one given without it, or one that isn't a
+   * positive finite number, is refused with a `TypeError` before anything is
+   * selected. After selection, `ContextManager.compile` checks the estimated
+   * request total and throws `OverBudgetError` if it exceeds the limit, even
+   * if a dry passthrough select returned over-limit entries. */
   requestLimitTokens?: number;
 }
 
@@ -2851,8 +2873,10 @@ export interface AutobiographicalConfig {
    * shadow pick and routes its production requests through the normal drain
    * queues. Dry selection skips the shadow pick.
    * If the shadow pick reports exhaustion with no production requested, the
-   * warning compares the selected plan's size to its soft target and
-   * rejection bound.
+   * warning reports the selected plan's token count, that no production was
+   * requested, and whether the plan exceeds the shadow rejection bound.
+   * When calibration is provisional, it includes the multiplier used for
+   * that pick. It does not predict which gate would refuse a live compile.
    * Shadow demand is speculative and never bypasses the `l1HoldbackChunks`
    * window.
    */

@@ -270,9 +270,11 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     const compiled = await manager.compile({ maxTokens: 800, reserveForResponse: 0 });
     assert.ok(compiled.messages.length > 0, 'the retry renders');
     assert.deepEqual(strategy.pickerRunBudgets, [800, 750, 800, 750], 'both attempts make a live and shadow pick');
-    assert.ok(warnings.some((w) => w.includes('DISCARDED provisional multiplier 1.45')));
+    const discarded = warnings.findIndex((w) => w.includes('DISCARDED provisional multiplier 1.45'));
+    assert.ok(discarded >= 0, 'the first attempt was discarded');
     const shadow = warnings.filter((w) => w.includes('production target 750:'));
-    assert.equal(shadow.length, 1, 'the retry no longer warns');
+    assert.equal(shadow.length, 1, 'only one shadow warning');
+    assert.ok(warnings.indexOf(shadow[0]!) < discarded, 'the shadow warning precedes the discard');
     assert.match(shadow[0]!, /under provisional calibration \(multiplier 1\.45\).*exceeds the 750-token rejection bound/);
   });
 

@@ -164,7 +164,7 @@ test('kv-stable exhausted semantics: a dead-band hold above the soft target is N
   );
 });
 
-test('kv-stable exhausted semantics: true only when even full folding exceeds the hard wall (escalated)', () => {
+test('kv-stable reports exhaustion when the adopted ideal exceeds the pre-grace budget', () => {
   // Deepest available fold is one L2 recall pair (200 tokens) covering all
   // 36 chunks; a 100-token wall is infeasible even fully folded.
   const ch = buildChronicleWithChain({
@@ -175,7 +175,7 @@ test('kv-stable exhausted semantics: true only when even full folding exceeds th
   const result = new Picker(strategy).run(inputs, BUDGET(100));
 
   assert.equal(strategy.lastPlan()?.escalated, true, 'plan reports escalation');
-  assert.equal(result.exhausted, true, 'over-the-wall is the one true exhausted state');
+  assert.equal(result.exhausted, true, 'the picker forwards kv-stable escalation');
   assert.ok(result.finalTokens > 100, 'and the tokens confirm it');
 });
 
