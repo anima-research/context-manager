@@ -3016,7 +3016,13 @@ export interface SummaryEntry {
    * Pre-adaptive code uses 0 | 1 | 2; new code may produce higher values.
    */
   sourceLevel: number;
-  /** IDs of source items (message IDs for L1, summary IDs for L_{k>1}) */
+  /**
+   * IDs of source items (message IDs for L1, summary IDs for L_{k>1}).
+   * `searchSummaries` and `listSummariesInRange` read the summaries past
+   * carried entries (`carriedFrom`): there a source that reached this
+   * summary through carried entries is named in their place, so it can sit
+   * below `sourceLevel`, and its parent more than one level above it.
+   */
   sourceIds: string[];
   /** Range of original message IDs covered */
   sourceRange: { first: string; last: string };

@@ -3946,6 +3946,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Look up a single summary by id. Returns null if not found.
+   *
+   * This is the stored entry as it is, where `searchSummaries` and
+   * `listSummariesInRange` read the summaries past carried entries
+   * (`carryStrandedSummaries`): it returns an entry marked `carriedFrom` for
+   * that entry's id, the parent it gives a carried summary is the entry
+   * that carries it, and a merge's `sourceIds` name the carried entry it
+   * took. Follow `carriedFrom` down, or the parent up, to reach what the
+   * lists show.
    */
   getSummary(id: string): SummaryEntry | null {
     this.requireLoadedBranch('getSummary');
@@ -8878,6 +8886,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * L1s that can't merge count toward the cap: a pruned source, the wide-span
    * quarantine, a lone interior summary, or a held one (mergeHeldSourceIds: an
    * operator hold, or a group a merge-quarantine record holds out of merges).
+   * One that `carryStrandedSummaries` carried no longer counts, as one a
+   * merge took doesn't: it has a parent, and waits for no L1 merge.
    * And under `hierarchical: false` tick runs no merge, though
    * checkMergeThreshold can still queue one.
    */
@@ -10109,7 +10119,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `repair-topology --mode rebuild` to give it partners, unless
    * `carryStrandedSummaries` is set and a higher summary stands beside it:
    * the next merge check carries that one up a level, so it isn't listed
-   * (`previewCarries` lists it). It reads the
+   * (`previewCarries` lists it). That is read from the store as it stands,
+   * one pass: a stray the check reaches only after it has carried another
+   * (one beside a lower stray that is carried up to it, or beside a wide
+   * summary) is still listed until that check has run, and `previewCarries`
+   * follows every step. It reads the
    * compression quarantine ledger afresh to name the quarantined chunks a
    * stray stands beside.
    *

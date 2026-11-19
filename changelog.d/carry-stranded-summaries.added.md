@@ -34,8 +34,28 @@
     that rewrites a carried summary in place edits that summary, and not the
     entries that carry it. The request for a transition summary leaves
     carried entries out, since they repeat a summary's text.
+  - What reads the stored entries as they are: `getSummary` returns a
+    carried entry for its id, names it as the parent of the summary it
+    carries, and lists it among the sources of the merge that took it, where
+    the two lists above name the summary carried in its place (so there a
+    source can sit more than one level below its parent). The counts by
+    level (`getStats`, `getProgressSnapshot`, the debt report's
+    `unmergedFrontier`, `audit-topology`) count a carried entry at its level
+    and the summary it carries as merged, as the merge check reads them, so
+    a carry moves one from a level's count to the next with no change in
+    what a compile sends. A carried L1 no longer counts toward
+    `maxSpeculativeL1s`, as one a merge took doesn't.
+  - A store that holds carried entries needs a context-manager that knows
+    them. An earlier release reads each as an ordinary summary of its level:
+    it renders the entry in place of the summary it carries and counts it as
+    a deeper fold of those messages, so going back to one changes what a
+    compile sends. Turning the option off does not: the entries stay, and
+    are read as above.
   - `getStrandedSummaries()` no longer lists a summary the next merge check
-    carries when the option is set.
+    carries when the option is set. It reads the store as it stands, in one
+    pass: a summary that check reaches only after carrying another beside it
+    stays listed until the check has run, and `previewCarries()` follows
+    every step.
   - `previewCarries()` lists what the rule would do to a store as it stands,
     writing nothing: each carry and each merge that would then land, in
     order, with the merge's sources and their tokens. The `--carry-preview`
