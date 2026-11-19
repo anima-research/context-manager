@@ -12,6 +12,7 @@ interface SummaryEntry {
   sourceRange: { first: string; last: string };
   parentId?: string;
   mergedInto?: string;
+  carriedFrom?: string;
 }
 
 const USAGE = 'Usage: inspect-store <store-path> [--namespace <ns>] [--message-slot isolated|shared] [--output <dir>] [--sample-compile <tokens>]';
@@ -248,7 +249,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     const tree: string[] = ['# Summary tree\n', 'Sorted by level (highest first), then by source order.\n'];
     for (const s of sortedByLevel) {
       const parent = s.parentId ?? s.mergedInto;
-      tree.push(`\n## ${s.id} (L${s.level}, ${s.tokens} tokens)${parent ? ` parent=${parent}` : ''}`);
+      // An entry that carries a summary up a level holds that summary's text again, and has it as its one source.
+      tree.push(`\n## ${s.id} (L${s.level}, ${s.tokens} tokens)${parent ? ` parent=${parent}` : ''}${s.carriedFrom ? ` carries=${s.carriedFrom}` : ''}`);
       tree.push(`sourceLevel=${s.sourceLevel} sources=${s.sourceIds.length} range=${s.sourceRange.first}…${s.sourceRange.last}`);
       tree.push('', s.content, '', '---');
     }
