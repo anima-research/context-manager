@@ -39,6 +39,10 @@ import type {
   DerivationManifest,
   DerivationManifestOptions,
   RenderedSummaryInfo,
+  ExternalMemoryProvenance,
+  MemoryWorkItem,
+  MemoryWorkTarget,
+  SummaryTextEdit,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -96,7 +100,7 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
-import { isCompressionWithdrawn } from '../compression-withdrawn.js';
+import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import {
@@ -5300,6 +5304,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private requireBranchMutation(entrypoint: string): void {
+    // Work an operator runs only to read its request (externalWork with no
+    // `by`) changes nothing: it ends at the first change the strategy would
+    // make to its own state before the call.
+    if (this.externalWork && !this.externalWork.by) {
+      throw new Error(
+        `the strategy would send no request for this work as it stands: it would change its own state first (${entrypoint}); ` +
+          'its warnings say why',
+      );
+    }
     if (
       this.isBranchIdentityCurrent(this.loadedBranchIdentity) ||
       this.isBranchIdentityCurrent(this.initializingBranchIdentity)
@@ -7107,6 +7120,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
     this.requireBranchMutation('setMergedInto');
     entry.mergedInto = mergedIntoId;
+    this.writeStoredSummary(entry, 'setMergedInto', 'merge state');
+  }
+
+  /** Write a summary this instance changed in memory over every stored copy of it. */
+  private writeStoredSummary(entry: SummaryEntry, operation: string, what: string): void {
     if (!this.store) return;
     // Resolve the log position by ID against the PERSISTED array — never by
     // in-memory index. loadPersistedState now drops empty and unreadable
@@ -7135,7 +7153,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!found) {
       this.heldAsStoredAt.delete(this.summariesStateId);
       this.diag.warn(
-        `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
+        `[autobiographical] ${operation}: ${entry.id} not found in persisted summary log — ${what} not persisted`,
       );
     }
   }
@@ -7200,13 +7218,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * merge that would form after it at its level, and froze a resident's whole
    * pyramid for 16 days (322 L1s never attempted, zero merge calls).
    * `position` is the merge position index, when the caller has one.
+   * `exceptRecord` is the key of a merge-quarantine record left out: the one
+   * whose own group an operator runs by hand (externalWork).
    */
-  protected mergeHeldSourceIds(position?: ReadonlyMap<MessageId, number>): Set<string> {
+  protected mergeHeldSourceIds(position?: ReadonlyMap<MessageId, number>, exceptRecord?: string): Set<string> {
     const ids = new Set<string>(this.config.mergeHoldSummaryIds ?? []);
     if (this.mergeQuarantine.size === 0) return ids;
     const order = position ?? this.mergePositionIndex();
     for (const record of this.mergeQuarantine.values()) {
-      if (!this.mergeRecordHolds(record, order)) continue;
+      if (record.key === exceptRecord || !this.mergeRecordHolds(record, order)) continue;
       for (const id of record.sourceIds) ids.add(id);
     }
     return ids;
@@ -11884,7 +11904,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       throw new CompressionQuarantineUnreadableError(error);
     }
-    const durableActive = this.durableQuarantineFor(durableQuarantine, quarantineRecord);
+    // Work an operator runs by hand (externalWork) passes a quarantine of its
+    // own family: the text comes from outside, or the request isn't sent.
+    const durableActive = this.externalWork ? undefined : this.durableQuarantineFor(durableQuarantine, quarantineRecord);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       if (!this.warnedQuarantineSkips.has(quarantineRecord.chunkSourceHash)) {
@@ -13390,6 +13412,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map(b => b.text)
           .join('\n');
+        // An operator's text (externalWork) is stored as given: only a
+        // model's answer is read for a thinking wrapper, so no text of
+        // theirs strips to an empty answer the ladder would record.
+        if (this.externalWork?.by) return { text: rawText, recoveredWholeWrapper: false };
         // The opt-in reads an answer of text blocks alone; one with native
         // reasoning beside its text is read as before.
         const onlyTextBlocks = r.content.every((block) => block.type === 'text');
@@ -13604,17 +13630,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance: which request authored this
         // memory and how the generation ended (always 'end_turn' post-gate;
-        // the field's presence marks the entry as gate-verified).
-        ...(successfulTrace
-          ? {
-              provenance: {
-                stopReason: successfulTrace.stopReason ?? 'end_turn',
-                requestHash: successfulTrace.requestHash,
-                // The fallback model, where its rung wrote the memory.
-                model: successfulTrace.model ?? model,
-              },
-            }
-          : {}),
+        // the field's presence marks the entry as gate-verified). A text an
+        // operator installed (externalWork) has none, since no model's
+        // answer passed the gate: `external` names the request it answers.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, ...(successfulTrace ? { requestHash: successfulTrace.requestHash } : {}) } }
+          : successfulTrace
+            ? {
+                provenance: {
+                  stopReason: successfulTrace.stopReason ?? 'end_turn',
+                  requestHash: successfulTrace.requestHash,
+                  // The fallback model, where its rung wrote the memory.
+                  model: successfulTrace.model ?? model,
+                },
+              }
+            : {}),
       };
 
       // Provenance the auditor can READ: store the accepted request under the
@@ -14338,7 +14368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // retried only by clearMergeQuarantine, which deletes the record first.
     this.refreshStoreOrder(ctx.messageStore.getAll());
     const position = this.mergePositionIndex();
-    const held = this.mergeHeldSourceIds(position);
+    const held = this.mergeHeldSourceIds(position, this.externalWork?.mergeRecordKey);
     const heldSources = sources.filter((source) => held.has(source.id));
     if (heldSources.length > 0) {
       this.diag.warn(
@@ -15011,7 +15041,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // are captured for replay — see the L1 site / captureResponseContent.
       const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
       const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
-      const mergeExtraction = extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      // An operator's text (externalWork) is stored as given, as at the L1 site.
+      const mergeExtraction = this.externalWork?.by
+        ? { text: assessment.text, recoveredWholeWrapper: false }
+        : extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
       const mergedText = mergeExtraction.text;
       const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
       // A recovered answer has text blocks alone, so it stores no carrier,
@@ -15062,12 +15095,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance (see SummaryEntry.provenance):
         // always 'end_turn' post-gate; presence marks the entry gate-verified.
-        provenance: {
-          stopReason: 'end_turn',
-          requestHash,
-          // The fallback model, where its rung wrote the merge.
-          model: requestModel,
-        },
+        // A text an operator installed has none, as at the L1 site. The
+        // model is the fallback model, where its rung wrote the merge.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, requestHash } }
+          : { provenance: { stopReason: 'end_turn', requestHash, model: requestModel } }),
       };
       logNewSummaryId = newEntry.id;
 
@@ -15146,6 +15178,255 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: logError,
       }, this.ns);
     }
+  }
+
+  // ===========================================================================
+  // External memories: text written outside this strategy's compression
+  // calls, for work the provider refuses on every attempt. The tree's shape
+  // stays the strategy's: an operator supplies the text of work the strategy
+  // would do itself, and the text enters where a provider's answer would.
+  // ===========================================================================
+
+  /**
+   * Set while an operator's work runs (exportMemoryRequest,
+   * importExternalMemory). `by` stamps the summary the work writes; without
+   * it the work is run only to read its request, and every change the
+   * strategy would make to its own state on the way is refused
+   * (requireBranchMutation). `mergeRecordKey` is the merge-quarantine record
+   * whose own group it is. It is the instance's, not the call's: compression
+   * running beside the work would read it too, so the work is for a
+   * strategy with no tick or other compression in progress.
+   */
+  private externalWork: { by?: ExternalMemoryProvenance; mergeRecordKey?: string } | null = null;
+
+  /**
+   * The work `target` names, as the strategy would do it now, or an error
+   * saying why it would do none.
+   *
+   * A chunk record's L1: the record's chunk, not yet covered by an L1, and
+   * not one the thin-chunk guard stubs without a request. A quarantined
+   * chunk is such a chunk.
+   *
+   * The next merge into a level, the first of: the group of the oldest
+   * merge-quarantine record at that level that holds its sources
+   * (mergeRecordHolds), in store order, as clearMergeQuarantine would queue
+   * it; the first queued merge into that level that executeMerge would
+   * still run; the group the merge check would queue now
+   * (contiguousMergeCandidates over the level's unparented, unqueued
+   * summaries).
+   */
+  private externalWorkFor(target: MemoryWorkTarget, ctx: StrategyContext): {
+    item: Omit<MemoryWorkItem, 'requestHash'>;
+    mergeRecordKey?: string;
+    run: (ctx: StrategyContext) => Promise<void>;
+  } {
+    this.requireLoadedBranch('externalWorkFor');
+    if ('chunkRecordId' in target) {
+      const chunk = this.chunks.find((c) => c.recordId === target.chunkRecordId);
+      if (!chunk) throw new Error(`no chunk record ${target.chunkRecordId}`);
+      const covered = new Set(this.summaries.filter((s) => s.level === 1).flatMap((s) => s.sourceIds));
+      if (chunk.compressed || chunk.messages.some((m) => covered.has(m.id))) {
+        throw new Error(`chunk ${target.chunkRecordId} is compressed already, or an L1 covers a message of it`);
+      }
+      if (this.thinChunkChars(chunk) !== undefined) {
+        throw new Error(`chunk ${target.chunkRecordId} is a quiet stretch, which the strategy stubs without a request`);
+      }
+      const ids = chunk.messages.map((m) => m.id);
+      return {
+        item: { level: 1, sourceLevel: 0, sourceIds: ids, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! }, chunkRecordId: target.chunkRecordId },
+        run: (runCtx) => this.compressChunkHierarchical(chunk, runCtx),
+      };
+    }
+
+    const level = target.level;
+    this.refreshStoreOrder(ctx.messageStore.getAll());
+    const position = this.mergePositionIndex();
+    const record = [...this.mergeQuarantine.values()]
+      .filter((r) => r.level === level && this.mergeRecordHolds(r, position))
+      .sort((a, b) => a.quarantinedAt - b.quarantinedAt)[0];
+    const held = this.mergeHeldSourceIds(position);
+    const runnable = (ids: readonly string[]): SummaryEntry[] | null => {
+      const sources = ids.map((id) => this.summaryById(id));
+      if (sources.some((s) => !s || getSummaryParentId(s) || held.has(s.id))) return null;
+      return this.mergeTopologyProblem(level, sources as SummaryEntry[], position) === null ? sources as SummaryEntry[] : null;
+    };
+    const queued = record ? undefined : this.mergeQueue.find((m) => m.level === level && runnable(m.sourceIds));
+    let sources: SummaryEntry[] | null | undefined;
+    if (record) {
+      [sources] = this.contiguousSourceRuns(record.sourceIds.map((id) => this.summaryById(id)!), position);
+    } else if (queued) {
+      sources = runnable(queued.sourceIds);
+    } else if (this.config.speculativeProduction || level <= 3) {
+      const inQueue = new Set(this.mergeQueue.flatMap((m) => m.sourceIds));
+      sources = this.contiguousMergeCandidates(
+        this.summaries.filter((s) => s.level === level - 1 && !getSummaryParentId(s) && !inQueue.has(s.id)),
+        this.config.mergeThreshold ?? 6,
+      );
+    }
+    if (!sources || sources.length === 0) throw new Error(`the strategy would merge nothing into L${level} now`);
+    // A queued entry keeps its own list: executeMerge reads its retry state by it.
+    const sourceIds = queued ? queued.sourceIds : sources.map((s) => s.id);
+    return {
+      item: {
+        level,
+        sourceLevel: level - 1,
+        sourceIds: [...sourceIds],
+        sourceRange: { first: sources[0]!.sourceRange.first, last: sources[sources.length - 1]!.sourceRange.last },
+      },
+      ...(record ? { mergeRecordKey: record.key } : {}),
+      run: async (runCtx) => {
+        if (!await this.executeMerge(level, sourceIds, runCtx)) return;
+        // What tick does after a merge it ran lands: the entry leaves the
+        // queue, and a record the merge paid off is swept.
+        const at = queued ? this.mergeQueue.indexOf(queued) : -1;
+        if (at >= 0) {
+          this.mergeQueue.splice(at, 1);
+          this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+        }
+        if (record) this.sweepPaidOffMergeQuarantine();
+      },
+    };
+  }
+
+  /** Run the work with `complete` standing where the provider's call would; a withdrawal it throws ends the work quietly. */
+  private async runExternalWork(
+    work: ReturnType<AutobiographicalStrategy['externalWorkFor']>,
+    ctx: StrategyContext,
+    by: ExternalMemoryProvenance | undefined,
+    complete: (request: NormalizedRequest) => Promise<NormalizedResponse>,
+  ): Promise<void> {
+    this.externalWork = { ...(by ? { by } : {}), ...(work.mergeRecordKey ? { mergeRecordKey: work.mergeRecordKey } : {}) };
+    try {
+      await work.run({ ...ctx, membrane: { complete } as unknown as Membrane });
+    } catch (error) {
+      if (!isCompressionWithdrawn(error)) throw error;
+    } finally {
+      this.externalWork = null;
+    }
+  }
+
+  /**
+   * The request the strategy would send now for one piece of work, and the
+   * work it is for. The work runs as tick would run it, up to the call,
+   * which is withdrawn (CompressionWithdrawn) in place of being made, so
+   * nothing is sent, counted or written. A quarantine of the work itself
+   * doesn't stop it. An error when the strategy would make no request for
+   * it as it stands: while it waits on the host's tool definitions, or
+   * where it would change its own state first (skip a group holding a held
+   * source and queue what stands beside it, adopt a summary the store
+   * already holds), a change that is refused, not made.
+   */
+  async exportMemoryRequest(target: MemoryWorkTarget, ctx: StrategyContext): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }> {
+    const work = this.externalWorkFor(target, ctx);
+    let request: NormalizedRequest | undefined;
+    await this.runExternalWork(work, ctx, undefined, async (sent) => {
+      request ??= structuredClone(sent);
+      throw new CompressionWithdrawn('request exported, not sent');
+    });
+    if (!request) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
+    return { item: { ...work.item, requestHash: sha256Json(request) }, request };
+  }
+
+  /**
+   * Install `body` as the summary of `item`, a work item exportMemoryRequest
+   * gave. Refused unless the strategy would do that same work now, the
+   * same level, sources in the same order and range, and builds for it the
+   * request it built then (`item.requestHash`): a text written for a request
+   * whose history, recall or settings have changed since isn't its answer.
+   * The text takes the place of the provider's answer to that request, the
+   * first the work sends, so the summary is written as a native one is: its
+   * lineage, its sources' parent, its chunk record, its token stamp from the
+   * text (no usage comes with it), and the quarantine of its chunk or merge
+   * paid off. The text is stored as given, with no thinking wrapper read
+   * out of it as out of a model's answer. It carries no reasoning and no
+   * `provenance`, which is a model call's: `external` says who supplied it
+   * and names the request it answers. Without `apply` the work is run to
+   * its request as exportMemoryRequest runs it, the same checks are made,
+   * and nothing is written.
+   */
+  async importExternalMemory(
+    item: MemoryWorkItem,
+    body: string,
+    by: Omit<ExternalMemoryProvenance, 'at'>,
+    ctx: StrategyContext,
+    options: { apply?: boolean } = {},
+  ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }> {
+    const work = this.externalWorkFor(item.chunkRecordId !== undefined ? { chunkRecordId: item.chunkRecordId } : { level: item.level }, ctx);
+    const now = work.item;
+    if (
+      now.level !== item.level || now.sourceLevel !== item.sourceLevel ||
+      now.sourceRange.first !== item.sourceRange?.first || now.sourceRange.last !== item.sourceRange?.last ||
+      now.sourceIds.length !== item.sourceIds?.length || now.sourceIds.some((id, i) => id !== item.sourceIds[i])
+    ) {
+      throw new Error(
+        `the work described is not what the strategy would do now, which is an L${now.level} over ` +
+          `[${now.sourceIds.join(', ')}] (${now.sourceRange.first}..${now.sourceRange.last}); export its request again`,
+      );
+    }
+    if (body.trim().length === 0) throw new Error('the memory text is empty');
+
+    const before = new Set(this.summaries.map((s) => s.id));
+    const stamp = options.apply ? { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) } : undefined;
+    /** The first request the work sends now, hashed as the export hashed its own. */
+    let requestHash: string | undefined;
+    await this.runExternalWork(work, ctx, stamp, async (request) => {
+      // One answer: a text the strategy turns down must not answer its next request too.
+      if (requestHash !== undefined) throw new CompressionWithdrawn('external memory text already given');
+      requestHash = sha256Json(request);
+      if (requestHash !== item.requestHash) throw new CompressionWithdrawn('not the request the text was written for');
+      if (!stamp) throw new CompressionWithdrawn('dry run: the text is not given');
+      return { content: [{ type: 'text', text: body }], stopReason: 'end_turn', usage: { inputTokens: 0, outputTokens: 0 } } as unknown as NormalizedResponse;
+    });
+    if (requestHash === undefined) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
+    if (requestHash !== item.requestHash) {
+      throw new Error(
+        `the request the strategy builds for this work now (sha256 ${requestHash}) is not the one exported ` +
+          `(${item.requestHash ?? 'none recorded'}): what it shows has changed since; export its request again`,
+      );
+    }
+    const described = { ...now, requestHash };
+    if (!stamp) return { item: described, applied: false, tokens: Math.ceil(body.length / 3) };
+    const entry = this.summaries.find((s) => !before.has(s.id) && s.external !== undefined);
+    if (!entry) throw new Error('the strategy did not store the text; its warnings say why');
+    return { item: described, applied: true, tokens: entry.tokens, summaryId: entry.id };
+  }
+
+  /**
+   * Replace the text of one summary. Its lineage stays as it is; its tokens
+   * are stamped from the new text; what described the call that wrote the
+   * old text goes, since it no longer matches: the verbatim response blocks
+   * it carried, its `provenance` and its split-stitch record (`stitched`);
+   * and `external` says who supplied the text. The store's history keeps
+   * the entry as it was. Summaries merged over the old text are reported
+   * and left alone. Without `apply` nothing is written.
+   */
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
+    this.requireLoadedBranch('editSummaryText');
+    const entry = this.summaries.find((s) => s.id === id);
+    if (!entry) throw new Error(`no summary ${id}`);
+    if (body.trim().length === 0) throw new Error('the memory text is empty');
+    const parents: SummaryTextEdit['parents'] = [];
+    for (let parent = this.summaryById(getSummaryParentId(entry) ?? ''); parent; parent = this.summaryById(getSummaryParentId(parent) ?? '')) {
+      parents.push({ id: parent.id, level: parent.level });
+    }
+    const edit: SummaryTextEdit = {
+      id,
+      level: entry.level,
+      applied: options.apply === true,
+      prior: { sha256: createHash('sha256').update(entry.content, 'utf8').digest('hex'), length: entry.content.length, tokens: entry.tokens },
+      tokens: Math.ceil(body.length / 3),
+      droppedResponseBlocks: entry.responseContent?.length ?? 0,
+      parents,
+    };
+    if (!options.apply) return edit;
+    entry.content = body;
+    entry.tokens = edit.tokens;
+    delete entry.responseContent;
+    delete entry.provenance;
+    delete entry.stitched;
+    entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    this.writeStoredSummary(entry, 'editSummaryText', 'new text');
+    return edit;
   }
 
   /** Inventory, not solver eligibility: pins, locks, and geometry can prevent using these summaries. */
