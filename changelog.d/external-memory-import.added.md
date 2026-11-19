@@ -22,12 +22,17 @@
     is read out of it as out of a model's answer. It carries no reasoning.
   - `edit` replaces the text of one summary by id, with the file's text
     stored the same way: lineage untouched, tokens stamped from the new
-    text, its verbatim response blocks dropped. The summaries merged over
-    the old text are reported and left as they are.
+    text, and what described the call that wrote the old text dropped (its
+    verbatim response blocks, its `provenance`, its split-stitch record).
+    The summaries merged over the old text are reported and left as they
+    are.
 
-  `SummaryEntry.external` (`{ by, at, note? }`, optional) records who
-  supplied such a text; entries without it are unchanged, nothing renders
-  it and no selection reads it. The operations are also methods:
+  `SummaryEntry.external` (`{ by, at, note?, requestHash? }`, optional)
+  records who supplied such a text, and for an installed one the sha256 of
+  the request it answers. An entry that has it has no `provenance`, which
+  stays what it was: the record of a model's accepted answer. Entries
+  without `external` are unchanged, nothing renders it and no selection
+  reads it. The operations are also methods:
   `ContextManager.exportMemoryRequest`, `importExternalMemory` and
   `editSummaryText`, over the strategy's methods of the same names
   (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,

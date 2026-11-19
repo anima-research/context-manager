@@ -3019,8 +3019,10 @@ export interface SummaryEntry {
    * evidence, so entries authored before the 2026-08-01 disposition gate
    * (which could canonize refusals/truncations, e.g. the 163-char cyber
    * refusal that became an L4 parent) are auditable: `provenance` absent →
-   * pre-gate entry, verify against host-harness logs via content match;
-   * present → `requestHash` keys the request that authored this summary.
+   * pre-gate entry, verify against host-harness logs via content match, or
+   * an entry whose text came from outside (`external`), which no model
+   * call authored; present → `requestHash` keys the request that authored
+   * this summary.
    *
    * That key is readable, not merely verifiable, WHERE the host opted into
    * preimage persistence (`persistMintPreimages: true`, off by default): the
@@ -3055,10 +3057,11 @@ export interface SummaryEntry {
    * calls: an operator installed it as the result of the work, or replaced
    * the text of an existing summary (`importExternalMemory`,
    * `editSummaryText`). Absent on every other entry. Nothing renders it and
-   * no selection reads it. An installed entry's `provenance.requestHash`
-   * names the request the strategy built for the work, which no model
-   * answered here, and carries no model; an edited entry's `provenance`
-   * still names the call that wrote the text the edit replaced.
+   * no selection reads it. An entry that has it has no `provenance`: that
+   * records a model's accepted answer, and here there is none. An installed
+   * entry names the request it answers in `external.requestHash`; an edit
+   * drops the `provenance` of the call that wrote the text it replaced,
+   * which the store's history keeps with the old entry.
    */
   external?: ExternalMemoryProvenance;
 }
@@ -3070,6 +3073,13 @@ export interface ExternalMemoryProvenance {
   /** When it was installed (ms since epoch). */
   at: number;
   note?: string;
+  /**
+   * On an installed text (`importExternalMemory`): sha256 of the request
+   * the strategy built for the work, the one exported, which the text was
+   * written for and no model answered here. It is hashed, and its preimage
+   * persisted, as `provenance.requestHash` is. Absent on an edit.
+   */
+  requestHash?: string;
 }
 
 /**
@@ -3107,10 +3117,11 @@ export interface SummaryTextEdit {
   id: string;
   level: SummaryLevel;
   applied: boolean;
-  /** The text replaced: its sha256 (hex, of the UTF-8 text), length in characters and token stamp. */
+  /** The text replaced: its sha256 (hex, of the UTF-8 text), its `String.length` (UTF-16 code units) and its token stamp. */
   prior: { sha256: string; length: number; tokens: number };
+  /** The new text's token stamp: an estimate from its length, as for any summary that comes with no usage. */
   tokens: number;
-  /** Verbatim response blocks the entry carried, which go with the text they matched. */
+  /** Verbatim response blocks the entry carried, which go with the text they matched (so do its `provenance` and `stitched`). */
   droppedResponseBlocks: number;
   /** Summaries merged over the old text, nearest first. They are left as they are. */
   parents: Array<{ id: string; level: SummaryLevel }>;

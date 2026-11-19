@@ -53,12 +53,15 @@
  * takes the place of the provider's answer, so the summary is written as a
  * native one is, its sources parented, its chunk record marked and the
  * quarantine of its chunk or merge paid off, and the merge check runs after
- * it as after any summary. It carries no reasoning, and `external`
- * ({ by, at, note }) records who supplied it.
+ * it as after any summary. It carries no reasoning and no `provenance`,
+ * which records a model's answer: `external` ({ by, at, note, requestHash })
+ * records who supplied it and the request it answers.
  *
  * edit replaces the text of one summary by id: lineage untouched, tokens
- * stamped from the new text, the verbatim response blocks dropped, `external`
- * set. It prints the old text's sha256 and length, and the summaries merged
+ * stamped from the new text, `external` ({ by, at, note }) set, and what
+ * described the call that wrote the old text dropped (its verbatim response
+ * blocks, its `provenance`, its split-stitch record). It prints the old
+ * text's sha256 and length, and the summaries merged
  * over the old text, which it leaves as they are. The store's history keeps
  * the old text: the line printed after an applied edit names the sequence
  * to read the summaries state at (chronicle's getStateJsonAt).

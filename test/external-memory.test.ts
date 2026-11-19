@@ -174,7 +174,8 @@ describe('external-memory', () => {
     assert.equal(parent.external?.by, 'operator');
     assert.equal(parent.external?.note, 'refused five times');
     assert.equal(typeof parent.external?.at, 'number');
-    assert.equal(parent.provenance?.model, undefined, 'no model is named as its author');
+    assert.equal(parent.provenance, undefined, 'no model call is named as its author');
+    assert.equal(parent.external?.requestHash, item.requestHash, 'and it names the request it answers');
     for (const s of after.filter((s) => s.level === 1)) {
       assert.equal(s.mergedInto, item.sourceIds.includes(s.id) ? parent.id : undefined, `${s.id}'s parent`);
       assert.equal(s.external, undefined, 'the other entries are as they were');
@@ -365,6 +366,7 @@ describe('external-memory', () => {
     const parent = all.find((s) => s.level === 2)!;
     const target = all.find((s) => s.id === parent.sourceIds[1])!;
     assert.ok(target.responseContent && target.responseContent.length === 2, 'setup: the L1 carries its response blocks');
+    assert.equal(target.provenance?.model, MODEL, 'setup: and the provenance of the call that wrote it');
 
     const text = bodyFile('The second stretch, rewritten by hand.');
     const args = ['edit', path, '--namespace', NS, '--id', target.id, '--body-file', text, '--by', 'operator'];
@@ -385,6 +387,8 @@ describe('external-memory', () => {
     assert.equal(edited.content, 'The second stretch, rewritten by hand.');
     assert.equal(edited.tokens, Math.ceil(edited.content.length / 3));
     assert.equal(edited.responseContent, undefined);
+    assert.equal(edited.provenance, undefined, 'the call that wrote the old text is not named as the author of the new');
+    assert.deepEqual(Object.keys(edited.external ?? {}), ['by', 'at']);
     assert.equal(edited.external?.by, 'operator');
     const lineage = (s: SummaryEntry) => [s.id, s.level, s.sourceLevel, s.sourceIds, s.sourceRange, s.mergedInto, s.parentId, s.created];
     assert.deepEqual(lineage(edited), lineage(target));

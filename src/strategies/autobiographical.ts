@@ -13349,17 +13349,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance: which request authored this
         // memory and how the generation ended (always 'end_turn' post-gate;
-        // the field's presence marks the entry as gate-verified).
-        ...(successfulTrace
-          ? {
-              provenance: {
-                stopReason: successfulTrace.stopReason ?? 'end_turn',
-                requestHash: successfulTrace.requestHash,
-                ...(this.externalWork?.by ? {} : { model }),
-              },
-            }
-          : {}),
-        ...(this.externalWork?.by ? { external: this.externalWork.by } : {}),
+        // the field's presence marks the entry as gate-verified). A text an
+        // operator installed (externalWork) has none, since no model's
+        // answer passed the gate: `external` names the request it answers.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, ...(successfulTrace ? { requestHash: successfulTrace.requestHash } : {}) } }
+          : successfulTrace
+            ? {
+                provenance: {
+                  stopReason: successfulTrace.stopReason ?? 'end_turn',
+                  requestHash: successfulTrace.requestHash,
+                  model,
+                },
+              }
+            : {}),
       };
 
       // Provenance the auditor can READ: store the accepted request under the
@@ -14606,12 +14609,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance (see SummaryEntry.provenance):
         // always 'end_turn' post-gate; presence marks the entry gate-verified.
-        provenance: {
-          stopReason: 'end_turn',
-          requestHash,
-          ...(this.externalWork?.by ? {} : { model: this.requireCompressionModel() }),
-        },
-        ...(this.externalWork?.by ? { external: this.externalWork.by } : {}),
+        // A text an operator installed has none, as at the L1 site.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, requestHash } }
+          : { provenance: { stopReason: 'end_turn', requestHash, model: this.requireCompressionModel() } }),
       };
       logNewSummaryId = newEntry.id;
 
@@ -14850,11 +14851,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * lineage, its sources' parent, its chunk record, its token stamp from the
    * text (no usage comes with it), and the quarantine of its chunk or merge
    * paid off. The text is stored as given, with no thinking wrapper read
-   * out of it as out of a model's answer. It carries no reasoning,
-   * `external` says who supplied it, and
-   * its provenance names no model. Without `apply` the work is run to its
-   * request as exportMemoryRequest runs it, the same checks are made, and
-   * nothing is written.
+   * out of it as out of a model's answer. It carries no reasoning and no
+   * `provenance`, which is a model call's: `external` says who supplied it
+   * and names the request it answers. Without `apply` the work is run to
+   * its request as exportMemoryRequest runs it, the same checks are made,
+   * and nothing is written.
    */
   async importExternalMemory(
     item: MemoryWorkItem,
@@ -14905,10 +14906,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Replace the text of one summary. Its lineage stays as it is; its tokens
-   * are stamped from the new text; the verbatim response blocks it carried
-   * go, since they no longer match; and `external` says who supplied the
-   * text. Summaries merged over the old text are reported and left alone.
-   * Without `apply` nothing is written.
+   * are stamped from the new text; what described the call that wrote the
+   * old text goes, since it no longer matches: the verbatim response blocks
+   * it carried, its `provenance` and its split-stitch record (`stitched`);
+   * and `external` says who supplied the text. The store's history keeps
+   * the entry as it was. Summaries merged over the old text are reported
+   * and left alone. Without `apply` nothing is written.
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -14932,6 +14935,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entry.content = body;
     entry.tokens = edit.tokens;
     delete entry.responseContent;
+    delete entry.provenance;
+    delete entry.stitched;
     entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
     this.writeStoredSummary(entry, 'editSummaryText', 'new text');
     return edit;
