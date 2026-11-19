@@ -22529,10 +22529,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * envelope the result, rather than truncating an already-enveloped body.
    */
   protected summaryAnswerProse(summary: SummaryEntry): ContentBlock[] {
-    if (summary.responseContent && summary.responseContent.length > 0) {
-      return [...summary.responseContent];
+    const memory = this.carriedMemory(summary);
+    if (memory.responseContent && memory.responseContent.length > 0) {
+      return [...memory.responseContent];
     }
-    return [{ type: 'text', text: summary.content }];
+    return [{ type: 'text', text: memory.content }];
+  }
+
+  /**
+   * The summary whose text answers for `entry`: the entry itself, or, for
+   * one that carries a summary up a level (`carryStrandedSummaries`), the
+   * summary a summarizer wrote under it, through each entry that carries
+   * it. A compile reads that summary in the entry's place (pastCarries), and
+   * a summarizer request that names the entry (a merge over it, a recall
+   * before a chunk or a merge) answers with the same text, as it stands
+   * now: a repair that rewrites a summary in place reaches every entry that
+   * carries it, and the copy an entry was written with stands only where
+   * this instance doesn't hold the summary under it.
+   */
+  private carriedMemory(entry: SummaryEntry): SummaryEntry {
+    for (let under: SummaryEntry | undefined; carriesItsSource(entry) && (under = this.summaryById(entry.sourceIds[0]!)); ) entry = under;
+    return entry;
   }
 
   /**

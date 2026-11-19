@@ -470,6 +470,32 @@ describe('a carry on a store', () => {
     assert.ok(asked.includes('[CM] Recall memory P.'), 'premise: and the summaries before the run');
   });
 
+  it('asks a merge over a carried entry with the text of the summary it carries as that stands now, not the copy the carry wrote', async () => {
+    // As a store whose s was carried twice, and its text then repaired in place: the two entries keep the text they copied.
+    await seed(RAGGED, (summaries) => {
+      const s = summaries.find((x) => x.id === 's')!;
+      const { mergedInto: _none, ...memory } = s;
+      Object.assign(s, { content: 'what a repair wrote', mergedInto: 'L4-500' });
+      return [
+        ...summaries,
+        { ...memory, id: 'L4-500', level: 4, sourceLevel: 3, sourceIds: ['s'], carriedFrom: 's', mergedInto: 'L5-501' } as SummaryEntry,
+        { ...memory, id: 'L5-501', level: 5, sourceLevel: 4, sourceIds: ['L4-500'], carriedFrom: 'L4-500' } as SummaryEntry,
+      ];
+    }, STORE, 502);
+    const live = answering();
+    const run = await opened({ carryStrandedSummaries: true }, live.membrane);
+    try {
+      assert.deepEqual(run.lane.summaries.filter((x) => x.carriedFrom !== undefined).map((x) => x.content), ['memory s', 'memory s'], 'premise: the entries hold the text as it was carried');
+      assert.deepEqual(run.lane.mergeQueue.map((x) => x.sourceIds), [['A', 'L5-501', 'B']], 'premise: the run with the carried entry is queued');
+      await run.settle();
+      assert.equal(live.requests.length, 1);
+      const asked = JSON.stringify(live.requests[0]);
+      assert.ok(asked.includes('[CM] Recall memory L4-500.'), 'premise: the request names the entry under the one the merge takes');
+      assert.ok(asked.includes('"what a repair wrote"'), 'answered with the text s holds now');
+      assert.ok(!asked.includes('"memory s"'), 'and not with the copy');
+    } finally { run.manager.close(); }
+  });
+
   it('compiles the same bytes before and after a carry, and never folds the span to a carried level', async () => {
     for (const foldingStrategy of ['flat-profile', 'oldest-first'] as const) {
       // An envelope that names each summary's id, level and span: the bytes a carried entry of its own id would change.

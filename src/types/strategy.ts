@@ -2447,7 +2447,8 @@ export interface AutobiographicalConfig {
    * entry lands, and then that merge's summary is the next level its
    * messages fold to. `searchSummaries` and `listSummariesInRange` read
    * them the same way. A summarizer request names a carried entry by its
-   * own id, as it names any summary of that level. `previewCarries` lists
+   * own id, as it names any summary of that level, and answers with the
+   * text of the summary it carries as that stands. `previewCarries` lists
    * what the rule would do to a store as it stands.
    */
   carryStrandedSummaries?: boolean;
@@ -3105,8 +3106,12 @@ export interface SummaryEntry {
    * Set on an entry no summarizer call wrote: the id of the summary one
    * level down that it carries up unchanged (`carryStrandedSummaries`), its
    * one source. Its text, `responseContent`, `tokens`, `created` and
-   * `provenance` are that summary's own, so `provenance` names the request
-   * that authored the text, at the level it was written for.
+   * `provenance` are that summary's own, copied when it was carried, so
+   * `provenance` names the request that authored the text, at the level it
+   * was written for. The copy is not kept in step with the summary: a
+   * compile and a summarizer request read the text from the summary carried
+   * as it stands, so a repair that rewrites a summary in place edits that
+   * summary, not the entries that carry it.
    *
    * The entry is a carry only while that summary is its one source. A
    * topology repair can give it another (an adoption, a re-homed fragment)

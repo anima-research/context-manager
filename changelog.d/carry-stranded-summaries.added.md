@@ -28,9 +28,12 @@
     lands, and that merge's summary is then the next level those messages
     fold to. `searchSummaries` and `listSummariesInRange` read them the same
     way, so no memory is listed twice. A summarizer request names a carried
-    entry by its own id, as it names any summary of that level. The request
-    for a transition summary leaves carried entries out, since they repeat a
-    summary's text.
+    entry by its own id, as it names any summary of that level, and answers
+    with the text of the summary it carries as that summary stands. The
+    entry's own copy of the text is not kept in step with it, so a repair
+    that rewrites a carried summary in place edits that summary, and not the
+    entries that carry it. The request for a transition summary leaves
+    carried entries out, since they repeat a summary's text.
   - `getStrandedSummaries()` no longer lists a summary the next merge check
     carries when the option is set.
   - `previewCarries()` lists what the rule would do to a store as it stands,
