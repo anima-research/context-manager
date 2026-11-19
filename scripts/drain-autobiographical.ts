@@ -21,11 +21,11 @@ import {
   AnthropicAdapter,
   Membrane,
   NativeFormatter,
-  type ToolDefinition,
 } from '@animalabs/membrane';
-import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
 import { DEFAULT_RUNS_CONFIG } from '../src/repair/topology.js';
+import { latestToolsFromAnthropicLog, residentStrategyOptions } from './resident-settings.js';
 
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
@@ -82,34 +82,6 @@ const recipe = recipePath
     }
   : undefined;
 const recipeStrategy = recipe?.agent?.strategy ?? {};
-const passthroughKeys = [
-  'compressionMaxTokens',
-  'compressionRefusalCurveFallbacks',
-  'compressionContextBudgetTokens',
-  'compressionSourceOnly',
-  'compressionSourceOnlyFallback',
-  'compressionMergeSourceOnly',
-  'compressionMergeSourceOnlyFallback',
-  'compressionToolProseFallback',
-  'compressionSplitFallback',
-  'compressionSplitPlaceholder',
-  'compressionSplitMaxCallsPerChunk',
-  'compressionSplitMaxCallsPer10Min',
-  'compressionRecallBudgetTokens',
-  'recoverLiteralThinkingWrappedCompression',
-  'mergeHoldSummaryIds',
-  'mergeMaxSourceSpanMessages',
-  'l1HoldbackChunks',
-  'summaryTargetTokens',
-  'identityReminder',
-  'witnessedIdentityReminder',
-  'witnessedBeforeSequence',
-  'witnessedInstruction',
-] as const;
-const recipeOptions: Record<string, unknown> = {};
-for (const key of passthroughKeys) {
-  if (recipeStrategy[key] !== undefined) recipeOptions[key] = recipeStrategy[key];
-}
 class DrainStrategy extends AutobiographicalStrategy {
   protected override landsAsPlanned(): boolean {
     return true;
@@ -128,21 +100,7 @@ class DrainStrategy extends AutobiographicalStrategy {
     };
   }
 }
-const strategy = new DrainStrategy({
-  ...recipeOptions,
-  adaptiveResolution: true,
-  hierarchical: true,
-  speculativeProduction: recipeStrategy.speculativeProduction !== false,
-  autoTickOnNewMessage: false,
-  headWindowTokens: Number(recipeStrategy.headWindowTokens ?? 4_000),
-  recentWindowTokens: Number(recipeStrategy.recentWindowTokens ?? 100_000),
-  maxMessageTokens: Number(recipeStrategy.maxMessageTokens ?? 10_000),
-  mergeThreshold: Number(recipeStrategy.mergeThreshold ?? 6),
-  maxSpeculativeL1s: Number(recipeStrategy.maxSpeculativeL1s ?? 36),
-  compressionModel: model,
-  summaryParticipant: participant,
-  enforceBudget: true,
-});
+const strategy = new DrainStrategy(residentStrategyOptions(recipeStrategy, model, participant));
 const tools = toolsLog ? latestToolsFromAnthropicLog(toolsLog) : [];
 
 const manager = await ContextManager.open({
@@ -232,53 +190,3 @@ if (final.quarantines === null || final.quarantines > 0) {
 // A last report with an error fails, and so does one whose quarantines it
 // couldn't count (null).
 if (!completed || final.quarantines !== 0 || final.debtError !== undefined) process.exit(1);
-
-function latestToolsFromAnthropicLog(path: string): ToolDefinition[] {
-  const fd = openSync(path, 'r');
-  try {
-    const size = fstatSync(fd).size;
-    for (let bytes = 4 * 1024 * 1024; bytes <= 64 * 1024 * 1024; bytes *= 2) {
-      const length = Math.min(size, bytes);
-      const buffer = Buffer.alloc(length);
-      readSync(fd, buffer, 0, length, size - length);
-      const lines = buffer.toString('utf8').split('\n');
-      if (size > length) lines.shift(); // discard a partial first record
-      for (let index = lines.length - 1; index >= 0; index--) {
-        let row: {
-          type?: unknown;
-          kind?: unknown;
-          rawRequest?: { tools?: unknown };
-        };
-        try { row = JSON.parse(lines[index]!); } catch { continue; }
-        if (row.type !== 'call' || row.kind !== 'stream' || !Array.isArray(row.rawRequest?.tools)) {
-          continue;
-        }
-        const normalized: ToolDefinition[] = [];
-        for (const candidate of row.rawRequest.tools) {
-          if (!candidate || typeof candidate !== 'object') continue;
-          const raw = candidate as {
-            name?: unknown;
-            description?: unknown;
-            input_schema?: unknown;
-          };
-          if (
-            typeof raw.name !== 'string' ||
-            typeof raw.description !== 'string' ||
-            !raw.input_schema ||
-            typeof raw.input_schema !== 'object'
-          ) continue;
-          normalized.push({
-            name: raw.name,
-            description: raw.description,
-            inputSchema: raw.input_schema as ToolDefinition['inputSchema'],
-          });
-        }
-        if (normalized.length > 0) return normalized;
-      }
-      if (length === size) break;
-    }
-  } finally {
-    closeSync(fd);
-  }
-  throw new Error(`no stream-call tool definition found in the last 64 MiB of ${path}`);
-}

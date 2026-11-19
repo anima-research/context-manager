@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
 import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
@@ -3050,6 +3050,82 @@ export interface SummaryEntry {
     /** Compression model that authored this summary. */
     model?: string;
   };
+  /**
+   * Set when the text came from outside the strategy's own compression
+   * calls: an operator installed it as the result of the work, or replaced
+   * the text of an existing summary (`importExternalMemory`,
+   * `editSummaryText`). Absent on every other entry. Nothing renders it and
+   * no selection reads it. An installed entry's `provenance.requestHash`
+   * names the request the strategy built for the work, which no model
+   * answered here, and carries no model; an edited entry's `provenance`
+   * still names the call that wrote the text the edit replaced.
+   */
+  external?: ExternalMemoryProvenance;
+}
+
+/** Who supplied a summary's text from outside the strategy, and when. */
+export interface ExternalMemoryProvenance {
+  /** The operator's name for who or what wrote the text. */
+  by: string;
+  /** When it was installed (ms since epoch). */
+  at: number;
+  note?: string;
+}
+
+/**
+ * One piece of compression work as the strategy holds it: the summary it
+ * would write. `exportMemoryRequest` returns it beside the request, and
+ * `importExternalMemory` takes it back and installs a text only while the
+ * strategy would still produce the same work.
+ */
+export interface MemoryWorkItem {
+  /** Level of the summary the work writes. */
+  level: SummaryLevel;
+  /** Level of its sources: 0 for an L1's messages. */
+  sourceLevel: number;
+  /** Message ids for an L1, summary ids above it, in the order the summary lists them. */
+  sourceIds: string[];
+  /** First and last message id the summary covers. */
+  sourceRange: { first: string; last: string };
+  /** For an L1: the chunk record the work compresses. */
+  chunkRecordId?: string;
+}
+
+/** Which work: the merge the strategy would do next into `level`, or the L1 of a chunk record. */
+export type MemoryWorkTarget = { level: SummaryLevel } | { chunkRecordId: string };
+
+/** What an edit of a summary's text replaced (`editSummaryText`). */
+export interface SummaryTextEdit {
+  id: string;
+  level: SummaryLevel;
+  applied: boolean;
+  /** The text replaced: its sha256 (hex, of the UTF-8 text), length in characters and token stamp. */
+  prior: { sha256: string; length: number; tokens: number };
+  tokens: number;
+  /** Verbatim response blocks the entry carried, which go with the text they matched. */
+  droppedResponseBlocks: number;
+  /** Summaries merged over the old text, nearest first. They are left as they are. */
+  parents: Array<{ id: string; level: SummaryLevel }>;
+}
+
+/**
+ * Strategy that takes memory text written outside its own compression calls.
+ * Implemented by AutobiographicalStrategy and its subclasses.
+ */
+export interface ExternalMemoryStrategy extends ContextStrategy {
+  exportMemoryRequest(target: MemoryWorkTarget, ctx: StrategyContext): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }>;
+  importExternalMemory(
+    item: MemoryWorkItem,
+    body: string,
+    by: Omit<ExternalMemoryProvenance, 'at'>,
+    ctx: StrategyContext,
+    options?: { apply?: boolean },
+  ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }>;
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: { apply?: boolean }): SummaryTextEdit;
+}
+
+export function isExternalMemoryStrategy(s: ContextStrategy): s is ExternalMemoryStrategy {
+  return 'importExternalMemory' in s && typeof (s as ExternalMemoryStrategy).importExternalMemory === 'function';
 }
 
 /**
