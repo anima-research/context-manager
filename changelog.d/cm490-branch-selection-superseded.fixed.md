@@ -1,1 +1,1 @@
-- If a newer initialization starts during branch reconciliation, `switchBranch()` and `fork()` report `InitializationSupersededError` with the original branch and creation flag instead of a branch-name mismatch.
+- If a reentrant switch starts a newer initialization while `switchBranch()` or `fork()` reconciles its branch, the call rejects with `InitializationSupersededError` naming the requested branch and creation flag, instead of the generic "Branch changed during strategy initialization" error.
