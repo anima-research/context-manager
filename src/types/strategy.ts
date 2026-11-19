@@ -2664,6 +2664,29 @@ export interface AutobiographicalConfig {
    */
   compressionSplitFallback?: boolean;
   /**
+   * Fallback-model rung: a model to send the canonical request to, with only
+   * its model changed, once the compression model has refused on every rung
+   * that keeps it writing the memory in full. It runs before the split rung
+   * and before quarantine, for an L1 and for a merge (after the merge's last
+   * attempt), and only when every answer so far was a refusal: a provider
+   * error, a truncated or empty generation, or an overload is handled as
+   * before. Its memory is stored as text alone, without the reasoning blocks
+   * of its answer (`responseContent`), which a memory is otherwise replayed
+   * with: the agent's model and the compression model can't be given
+   * reasoning another model signed. `provenance.model` on the entry names
+   * this model. If it refuses too, the split rung and quarantine
+   * follow as before. They follow at once, with no pause of the compression
+   * lane, where a failed call says this model is held for longer than the
+   * lane's backoff ceiling of 10 minutes, or with no end (a provider's stated
+   * wait, or the caller's provider admission); a shorter wait pauses the
+   * lane and the rung is asked again. Setting or changing it is a new request
+   * regime for L1 compression, so already-quarantined chunks earn a fresh
+   * bounded attempt without a manual clear; a quarantined merge still needs
+   * `clearMergeQuarantine`. Unset by default: the memories are then written
+   * by the compression model alone.
+   */
+  compressionFallbackModel?: string;
+  /**
    * With compressionSplitFallback: allow a one-line bracketed operator placeholder for a
    * SINGLE message that refuses in every form (names the message id; the message stays in
    * the record). Without it, such a chunk falls through to quarantine. Off by default.
@@ -3105,7 +3128,10 @@ export interface SummaryEntry {
      * hash keys, because they are what the model actually read.
      */
     requestHash: string;
-    /** Compression model that authored this summary. */
+    /**
+     * The model that authored this summary: the compression model, or
+     * `compressionFallbackModel` where the fallback-model rung wrote it.
+     */
     model?: string;
   };
   /**
