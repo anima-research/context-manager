@@ -40,7 +40,11 @@
     writing nothing: each carry and each merge that would then land, in
     order, with the merge's sources and their tokens. The `--carry-preview`
     flag of `audit-topology` prints it, as the resident's own merge check
-    reads the store, and `--carry-preview=drain` as a drain does.
+    reads the store, and `--carry-preview=drain` as a drain does. A drain
+    compresses the chunks that wait before it carries or merges, and the
+    preview doesn't project the L1s they land: read as a drain it counts
+    those chunks (`chunksWaiting`, and a `provisional` line in the text
+    output), and its steps hold only once they have landed.
   - `repair-topology`, `audit-topology` and the planner
     (`RepairRunsConfig.carryStrandedSummaries`) take the setting as
     `--carry-stranded-summaries`. A rebuild planned with it projects the

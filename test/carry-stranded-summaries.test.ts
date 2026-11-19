@@ -778,6 +778,23 @@ describe('the preview, previewCarries()', () => {
     } finally { manager.close(); }
   });
 
+  it('read as a drain, says how many chunks wait for compression, which a drain lands before it carries', () => {
+    const gapped: Slot[] = [['A', 5, 16], ['s', 3, 4], ['gap', 0, 4], ['B', 5, 16], ['n4', 4, 8], ['n3', 3, 4]];
+    const chunks = [{ from: 0, to: 19, compressed: true }, { from: 20, to: 23, compressed: false }, { from: 24, to: 51, compressed: true }];
+    const queued = (): Probe => {
+      const p = new Probe({ carryStrandedSummaries: true }).lay(gapped, chunks);
+      (p as unknown as { compressionQueue: number[] }).compressionQueue = [1];
+      return p;
+    };
+    const asDrain = queued().previewCarries({ asDrain: true });
+    assert.ok(asDrain.steps?.some((step) => step.kind === 'carry' && step.id === 's'), 'premise: as the store stands, s is carried');
+    assert.equal('chunksWaiting' in asDrain && asDrain.chunksWaiting, 1, 'the chunk beside s lands an L1 first, so the steps are provisional');
+    assert.equal('chunksWaiting' in queued().previewCarries(), false, 'a resident\'s own check waits for no chunk');
+    const held = queued();
+    held.quarantineChunk(20, 23);
+    assert.equal('chunksWaiting' in held.previewCarries({ asDrain: true }), false, 'a chunk the quarantine holds lands nothing: the preview reads it as a hole');
+  });
+
   it('is printed by audit-topology --carry-preview, which leaves the summaries as they were', async () => {
     await seed(slots);
     const audit = (...flags: string[]) => spawnSync(process.execPath, [join(process.cwd(), 'dist/scripts/audit-topology.js'), STORE, '--namespace', 'probe', ...flags], { encoding: 'utf8' });

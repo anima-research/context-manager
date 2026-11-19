@@ -251,6 +251,7 @@ function carryPreviewFailedMessage(cause: unknown): string {
     'The carry preview could not be made.',
     `Cause: ${causeText(cause)}`,
     'Effect: nothing is listed, and the store is as it was.',
+    'Fix: fix what the cause names in the store or its quarantine ledger, then ask again. If it names neither, this is a fault in context-manager or in its options: report it.',
   ].join('\n');
 }
 
@@ -13970,21 +13971,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * ledger afresh, as getStrandedSummaries does, and where that or the
    * projection fails it returns an `error` in place of the list. It writes
    * nothing, and never throws.
+   *
+   * A drain compresses every chunk its compression queue holds before its
+   * merge check carries or picks anything, and the steps don't project the
+   * L1s those chunks land. So read as a drain, `chunksWaiting` counts the
+   * queued chunks no compression quarantine holds, when there are any: the
+   * steps are then provisional, since an L1 that lands beside a summary
+   * listed here gives it a partner, or stands alone beside it, and what
+   * follows differs. Preview again once they have landed. It counts the
+   * chunks this instance queued when it opened the store; messages no chunk
+   * record holds yet, which a drain chunks and compresses too, aren't
+   * counted. A resident's own check waits for no chunk, so that reading
+   * gives no count.
    */
-  previewCarries(options: { asDrain?: boolean } = {}): { steps: LadderStep[] } | { steps: null; error: string } {
+  previewCarries(options: { asDrain?: boolean } = {}): { steps: LadderStep[]; chunksWaiting?: number } | { steps: null; error: string } {
     try {
       const order = this.mergePositionIndex();
-      const input = { ...this.mergeRunsInput(order), planning: options.asDrain ?? this.landsAsPlanned() };
+      const asDrain = options.asDrain ?? this.landsAsPlanned();
+      const input = { ...this.mergeRunsInput(order), planning: asDrain };
       const queue = this.mergeQueue.filter((m) => queuedMergeRuns(m, (id) => this.summaryById(id), getSummaryParentId, order, input.held));
+      const holes = this.mergeHoles(order, input.held, this.readCompressionQuarantineProjection());
+      // A quarantined chunk is a hole of level 0 over its messages: it lands nothing.
+      const quarantined = (chunk: Chunk): boolean => chunk.messages.some((message) => {
+        const at = order.get(message.id);
+        return at !== undefined && holes.some((hole) => hole.level === 0 && hole.first <= at && at <= hole.last);
+      });
+      const chunksWaiting = !asDrain ? 0 : this.compressionQueue.filter((index) => {
+        const chunk = this.chunks[index];
+        return chunk !== undefined && !chunk.compressed && !quarantined(chunk);
+      }).length;
       return {
         steps: projectLadder(input, {
           threshold: this.config.mergeThreshold ?? 6,
           everyLevel: !!this.config.speculativeProduction,
           carry: true,
-          holes: this.mergeHoles(order, input.held, this.readCompressionQuarantineProjection()),
+          holes,
           leaves: (s) => this.ownedLeafRows(s),
           queue,
         }),
+        ...(chunksWaiting > 0 ? { chunksWaiting } : {}),
       };
     } catch (thrown) {
       return { steps: null, error: carryPreviewFailedMessage(thrown) };

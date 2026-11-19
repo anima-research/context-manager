@@ -22,7 +22,9 @@
  * do to the store as it stands under those settings, whether or not the
  * resident has it set: each carry and each merge that would then land, in
  * order (`previewCarries()`). It reads the store as the resident's own merge
- * check does; --carry-preview=drain reads it as drain-autobiographical does.
+ * check does; --carry-preview=drain reads it as drain-autobiographical does,
+ * and says so when chunks still wait for compression: a drain lands those
+ * first, so the steps are provisional until they have (`chunksWaiting`).
  * It writes nothing more than the audit-only open already does.
  *
  * Exit code 0 = no topology violation, 2 = violations found, 1 = could not
@@ -139,6 +141,10 @@ async function main(): Promise<void> {
         } else {
           const carries = preview.steps.filter((step) => step.kind === 'carry').length;
           console.log(`  carry preview (${reading}): ${carries} carr${carries === 1 ? 'y' : 'ies'}, ${preview.steps.length - carries} merge(s), in order`);
+          if (preview.chunksWaiting) {
+            console.log(`    provisional: ${preview.chunksWaiting} chunk(s) wait for compression, and a drain lands their L1s before it carries or merges; ` +
+              'where one lands beside a summary listed below, the steps from there differ. Preview again once they have landed.');
+          }
           for (const step of preview.steps) {
             console.log(step.kind === 'carry'
               ? `    carry ${step.id}: L${step.fromLevel} to L${step.toLevel}, no model call (as ${step.as})`
