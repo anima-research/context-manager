@@ -3,8 +3,8 @@
 `compression-main-a81.json` was first captured from public **pre-feature** source
 `a81d20656d8991f4d5963719535cab11703ff879`, not the feature PR. The filename retains
 that historical baseline name. `source` is provenance, not a forever-pinned SHA.
-New captures also record `sourceTree`. The original fixture remains unchanged in
-R2. The single-key object `{ "$cmGoldenUndefined": true }` encodes an explicit
+New captures also record `sourceTree`. The original fixture is unchanged since
+its first capture. The single-key object `{ "$cmGoldenUndefined": true }` encodes an explicit
 `undefined` value: strict comparison checks own-property presence and discards
 no request fields or text. All content is synthetic; no provider, private
 history, or resident store is used.

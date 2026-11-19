@@ -8,7 +8,6 @@ import { Membrane, TimeoutAbortError, abortError } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore, CompressionWithdrawn } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
-import { constructedRecallHeader } from '../src/recall-header.js';
 import type { StoredMessage, StrategyContext, SummaryEntry } from '../src/types/index.js';
 
 const BASE = './test-compression-recall-curve';
@@ -47,20 +46,6 @@ function response(stopReason: 'refusal' | 'end_turn' | 'max_tokens', text = '') 
       },
     },
   };
-}
-
-async function quiet<T>(work: () => Promise<T>): Promise<{ logs: string[]; result: PromiseSettledResult<T> }> {
-  const logs: string[] = [];
-  const original = console.error;
-  const originalWarn = console.warn;
-  console.error = console.warn = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
-  try {
-    const [result] = await Promise.allSettled([work()]);
-    return { logs, result: result! };
-  } finally {
-    console.error = original;
-    console.warn = originalWarn;
-  }
 }
 
 function scriptedMembrane(stops: Array<'refusal' | 'end_turn' | 'max_tokens'>) {
@@ -2590,135 +2575,6 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  for (const authoredOmission of [false, true]) {
-    it(`failed curve trace binds the last dispatched snapshot (omission=${authoredOmission})`, async () => {
-      const log = `${freshPath()}-error-trace.jsonl`;
-      paths.push(log);
-      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-      try {
-        const rejection = Object.assign(new Error('request rejected'), { type: 'invalid_request', httpStatus: 400, retryable: false });
-        const carrier = Object.assign(new Error('thinking cannot be modified'), { type: 'invalid_request', httpStatus: 400, retryable: false });
-        const mock = flexibleMembrane(authoredOmission
-          ? [{ stop: 'refusal' }, { error: rejection }]
-          : [{ stop: 'refusal' }, { error: carrier }, { error: rejection }]);
-        const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1, compressionSourceOnlyFallback: false });
-        if (authoredOmission) {
-          Object.defineProperty(fx.strategy, 'authorL1CompressionRequest', { value: (request: NormalizedRequest) => {
-            const removed = new Set<number>();
-            request.messages.forEach((message, i) => {
-              if (message.content.some(block => block.type === 'text' && /^\[CM\] Recall memory /.test(block.text))) {
-                removed.add(i); removed.add(i + 1);
-              }
-            });
-            return { ...request, messages: request.messages.filter((_message, i) => !removed.has(i)) };
-          } });
-        } else {
-          for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
-          fx.strategy.flushSummaries();
-        }
-        await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-        assert.equal(mock.calls.length, authoredOmission ? 2 : 3);
-        const sent = mock.calls.at(-1)!.request;
-        const entries = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-        const failed = entries.find(entry => entry.event === 'compression:attempt' && entry.metadata.outcome === 'provider_error').metadata;
-        assert.equal(failed.requestHash, createHash('sha256').update(JSON.stringify(sent)).digest('hex'));
-        assert.equal(failed.messageCount, sent.messages.length);
-        assert.equal(failed.estimatedTokens, Math.ceil(JSON.stringify(sent).length / 4));
-        assert.deepEqual(failed.recallIds, recallIds(sent));
-        assert.deepEqual(failed.recallLevels, recallIds(sent).map(id => fx.strategy.summariesView().find(summary => summary.id === id)!.level));
-        if (authoredOmission) assert.equal(failed.leafCoverageHash, createHash('sha256').update('[]').digest('hex'));
-        else assert.ok(!JSON.stringify(sent).includes('private-'), 'failed trace is for stripped retry');
-        fx.manager.close();
-      } finally {
-        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-      }
-    });
-  }
-
-  it('carrier-stripped recall pricing estimates text, not stored thinking tokens', async () => {
-    const log = `${freshPath()}-pricing.jsonl`;
-    paths.push(log);
-    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-    try {
-      const mock = flexibleMembrane([{ error: Object.assign(new Error('thinking cannot be modified'), {
-        type: 'invalid_request', httpStatus: 400, retryable: false,
-      }) }, { stop: 'end_turn', text: 'summary' }]);
-      const fx = await fixture(mock.membrane);
-      for (const entry of fx.strategy.summariesView()) {
-        entry.responseContent = carrierBlocks(entry.id, '<thinking>' + 'literal preamble '.repeat(200) + '</thinking>' + entry.content);
-        entry.tokens = 10_000;
-      }
-      fx.strategy.flushSummaries();
-      await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-      assert.equal(mock.calls.length, 2);
-      const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-        .find(entry => entry.operation === 'compress_l1' && !entry.event);
-      assert.equal(receipt.metadata.prior_summary_count_kept, 2);
-      assert.equal(receipt.metadata.prior_summary_token_estimate, 'text-content-estimate');
-      const expectedTokens = fx.parents.reduce((total, entry) => {
-        const replayed = '<thinking>' + 'literal preamble '.repeat(200) + '</thinking>' + entry.content;
-        return total + managerContext(fx.manager).messageStore.estimateTokens({ content: [text(replayed)] } as StoredMessage) + 50;
-      }, 0);
-      assert.equal(receipt.metadata.prior_summary_tokens, expectedTokens, 'exact replayed text estimate plus pair overhead, not stored thinking tokens');
-      assert.equal(quarantineEvents(fx.manager).length, 0);
-      fx.manager.close();
-    } finally {
-      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-    }
-  });
-
-  for (const mode of ['empty', 'unavailable', 'transient'] as const) {
-    const empty = mode === 'empty';
-    it(`recall telemetry ${mode} without blocking dispatch`, async () => {
-      const log = `${freshPath()}-unavailable.jsonl`;
-      paths.push(log);
-      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-      try {
-        const mock = flexibleMembrane([{ raw: { content: [], stopReason: 'end_turn' } }, { stop: 'end_turn', text: 'summary' }]);
-        const fx = await fixture(mock.membrane, { compressionSourceOnly: empty });
-        const internals = fx.strategy as unknown as { persistedCanonicalSummariesById(): Map<string, SummaryEntry> };
-        const original = internals.persistedCanonicalSummariesById.bind(fx.strategy);
-        let reads = 0;
-        let telemetryReads = 0;
-        let authoring = false;
-        const hooks = fx.strategy as unknown as { authorL1CompressionRequest(request: NormalizedRequest, ids: string[]): NormalizedRequest };
-        const author = hooks.authorL1CompressionRequest.bind(fx.strategy);
-        hooks.authorL1CompressionRequest = (request, ids) => { authoring = true; return author(request, ids); };
-        internals.persistedCanonicalSummariesById = () => {
-          reads++;
-          // Only the log preparation read fails; planning reads stay real.
-          if (authoring) {
-            telemetryReads++;
-            if (mode !== 'transient' || telemetryReads === 1) throw new Error('private store error');
-          }
-          return original();
-        };
-        const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-        assert.equal(result.status, 'fulfilled');
-        assert.equal(mock.calls.length, 2, 'empty response retries despite telemetry failures');
-        assert.ok(reads > 0, 'planning still uses its projection');
-        assert.equal(telemetryReads, empty ? 0 : 2);
-        const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-          .find(entry => entry.operation === 'compress_l1' && !entry.event);
-        assert.equal(receipt.metadata.prior_summary_count_kept, empty ? 0 : mode === 'transient' ? 2 : null);
-        assert.equal(receipt.metadata.prior_summary_tokens, empty ? 0 : mode === 'transient' ? 140 : null);
-        assert.equal(receipt.metadata.prior_summary_token_estimate, mode === 'unavailable' ? 'unavailable' : 'stored-summary-estimate');
-        assert.equal(logs.filter(line => line.includes('recall telemetry unavailable')).length, empty ? 0 : 1);
-        assert.ok(!logs.join('').includes('private store error'));
-        assert.equal(quarantineEvents(fx.manager).length, 0);
-        fx.manager.close();
-      } finally {
-        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-      }
-    });
-  }
-
   it('emits metadata traces for refusal, curve attempt, success, and persistence', async () => {
     const logPath = `${freshPath()}-trace.jsonl`;
     paths.push(logPath);
@@ -4376,6 +4232,17 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     [Symbol.for('@animalabs/context-manager:compression-withdrawn')]: true,
   });
 
+  async function quiet<T>(work: () => Promise<T>): Promise<{ logs: string[]; result: PromiseSettledResult<T> }> {
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+    try {
+      const [result] = await Promise.allSettled([work()]);
+      return { logs, result: result! };
+    } finally {
+      console.error = original;
+    }
+  }
 
   // Date.now reads a clock the test moves, for the work it runs.
   async function withClock<T>(clock: { now: number }, work: () => Promise<T>): Promise<T> {
@@ -4591,38 +4458,7 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     assert.ok(withdrawn instanceof Error);
   });
 
-  it('a pre-send withdrawal of a retry preserves the preceding dispatched request', async () => {
-    const log = `${freshPath()}-withdrawn-retry.jsonl`;
-    paths.push(log);
-    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-    try {
-      const withdrawn = new CompressionWithdrawn('host did not forward retry');
-      const mock = flexibleMembrane([{ stop: 'refusal' }, { error: withdrawn }]);
-      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true });
-      const { result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-      assert.equal((result as PromiseRejectedResult).reason, withdrawn);
-      assert.equal(mock.calls.length, 2, 'one sent request and one intercepted retry');
-      assert.notDeepEqual(mock.calls[0].request, mock.calls[1].request);
-      const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-        .find(entry => entry.operation === 'compress_l1' && !entry.event);
-      assert.deepEqual(receipt.messages, mock.calls[0].request.messages.map(message => ({
-        participant: message.participant, blockCount: message.content.length,
-        blockTypes: message.content.map(block => block.type),
-        textChars: message.content.reduce((n, block) => n + (block.type === 'text' ? block.text.length : 0), 0),
-      })), 'receipt retains the preceding actual request, not the withdrawn retry');
-      assert.equal(receipt.metadata.prior_summary_count_kept, recallIds(mock.calls[0].request).length);
-      assert.equal(receipt.metadata.request_scope, 'last-dispatched-attempt');
-      assert.equal(receipt.metadata.withdrawn, true);
-      assert.equal(quarantineEvents(fx.manager).length, 0, 'withdrawal does not exhaust quarantine');
-      fx.manager.close();
-    } finally {
-      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-    }
-  });
-
-  it('does not label a branded pre-send withdrawal as a dispatched request', async () => {
+  it('says withdrawn, not error, in the opt-in compression log', async () => {
     const log = `${freshPath()}-calls.jsonl`;
     const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
     process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
@@ -4631,9 +4467,11 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
       const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
       await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
       fx.manager.close();
-      const receipts = (existsSync(log) ? readFileSync(log, 'utf8').trim() : '').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
         .filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
-      assert.equal(receipts.length, 0, 'no dispatch was confirmed');
+      assert.equal(receipts.length, 1, 'one receipt for the call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+      assert.ok(!('error' in receipts[0]!), 'and no error');
     } finally {
       if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
       else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
@@ -4641,7 +4479,7 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     }
   });
 
-  it('records branch discard but no dispatched request for a branded withdrawal after a branch move', async () => {
+  it('says withdrawn in the opt-in compression log when the branch moved while the withdrawn call was out', async () => {
     const log = `${freshPath()}-calls.jsonl`;
     const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
     process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
@@ -4657,9 +4495,11 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
       assert.equal(fx.manager.currentBranch().name, fork);
       assert.equal(result.status, 'fulfilled');
       fx.manager.close();
-      const entries = (existsSync(log) ? readFileSync(log, 'utf8').trim() : '').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+      const entries = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
       const receipts = entries.filter((entry) => entry.operation === 'compress_l1' && entry.event === undefined);
-      assert.equal(receipts.length, 0, 'no dispatch was confirmed');
+      assert.equal(receipts.length, 1, 'one receipt for the call');
+      assert.equal((receipts[0]!.metadata as Record<string, unknown>).withdrawn, true);
+      assert.ok(!('error' in receipts[0]!), 'and no error');
       const discards = entries.filter((entry) => entry.event === 'compression:branch-result-discarded');
       assert.deepEqual(discards.map((entry) => (entry.metadata as Record<string, unknown>).phase), ['canonical_withdrawn'], 'the discard names the withdrawal, not an error');
     } finally {
@@ -5200,290 +5040,3 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     fx.manager.close();
   });
 });
-
-
-describe('L1 no-dispatch outcome receipts', () => {
-  for (const logging of [false, true]) {
-    for (const reason of ['deferral', 'withdrawal', 'error'] as const) {
-      it(`records ${reason} without claiming a send (logging=${logging})`, async () => {
-        const log = `${freshPath()}-no-dispatch.jsonl`;
-        paths.push(log);
-        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-        let fx: Fixture | undefined;
-        try {
-          const error = reason === 'withdrawal' ? new CompressionWithdrawn('host stopped before send')
-            : Object.assign(new Error(`${reason} before send`), reason === 'deferral' ? { providerAdmission: 'deferred' } : {});
-          const mock = flexibleMembrane([{ error }]);
-          fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
-          if (reason === 'error') {
-            // A local authoring failure happens before callProvider, unlike a
-            // provider error, which is evidence of an attempted dispatch.
-            (fx.strategy as unknown as { authorL1CompressionRequest(): never }).authorL1CompressionRequest = () => { throw error; };
-          }
-          const { result } = await quiet(() => fx!.strategy.run(fx!.target, managerContext(fx!.manager)));
-          assert.equal(result.status, 'rejected');
-          assert.equal((result as PromiseRejectedResult).reason, error);
-          assert.equal(mock.calls.length, reason === 'error' ? 0 : 1, 'admission/withdrawal intercept the call before transport');
-          assert.equal(fx.target.compressed, false);
-          const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
-          assert.equal(entries.filter(entry => entry.operation === 'compress_l1' && !entry.event).length, 0);
-          const outcomes = entries.filter(entry => entry.event === 'compression:no-dispatch');
-          assert.equal(outcomes.length, logging ? 1 : 0);
-          assert.deepEqual(quarantineEvents(fx.manager), [], 'no unsent attempt exhausts a family, with or without logging');
-          if (!logging) { assert.equal(existsSync(log), false); return; }
-          const outcome = outcomes[0];
-          assert.equal(outcome.operation, 'compress_l1');
-          assert.equal(outcome.metadata.dispatched, false);
-          assert.equal(outcome.metadata.reason, reason);
-          assert.equal(outcome.metadata.detail, error.message);
-          assert.deepEqual(outcome.metadata.chunk_message_ids, fx.target.messages.map(message => message.id));
-          for (const key of ['system', 'messages', 'request', 'response']) assert.equal(key in outcome, false);
-          assert.equal(outcome.metadata.request_scope, undefined);
-          assert.deepEqual(quarantineEvents(fx.manager), [], 'no unsent attempt exhausts a family');
-        } finally {
-          fx?.manager.close();
-          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-        }
-      });
-    }
-  }
-});
-
-
-it('recall curves preserve collapsed raw blocks and identical untagged pairs', async () => {
-  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'summary' }]);
-  const fx = await fixture(mock.membrane);
-  try {
-    await fx.strategy.run(fx.target, managerContext(fx.manager));
-    const canonical = mock.calls[0]!.originalRequest!;
-    const pairIndex = canonical.messages.findIndex(message => message.content.some(block => block.type === 'text' && block.text === '[CM] Recall memory L2-201.'));
-    assert.ok(pairIndex >= 0);
-    const rawPair = structuredClone(canonical.messages.slice(pairIndex, pairIndex + 2));
-    const rawPrefix = text('raw Context Manager history before the constructed header');
-    const messages = [...rawPair, ...canonical.messages];
-    const headerIndex = pairIndex + rawPair.length;
-    messages[headerIndex] = { ...messages[headerIndex]!, content: [rawPrefix, ...messages[headerIndex]!.content] };
-    const build = fx.strategy as unknown as { buildRecallCurveVariants(request: NormalizedRequest, kept: SummaryEntry[], all: StoredMessage[]): Array<{ parent: SummaryEntry; request: NormalizedRequest }> };
-    const variants = build.buildRecallCurveVariants({ ...canonical, messages }, fx.parents, managerContext(fx.manager).messageStore.getAll());
-    const variant = variants.find(item => item.parent.id === 'L2-201');
-    assert.ok(variant, 'collapsed constructed header still expands in the presence of identical raw bytes');
-    assert.deepEqual(variant.request.messages.slice(0, 2), rawPair, 'raw duplicate is neither ambiguous nor replaced');
-    assert.equal(variant.request.messages[headerIndex]!.content[0], rawPrefix, 'raw prefix keeps its block identity');
-    assert.deepEqual(variant.request.messages[headerIndex]!.content, [rawPrefix, text('[CM] Recall memory L1-102.')]);
-    assert.deepEqual(variant.request.messages[headerIndex + 1]!.content, [text(fx.children[2]!.content)]);
-  } finally { fx.manager.close(); }
-});
-
-it('a later dispatch recovers recall totals after an unknown authored recall', async () => {
-  const log = `${freshPath()}-recovered-totals.jsonl`;
-  paths.push(log);
-  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-  const mock = flexibleMembrane([{ raw: { content: [], stopReason: 'end_turn' } }, { stop: 'end_turn', text: 'summary' }]);
-  const fx = await fixture(mock.membrane);
-  try {
-    const hooks = fx.strategy as unknown as { authorL1CompressionRequest(request: NormalizedRequest, ids: string[]): NormalizedRequest };
-    const author = hooks.authorL1CompressionRequest.bind(fx.strategy);
-    let calls = 0;
-    hooks.authorL1CompressionRequest = (request, ids) => {
-      const result = author(request, ids);
-      return calls++ ? result : { ...result, messages: [
-        { participant: 'Context Manager', content: [constructedRecallHeader('L1-unknown')] },
-        { participant: 'Claude', content: [text('unknown recall')] }, ...result.messages,
-      ] };
-    };
-    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-    assert.equal(result.status, 'fulfilled');
-    assert.equal(mock.calls.length, 2);
-    assert.equal(logs.filter(line => line.includes('recall telemetry unavailable')).length, 1);
-    const receipt = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(entry => entry.operation === 'compress_l1' && !entry.event);
-    assert.equal(receipt.metadata.prior_summary_count_kept, 2);
-    assert.ok(receipt.metadata.prior_summary_tokens > 0);
-    assert.equal(receipt.metadata.prior_summary_token_estimate, 'stored-summary-estimate');
-  } finally {
-    fx.manager.close();
-    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-  }
-});
-
-it('warns without replacing a successful compression when receipt preparation throws', async () => {
-  const log = `${freshPath()}-receipt-warning.jsonl`;
-  paths.push(log);
-  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'summary' }]);
-  const fx = await fixture(mock.membrane);
-  try {
-    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold = () => {
-      // Mint persistence has finished; only telemetry now needs this message.
-      Object.defineProperty(mock.calls[0]!.originalRequest!.messages[0], 'participant', { get() { throw new Error('private payload'); } });
-    };
-    const { logs, result } = await quiet(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
-    assert.equal(result.status, 'fulfilled');
-    assert.equal(fx.target.compressed, true);
-    assert.equal(logs.filter(line => line.includes('receipt preparation failed')).length, 1);
-    assert.ok(!logs.join('').includes('private payload'));
-  } finally {
-    fx.manager.close();
-    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-  }
-});
-
-
-describe('public tick operation-wide no-dispatch boundary', () => {
-  for (const exit of ['preparation', 'fatal-lookalike', 'quarantine-read', 'opening', 'tools', 'branch-discard', 'adoption', 'quarantine', 'reused-exhaustion'] as const) {
-    it(`records exactly one pre-send outcome for ${exit}`, async () => {
-      const log = `${freshPath()}-public-no-dispatch.jsonl`;
-      paths.push(log);
-      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-      const mock = flexibleMembrane([{ stop: 'refusal' }]);
-      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: false });
-      const localError = new Error(`local ${exit} failure`);
-      const hooks = fx.strategy as unknown as {
-        prepareCompressionAhead(r: NormalizedRequest): NormalizedRequest;
-        prepareCompressionCandidate(r: NormalizedRequest, label: string): NormalizedRequest;
-        getCompressionOpening(): string;
-        familyWaitsForTools(): boolean;
-        exhaustCompressionRequestFamily(...args: unknown[]): Promise<unknown>;
-      };
-      const queue = () => { fx.target.index = 0; fx.strategy.setTickWork([fx.target], [0]); };
-      try {
-        queue();
-        if (exit === 'preparation') hooks.prepareCompressionAhead = () => { throw localError; };
-        if (exit === 'fatal-lookalike') {
-          // Only the actual, already-audited fatal is exempt, not hook errors
-          // with the same text or a spoofed class name.
-          localError.name = 'MissingCompressionModelError';
-          localError.message = 'compressionModel is NOT configured. Memory formation is halted';
-          hooks.prepareCompressionAhead = () => { throw localError; };
-        }
-        if (exit === 'opening') hooks.getCompressionOpening = () => { throw localError; };
-        if (exit === 'tools') hooks.familyWaitsForTools = () => true;
-        if (exit === 'quarantine-read') {
-          // Leave tick's alarm/sweep and prompt-layout reads intact; fail the
-          // durable admission read after preparation, as an unreadable ledger.
-          let prepared = false;
-          const prepare = hooks.prepareCompressionAhead.bind(fx.strategy);
-          hooks.prepareCompressionAhead = r => { const result = prepare(r); prepared = true; return result; };
-          const store = fx.manager.getStore();
-          const read = store.getStateJson.bind(store);
-          store.getStateJson = id => {
-            if (prepared && id === 'default/autobio:compression-refusal-quarantine-events') { prepared = false; throw localError; }
-            return read(id);
-          };
-        }
-        if (exit === 'branch-discard') {
-          const prepare = hooks.prepareCompressionCandidate.bind(fx.strategy);
-          hooks.prepareCompressionCandidate = (r, label) => {
-            const result = prepare(r, label);
-            fx.strategy.detach();
-            return result;
-          };
-        }
-        if (exit === 'adoption') {
-          fx.strategy.seed(summary('L1-999', 1, fx.target.messages.map(m => m.id),
-            fx.target.messages[0]!.id, fx.target.messages.at(-1)!.id));
-        }
-        if (exit === 'quarantine' || exit === 'reused-exhaustion') {
-          const exhaust = hooks.exhaustCompressionRequestFamily.bind(fx.strategy);
-          if (exit === 'reused-exhaustion') {
-            hooks.exhaustCompressionRequestFamily = async () => { throw new CompressionWithdrawn('interrupted before exhaustion'); };
-          }
-          const first = await quiet(() => fx.manager.tick());
-          assert.equal(first.result.status, exit === 'quarantine' ? 'fulfilled' : 'rejected');
-          assert.equal(mock.calls.length, 1, 'canonical refusal is durable');
-          hooks.exhaustCompressionRequestFamily = exhaust;
-          queue();
-          rmSync(log, { force: true });
-        }
-        const before = mock.calls.length;
-        const { result } = await quiet(() => fx.manager.tick());
-        assert.equal(result.status, ['preparation', 'fatal-lookalike', 'quarantine-read', 'opening'].includes(exit) ? 'rejected' : 'fulfilled');
-        if (exit === 'quarantine-read') assert.equal((result as PromiseRejectedResult).reason.name, 'CompressionQuarantineUnreadableError');
-        assert.equal(mock.calls.length, before, 'public tick never sends on this exit');
-        const entries = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
-        const outcomes = entries.filter(e => e.event === 'compression:no-dispatch');
-        assert.equal(outcomes.length, 1, 'one structural boundary covers each exit');
-        const expected = exit === 'tools' ? 'deferral' : exit === 'branch-discard' ? 'withdrawal'
-          : exit === 'adoption' ? 'no-op' : exit === 'quarantine' ? 'quarantine'
-          : exit === 'reused-exhaustion' ? 'stopped' : 'error';
-        assert.equal(outcomes[0].metadata.reason, expected);
-        assert.equal(outcomes[0].metadata.dispatched, false);
-        assert.ok(outcomes[0].metadata.detail.length > 0);
-        assert.deepEqual(outcomes[0].metadata.chunk_message_ids, fx.target.messages.map(m => m.id));
-        for (const key of ['system', 'messages', 'request', 'response']) assert.equal(key in outcomes[0], false);
-        assert.equal(entries.filter(e => e.operation === 'compress_l1' && !e.event).length, 0);
-        if (exit !== 'quarantine' && exit !== 'reused-exhaustion') {
-          assert.deepEqual(quarantineEvents(fx.manager), [], 'unsent work creates no quarantine');
-        }
-      } finally {
-        fx.manager.close();
-        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-      }
-    });
-  }
-});
-
-
-it('public tick leaves merge discovery untouched when scheduling is disabled', async () => {
-  const mock = flexibleMembrane([{ stop: 'end_turn', text: 'new summary' }]);
-  const fx = await fixture(mock.membrane, { mergeThreshold: 2 });
-  try {
-    (fx.strategy as unknown as { allowsMergeScheduling(): boolean }).allowsMergeScheduling = () => false;
-    fx.target.index = 0;
-    fx.strategy.setTickWork([fx.target], [0]);
-    await fx.manager.tick();
-    assert.equal(mock.calls.length, 1);
-    assert.equal(fx.target.compressed, true);
-    assert.deepEqual(fx.strategy.mergeQueueView(), [], 'contiguous L2 parents must not be discovered/enqueued');
-    // Positive control: the same frontier really is eligible when enabled.
-    (fx.strategy as unknown as { allowsMergeScheduling(): boolean }).allowsMergeScheduling = () => true;
-    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold();
-    assert.ok(fx.strategy.mergeQueueView().length > 0, 'ordinary discovery can queue the same frontier');
-  } finally { fx.manager.close(); }
-});
-
-it('a failed log write and throwing warning cannot skip later attempt records or the receipt', async () => {
-  const log = `${freshPath()}-warning-survival.jsonl`;
-  const invalid = `${freshPath()}-invalid-log`;
-  paths.push(log, invalid);
-  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-  const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'summary' }]);
-  const fx = await fixture(mock.membrane);
-  const warn = console.warn;
-  try {
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(invalid, 'not a directory');
-    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold = () => {
-      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = `${invalid}/calls.jsonl`;
-    };
-    let warnings = 0;
-    console.warn = () => {
-      warnings++;
-      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
-      throw new Error('warning sink failed');
-    };
-    await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(fx.target.compressed, true);
-    assert.equal(warnings, 1, 'the first attempt write fails, including its warning');
-    const entries = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    assert.ok(entries.some(e => e.event === 'compression:attempt' && e.metadata.outcome === 'success'), 'later attempt still logged');
-    assert.equal(entries.filter(e => e.operation === 'compress_l1' && !e.event).length, 1, 'operation receipt still attempted');
-  } finally {
-    console.warn = warn;
-    fx.manager.close();
-    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
-  }
-});
-
-// Root-level regressions also own temporary stores/logs outside the suites above.
-after(cleanup);

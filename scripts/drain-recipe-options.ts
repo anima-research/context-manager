@@ -27,7 +27,6 @@ export function drainRecipeOptions(recipeStrategy: Record<string, unknown>): Rec
   ] as const;
   const recipeOptions: Record<string, unknown> = {};
   for (const key of passthroughKeys) {
-    if (key === 'compressionInstructions' && !Object.prototype.propertyIsEnumerable.call(recipeStrategy, key)) continue;
     if (recipeStrategy[key] !== undefined) recipeOptions[key] = recipeStrategy[key];
   }
   return recipeOptions;

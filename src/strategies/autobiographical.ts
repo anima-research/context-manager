@@ -1,5 +1,4 @@
-import { constructedRecallHeader, sentRecallHeaderIds } from '../recall-header.js';
-import { compressionInstruction, validateCompressionInstructions } from '../compression-instructions.js';
+import { compressionInstruction, hasCompressionTemplate, validateCompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
@@ -145,7 +144,7 @@ function logCompressionCall(entry: Record<string, unknown>, namespace: string): 
     const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
   } catch (err) {
-    try { namespaceDiagnostics(() => namespace).warn('compression log write failed:', err); } catch { /* Best effort, including diagnostics. */ }
+    namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
   }
 }
 
@@ -284,9 +283,6 @@ class CompressionQuarantineUnreadableError extends Error {
     this.name = 'CompressionQuarantineUnreadableError';
   }
 }
-
-/** Already audited fatals, identified without inspecting arbitrary thrown values. */
-const missingCompressionModelErrors = new WeakSet<object>();
 
 /**
  * Whether a merge group still stands as it was recorded: every source present
@@ -555,6 +551,15 @@ export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
  *  For a body the head and the recent window share, that's a recent message. */
 function lastSourceOf(entry: ContextEntry): MessageId | undefined {
   return entry.sourceMessageIds?.at(-1) ?? entry.sourceMessageId;
+}
+
+/** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
+ *  any other message. A recall pair is such a header and the answer after it. */
+function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
+  if (message.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
+  const block = message.content[0];
+  if (block?.type !== 'text') return undefined;
+  return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
 }
 
 /**
@@ -1101,14 +1106,19 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
  * compression model changed while it was in flight.
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
+/**
+ * The hash of the request each failed L1 call actually dispatched, keyed by
+ * its error. A rung's outcome keeps the rung's identity, but after a carrier
+ * rejection the rung dispatches its stripped request, whose failures are a
+ * run of their own (chunkRunKey).
+ */
+const dispatchedRequestHash = new WeakMap<object, string>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
 }
 
 interface CompressionRefusalNormalizedConfig {
-  /** Absent on historical ordinary records; isolates request-authoring modes. */
-  outcomeNamespace?: string;
   accountingVersion: number;
   fallbackLimit: number;
   contextBudgetTokens: number;
@@ -1526,11 +1536,7 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
     dropped,
     unlisted,
   );
-  // Repair/rebuild model ordinary compression only. Surgery refusals must
-  // not suppress the future L1s ordinary tick can still produce.
-  const hashes = new Set([...active.values()]
-    .filter(({ record }) => record.normalizedConfig?.outcomeNamespace === undefined)
-    .map((entry) => entry.record.chunkSourceHash));
+  const hashes = new Set([...active.values()].map((entry) => entry.record.chunkSourceHash));
   return { holds: (messageIds) => hashes.has(sha256Json([...messageIds])), dropped: [...dropped], unlisted: [...unlisted] };
 }
 
@@ -1865,9 +1871,9 @@ function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
  * invalid_request 400 about thinking blocks (e.g. the "cannot be modified"
  * class), never a policy refusal. Retry once, stripped, loudly.
  */
-export function isCarrierTransportRejection(error: unknown): boolean {
+function isCarrierTransportRejection(error: unknown): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
-  const msg = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
+  const msg = (e?.message ?? '').toLowerCase();
   const badRequest =
     e?.httpStatus === 400 ||
     (typeof e?.type === 'string' && e.type.toLowerCase().includes('invalid')) ||
@@ -2375,9 +2381,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         + "recipe names the model whose voice these memories are.";
       this.diag.error(msg);
       logCompressionCall({ event: "no-compression-model", fatal: true }, this.ns);
-      const error = new Error(msg);
-      missingCompressionModelErrors.add(error);
-      throw error;
+      throw new Error(msg);
     }
     return m;
   }
@@ -2560,41 +2564,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   constructor(config: AutobiographicalOptions = {}) {
     // Retain TypeError for malformed caller settings before structuredClone runs.
-    let instructionSettings: unknown;
-    // Match ordinary option enumeration: do not ask a proxy for a descriptor
-    // of an absent key. Unrelated outer-option failures keep their own errors.
-    if (Reflect.ownKeys(Object(config)).includes('compressionInstructions')) {
-      let enumerable: boolean;
-      try {
-        enumerable = Object.prototype.propertyIsEnumerable.call(config, 'compressionInstructions');
-        if (enumerable) instructionSettings = config.compressionInstructions;
-      } catch {
-        throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
-      }
-      if (enumerable) {
-        const original = config;
-        const descriptors: PropertyDescriptorMap = {};
-        for (const key of Reflect.ownKeys(original).filter((key): key is string => typeof key === 'string')) {
-          let descriptor: PropertyDescriptor | undefined;
-          try { descriptor = Object.getOwnPropertyDescriptor(original, key); }
-          catch (error) {
-            if (key !== 'compressionInstructions') throw error;
-            throw new TypeError('Invalid compressionInstructions configuration: configuration: unable to inspect settings');
-          }
-          if (descriptor) Object.defineProperty(descriptors, key, { value: descriptor, enumerable: true, configurable: true, writable: true });
-        }
-        // Resolve every other option via the original receiver, including proxy
-        // get traps on data properties. Only instructions are snapshotted here.
-        for (const key of Object.keys(descriptors)) {
-          const descriptor = descriptors[key]!;
-          if (!descriptor.enumerable) continue;
-          descriptors[key] = { enumerable: true, configurable: true, get: () => Reflect.get(original, key, original) };
-        }
-        descriptors.compressionInstructions = { value: instructionSettings as AutobiographicalOptions['compressionInstructions'], enumerable: true, writable: true, configurable: true };
-        config = Object.defineProperties({}, descriptors);
-      }
-    }
-    validateCompressionInstructions(instructionSettings);
+    validateCompressionInstructions(config.compressionInstructions);
     const suppliedLayers: ConfigLayer[] = [
       { source: 'library-default', values: { ...DEFAULT_AUTOBIOGRAPHICAL_CONFIG } as Record<string, unknown> },
       { source: 'caller', values: config as Record<string, unknown> },
@@ -2627,25 +2597,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // AutobiographicalConfig that the caller did not itself override, which is
     // what makes this narrowing as sound as the spread it replaces.
     this.config = resolved.effective as unknown as AutobiographicalConfig;
-    // Absent settings must not be supplied by Object.prototype. Keep these
-    // shadows non-enumerable so effective-config keys/provenance stay unchanged.
-    for (const key of ['compressionInstructions', 'witnessedInstruction'] as const) {
-      if (!Object.hasOwn(this.config, key)) Object.defineProperty(this.config, key, {
-        value: undefined, enumerable: false, writable: true, configurable: true,
-      });
-    }
     // Snapshot JSON settings so caller mutation cannot invalidate a checked template.
     if (this.config.compressionInstructions !== undefined) {
-      validateCompressionInstructions(this.config.compressionInstructions);
-      try {
-        this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
-      } catch {
-        throw new TypeError('Invalid compressionInstructions configuration: configuration: settings must be cloneable');
-      }
+      this.config.compressionInstructions = structuredClone(this.config.compressionInstructions);
     }
     validateCompressionInstructions(this.config.compressionInstructions);
-    if (this.config.witnessedInstruction !== undefined && compressionInstruction(this.config.compressionInstructions, 'witnessedChunk', { targetTokens: 0 }) !== undefined) {
-      throw new TypeError('Conflicting witnessedInstruction and compressionInstructions.templates.witnessedChunk; remove one setting');
+    if (this.config.witnessedInstruction && this.config.compressionInstructions?.templates?.witnessedChunk !== undefined) {
+      throw new TypeError('Conflicting witnessed instruction configuration');
     }
     this.configProvenance = resolved.provenance;
     this.unreportedEffectiveConfig = this.config.logEffectiveConfig ? resolved : null;
@@ -2834,11 +2792,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : undefined;
       if (cleaned && Object.keys(cleaned).length > 0) {
         this.config = { ...savedConfig, ...cleaned };
-        for (const key of ['compressionInstructions', 'witnessedInstruction'] as const) {
-          if (!Object.hasOwn(this.config, key)) Object.defineProperty(this.config, key, {
-            value: undefined, enumerable: false, writable: true, configurable: true,
-          });
-        }
         // Both memoize config-derived values, so a swapped config must not see
         // a cache built under the old one.
         this._adaptivePicker = null;
@@ -3335,26 +3288,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private endGeneration(): void {
     this.compressionBranchGeneration++;
     for (const call of this.callsOut) call.abort();
-  }
-
-  /** Trusted construction-side observation, after all L1 wire transformations.
-   * Consumers must snapshot here, not infer recall provenance in a transport proxy.
-   * Also runs for the explicit carrier-stripped retry. Never persisted.
-   */
-  protected observeL1CompressionRequest(_request: NormalizedRequest, _recallIds: readonly string[]): void {}
-
-  /** Outcome identities for opt-in request rewriting must not alias ordinary
-   * ladders. Undefined preserves the historical ordinary family identity.
-   */
-  protected compressionOutcomeNamespace(): string | undefined { return undefined; }
-
-  /** Opt-in L1 authoring, before dispatch identity and accepted provenance are
-   * formed. The default returns the identical request; surgery overrides this
-   * rather than editing bytes behind the strategy's transport boundary.
-   */
-  protected authorL1CompressionRequest(request: NormalizedRequest, recallIds: readonly string[]): NormalizedRequest {
-    this.observeL1CompressionRequest(request, recallIds);
-    return request;
   }
 
   /**
@@ -4518,6 +4451,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
    *
+   * Only a pair that ends before `recallPairsEnd` counts, for every seam:
+   * the head seam goes on the message before the first such pair. The L1
+   * prompt passes the custom opening's wire index; every other call reads
+   * the whole sequence.
+   *
    * Returns true iff at least one breakpoint was placed — callers attach
    * `cacheTtl` only then, so every marker-less request (kill switch, capped
    * ladder with no head window, no ladder yet) keeps the exact pre-seam request shape and its
@@ -4527,6 +4465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     messages: NormalizedRequest['messages'],
     recallLadder: readonly SummaryEntry[],
     capped: boolean,
+    recallPairsEnd = messages.length,
   ): boolean {
     if (this.config.compressionCacheMarkers === false) return false;
     // Replayed history can carry stale BLOCK-level cache_control from the
@@ -4552,8 +4491,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let headEnd = -1;
     let deepEnd = -1;
     let frontierEnd = -1;
-    for (let i = 0; i < messages.length - 1; i++) {
-      const id = sentRecallHeaderIds(messages[i]!)[0];
+    for (let i = 0; i < Math.min(recallPairsEnd, messages.length) - 1; i++) {
+      const id = recallHeaderId(messages[i]!);
       if (id === undefined) continue;
       const level = levelById.get(id);
       if (level === undefined) continue;
@@ -4906,11 +4845,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * untouched. Children are ordered by raw source position, never by the
    * parent's sourceIds ordering, and their recursively expanded leaf set must
    * exactly equal the parent's set before the variant is eligible.
+   * The parent's pair is looked for only before `recallPairsEnd`, the custom
+   * opening's wire index when there is one.
    */
   private buildRecallCurveVariants(
     canonicalRequest: NormalizedRequest,
     keptSummaries: SummaryEntry[],
     allMessages: StoredMessage[],
+    recallPairsEnd = canonicalRequest.messages.length,
   ): RecallCurveVariant[] {
     // Alternate curves are allowed to use persisted authored nodes only. Do
     // not trust a merely in-memory node, even though production pushSummary()
@@ -4964,19 +4906,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         childLeaves[childLeaves.length - 1] !== parent.sourceRange.last
       ) continue;
 
+      const parentHeader = `[CM] Recall memory ${parent.id}.`;
       // The canonical pair body is whatever summaryAnswerContent produced —
       // a single text block for legacy entries, or verbatim reasoning
       // carriers + text for entries with responseContent. Match by exact
       // JSON equality against that same construction.
       const expectedBody = JSON.stringify(this.summaryAnswerContent(parent));
       const pairIndexes: number[] = [];
-      for (let i = 0; i < canonicalRequest.messages.length - 1; i++) {
+      // A pair is read only before recallPairsEnd (the custom opening).
+      for (let i = 0; i < Math.min(recallPairsEnd, canonicalRequest.messages.length) - 1; i++) {
         const header = canonicalRequest.messages[i]!;
         const body = canonicalRequest.messages[i + 1]!;
         if (
           header.participant === 'Context Manager' &&
-          sentRecallHeaderIds(header).length === 1 &&
-          sentRecallHeaderIds({ participant: header.participant, content: header.content.slice(-1) })[0] === parent.id &&
+          header.content.length === 1 &&
+          header.content[0]?.type === 'text' &&
+          header.content[0].text === parentHeader &&
           JSON.stringify(body.content) === expectedBody
         ) pairIndexes.push(i);
       }
@@ -4985,7 +4930,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const replacement = children.flatMap((child) => [
         {
           participant: 'Context Manager',
-          content: [constructedRecallHeader(child.id)],
+          content: [{ type: 'text' as const, text: `[CM] Recall memory ${child.id}.` }],
         },
         {
           participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
@@ -4993,9 +4938,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
       ]);
       const pairIndex = pairIndexes[0]!;
-      // Collapse may have joined preceding raw CM blocks to this header.
-      // Preserve them ahead of the first child header, never replace raw text.
-      replacement[0]!.content.unshift(...canonicalRequest.messages[pairIndex]!.content.slice(0, -1));
       const request: NormalizedRequest = {
         ...canonicalRequest,
         messages: [
@@ -5266,7 +5208,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // earn a fresh bounded family even when the old regime already filled its
     // cap. Within the new regime the cap remains sticky.
     const sameRegime = sameHash.filter((active) =>
-      active.record.normalizedConfig?.outcomeNamespace === record.normalizedConfig.outcomeNamespace &&
       active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
         record.normalizedConfig.sourceOnlyFallbackEnabled &&
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
@@ -5395,17 +5336,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
     if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
     const projection = this.readCompressionQuarantineProjection();
-    // Retention is per authoring mode too: one mode's churn must not evict
-    // the other mode's durable refusals and silently reopen its paid ladders.
-    const counts = new Map<string | undefined, number>();
     const retained = [...projection.values()]
       .sort((a, b) => b.record.created - a.record.created)
-      .filter(({ record }) => {
-        const namespace = record.normalizedConfig?.outcomeNamespace;
-        const count = counts.get(namespace) ?? 0;
-        counts.set(namespace, count + 1);
-        return count < COMPRESSION_QUARANTINE_MAX_ACTIVE;
-      });
+      .slice(0, COMPRESSION_QUARANTINE_MAX_ACTIVE);
     const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
       generationId: item.generationId,
       record: item.record,
@@ -5444,16 +5377,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getCompressionQuarantineStatus(now: number = Date.now()): CompressionQuarantineStatus {
     return this.readCompressionQuarantineStatus(now).status;
-  }
-
-  /** Fail closed: an operator key must identify exactly the selected raw chunk. */
-  assertCompressionQuarantineChunk(key: string, chunkIndex: number): void {
-    const active = this.readCompressionQuarantineProjection().get(key);
-    if (!active) throw new Error('Expected quarantine key absent');
-    const chunk = this.chunks.find(chunk => chunk.index === chunkIndex);
-    if (!chunk || active.record.chunkSourceHash !== sha256Json(chunk.messages.map(message => message.id))) {
-      throw new Error('Quarantine key does not belong to selected chunk');
-    }
   }
 
   /**
@@ -6945,7 +6868,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.config.compressionModel || !this.hostContext?.membrane) return 0;
     const store = this.hostContext?.messageStore;
     const tools = this.hostContext?.tools;
-    const quarantined = this.quarantinedChunkSources(this.compressionOutcomeNamespace());
+    const quarantined = this.quarantinedChunkSources();
     const heldSources = this.mergeHeldSourceIds();
     const blocked = store ? this.holdBlockedIds(store) : null;
     const deferredForTools: (chunk: Chunk) => boolean =
@@ -7064,9 +6987,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const contextBudgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
     const toolProseFallback = this.toolProseHoistOptions();
-    const outcomeNamespace = this.compressionOutcomeNamespace();
     const normalizedConfig: CompressionRefusalNormalizedConfig = {
-      ...(outcomeNamespace === undefined ? {} : { outcomeNamespace }),
       accountingVersion: COMPRESSION_BUDGET_ACCOUNTING_VERSION,
       fallbackLimit,
       contextBudgetTokens,
@@ -7082,7 +7003,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(toolProseFallback ? { toolProseFallback } : {}),
     };
     const familyKey = sha256Json({
-      ...(outcomeNamespace === undefined ? {} : { outcomeNamespace }),
       model,
       chunkSourceHash,
       frontierHash,
@@ -8985,14 +8905,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return true;
   }
 
-  /** Opt-in operations may restrict a tick to L1 without consuming or
-   * reprioritizing unrelated queued merges. Ordinary compression allows both.
-   */
-  protected allowsMergeScheduling(): boolean { return true; }
-
   async tick(ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('tick');
-    const allowMerges = this.allowsMergeScheduling();
     phaseChannel.report('compress-tick'); // liveness-watchdog phase
     // Quarantine is deferred debt, never a resting state: every quarantined
     // chunk keeps its span raw, the fold floor creeps, and the picker
@@ -9042,7 +8956,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // line below; left unset when no queued chunk could run.
     let mergeTurn: 'relief' | 'after a failed L1' | 'speculative cap' | undefined;
     for (const key of candidates) {
-      if (allowMerges && this.speculativeCapHolds()) {
+      if (this.speculativeCapHolds()) {
         mergeTurn = 'speculative cap';
         break;
       }
@@ -9064,12 +8978,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
-      if (allowMerges && failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
+      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) {
         mergeTurn = 'after a failed L1';
         break;
       }
       // A merge that takes more off the floor than this chunk's L1 goes first.
-      if (allowMerges && this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
+      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore, ctx.tools)) {
         mergeTurn = 'relief';
         break;
       }
@@ -9237,8 +9151,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
     }
-
-    if (!allowMerges) return;
 
     if (this.mergePicksDeferred) {
       this.mergePicksDeferred = false;
@@ -11056,76 +10968,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // declared: no call was made.
     onToolsDeferred?: () => void,
   ): Promise<void> {
-    // One operation-wide boundary owns no-send receipts, including preparation
-    // and normal returns, except the separately audited missing-model fatal.
-    // Dispatch telemetry below only marks actual sends.
-    const outcome: {
-      dispatched: boolean;
-      reason: 'no-op' | 'quarantine' | 'stopped' | 'deferral' | 'withdrawal' | 'error';
-      detail: string;
-      failure?: { error: unknown };
-    } = { dispatched: false, reason: 'no-op', detail: 'Compression completed without a provider call' };
-    const started = Date.now();
-    const stopped = (reason: typeof outcome.reason, detail: string, notify?: () => void) => () => {
-      outcome.reason = reason;
-      outcome.detail = detail;
-      notify?.();
-    };
-    try {
-      await this.compressChunkHierarchicalOperation(chunk, ctx, outcome,
-        stopped('quarantine', 'Durable quarantine holds this request family', onQuarantineSkip),
-        stopped('stopped', 'Request stopped by overlap or an exhausted/held family', onRequestStopped),
-        stopped('withdrawal', 'Joined work was discarded', onJoinedWorkDiscarded),
-        stopped('deferral', 'Waiting for host tool definitions', onToolsDeferred));
-    } catch (error) {
-      outcome.failure = { error };
-      throw error;
-    } finally {
-      if (!outcome.dispatched && !missingCompressionModelErrors.has(outcome.failure?.error as object)
-        && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
-        try {
-          if (outcome.failure) {
-            const { error } = outcome.failure;
-            outcome.reason = 'error';
-            outcome.detail = 'Compression stopped before dispatch';
-            try {
-              outcome.reason = isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait ? 'deferral'
-                : isCompressionWithdrawn(error) || compressionFailureKind(error) === 'abort'
-                  || (error instanceof Error && error.name === 'CompressionBranchDiscard') ? 'withdrawal' : 'error';
-              outcome.detail = boundFailureLogText(error instanceof Error ? error.message : String(error));
-            } catch { /* Keep a payload-free fallback even for hostile thrown values. */ }
-          } else if (chunk.compressed) {
-            outcome.reason = 'no-op';
-            outcome.detail = 'Chunk covered without a provider call (adoption, deduplication or stub)';
-          }
-          logCompressionCall({
-            event: 'compression:no-dispatch',
-            operation: 'compress_l1',
-            metadata: {
-              chunk_message_ids: chunk.messages.map(message => message.id),
-              model: this.config.compressionModel,
-              dispatched: false,
-              reason: outcome.reason,
-              detail: outcome.detail,
-              latency_ms: Date.now() - started,
-            },
-          }, this.ns);
-        } catch {
-          // Observability must never replace an operation's result or error.
-        }
-      }
-    }
-  }
-
-  private async compressChunkHierarchicalOperation(
-    chunk: Chunk,
-    ctx: StrategyContext,
-    outcome: { dispatched: boolean; failure?: { error: unknown } },
-    onQuarantineSkip: () => void,
-    onRequestStopped: () => void,
-    onJoinedWorkDiscarded: () => void,
-    onToolsDeferred: () => void,
-  ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
     if (!ctx.membrane) {
@@ -11598,7 +11440,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         llmMessages.push({
           participant: 'Context Manager',
-          content: [constructedRecallHeader(s!.id)],
+          content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
         });
         // Recall answers carry the summary's verbatim reasoning carriers
         // (signed thinking) when captured — validated 2026-07-16 on a
@@ -11619,9 +11461,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Structural start of the exact source-only shape. Never recover this by
       // searching text: the target itself may quote the marker.
       const sourceOnlyStartIndex = llmMessages.length;
+      const opening = this.getCompressionOpening();
+      // Custom: an explicitly configured opening slot, whatever its text (even
+      // the built-in marker's), as the surgery script judges it, or a
+      // getCompressionOpening override returning other text.
+      const customOpening = opening !== COMPRESSION_MARKER
+        || hasCompressionTemplate(this.config.compressionInstructions, 'opening');
       llmMessages.push({
         participant: 'Context Manager',
-        content: [{ type: 'text', text: this.getCompressionOpening() }],
+        content: [{ type: 'text', text: opening }],
       });
 
       // ---- 5. Chunk messages raw ----
@@ -11642,9 +11490,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
       // First each recall answer is kept apart from the agent's own raw turn
       // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
-      // Only the prefix is scanned for recall headers. A custom opening (or
-      // source text) may itself look like one, but is not a recall pair.
-      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages, sourceOnlyStartIndex));
+      // Recall pairs are built only before the opening. A custom opening
+      // may itself look like a header, or follow a raw header-shaped turn as
+      // if it were its answer, so with a custom opening a pair counts only
+      // when its answer lies before the opening. The built-in opening is
+      // read as it always was, and without the bound its requests keep
+      // their bytes.
+      const split = splitMixedToolMessages(this.separateRecallAnswers(
+        llmMessages,
+        customOpening ? sourceOnlyStartIndex : llmMessages.length,
+      ));
 
       // Collapse consecutive same-participant messages for API compliance
       const collapsed = this.collapseConsecutiveMessages(split);
@@ -11655,7 +11510,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // by its tool_result, and any tool_result that doesn't follow a use.
       const cleaned = stripUnpairedToolBlocks(collapsed);
 
-      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
+      return { llmMessages, sourceOnlyStartIndex, customOpening, cleaned, headCoveredSkipped };
     };
 
     // The store's price of a built request as it is sent: each message with
@@ -11717,7 +11572,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const { priorSummaries, pinnedRawTokens } = history;
     const { kept: keptSummaries, keptTokens: recallTokens } = recall;
-    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
+    const { llmMessages, sourceOnlyStartIndex, customOpening, cleaned, headCoveredSkipped } = built;
 
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
@@ -11764,10 +11619,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mintMessages = cleaned
       .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
       .filter(m => m.content.length > 0);
+    // Where the recall pairs end on the wire, for the seams and the
+    // recall-curve variants, which find pairs by their text. With a custom
+    // opening that is the first message holding a block from the opening on:
+    // splitting, collapsing and stripping pass blocks through as the same
+    // objects, so this finds the opening wherever normalization put it, and
+    // neither a header-shaped opening nor a source turn quoting a recall pair
+    // is read as one. If no such block is left, no pair is read. With the
+    // built-in opening the whole request is read, as before. Custom is
+    // judged as for the separator above (slot presence or an override).
+    const fromOpening = new Set(llmMessages.slice(sourceOnlyStartIndex).flatMap((m) => m.content));
+    const recallPairsEnd = !customOpening
+      ? mintMessages.length
+      : Math.max(0, mintMessages.findIndex((m) => m.content.some((b) => fromOpening.has(b))));
     const mintSeamed = this.applyMintCacheSeams(
       mintMessages,
       keptSummaries,
       keptSummaries.length < priorSummaries.length,
+      recallPairsEnd,
     );
 
     const authoredRequest: NormalizedRequest = {
@@ -11851,6 +11720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       authoredRequest,
       keptSummaries,
       allMessages,
+      recallPairsEnd,
     );
     let fallbackPlan = this.compressionRefusalPlan(request, variants);
     const model = this.requireCompressionModel();
@@ -11865,10 +11735,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       undefined,
       sourceOnlyFallbackRequestHash,
     );
-    const outcomeNamespace = this.compressionOutcomeNamespace();
-    const runSubject = chunkRunSubject(outcomeNamespace === undefined
-      ? quarantineRecord.chunkSourceHash
-      : sha256Json([outcomeNamespace, quarantineRecord.chunkSourceHash]), chunk.messages);
+    const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
     // The attempt's first read of the ledger that can stop it, before any
     // model call: while the ledger can't be read, every attempt that would
     // call the model stops here, so the error says what that means for the
@@ -12105,65 +11972,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     /** Responses the provider gave for a carrier-stripped copy (runAttempt's
      *  degraded path), whose count is the copy's, not the planned request's. */
     const countedStripped = new WeakSet<object>();
-    const strippedErrors = new WeakSet<object>();
-    type RequestScope = 'last-dispatched-attempt' | 'last-split-piece';
-    let loggedRequest: NormalizedRequest | undefined;
-    let loggedScope: RequestScope = 'last-dispatched-attempt';
-    let loggedRecallCount: number | null = 0;
-    let loggedRecallTokens: number | null = 0;
-    let loggedRecallPricing = 'stored-summary-estimate';
-    let telemetrySummaries: Map<string, SummaryEntry> | undefined;
-    let telemetryUnavailable = false;
-    let lastAttemptRequest: NormalizedRequest | undefined;
-    const logDispatch = async (request: NormalizedRequest, scope: RequestScope, stripped: boolean): Promise<unknown> => {
-      // Capture totals before yielding. Never scan the persisted projection for
-      // an empty recall set; reuse the operation's lookup across retry rungs.
-      lastAttemptRequest = request;
-      let count: number | null = 0;
-      let tokens: number | null = 0;
-      const pricing = stripped ? 'text-content-estimate' : 'stored-summary-estimate';
-      if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) {
-        const ids = new Set(request.messages.flatMap(sentRecallHeaderIds));
-        if (ids.size) {
-          try {
-            telemetrySummaries ??= this.persistedCanonicalSummariesById();
-            const recalls = [...ids].map(id => telemetrySummaries!.get(id));
-            if (recalls.some(summary => !summary)) throw new Error('Recall totals unavailable');
-            count = recalls.length;
-            tokens = this.capRecallPairs((recalls as SummaryEntry[]).map(summary => stripped
-              ? { ...summary, tokens: this.estimateTokens(this.summaryAnswerProse(summary).filter(block => block.type === 'text')) }
-              : summary), Infinity).keptTokens;
-          } catch {
-            // Keep dispatch best effort without representing a failed read as
-            // a genuine zero. Warn only once, without leaking store/error data.
-            count = null;
-            tokens = null;
-            if (!telemetryUnavailable) {
-              try { this.diag.warn('autobio: compression recall telemetry unavailable; dispatch continues'); } catch { /* Best effort. */ }
-            }
-            telemetryUnavailable = true;
-          }
-        }
-      }
-      const commit = () => {
-        outcome.dispatched = true;
-        loggedRequest = request;
-        loggedScope = scope;
-        loggedRecallCount = count;
-        loggedRecallTokens = tokens;
-        loggedRecallPricing = tokens === null ? 'unavailable' : pricing;
-      };
-      try {
-        const response = await this.callProvider(ctx.membrane!, request);
-        commit();
-        return response;
-      } catch (error) {
-        // A branded host withdrawal can be pre-send. Unlike a cancellation of
-        // an already-out request, it supplies no evidence of dispatch.
-        if (!isAdmissionDeferral(error) && !isCompressionWithdrawn(error)) commit();
-        throw error;
-      }
-    };
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
@@ -12178,9 +11986,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         leafCoverageHash: string,
         expandedParentId?: string,
         expandedChildIds?: string[],
-        requestScope: RequestScope = 'last-dispatched-attempt',
       ): Promise<unknown> => {
-        lastAttemptRequest = undefined;
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         // Each attempt, a ladder's next rung included, checks before it calls
         // the provider: a strategy let go of between two attempts starts no
@@ -12191,8 +11997,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             name: 'CompressionBranchDiscard',
           });
         }
-        const preparedRequest = attemptRequest;
-        attemptRequest = this.authorL1CompressionRequest(preparedRequest, recallIds);
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -12228,13 +12032,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          response = await logDispatch(attemptRequest, requestScope, false);
+          response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
             noteDispatchedModel(error, attemptRequest);
+            if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -12273,13 +12078,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }, this.ns);
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
-          acceptedRequest = this.authorL1CompressionRequest(stripReasoningFromRequest(preparedRequest), recallIds);
+          acceptedRequest = stripReasoningFromRequest(attemptRequest);
           try {
-            response = await logDispatch(acceptedRequest, requestScope, true);
+            response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
-              strippedErrors.add(retryError);
+              dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
             }
             throw retryError;
           }
@@ -12297,9 +12102,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const stopReason = this.compressionResponseStopReason(response);
         const trace: CompressionAttemptTrace = {
           curveLabel,
-          ...sentAttemptIdentity(acceptedRequest, recallIds, recallLevels, leafCoverageHash),
+          recallIds,
+          recallLevels,
           ...(expandedParentId ? { expandedParentId } : {}),
           ...(expandedChildIds ? { expandedChildIds } : {}),
+          leafCoverageHash,
+          requestHash: sha256Json(acceptedRequest),
+          messageCount: acceptedRequest.messages.length,
+          estimatedTokens: this.estimateCompressionRequestTokens(acceptedRequest),
           renderedTokens: this.compressionResponseInputTokens(response),
           stopReason,
           refusalCategory: response && typeof response === 'object'
@@ -12311,24 +12121,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         attemptTraces.push(trace);
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
-      };
-
-      const sentAttemptIdentity = (
-        sent: NormalizedRequest, recallIds: string[], recallLevels: number[], leafCoverageHash: string,
-      ) => {
-        const sentRecallSet = new Set(sent.messages.flatMap(sentRecallHeaderIds));
-        const sentRecallIds = recallIds.filter(id => sentRecallSet.has(id));
-        const sentLeafIds = sentRecallIds.length === recallIds.length ? [] : sentRecallIds.flatMap(id => {
-          const summary = summariesById.get(id);
-          return summary ? this.recallCurveLeafIds(summary, summariesById, messagePosition) ?? [] : [];
-        }).sort((a, b) => (messagePosition.get(a) ?? 0) - (messagePosition.get(b) ?? 0));
-        return {
-          recallIds: sentRecallIds,
-          recallLevels: recallLevels.filter((_level, i) => sentRecallSet.has(recallIds[i]!)),
-          leafCoverageHash: sentRecallIds.length === recallIds.length ? leafCoverageHash : sha256Json(sentLeafIds),
-          requestHash: sha256Json(sent), messageCount: sent.messages.length,
-          estimatedTokens: this.estimateCompressionRequestTokens(sent),
-        };
       };
 
       // The provider's count of a request the ladder rewrites, its base, only
@@ -12493,6 +12285,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: unknown,
         curveLabel: string,
         requestHash: string,
+        streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
           // Counted against the request actually dispatched (the stripped one
@@ -12501,7 +12294,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
-            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, error !== null && typeof error === 'object' && strippedErrors.has(error)),
+            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash),
             compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched),
           );
           // The decision is the rung's outcome, which ends its run (noteOutcome).
@@ -12568,6 +12361,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 error,
                 curveLabel,
                 requestHash,
+                (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
@@ -12915,11 +12709,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (!result.reused) {
               const trace: CompressionAttemptTrace = {
                 curveLabel,
-                ...sentAttemptIdentity(lastAttemptRequest ?? variant.request,
-                  variantFrontier.map(summary => summary.id), variantFrontier.map(summary => summary.level),
-                  variant.leafCoverageHash),
+                recallIds: variantFrontier.map((summary) => summary.id),
+                recallLevels: variantFrontier.map((summary) => summary.level),
                 expandedParentId: variant.parent.id,
                 expandedChildIds: variant.children.map((child) => child.id),
+                leafCoverageHash: variant.leafCoverageHash,
+                requestHash: variant.requestHash,
+                messageCount: variant.request.messages.length,
+                estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
                 latencyMs: 0,
                 persisted: false,
                 outcome: 'provider_error',
@@ -13149,7 +12946,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.splitCallTimes.push(slot);
             let res: unknown;
             try {
-              res = await runAttempt(sub, label, [], [], leafHash, undefined, undefined, 'last-split-piece');
+              res = await runAttempt(sub, label, [], [], leafHash);
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
@@ -13642,7 +13439,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
-      outcome.failure = { error };
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
       // A host's withdrawal isn't a failure: the host asked for it, so its
       // receipts say withdrawn rather than carrying an error, a moved
@@ -13692,51 +13488,53 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
-      try {
-        for (const trace of attemptTraces) {
-          logCompressionCall({
-            event: 'compression:attempt',
-            operation: 'compress_l1',
-            metadata: {
-              chunk_message_ids: chunk.messages.map((message) => message.id),
-              chunk_hash: quarantineRecord.chunkSourceHash,
-              model,
-              ...trace,
-            },
-          }, this.ns);
-        }
-        if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG && loggedRequest) {
-          logCompressionCall({
-            operation: 'compress_l1',
-            // Summarize the last request actually dispatched, including opt-in
-            // authoring and carrier fallback, not the prepared recall-bearing plan.
-            system: loggedRequest.system ? summarizeTelemetryText(loggedRequest.system) : null,
-            messages: summarizeTelemetryMessages(loggedRequest.messages),
-            metadata: {
-              chunk_message_ids: chunk.messages.map((m) => m.id),
-              chunk_size: chunk.messages.length,
-              prior_summary_count: priorSummaries.length,
-              request_scope: loggedScope,
-              response_scope: 'whole-chunk',
-              prior_summary_count_kept: loggedRecallCount,
-              prior_summary_tokens: loggedRecallTokens,
-              prior_summary_token_estimate: loggedRecallPricing,
-              has_doc_context: docContext !== null,
-              doc_context: docContext,
-              target_tokens: targetTokens,
-              model,
-              latency_ms: Date.now() - callStart,
-              summary_id: logSummaryId,
-              ...(logWithdrawn ? { withdrawn: true } : {}),
-            },
-            response: summarizeTelemetryText(logResponse),
-            error: logError,
-          }, this.ns);
-        }
-      } catch {
-        // Never replace a compression result/error, or expose failed payloads.
-        try { this.diag.warn('autobio: compression receipt preparation failed; receipt may be missing'); } catch { /* Best effort. */ }
+      for (const trace of attemptTraces) {
+        logCompressionCall({
+          event: 'compression:attempt',
+          operation: 'compress_l1',
+          metadata: {
+            chunk_message_ids: chunk.messages.map((message) => message.id),
+            chunk_hash: quarantineRecord.chunkSourceHash,
+            model,
+            ...trace,
+          },
+        }, this.ns);
       }
+      logCompressionCall({
+        operation: 'compress_l1',
+        // The DISPATCHED bytes, read off the request object — deliberately
+        // NOT ctx.systemPrompt again. This finally runs after an awaited
+        // round trip and that getter is live, so a host activation landing
+        // mid-flight would make this receipt name a prompt the call never
+        // sent. Every rung that can actually reach the wire from here
+        // (withAppendedInstruction, withoutToolsParam,
+        // stripReasoningFromRequest) derives from `request` by spread, and the
+        // recall-curve variants from `authoredRequest`, its unprepared form;
+        // each leaves `system` untouched, as preparation does, so the
+        // canonical request's field is the sent value for all of them. Null
+        // when the request carried no system field, so the pre-threading log
+        // shape is preserved exactly; summarized (not verbatim) when it did,
+        // matching how `messages` is logged. `messages` summarizes the
+        // prepared canonical request.
+        system: request.system ? summarizeTelemetryText(request.system) : null,
+        messages: summarizeTelemetryMessages(request.messages),
+        metadata: {
+          chunk_message_ids: chunk.messages.map((m) => m.id),
+          chunk_size: chunk.messages.length,
+          prior_summary_count: priorSummaries.length,
+          prior_summary_count_kept: keptSummaries.length,
+          prior_summary_tokens: recallTokens,
+          has_doc_context: docContext !== null,
+          doc_context: docContext,
+          target_tokens: targetTokens,
+          model,
+          latency_ms: Date.now() - callStart,
+          summary_id: logSummaryId,
+          ...(logWithdrawn ? { withdrawn: true } : {}),
+        },
+        response: summarizeTelemetryText(logResponse),
+        error: logError,
+      }, this.ns);
     }
   }
 
@@ -13912,7 +13710,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected checkMergeThreshold(): void {
-    if (!this.allowsMergeScheduling()) return;
     this.requireBranchMutation('checkMergeThreshold');
     phaseChannel.report('merge-threshold'); // liveness-watchdog phase
     const bottomUp = this.landsAsPlanned();
@@ -14370,7 +14167,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of keptPriorSummaries) {
       llmMessages.push({
         participant: 'Context Manager',
-        content: [constructedRecallHeader(s.id)],
+        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
       // Carriers ride merge recall pairs too — see the L1 site rationale.
       llmMessages.push({
@@ -14434,7 +14231,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Emit the source itself as a recall pair, whatever its level.
         llmMessages.push({
           participant: 'Context Manager',
-          content: [constructedRecallHeader(src.id)],
+          content: [{ type: 'text', text: `[CM] Recall memory ${src.id}.` }],
         });
         llmMessages.push({
           participant,
@@ -14456,7 +14253,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (!child) continue;
           llmMessages.push({
             participant: 'Context Manager',
-            content: [constructedRecallHeader(child.id)],
+            content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
           });
           // Carriers ride merge source expansions too — see the L1 site.
           llmMessages.push({
@@ -14468,9 +14265,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ---- 3. INSTRUCTION ----
-    // Preserve historical telemetry, including skipped-level sources and retries.
-    // Custom instruction hooks independently infer the declared child level.
-    const sourceLevelShown = sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
+    // sourceLevelShown is the level of content the model actually sees
+    // (one level below the sources themselves).
+    const sourceLevelShown =
+      sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1;
 
     // Reading-mode detection: when ALL the merge's leaf messages are
     // shards of the same bodyGroup, we know the agent was reading a
@@ -14493,8 +14291,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sources,
               mergeReadingContext.totalTokens,
               targetTokens,
+              sourceLevelShown,
             )
-          : this.getMergeInstruction(targetLevel, sources, targetTokens),
+          : this.getMergeInstruction(targetLevel, sources, targetTokens, sourceLevelShown),
       // Only a merge whose every source is witnessed takes the witnessed
       // reminder. A mixed merge takes the live instruction and reminder, and
       // its request shows inherited and lived material together, with no
@@ -15183,7 +14982,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Until the host has declared its tools, tick defers a chunk it would
     // call the model for when its request carries tool blocks, or every such
     // chunk when the summarizer refuses requests without them.
-    const quarantined = this.quarantinedChunkSources(this.compressionOutcomeNamespace());
+    const quarantined = this.quarantinedChunkSources();
     const deferredForTools: (chunk: Chunk) => boolean =
       (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
@@ -15302,19 +15101,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The requests that leave held messages out (quarantinedMessageIds) leave
    * nothing out when this is undefined.
    */
-  private quarantinedChunkSources(outcomeNamespace?: string): Map<string, readonly MessageId[] | undefined> | undefined {
+  private quarantinedChunkSources(): Map<string, readonly MessageId[] | undefined> | undefined {
     let projection: Map<string, ActiveCompressionQuarantine>;
     try {
       projection = this.readCompressionQuarantineProjection();
     } catch {
       return undefined;
     }
-    // Request source selection always uses ordinary quarantine. Only queued
-    // outcome accounting passes the active authoring namespace explicitly.
     const sources = new Map<string, readonly MessageId[] | undefined>();
     for (const { record } of projection.values()) {
-      if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION ||
-          record.normalizedConfig?.outcomeNamespace !== outcomeNamespace) continue;
+      if (record.normalizedConfig?.accountingVersion !== COMPRESSION_BUDGET_ACCOUNTING_VERSION) continue;
       const listed = isIdList(record.sourceIds) ? record.sourceIds : undefined;
       if (!sources.get(record.chunkSourceHash)) sources.set(record.chunkSourceHash, listed);
     }
@@ -19626,15 +19422,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     targetLevel: SummaryLevel,
     sources: SummaryEntry[],
     targetTokens: number,
+    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
     // Witnessed pin propagation: consolidating all-witnessed sources must keep
     // the witnessed voice, or the merge re-first-persons inherited lives.
     if (sources.length > 0 && sources.every((s) => s.witnessed)) {
-      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
+      return compressionInstruction(this.config.compressionInstructions, 'witnessedMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
         ?? formatWitnessedMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
     }
-    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'merge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, targetTokens })
       ?? formatMergeInstruction(targetLevel, sourceLevelShown, targetTokens);
   }
 
@@ -19666,9 +19463,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sources: SummaryEntry[],
     totalTokens: number,
     targetTokens: number,
+    shownLevel?: number,
   ): string {
     const sourceLevelShown = sources.length > 0 ? Math.max(0, sources[0].level - 1) : 0;
-    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: sources[0]?.sourceLevel ?? sourceLevelShown, totalTokens, targetTokens })
+    return compressionInstruction(this.config.compressionInstructions, 'readingMerge', { targetLevel, sourceLevelShown: shownLevel ?? sourceLevelShown, totalTokens, targetTokens })
       ?? formatReadingMergeInstruction(targetLevel, sourceLevelShown, totalTokens, targetTokens);
   }
 
@@ -22395,9 +22193,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prompt, an opened chunk or the raw middle that starts with the agent's
    * turn; in a merge prompt, an L2 target or the raw middle that does. A
    * recall answer is the message after a `[CM] Recall memory <id>.` header
-   * (by construction identity) before recallHeadersEnd (default: the entire array).
-   * The L1 caller excludes its opening and source, not raw prefix history.
-   * The answer is the agent's, so a next message of the
+   * (recallHeaderId), and it is the agent's, so a next message of the
    * answer's participant is what the collapse below joins to it, and the
    * formatter at the wire. The turn goes in when the message right after the
    * answer is of that participant, or the first one after it that has any
@@ -22407,6 +22203,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * two together. Splitting and collapsing don't change which tool blocks are
    * paired, so they're stripped here as the request will strip them. Any
    * other sequence comes back with the same messages.
+   *
+   * Only a pair whose answer lies before `recallHeadersEnd` counts. The L1
+   * prompt passes the opening's index when the opening is custom (an
+   * explicitly configured opening slot, or a getCompressionOpening override
+   * returning other text), since custom text there may be shaped like a
+   * header, or follow a raw header-shaped turn as if it were its answer;
+   * every other call reads the whole sequence.
    */
   protected separateRecallAnswers(
     messages: Array<{ participant: string; content: ContentBlock[] }>,
@@ -22417,7 +22220,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
     messages.forEach((message, i) => {
       separated.push(message);
-      if (i === 0 || i - 1 >= recallHeadersEnd || sentRecallHeaderIds(messages[i - 1]!).length === 0) return;
+      if (i === 0 || i >= recallHeadersEnd || recallHeaderId(messages[i - 1]!) === undefined) return;
       let withContent = i + 1;
       while (withContent < messages.length && !hasContent(withContent)) withContent++;
       if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {

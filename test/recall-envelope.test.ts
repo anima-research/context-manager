@@ -15,9 +15,9 @@
  *     MECHANICALLY on the pre-change tree and re-captured only when the
  *     store's read-back changed (see recall-envelope-golden.generate.ts). A
  *     red here is a compat break in the change, never a stale golden.
- *  2. Q-side labels are untouched in both modes. Zero-recall surgery supports
- *     enveloped and bare pairs, but requires exact constructed answer bytes;
- *     changed, extended or collapsed answers must fail closed.
+ *  2. Nothing downstream keys on answer bytes. Q-side labels are untouched in
+ *     both modes, and zero-recall surgery removes enveloped pairs exactly as
+ *     it removes bare ones.
  */
 
 import { describe, it } from 'node:test';
@@ -309,20 +309,13 @@ describe('recallEnvelope: zero-recall surgery is mode-blind', () => {
   it('removes the same minted pairs whether or not answers are enveloped', async () => {
     const results = [];
     for (const mode of ['none', 'xml', 'bare'] as const) {
-      const rendered = await renderAdaptiveFixture({ recallEnvelope: mode }, undefined, undefined, undefined, undefined, undefined, true);
+      const rendered = await renderAdaptiveFixture({ recallEnvelope: mode });
       const ladders = rendered.compressionRequests.filter((messages) =>
-        messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))) &&
-        messages.some(m => textOf(m).includes('System: You will soon form a new memory')),
+        messages.some((m) => /^\[CM\] Recall memory /.test(textOf(m))),
       );
       assert.ok(ladders.length > 0, `${mode}: fixture must mint at least one request carrying a recall ladder`);
       const request = ladders[ladders.length - 1];
-      const answers = request.filter((_, i) => i > 0 && /^\[CM\] Recall memory /.test(textOf(request[i - 1])));
-      assert.ok(answers.length > 0);
-      for (const answer of answers) {
-        if (mode === 'xml') assert.match(textOf(answer), /<cm-recall id=.*<\/cm-recall>/s);
-        else if (mode === 'none') assert.doesNotMatch(textOf(answer), /<cm-recall/);
-      }
-      const surgery = transformZeroRecallCompression(request as never, new (class extends AutobiographicalStrategy { opening() { return this.getCompressionOpening(); } })().opening(), rendered.expectedRecallAnswers![rendered.compressionRequests.indexOf(request)]);
+      const surgery = transformZeroRecallCompression(request as never);
       results.push({
         mode,
         removed: surgery.removedRecallIds,

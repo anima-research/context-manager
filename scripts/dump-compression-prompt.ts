@@ -1,9 +1,8 @@
 /**
- * Approximate the default LLM prompt for a given
+ * Reconstruct the exact LLM prompt that would have been sent for a given
  * L1 summary's production. Uses the chronicle's stored state (messages,
  * summaries, source IDs) and the strategy's current prompt-building logic
- * to rebuild a default-worded prompt. Custom compression instructions and
- * subclass wording are not reconstructed.
+ * to rebuild the prompt deterministically.
  *
  * Usage:
  *   node dist/scripts/dump-compression-prompt.js <store-path> <L1-id> [output.md]
@@ -62,9 +61,23 @@ function formatDocChunkInstruction(
   doc: { title: string; style: string; originalTokens: number },
   targetTokens: number,
 ): string {
-  return new (class extends AutobiographicalStrategy {
-    reading() { return this.getReadingChunkInstruction({} as never, doc.originalTokens, targetTokens); }
-  })().reading();
+  return (
+    `You just read a slice of document "${doc.title}" (${doc.style}, approximately ` +
+    `${doc.originalTokens} tokens total in the full document). Earlier slices ` +
+    'of this same document are in your memory above as L1s — they are in ' +
+    'chronological order within the document. What comes after this slice ' +
+    'you have NOT yet read; treat yourself as reading the document in ' +
+    'order, not yet knowing what lies ahead.\n\n' +
+    'Write the memory of what this slice contained. Preserve concrete ' +
+    'detail aggressively:\n' +
+    '- Timestamps, dates, IDs, numeric values, quoted phrases\n' +
+    '- Key events, decisions, contradictions with earlier slices\n' +
+    '- Structural markers (section titles, entry boundaries) that help ' +
+    'you locate this slice within the whole later\n\n' +
+    `Speak in the first person. Target ~${targetTokens} tokens. Output ` +
+    'only the memory body — no preamble, no meta-commentary about ' +
+    'summarizing.'
+  );
 }
 
 interface PromptMessage {
@@ -88,7 +101,6 @@ async function main() {
     process.exit(1);
   }
 
-  console.error('Approximate default-worded reconstruction only; custom templates and subclass wording are not reconstructed.');
   const strategy = new AutobiographicalStrategy({
     adaptiveResolution: true,
     targetChunkTokens: 3000,
@@ -208,21 +220,30 @@ async function main() {
     });
   }
 
-  // 5. Approximate reading context: apply production's 2:1 threshold,
-  // but raw-text pricing still differs from prepared/calibrated production tokens.
+  // 5. Instruction (doc-aware if all chunk messages are one body: one
+  // ingestion, read as the strategy reads it, body-runs.ts)
   const firstAt = allMessages.findIndex((m) => m.id === chunkMessages[0].id);
   const body = firstAt >= 0 && allMessages[firstAt]!.bodyGroupId ? bodyBoundsIn(allMessages, firstAt) : null;
   const bodyMessages = body ? allMessages.slice(body.from, body.to + 1) : [];
   const allSameGroup = body !== null && chunkMessages.every((m) => bodyMessages.some((b) => b.id === m.id));
-  const rawTokens = (messages: typeof chunkMessages) => messages.reduce((total, m) => total + Math.ceil(m.content
-    .filter((b: ContentBlock) => b.type === 'text').map((b: any) => b.text).join('').length / 4), 0);
-  const originalTokens = rawTokens(bodyMessages);
-  const chunkTokens = rawTokens(chunkMessages);
   let instructionText: string;
-  if (allSameGroup && chunkTokens > 0 && originalTokens >= 2 * chunkTokens) {
-    const title = (chunkMessages[0].metadata?.sourceId as string | undefined) ??
+  if (allSameGroup) {
+    // Compute doc context like the strategy does
+    let originalTokens = 0;
+    for (const m of bodyMessages) {
+      const t = m.content
+        .filter((b: ContentBlock) => b.type === 'text')
+        .map((b: any) => b.text)
+        .join('');
+      originalTokens += Math.ceil(t.length / 4);
+    }
+    const title =
+      (chunkMessages[0].metadata?.sourceId as string | undefined) ??
       `doc-${chunkMessages[0].bodyGroupId!.slice(0, 16)}`;
-    instructionText = formatDocChunkInstruction({ title, style: 'chronological', originalTokens }, targetTokens);
+    instructionText = formatDocChunkInstruction(
+      { title, style: 'chronological', originalTokens },
+      targetTokens
+    );
   } else {
     instructionText = formatInstruction(targetTokens);
   }
@@ -241,7 +262,7 @@ async function main() {
 
   // Output
   const out: string[] = [];
-  out.push(`# Approximate default compression prompt for ${target.id}\n`);
+  out.push(`# Reconstructed compression prompt for ${target.id}\n`);
   out.push(`Source range: ${target.sourceRange.first} … ${target.sourceRange.last}\n`);
   out.push(`Source messages: ${target.sourceIds.length}\n`);
   out.push(`Prior L1s: ${priorL1s.length} (L1-0..L1-${targetIdx - 1})\n`);

@@ -1907,9 +1907,9 @@ export interface AutobiographicalConfig {
   /** Base instruction-hook customization; see docs/compression-instructions.md. */
   compressionInstructions?: CompressionInstructions;
 
-  /** Legacy config field; current compression request builders do not read it. */
+  /** System prompt for summarization */
   summarySystemPrompt?: string;
-  /** Legacy config field; not an active compression template. Use compressionInstructions. */
+  /** User prompt template for summarization. Use {content} for the transcript. */
   summaryUserPrompt?: string;
   /**
    * As-of perspective pin for inherited history (e.g. a resident continued
@@ -2359,10 +2359,10 @@ export interface AutobiographicalConfig {
    */
   l1HoldbackChunks?: number;
 
-  // Legacy inactive fields; current compression request builders do not read them.
-  /** @deprecated Inactive; use compressionInstructions for base compression wording. */
+  // Legacy aliases (deprecated, use summary* instead)
+  /** @deprecated Use summarySystemPrompt */
   diarySystemPrompt?: string;
-  /** @deprecated Inactive; use compressionInstructions for base compression wording. */
+  /** @deprecated Use summaryUserPrompt */
   diaryUserPrompt?: string;
 
   // --- Hierarchical compression (L1/L2/L3 pyramid) ---

@@ -81,7 +81,7 @@ describe('AutobiographicalStrategy compression model contract', () => {
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.strictEqual(entries.length, 1, 'the fatal audit must not be followed by an ordinary no-dispatch outcome');
+    assert.strictEqual(entries.length, 1);
     assert.strictEqual(entries[0].event, 'no-compression-model');
     assert.strictEqual(entries[0].fatal, true);
     // One process's strategies share the log: each entry names its namespace (#239).

@@ -1,39 +1,29 @@
-- Add JSON-compatible `compressionInstructions` templates to the base
-  autobiographical instruction hooks, with strict validation and per-phase
-  overrides. Omitted settings and the `default` preset preserve existing
-  wording; host recipe use requires companion forwarding and validation.
-- Export `validateCompressionInstructions`, `CompressionInstructions`,
-  `CompressionInstructionTemplates`, and `CompressionInstructionValues`.
-  Add protected `getCompressionOpening`, `getSourceMergeInstruction`, and
-  `observeL1CompressionRequest` hooks (the observer runs before L1 dispatch,
-  including carrier retries);
-  existing ordinary and reading merge hook signatures and call arities remain
-  unchanged, preserving subclass optional argument defaults. Custom merge
-  templates infer the shown source level from the source entries.
-- Keep source-level refusal retries on custom `merge`/`witnessedMerge` wording,
-  including reading-mode merges; forward drain recipe instructions and report
-  validation failures using value-free paths and reasons.
-- Keep the source-retry hook limited to target level, sources and target tokens;
-  reading-body token counts remain on the ordinary reading-merge hook only.
-- Template settings require enumerable string keys and cloneable values;
-  inherited outer strategy options are ignored; settings and templates require
-  plain objects with Object.prototype or null prototypes. Combining `witnessedInstruction`
-  (including an empty string) with `templates.witnessedChunk` is rejected.
-  Reading slots take precedence over witnessed slots except on split pieces
-  and source-level refusal retries.
-- Instruction settings read own fields on plain objects and normalize internal inspection errors
-  to value-free validation diagnostics. Existing skipped-level merge telemetry
-  is preserved independently of custom template values.
-- Keep recall-shaped custom compression openings from inserting a synthetic
-  conversation-resumes turn between consecutive source turns.
-- Instruction-setting inspection avoids absent proxy option descriptors, preserves
-  unrelated option receivers, and reports instruction inspection failures without
-  caller values. Unrelated outer-option failures keep their original errors.
-- Add protected `authorL1CompressionRequest` for opt-in request rewriting before
-  accepted provenance hashing. Overrides must call `super` or explicitly invoke
-  `observeL1CompressionRequest` to preserve observation; rewriting strategies
-  must override `compressionOutcomeNamespace` to isolate durable outcomes from
-  ordinary request families.
-- Subclasses may override protected `allowsMergeScheduling(): boolean` to opt
-  out of merge scheduling (the default returns true). Existing subclasses with
-  a same-named member must check its visibility and signature for compatibility.
+- Add a JSON-compatible `compressionInstructions` option to
+  `AutobiographicalStrategy`: per-phase templates (`opening`, `chunk`,
+  `witnessedChunk`, `readingChunk`, `merge`, `witnessedMerge`, `readingMerge`,
+  `transition`) with a fixed set of placeholders, validated at construction.
+  Omitting the option, `{}`, or `preset: 'default'` keeps today's requests
+  byte-for-byte. See `docs/compression-instructions.md`.
+  - Export `validateCompressionInstructions` and the `CompressionInstructions`,
+    `CompressionInstructionTemplates` and `CompressionInstructionValues` types.
+    Validation errors are `TypeError`s that name only an allowlisted path and
+    reason, never a supplied value, key or placeholder name. Combining a
+    nonempty `witnessedInstruction` with `templates.witnessedChunk` throws
+    `Conflicting witnessed instruction configuration` at construction; an
+    empty `witnessedInstruction` is ignored.
+  - New protected hooks for subclass authors: `getCompressionOpening`, and
+    `getSourceMergeInstruction` for the source-level merge retry (its base
+    implementation uses `merge`/`witnessedMerge`, ignoring reading mode). The
+    hooks `getMergeInstruction` and `getReadingMergeInstruction` take an
+    optional shown-level argument, `separateRecallAnswers` an optional
+    `recallHeadersEnd`, and `applyMintCacheSeams` an optional
+    `recallPairsEnd`. A subclass that already defines a member with one of
+    the new names should rename it before upgrading.
+  - With a custom `opening` (any configured `templates.opening`, even one
+    equal to the built-in text, or a `getCompressionOpening` override
+    returning other text), L1 requests read a recall pair only when its
+    header and answer both lie before the opening, for the resume separator,
+    the cache seams and the refusal-curve retry. The zero-recall surgery
+    script refuses a `strategyConfig` that sets `templates.opening`. The autobiographical drain script forwards
+    `compressionInstructions` from its recipe; hosts must forward and validate
+    the option themselves.
