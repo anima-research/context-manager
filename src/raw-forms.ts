@@ -54,10 +54,13 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredContentBlock } from './types/message.js';
+
+type Block = ContentBlock | StoredContentBlock;
 
 type RawFormCarrier = { rawXml?: unknown; rawItem?: unknown };
 
-function xmlKey(block: ContentBlock): string | undefined {
+function xmlKey(block: Block): string | undefined {
   // The XML formatter replays `rawXml` only for runs of tool_use and
   // tool_result blocks. On any other block it is not a replay form, and
   // releasing it would leave the block with nothing to render: the
@@ -70,7 +73,7 @@ function xmlKey(block: ContentBlock): string | undefined {
   return typeof raw === 'string' && raw.length > 0 ? `xml:${raw}` : undefined;
 }
 
-function isReasoningItem(block: ContentBlock): boolean {
+function isReasoningItem(block: Block): boolean {
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type === 'reasoning';
 }
@@ -80,13 +83,13 @@ function isReasoningItem(block: ContentBlock): boolean {
  * for an item it has no block for (see membrane's parseProviderContent). A text
  * block from a message item's part carries that message item instead.
  */
-export function isOpaqueCarrier(block: ContentBlock): boolean {
+export function isOpaqueCarrier(block: Block): boolean {
   if (block.type !== 'text') return false;
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
-function itemKey(block: ContentBlock): string | undefined {
+function itemKey(block: Block): string | undefined {
   const raw = (block as RawFormCarrier).rawItem;
   // The Responses formatter emits only an object, deduplicated per message by
   // `type:id`, or by its JSON when it has no string id.
@@ -98,7 +101,7 @@ function itemKey(block: ContentBlock): string | undefined {
 }
 
 /** The keys of the raw forms a block carries, as membrane's formatters tell them apart. */
-export function rawFormKeys(block: ContentBlock): string[] {
+export function rawFormKeys(block: Block): string[] {
   const keys: string[] = [];
   const xml = xmlKey(block);
   if (xml) keys.push(xml);
@@ -113,16 +116,16 @@ export function rawFormKeys(block: ContentBlock): string[] {
  * none of them, so an untouched block keeps its identity. An opaque carrier
  * keeps its raw item, which is its whole content.
  */
-export function withoutRawForms(block: ContentBlock, keys?: ReadonlySet<string>): ContentBlock {
+export function withoutRawForms<B extends Block>(block: B, keys?: ReadonlySet<string>): B {
   const xml = xmlKey(block);
   const item = isOpaqueCarrier(block) ? undefined : itemKey(block);
   const dropXml = xml !== undefined && (!keys || keys.has(xml));
   const dropItem = item !== undefined && (!keys || keys.has(item));
   if (!dropXml && !dropItem) return block;
-  const copy = { ...block } as ContentBlock & RawFormCarrier;
+  const copy = { ...block } as B & RawFormCarrier;
   if (dropXml) delete copy.rawXml;
   if (dropItem) delete copy.rawItem;
-  return copy as ContentBlock;
+  return copy;
 }
 
 /**
@@ -136,11 +139,11 @@ export function withoutRawForms(block: ContentBlock, keys?: ReadonlySet<string>)
  *
  * Returns `after` itself when nothing has to change.
  */
-export function releaseEditedRawForms(
-  before: readonly ContentBlock[],
-  after: ContentBlock[],
-): ContentBlock[] {
-  const kept = new Set<ContentBlock>(after);
+export function releaseEditedRawForms<B extends Block>(
+  before: readonly B[],
+  after: B[],
+): B[] {
+  const kept = new Set<B>(after);
   const released = new Set<string>();
   for (const block of before) {
     if (kept.has(block)) continue;
@@ -163,7 +166,7 @@ export function releaseEditedRawForms(
  * an opaque one included. Reasoning with no such item after it in the message
  * pairs with nothing here.
  */
-function pairingsOf(before: readonly ContentBlock[]): string[][] {
+function pairingsOf(before: readonly Block[]): string[][] {
   const pairings: string[][] = [];
   let pending: string[] = [];
   for (const block of before) {
@@ -183,7 +186,7 @@ function pairingsOf(before: readonly ContentBlock[]): string[][] {
  * Widen `released` to whole reasoning pairings, read from the message's
  * content as it was: a pairing with any member released is released whole.
  */
-function releasePairings(before: readonly ContentBlock[], released: Set<string>): void {
+function releasePairings(before: readonly Block[], released: Set<string>): void {
   const pairings = pairingsOf(before);
   let widened = true;
   while (widened) {

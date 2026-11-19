@@ -113,6 +113,7 @@ import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
+import { SWEEPS_APPLIED_STATE_ID, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -2229,6 +2230,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * ordinal, so while the length stands no row has left the window since.
    */
   private windowLengthLooked: number | undefined;
+  private sweepCursor: number | undefined;
   protected _compressionCount = 0;
   /**
    * Monotonic counter of queue items consumed by tick(): compression, merges,
@@ -2391,6 +2393,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get sweepCursorStateId(): string { return `${this.ns}/autobio:sweep-cursor`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
   /** A persisted kv-unified receipt was found while loading under another
@@ -2914,6 +2917,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `${ns}/autobio:locks`,
         `${ns}/autobio:calibration`,
         `${ns}/autobio:merge-quarantine`,
+        `${ns}/autobio:sweep-cursor`,
         `${ns}/kvunified:presentation-receipt`,
       ],
       statePrefixes: [],
@@ -3153,6 +3157,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
     this.windowLengthLooked = undefined;
+    this.sweepCursor = undefined;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -3213,6 +3218,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.demoteSplitSummaries(messages, ctx);
       if (abortIfStale()) return;
       this.assertStoreTopology(messages);
+      if (abortIfStale()) return;
+      this.letGoOfSweptRows(ctx, 'initialize');
       // Kick the merge ladder for pre-existing unmerged summaries. Normally a
       // compression/merge completion does this, but a store that boots with a
       // backlog above threshold and an empty queue (e.g. after a pyramid
@@ -3528,6 +3535,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
     registerState({
       id: this.calibrationStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.sweepCursorStateId,
       strategy: 'snapshot',
     });
     registerState({
@@ -8464,6 +8475,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private windowLost(leaving: ReadonlySet<MessageId>, ctx: StrategyContext): void {
     if (leaving.size === 0) return;
+    this.letGoOf(leaving, ctx, 'left the window', () => this.unfoldRowsThatLeft(leaving, ctx));
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
+    }
+  }
+
+  private letGoOf(
+    leaving: ReadonlySet<MessageId>,
+    ctx: StrategyContext,
+    why: string,
+    unfold: () => { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] },
+  ): void {
     // The chunk in flight over a row that left, and each chunk holding one,
     // are marked first, before any write: should a write below fail, a
     // compression in flight over the row still writes nothing when it lands.
@@ -8478,10 +8501,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the writes didn't do, the next open repairs, as after a stop between
     // them.
     try {
-      const unfolded = this.unfoldRowsThatLeft(leaving, ctx);
+      const unfolded = unfold();
       if (unfolded.dropped.length > 0 || unfolded.refolded.length > 0 || unfolded.emptied.length > 0) {
         this.diag.warn(
-          `[autobiographical] ${leaving.size} row(s) left the window: dropped the summaries covering them ` +
+          `[autobiographical] ${leaving.size} row(s) ${why}: dropped the summaries covering them ` +
             `[${unfolded.dropped.join(', ')}] and cleared the parent of [${unfolded.orphaned.join(', ')}]; chunk records to be ` +
             `compressed again over the rows they keep [${unfolded.refolded.join(', ')}], removed, keeping none [${unfolded.emptied.join(', ')}]`,
         );
@@ -8498,8 +8521,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.sweepPaidOffMergeQuarantine();
       this.checkMergeThreshold();
     }
-    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
-      this.driveSpeculativeDrain(ctx);
+  }
+
+  private letGoOfSweptRows(ctx: StrategyContext | null, operation: string): void {
+    const store = this.store;
+    if (!ctx || !store || this.config.auditOnly || sweepPassRunning(store)) return;
+    try {
+      if (this.sweepCursor === undefined) {
+        const stored: unknown = store.getStateJson(this.sweepCursorStateId);
+        this.sweepCursor = typeof stored === 'number' && Number.isInteger(stored) && stored >= 0 ? stored : 0;
+      }
+      let from = this.sweepCursor;
+      const listLength = store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0;
+      if (from > listLength) {
+        this.diag.warn(
+          `[autobiographical] the sweep cursor stands at ${from}, past the end of the branch's applied list (${listLength} items): ` +
+            'reading the list from its start, before ' + operation,
+        );
+        from = 0;
+      }
+      if (listLength <= from) return;
+      const { items, length, unreadable } = sweepsApplied(store, from);
+      if (unreadable.length > 0) {
+        this.diag.warn(
+          `[autobiographical] item(s) [${unreadable.join(', ')}] of the branch's applied list don't parse: the rows they list, if any, ` +
+            `are not let go of, before ${operation}`,
+        );
+      }
+      const listed = listedRows(items);
+      if (listed.size > 0) {
+        if (this.storeWrittenElsewhere()) this.takeUpStoreBeforeLetGo(listed, ctx);
+        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldSweptRows(listed, ctx));
+      }
+      store.setStateJson(this.sweepCursorStateId, length);
+      this.sweepCursor = length;
+    } catch (err) {
+      this.diag.warn(`[autobiographical] letting go of rows a sweep's pass listed, before ${operation}, failed: ${describeThrown(err)}`);
     }
   }
 
@@ -8551,15 +8608,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ctx: StrategyContext,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
     const view = ctx.messageStore;
-    // The L1s holding a row that left among their sources, the L1 of each
-    // chunk record holding one, and (in unfold) every summary above them.
-    const seeds = new Set<string>();
-    for (const summary of this.summaries) {
-      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
-    }
-    for (const record of this.chunkRecords) {
-      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
-    }
+    const seeds = this.summariesFolding(leaving);
 
     // A row that left and is in the window again, presented again before
     // this was heard, stays in a record that holds it beside a row of its
@@ -8599,6 +8648,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const kept = staying(record);
       return inWindowOrder(record.sourceIds.filter((id) => !leaving.has(id) || kept.has(id)));
     });
+  }
+
+  private unfoldSweptRows(
+    listed: ReadonlySet<MessageId>,
+    ctx: StrategyContext,
+  ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
+    const view = ctx.messageStore;
+    return this.unfold(this.summariesFolding(listed), (record) =>
+      record.sourceIds.some((id) => listed.has(id)) ? record.sourceIds.filter((id) => view.get(id) !== null) : undefined,
+    );
+  }
+
+  private summariesFolding(rows: ReadonlySet<MessageId>): Set<string> {
+    const seeds = new Set<string>();
+    for (const summary of this.summaries) {
+      if (summary.level === 1 && summary.sourceIds.some((id) => rows.has(id))) seeds.add(summary.id);
+    }
+    for (const record of this.chunkRecords) {
+      if (record.summaryId && record.sourceIds.some((id) => rows.has(id))) seeds.add(record.summaryId);
+    }
+    return seeds;
   }
 
   /**
@@ -8886,6 +8956,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   async tick(ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('tick');
+    this.letGoOfSweptRows(ctx, 'tick');
     phaseChannel.report('compress-tick'); // liveness-watchdog phase
     // Quarantine is deferred debt, never a resting state: every quarantined
     // chunk keeps its span raw, the fold floor creeps, and the picker
@@ -9482,6 +9553,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
       this.letGoOfRowsLeftUnheard(this.hostContext, 'select');
+      this.letGoOfSweptRows(this.hostContext, 'select');
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.

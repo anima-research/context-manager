@@ -21,6 +21,7 @@ const stateIds = [
   'autobio:merge-quarantine',
   'autobio:pins',
   'autobio:calibration',
+  'autobio:sweep-cursor',
   'autobio:compression-refusal-quarantine-events',
   'autobio:compression-family-progress',
   'autobio:resolutions',

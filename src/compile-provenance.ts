@@ -14,7 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { bodyBoundsIn } from './body-runs.js';
+import { bodyBoundsIn, isWholeGroup } from './body-runs.js';
 import type {
   CompiledMessageSources,
   ContextEntry,
@@ -183,19 +183,10 @@ export function attributeEntries(
     entryBodies.push(states);
   }
 
-  // Pass 2: per-entry sources with request-level completeness. A group that
-  // declared its size must hold exactly that many shards, indices 0..n-1: an
-  // interrupted write leaves immutable members that are not the whole body.
-  // A group without a declaration (written before it was recorded) can only
-  // be judged by the members stored for it: complete then means every one of
-  // them was carried, not that the group was written whole.
-  const wholeGroup = (state: BodyState): boolean => {
-    const declared = state.head.shardCount;
-    if (declared === undefined) return true;
-    const indices = new Set(state.members.map((m) => m.shardIndex));
-    return state.members.length === declared && indices.size === declared
-      && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
-  };
+  // Pass 2: per-entry sources with request-level completeness (isWholeGroup).
+  // For a group without a declaration, complete means every member stored
+  // for it was carried, not that the group was written whole.
+  const wholeGroup = (state: BodyState): boolean => isWholeGroup(state.head, state.members);
   const allShards = (state: BodyState): boolean =>
     wholeGroup(state) && state.members.every((m) => state.present.has(m.id));
   const complete = (state: BodyState): boolean => state.contentOk && allShards(state);

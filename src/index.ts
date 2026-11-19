@@ -130,6 +130,23 @@ export type {
   RequestIdentity,
 } from './types/index.js';
 
+// Sweeps
+export { SWEEP_TAKE_RECORD, SWEEPS_APPLIED_STATE_ID, sweepsApplied, listedRows } from './sweep.js';
+export type {
+  SweepBody,
+  SweepEntry,
+  SweepTake,
+  ListedBody,
+  SweepApplied,
+  SweepChange,
+  SweepFailure,
+  SweepShow,
+  SweepPassOutcome,
+  SweepPassReport,
+  SweepPass,
+  SweepReceipt,
+} from './sweep.js';
+
 // Accepted rounds and fold receipts
 export {
   FOLD_QUERY_DEFAULT_LIMIT,
