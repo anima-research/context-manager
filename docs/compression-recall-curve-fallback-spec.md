@@ -17,7 +17,7 @@ Autobiographical L1 compression constructs an as-of memory-write request from:
 
 For Mythos, the canonical request began returning Anthropic `stop_reason: refusal`, category `reasoning_extraction`. The target chunk and primary conversational lane were healthy. Repeated speculative/maintenance ticks retried stable request hashes many times, leaving the chunk raw and threatening eventual context-budget failure.
 
-Removing recall, private state, or using a neutral/alternate model is prohibited. Memory must be written by the as-of instance with semantic and preferably asemantic continuity: same model, identity head, authored memories, raw target experience, tools, chronology, and information coverage.
+Removing recall, private state, or using a neutral/alternate model is prohibited by default: the rungs that drop recall or ask another model are ones a host opts into (invariants 1 and 2). Memory must be written by the as-of instance with semantic and preferably asemantic continuity: same model, identity head, authored memories, raw target experience, tools, chronology, and information coverage.
 
 ## Experimental result
 
@@ -41,7 +41,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 ## Non-negotiable invariants
 
 1. **Canonical first.** Always issue the current canonical compression request unchanged. Fallback activates only after the canonical stage ends without a summary: a refusal or an incomplete answer takes the bounded curve, and a rejection attributable to the request, or a rung decided by its failures (see 10), goes to source-only-final once when that rung is configured, and otherwise exhausts the family.
-2. **Same as-of model.** Do not use a neutral observer or alternate model/provider.
+2. **Same as-of model.** Do not use a neutral observer or alternate model/provider. The one exception is opt-in: with `compressionFallbackModel` set (it is unset by default), a ladder whose every answer was a refusal sends the canonical request once more with only its model changed, after source-only-final and its hoist and before split-stitch. The memory that model writes is stored as text alone, without its reasoning blocks, and the entry's `provenance.model` names it. A merge gets the same once every one of its attempts was refused: its first attempt's request, with only the model changed, after the last attempt and before quarantine.
 3. **No semantic omission.** Preserve head, raw middle, target chunk, tool cycles, instruction, and all leaf-history coverage selected by the canonical recall frontier.
 4. **No private-state sanitization.** Do not remove, redact, deduplicate, or placeholder `think`, `skip_reply`, thinking, tool, or other state as part of this feature.
 5. **Authored nodes only.** Alternate curves may use only summaries already authored and persisted by this instance. No mechanical or external summary may be introduced.
@@ -166,7 +166,8 @@ ways:
   (when the canonical's own first call refused; a refusal of its no-tools
   or tools-less retry leaves the stage incomplete, and the hoist doesn't
   run), the recall variants, source-only-final and its hoist (after a
-  refusal), and split-stitch;
+  refusal), the fallback-model rung (where `compressionFallbackModel` is
+  set and every answer before it was a refusal), and split-stitch;
 - the canonical stage (the canonical, or its no-tools or tools-less retry)
   throws a request-attributable provider error (`context_length`,
   `invalid_request`, `safety`, `unsupported`), or one its failures decided:
@@ -180,8 +181,8 @@ ways:
   so an answer that strips to empty takes this exit whichever rung gave it.
   After the canonical stage's, a recall variant's or split-stitch's, the
   canonical's plain-prose retry is asked once, and the family exhausts if it
-  ends without a summary too. After source-only-final's or a tool-prose
-  hoist's, the family exhausts at once.
+  ends without a summary too. After source-only-final's, a tool-prose
+  hoist's or the fallback-model rung's, the family exhausts at once.
 
 A rung ends without a summary when it refuses, answers incompletely or with
 no persistable text, throws a request-attributable provider error or one its
