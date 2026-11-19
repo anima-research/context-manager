@@ -1100,6 +1100,9 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
   if (Number.isFinite(until)) return `until ${new Date(until).toISOString()}`;
   return 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
 };
+/** How a long hold of the fallback model reads in its line (see fallbackModelHeldUntil). */
+const heldUntilText = (until: number): string =>
+  Number.isFinite(until) ? `until ${new Date(until).toISOString()}` : 'with no end stated';
 /**
  * The model each failed compression call was dispatched with, keyed by its
  * error: the pause describes the call that failed, even if the configured
@@ -1309,8 +1312,10 @@ const CANONICAL_STAGE_LABELS = new Set(['canonical', 'canonical-no-tools', 'cano
 
 /**
  * A rung decided by its failures (COMPRESSION_PERSISTENT_FAILURES transient
- * failures, the first and each later one after a landing): the policy's
- * outcome, `persistent-<class>`, not an answer any provider gave.
+ * failures, the first and each later one after a landing, or the
+ * fallback-model rung's one failure that says its model is held for long:
+ * fallbackModelHeldUntil): the policy's outcome, `persistent-<class>`, not an
+ * answer any provider gave.
  */
 function isFailureDecision(entry: { outcome: string; errorType?: string }): boolean {
   return entry.outcome === 'provider_error' && typeof entry.errorType === 'string' && entry.errorType.startsWith('persistent-');
@@ -6357,11 +6362,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the fallback-model rung's (`compressionFallbackModel`). A failed call to
    * the fallback model paces the lane as the compression model's does, or
    * each tick would send that rung's request again, inside the backoff and
-   * the provider's stated wait.
+   * the provider's stated wait. Only a short wait gets this far: a long hold
+   * of the fallback model ends its rung and pauses nothing
+   * (fallbackModelHeldUntil).
    */
   private pauseOnLaneModel(pause: CompressionLanePause): boolean {
     const fallbackModel = this.config.compressionFallbackModel;
     return pause.model === this.config.compressionModel || (!!fallbackModel && pause.model === fallbackModel);
+  }
+
+  /**
+   * Until when a failed call to the fallback model says that model is held,
+   * where that is longer than its rung waits: the provider's stated wait, or
+   * the deadline of the caller's provider admission, when it ends after the
+   * lane's own backoff ceiling (COMPRESSION_PAUSE_MAX_BACKOFF_MS), and
+   * Infinity for one with no end (a wait that can't be held as an instant, or
+   * a deferral that gives no deadline). Undefined for a shorter wait or none
+   * stated, which pause the lane as the compression model's do, the ladder
+   * resuming at the rung.
+   *
+   * The rung is a last resort for one request, and every other chunk and
+   * merge needs only the compression model: a hold of hours or days on the
+   * fallback model must not stop them. So on such a hold the rung gives up
+   * for its request, decided as a rung its failures decided
+   * (`persistent-<class>`), with no pause, and the request goes on as after
+   * the fallback model's refusal. `error` is one that says nothing about the
+   * request (compressionFailureKind's 'transient').
+   */
+  private fallbackModelHeldUntil(error: unknown): number | undefined {
+    const stated = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+    const wait = typeof stated === 'number' && !Number.isNaN(stated) && stated >= 0
+      ? stated
+      : isAdmissionDeferral(error) ? Number.POSITIVE_INFINITY : undefined;
+    if (wait === undefined || wait <= AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS) return undefined;
+    const until = Date.now() + wait;
+    return until <= MAX_DATE_MS ? until : Number.POSITIVE_INFINITY;
   }
 
   /**
@@ -9317,6 +9352,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // interrupt, the run is decided before any pause: the failure that
         // decides it is the merge's own, not the lane's, so it pauses nothing.
         if (failureKind === 'transient') {
+          // The fallback-model rung doesn't wait out a long hold of its model
+          // (fallbackModelHeldUntil): its attempt is rejected as one its
+          // failures decided, which quarantines the group as the fallback
+          // model's refusal does. Nothing is thrown and the lane isn't paused.
+          const heldUntil = mergeFallbackModel !== undefined && this.isCompressionBranchCurrent(sourceBranch)
+            ? this.fallbackModelHeldUntil(error)
+            : undefined;
+          if (heldUntil !== undefined) {
+            const failureClass = compressionFailureClass(error);
+            this.diag.warn(
+              `[autobiographical] fallback model ${mergeFallbackModel} is held ${heldUntilText(heldUntil)}: its rung is skipped for ` +
+                `the L${merge.level} merge of ${merge.sourceIds.length} summaries, which goes on as after its refusal (no pause)`,
+            );
+            this.mergeFailureOrder.delete(mergeFailureKey(merge));
+            this.recordMergeRejection(
+              merge,
+              new MergeDispositionRejection(
+                merge.level,
+                'provider_error',
+                sha256Json({ level: merge.level, sourceIds: merge.sourceIds, transport: `persistent-${failureClass}` }),
+                undefined,
+                `persistent-${failureClass}`,
+              ),
+            );
+            return;
+          }
           if (!isAdmissionDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
             const failureClass = compressionFailureClass(error);
             const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? mergeModel;
@@ -12251,6 +12312,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         endRungRuns(outcome.curveLabel);
         persistProgress();
       };
+      /** Until when the fallback model is held, where its rung gave up on that hold (Infinity: no end stated). */
+      let fallbackModelHeld: number | undefined;
       /**
        * A failure that is not a rejection says nothing about the request by its
        * kind: keep what the ladder has learned and rethrow (the outer catch
@@ -12271,6 +12334,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         requestHash: string,
         streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
+        // The fallback-model rung doesn't wait out a long hold of its model
+        // (fallbackModelHeldUntil): it ends here with a decided outcome, so
+        // nothing is thrown, the lane isn't paused, and the ladder goes on as
+        // after the fallback model's refusal. ladderStep, the rung's only
+        // caller, has checked that the branch is current.
+        if (curveLabel === 'fallback-model') {
+          fallbackModelHeld = this.fallbackModelHeldUntil(error);
+          if (fallbackModelHeld !== undefined) {
+            return { curveLabel, requestHash, outcome: 'provider_error', errorType: `persistent-${compressionFailureClass(error)}` };
+          }
+        }
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
           // Counted against the request actually dispatched (the stripped one
           // after a carrier rejection is its own run); the outcome at the
@@ -12828,7 +12902,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // transport's rejection of reasoning carriers is followed by the same
         // rung's stripped request, so neither stands in the way. Its answer is
         // persisted as any rung's is, but as text alone, without its reasoning
-        // blocks; the entry's provenance names the model.
+        // blocks; the entry's provenance names the model. A failure of its
+        // call that says nothing about the request pauses the lane and the
+        // ladder resumes here, unless it says the model is held for long: then
+        // the rung is decided at once and the ladder goes on (interrupt).
         const fallbackModel = this.config.compressionFallbackModel;
         if (
           !fallbackResponse && fallbackModel && canonicalOutcome === 'refusal' &&
@@ -12871,11 +12948,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
           }
           if (result.kind === 'answered' || !result.reused) {
-            this.diag.warn(`[autobiographical] fallback model ${fallbackModel} for chunk ${chunk.index}: ${rungOutcome}`);
+            this.diag.warn(
+              fallbackModelHeld !== undefined
+                ? `[autobiographical] fallback model ${fallbackModel} is held ${heldUntilText(fallbackModelHeld)}: its rung is skipped for ` +
+                  `chunk ${chunk.index}, which goes on as after its refusal (no pause)`
+                : `[autobiographical] fallback model ${fallbackModel} for chunk ${chunk.index}: ${rungOutcome}`,
+            );
             logCompressionCall({
               event: 'compression:fallback-model',
               operation: 'compress_l1',
-              metadata: { quarantine_key: quarantineRecord.key, model, fallback_model: fallbackModel, requestHash, outcome: rungOutcome },
+              metadata: {
+                quarantine_key: quarantineRecord.key, model, fallback_model: fallbackModel, requestHash, outcome: rungOutcome,
+                ...(fallbackModelHeld !== undefined
+                  ? { held_until: Number.isFinite(fallbackModelHeld) ? new Date(fallbackModelHeld).toISOString() : null }
+                  : {}),
+              },
             }, this.ns);
           }
         }

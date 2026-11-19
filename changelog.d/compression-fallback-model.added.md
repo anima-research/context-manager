@@ -14,8 +14,14 @@
     being sent doesn't stand in the way.
   - An overload of the fallback model, or any other failure of its call that
     says nothing about the request, pauses the compression lane as the
-    compression model's does, for the lane's backoff and any wait the
-    provider stated, and the rung is asked again once the pause ends.
+    compression model's does, and the rung is asked again once the pause
+    ends, where the wait is short: none stated, or one that ends within the
+    lane's backoff ceiling of 10 minutes. Where a provider's stated wait or
+    the caller's provider admission holds the fallback model for longer, or
+    with no end, the rung gives up for that request instead: nothing is
+    paused, the outcome is recorded as `provider_error:persistent-<class>`,
+    and the request goes on as after the fallback model's refusal, so a hold
+    on the fallback model never stops other compression.
   - Its memory is stored as text alone: the reasoning blocks of its answer
     aren't kept (the entry has no `responseContent`), since a memory's
     reasoning is replayed to the agent's model and to the compression model,

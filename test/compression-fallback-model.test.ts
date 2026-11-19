@@ -34,6 +34,18 @@ const THINKING = { type: 'thinking', thinking: 'how it went', signature: 'sig-ot
 const ok = (t: string, blocks: ContentBlock[] = []) => ({ content: [...blocks, text(t)], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 37 } });
 type Answer = typeof REFUSAL | typeof TRUNCATED | ReturnType<typeof ok> | { throw: unknown };
 
+/** The lane's own backoff ceiling: the longest hold of its model the fallback-model rung waits out. */
+const CEILING = AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS;
+const WEEK = 7 * 24 * 3_600_000;
+/** A provider's rate limit, stating its wait. */
+const rateLimited = (retryAfterMs: number) =>
+  Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryable: true, retryAfterMs });
+/** The caller's provider admission refusing a call to a held model: no call was made. */
+const deferred = (retryAfterMs?: number) => Object.assign(
+  new Error('zz the model is held; no call was made'),
+  { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+);
+
 /** Answers by model: each model's answers in order, the last one repeating. */
 function byModel(script: Record<string, Answer[] | ((request: NormalizedRequest) => Answer)>) {
   const calls: NormalizedRequest[] = [];
@@ -62,6 +74,21 @@ class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   entries(): SummaryEntry[] { return [...this.summaries]; }
   queue() { return this.mergeQueue.map((item) => ({ ...item })); }
+  private lanePause(): { model: string | undefined; backoffUntil: number; statedUntil: number | null } | null {
+    return (this as unknown as { compressionPause: { model: string | undefined; backoffUntil: number; statedUntil: number | null } | null }).compressionPause;
+  }
+  /** The lane's pause (white-box): the model it is on, or null when there is none. */
+  pause(): { model: string | undefined } | null {
+    const pause = this.lanePause();
+    return pause ? { model: pause.model } : null;
+  }
+  /** Stand for time passing: the pause has ended. */
+  expirePause(): void {
+    const pause = this.lanePause();
+    if (!pause) return;
+    pause.backoffUntil = 0;
+    if (pause.statedUntil !== null) pause.statedUntil = 0;
+  }
 }
 function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
@@ -270,9 +297,123 @@ describe('fallback-model rung: L1', () => {
     assert.equal(fresh.strategy.getCompressionQuarantineStatus().count, 0, 'the debt is paid');
     await fresh.manager.close();
   });
+
+  it('the fallback model is held for a week: its rung is given up with no lane pause, the chunk is quarantined, and the chunk queued behind it is compressed next', async () => {
+    await withCompressionLog(async (events) => {
+      // Two chunks queued, taken by tick. The compression model refuses the
+      // first and writes the second, whose request alone reaches raw-7.
+      const own = (request: NormalizedRequest): Answer =>
+        (texts(request).some((t) => t.startsWith('raw-7 ')) ? ok('memory of the chunk behind') : REFUSAL);
+      const mock = byModel({ [OWN]: own, [OTHER]: [{ throw: rateLimited(WEEK) }] });
+      const strategy = new ProbeStrategy({
+        compressionModel: OWN, compressionFallbackModel: OTHER, targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0,
+        autoTickOnNewMessage: false, l1HoldbackChunks: 0, minChunkCharsForLLM: 0, mergeThreshold: 99, quarantineAlarmIntervalMs: 0,
+        compressionRefusalCurveFallbacks: 0,
+      } as never);
+      const manager = await ContextManager.open({ path: freshPath(), strategy, membrane: mock.membrane });
+      const ids: string[] = [];
+      for (let i = 0; i < 8; i++) ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]));
+
+      await strategy.tick(managerContext(manager));
+      assert.deepEqual(mock.models(), [OWN, OTHER], 'the first chunk: the canonical, then the fallback model once');
+      assert.equal(strategy.pause(), null, 'the hold pauses nothing');
+      const status = strategy.getCompressionQuarantineStatus();
+      assert.equal(status.count, 1, 'the chunk is quarantined, as after the fallback model\'s refusal');
+      assert.equal(status.spans[0]!.latestOutcome, 'provider_error:persistent-rate_limit:429', 'the rung is decided, and not as a refusal');
+      const rung = events().filter((e) => e.event === 'compression:fallback-model');
+      assert.equal(rung.length, 1);
+      assert.equal(rung[0]!.metadata?.outcome, 'provider_error');
+      assert.match(String(rung[0]!.metadata?.held_until), /^\d{4}-\d\d-\d\dT/, 'the event says until when the model is held');
+
+      await strategy.tick(managerContext(manager));
+      assert.deepEqual(mock.models(), [OWN, OTHER, OWN], 'the next tick takes the chunk behind, on the compression model');
+      const behind = strategy.entries().find((entry) => entry.content === 'memory of the chunk behind');
+      assert.ok(behind, 'the chunk behind is compressed');
+      assert.equal(behind!.sourceIds.at(-1), ids[7]);
+      assert.equal(behind!.provenance?.model, OWN);
+
+      await strategy.tick(managerContext(manager));
+      await strategy.tick(managerContext(manager));
+      assert.equal(mock.calls.length, 3, 'the rung is decided for the request: no later tick asks the fallback model again');
+      await manager.close();
+    });
+  });
+
+  it("a hold with no end, and the caller's admission deferring the call for long or with no deadline, give the rung up the same way, and it stays decided across a restart", async () => {
+    const holds: Array<[string, unknown]> = [
+      ["a stated wait that can't be held as an instant", rateLimited(Number.POSITIVE_INFINITY)],
+      ['an admission deferral whose deadline is a week away', deferred(WEEK)],
+      ['an admission deferral that gives no deadline', deferred()],
+    ];
+    for (const [name, hold] of holds) {
+      const path = freshPath();
+      const mock = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: hold }] });
+      const fx = await buildL1(mock.membrane, { fallbackModel: OTHER, path });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.deepEqual(mock.models(), [OWN, OWN, OTHER], `${name}: canonical, source-only-final, then the fallback model once`);
+      assert.equal(fx.strategy.pause(), null, `${name}: no pause`);
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, `${name}: quarantined`);
+      assert.equal(fx.target.compressed, false);
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 3, `${name}: decided, so nothing is sent again`);
+      await fx.manager.close();
+
+      const restarted = byModel({ [OWN]: [REFUSAL], [OTHER]: [ok('must not be asked')] });
+      const strategy = new ProbeStrategy(l1Config({ fallbackModel: OTHER }));
+      const manager = await ContextManager.open({ path, strategy, membrane: restarted.membrane });
+      await strategy.run(chunkOf(manager, fx.ids), managerContext(manager));
+      assert.equal(restarted.calls.length, 0, `${name}: nor after a restart`);
+      await manager.close();
+    }
+  });
+
+  it('held for a week with the split rung on: the split rung follows, as after a refusal, and its stitched memory names the compression model', async () => {
+    const own = (request: NormalizedRequest): Answer => (targets(request) >= 2 ? REFUSAL : ok(`piece:${texts(request).find((t) => /^raw-\d+ /.test(t))!.split(' ')[0]}`));
+    const mock = byModel({ [OWN]: own, [OTHER]: [{ throw: rateLimited(WEEK) }] });
+    const fx = await buildL1(mock.membrane, { fallbackModel: OTHER, split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.deepEqual(mock.models().slice(0, 3), [OWN, OWN, OTHER]);
+    assert.ok(mock.calls.slice(3).length > 0 && mock.calls.slice(3).every((call) => modelOf(call) === OWN && targets(call) < 4), 'then the split rung, on the compression model');
+    const entry = fx.strategy.entries().at(-1)!;
+    assert.ok(entry.stitched, 'the split rung wrote the memory');
+    assert.equal(entry.provenance?.model, OWN);
+    assert.equal(fx.strategy.pause(), null);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    await fx.manager.close();
+  });
+
+  it("the line is the lane's backoff ceiling: a wait that ends within it pauses the lane and the ladder resumes at the rung, and one past it gives the rung up", async () => {
+    const within: Array<[string, unknown]> = [
+      ['a stated wait at the ceiling', rateLimited(CEILING)],
+      ['an admission deferral with a deadline a minute away', deferred(60_000)],
+    ];
+    for (const [name, wait] of within) {
+      const mock = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: wait }, ok('written after the wait')] });
+      const fx = await buildL1(mock.membrane, { fallbackModel: OTHER });
+      await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /^Error: zz /, `${name}: the failure interrupts the ladder`);
+      assert.equal(fx.strategy.pause()?.model, OTHER, `${name}: the lane is paused on the fallback model`);
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, `${name}: nothing is decided`);
+      fx.strategy.expirePause();
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.deepEqual(mock.models(), [OWN, OWN, OTHER, OTHER], `${name}: resumed at the rung, the compression model's rungs not paid again`);
+      const entry = fx.strategy.entries().at(-1)!;
+      assert.equal(entry.content, 'written after the wait');
+      assert.equal(entry.provenance?.model, OTHER);
+      await fx.manager.close();
+    }
+
+    const mock = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: rateLimited(CEILING + 1) }] });
+    const fx = await buildL1(mock.membrane, { fallbackModel: OTHER });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.deepEqual(mock.models(), [OWN, OWN, OTHER]);
+    assert.equal(fx.strategy.pause(), null, 'a millisecond past the ceiling: no pause');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'and the rung is given up');
+    await fx.manager.close();
+  });
 });
 
-async function buildMerge(membrane: unknown, options: Record<string, unknown> = {}) {
+async function buildMerge(membrane: unknown, options: Record<string, unknown> = {}, behind = false) {
   const strategy = new ProbeStrategy({
     compressionModel: OWN, hierarchical: true, targetChunkTokens: 100_000, recentWindowTokens: 0, headWindowTokens: 0,
     autoTickOnNewMessage: false, mergeThreshold: 99, quarantineAlarmIntervalMs: 0, mergeAttemptLimit: 3,
@@ -289,6 +430,12 @@ async function buildMerge(membrane: unknown, options: Record<string, unknown> = 
   strategy.seed(l1('L1-100', 0, 1));
   strategy.seed(l1('L1-101', 2, 3));
   strategy.qMerge(2, sourceIds);
+  if (behind) {
+    // A second merge, queued behind the first.
+    strategy.seed(l1('L1-102', 4, 5));
+    strategy.seed(l1('L1-103', 6, 7));
+    strategy.qMerge(2, ['L1-102', 'L1-103']);
+  }
   const tick = async (times: number) => { for (let i = 0; i < times; i++) await strategy.tick(managerContext(manager)); };
   return { manager, strategy, ids, sourceIds, tick };
 }
@@ -354,6 +501,64 @@ describe('fallback-model rung: merges', () => {
     assert.match(fx.strategy.checkReadiness().description ?? '', /compression paused/, 'and readiness names the pause');
     assert.equal(fx.strategy.queue().length, 1, 'the merge stays queued for the rung');
     await fx.manager.close();
+  });
+
+  it("the fallback model is held for long on a merge's rung: the group is quarantined as after its refusal, with no lane pause, and the merge queued behind it runs next", async () => {
+    const holds: Array<[string, unknown]> = [
+      ["a week's stated wait", rateLimited(WEEK)],
+      ['an admission deferral that gives no deadline', deferred()],
+    ];
+    for (const [name, hold] of holds) {
+      // The compression model refuses the first merge's three attempts, then writes the second merge.
+      const mock = byModel({ [OWN]: [REFUSAL, REFUSAL, REFUSAL, ok('the merge behind')], [OTHER]: [{ throw: hold }] });
+      const fx = await buildMerge(mock.membrane, { compressionFallbackModel: OTHER }, true);
+      await fx.tick(4);
+      assert.deepEqual(mock.models(), [OWN, OWN, OWN, OTHER], `${name}: three attempts, then the fallback model once`);
+      assert.equal(fx.strategy.pause(), null, `${name}: no pause`);
+      const status = fx.strategy.getMergeQuarantineStatus();
+      assert.equal(status.count, 1, `${name}: the group is quarantined`);
+      assert.deepEqual(status.records[0]!.sourceIds, fx.sourceIds);
+      assert.equal(status.records[0]!.lastOutcome, 'provider_error', `${name}: decided, and not as a refusal`);
+      assert.deepEqual(fx.strategy.queue().map((merge) => merge.sourceIds), [['L1-102', 'L1-103']], `${name}: it has left the head of the queue`);
+
+      await fx.tick(1);
+      assert.deepEqual(mock.models(), [OWN, OWN, OWN, OTHER, OWN], `${name}: the merge behind runs on the compression model`);
+      const parent = fx.strategy.entries().find((s) => s.level === 2)!;
+      assert.ok(parent, `${name}: and is written`);
+      assert.deepEqual(parent.sourceIds, ['L1-102', 'L1-103']);
+      assert.equal(parent.provenance?.model, OWN);
+      await fx.tick(2);
+      assert.equal(mock.calls.length, 5, `${name}: decided, so the fallback model is not asked again`);
+      await fx.manager.close();
+    }
+  });
+
+  it("a merge's rung draws the same line: a stated wait within the lane's backoff ceiling pauses the lane and the rung is asked again, and one past it quarantines the group", async () => {
+    const within = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: rateLimited(CEILING) }, ok('merged after the wait')] });
+    const a = await buildMerge(within.membrane, { compressionFallbackModel: OTHER });
+    await a.tick(3);
+    await assert.rejects(a.tick(1), /zz rate limited/);
+    assert.equal(a.strategy.pause()?.model, OTHER, 'the lane is paused on the fallback model');
+    assert.equal(a.strategy.queue().length, 1, 'and the entry stays queued for the rung');
+    assert.equal(a.strategy.queue()[0]!.attempts, 3, 'with no attempt counted');
+    await a.tick(2);
+    assert.equal(within.calls.length, 4, 'nothing is sent inside the wait');
+    a.strategy.expirePause();
+    await a.tick(1);
+    assert.deepEqual(within.models(), [OWN, OWN, OWN, OTHER, OTHER], 'the rung is asked again once the wait ends');
+    const parent = a.strategy.entries().find((s) => s.level === 2)!;
+    assert.equal(parent.content, 'merged after the wait');
+    assert.equal(parent.provenance?.model, OTHER);
+    await a.manager.close();
+
+    const past = byModel({ [OWN]: [REFUSAL], [OTHER]: [{ throw: rateLimited(CEILING + 1) }] });
+    const b = await buildMerge(past.membrane, { compressionFallbackModel: OTHER });
+    await b.tick(4);
+    assert.deepEqual(past.models(), [OWN, OWN, OWN, OTHER]);
+    assert.equal(b.strategy.pause(), null, 'a millisecond past the ceiling: no pause');
+    assert.equal(b.strategy.getMergeQuarantineStatus().count, 1, 'and the group is quarantined');
+    assert.equal(b.strategy.queue().length, 0);
+    await b.manager.close();
   });
 
   it('option unset: quarantined at the limit with no extra call', async () => {

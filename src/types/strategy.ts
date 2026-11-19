@@ -2625,9 +2625,13 @@ export interface AutobiographicalConfig {
    * with: the agent's model and the compression model can't be given
    * reasoning another model signed. `provenance.model` on the entry names
    * this model. If it refuses too, the split rung and quarantine
-   * follow as before. Setting or changing it is a new request regime for L1
-   * compression, so already-quarantined chunks earn a fresh bounded attempt
-   * without a manual clear; a quarantined merge still needs
+   * follow as before. They follow at once, with no pause of the compression
+   * lane, where a failed call says this model is held for longer than the
+   * lane's backoff ceiling of 10 minutes, or with no end (a provider's stated
+   * wait, or the caller's provider admission); a shorter wait pauses the
+   * lane and the rung is asked again. Setting or changing it is a new request
+   * regime for L1 compression, so already-quarantined chunks earn a fresh
+   * bounded attempt without a manual clear; a quarantined merge still needs
    * `clearMergeQuarantine`. Unset by default: the memories are then written
    * by the compression model alone.
    */
