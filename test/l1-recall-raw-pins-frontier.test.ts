@@ -60,7 +60,7 @@ function summarizer(respond: (call: number) => unknown[], requests: any[] = [], 
     const scripted = script.shift();
     if (scripted === 'refusal') {
       return { stopReason: 'refusal', content: [], usage: { inputTokens: 500, outputTokens: 0 },
-        raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+        raw: { response: { stop_details: { category: 'cyber' } } } };
     }
     if (scripted === 'tool_use') return { stopReason: 'tool_use', content: [], usage: { inputTokens: 500, outputTokens: 10 } };
     const content = scripted === 'thinking-wrapped' ? [{ type: 'text', text: '<thinking>a draft</thinking>' }] : respond(calls);

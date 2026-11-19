@@ -192,6 +192,18 @@ one rung, counted as rule 10 says, decide it. An abort, the caller's signal
 or a host's withdrawal, ends no rung and counts no failure: nothing is
 recorded, and the family stays open.
 
+A rung refused as `reasoning_extraction` ends as any refused rung does, and
+the request of the rung after it is not sent in the same pass: the lane
+pauses as after a transient failure (5 s, doubling to 10 minutes), and the
+ladder goes on from that rung on a later tick, with the refused rung's answer
+reused from the family's progress. Such a refusal does not end the lane's
+pause, so the backoff grows while these refusals are all that comes back, and
+any other answer ends it. The split-stitch rung waits as a whole; its pieces
+follow one another within its one attempt. A refused merge counts its attempt
+as before, and after a `reasoning_extraction` refusal the lane pauses in the
+same way before the merge's next attempt. A refusal of any other category is
+followed by the next rung, or the next attempt, as before.
+
 When a family exhausts:
 
 - leave the chunk raw;

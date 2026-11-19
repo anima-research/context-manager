@@ -16,7 +16,7 @@ const answer = (t: string, outputTokens = 20): Answer => ({ content: [text(t)], 
 const longMemory = () => answer('a long consolidated memory of the stretch before. '.repeat(400), 5_000);
 const REFUSAL: Answer = {
   content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 },
-  raw: { response: { stop_details: { category: 'reasoning_extraction' } } },
+  raw: { response: { stop_details: { category: 'cyber' } } },
 };
 const rejection = () => Object.assign(new Error('zz invalid_request failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
 const admissionDeferral = () => Object.assign(new Error('zz held by provider admission'), {

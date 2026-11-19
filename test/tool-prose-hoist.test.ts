@@ -91,7 +91,7 @@ function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
 const tool = (name: string): ToolDefinition => ({ name, description: 'd', inputSchema: { type: 'object', properties: {} } } as never);
-const REFUSAL = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+const REFUSAL = { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } };
 const OK = (t: string) => ({ content: [text(t)], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } });
 
 interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; tools?: string[]; reason?: string; path?: string; }

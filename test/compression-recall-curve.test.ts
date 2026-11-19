@@ -41,7 +41,7 @@ function response(stopReason: 'refusal' | 'end_turn' | 'max_tokens', text = '') 
     raw: {
       response: {
         stop_details: stopReason === 'refusal'
-          ? { category: 'reasoning_extraction' }
+          ? { category: 'cyber' }
           : null,
       },
     },
@@ -2601,7 +2601,7 @@ describe('compression refusal recall curves', () => {
       const attempts = entries.filter((entry) => entry.event === 'compression:attempt');
       assert.equal(attempts.length, 2);
       assert.equal(attempts[0]!.metadata?.persisted, false);
-      assert.equal(attempts[0]!.metadata?.refusalCategory, 'reasoning_extraction');
+      assert.equal(attempts[0]!.metadata?.refusalCategory, 'cyber');
       assert.equal(attempts[1]!.metadata?.persisted, true);
       assert.match(String(attempts[1]!.metadata?.requestHash), /^[a-f0-9]{64}$/);
       assert.match(String(attempts[1]!.metadata?.leafCoverageHash), /^[a-f0-9]{64}$/);
