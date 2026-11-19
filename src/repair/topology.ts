@@ -27,7 +27,8 @@
  * - level 1: the L1 keeps its largest contiguous run; the other messages are
  *   released from it and its chunk record, so the chunker re-owns them.
  * - a parent left with fewer than two sources is dissolved (its child becomes
- *   a root; the grandparent shrinks and may dissolve in turn).
+ *   a root; the grandparent shrinks and may dissolve in turn). A parent
+ *   written with one source, to carry it up a level (`carriedFrom`), stands.
  * - touched ancestors get their `sourceRange` recomputed; kv-stable
  *   resolutions deeper than the leaf's remaining chain are clamped.
  * - `releaseHead`: detached L1s (and uncompressed records) that form a prefix
@@ -39,7 +40,10 @@
  */
 
 import { isDeepStrictEqual } from 'node:util';
-import { mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn, type LevelRuns, type Placed } from '../strategies/merge-runs.js';
+import {
+  carriesAtLevel, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn,
+  type LevelRuns, type Placed, type RunHole, type StoreRunsInput,
+} from '../strategies/merge-runs.js';
 import {
   loadedChunkRecords, releaseUnsummarizedRecords, settleRepairLine, settleStoredSummaries, settlingRepaired,
 } from '../strategies/settle-summaries.js';
@@ -53,6 +57,8 @@ export interface RepairSummary {
   sourceRange: { first: string; last: string };
   mergedInto?: string;
   parentId?: string;
+  /** The summary this one carries up a level unchanged, its one source (the strategy's `carryStrandedSummaries`). */
+  carriedFrom?: string;
   [key: string]: unknown;
 }
 export interface RepairRecord {
@@ -105,8 +111,12 @@ export interface RepairRunsConfig {
   mergeHoldSummaryIds: string[];
   /** Whether the merge check reads every level (speculative production) or L1 and L2 only. */
   speculativeProduction: boolean;
+  /** Whether the merge check carries a summary no merge can take up a level (the strategy's `carryStrandedSummaries`, off unless set). */
+  carryStrandedSummaries: boolean;
 }
-export const DEFAULT_RUNS_CONFIG: RepairRunsConfig = { mergeThreshold: 6, mergeMaxSourceSpanMessages: 1500, mergeHoldSummaryIds: [], speculativeProduction: true };
+export const DEFAULT_RUNS_CONFIG: RepairRunsConfig = {
+  mergeThreshold: 6, mergeMaxSourceSpanMessages: 1500, mergeHoldSummaryIds: [], speculativeProduction: true, carryStrandedSummaries: false,
+};
 
 function runsConfigOf(runs: Partial<RepairRunsConfig> = {}): RepairRunsConfig {
   const given = Object.fromEntries(Object.entries(runs).filter(([, value]) => value !== undefined));
@@ -252,6 +262,8 @@ interface View {
 }
 
 const parentOf = (s: RepairSummary): string | undefined => s.mergedInto ?? s.parentId;
+/** A parent written with one source, the summary it carries up a level (`carriedFrom`): whole as it stands, where a merge left with one source is not. */
+const carries = (s: RepairSummary): boolean => s.sourceIds.length === 1 && s.carriedFrom === s.sourceIds[0];
 const setParent = (s: RepairSummary, id: string | undefined): void => {
   if (id === undefined) { delete s.mergedInto; delete s.parentId; return; }
   if ('parentId' in s && s.mergedInto === undefined) s.parentId = id; else s.mergedInto = id;
@@ -299,6 +311,19 @@ function runsInSummaries<S extends RepairSummary>(
   queue: 'stored' | 'drained',
   planning = false,
 ): Map<number, LevelRuns<S>> {
+  const { input, top } = runsInput(summaries, inputs, position, config, queue, planning);
+  return mergeRunsByLevel<S>(input, top);
+}
+
+/** The run rule's reading of `summaries`, and the highest level the merge check reads. */
+function runsInput<S extends RepairSummary>(
+  summaries: readonly S[],
+  inputs: Pick<RepairInputs, 'mergeQueue' | 'mergeQuarantine'>,
+  position: ReadonlyMap<string, number>,
+  config: RepairRunsConfig,
+  queue: 'stored' | 'drained',
+  planning: boolean,
+): { input: StoreRunsInput<S>; top: number; byId: Map<string, S> } {
   const byId = new Map(summaries.map((s) => [s.id, s] as const));
   const held = heldIn(byId, inputs, position, config);
   const queued = new Set<string>();
@@ -309,10 +334,71 @@ function runsInSummaries<S extends RepairSummary>(
   }
   let top = 2;
   if (config.speculativeProduction) for (const s of summaries) top = Math.max(top, s.level ?? 1);
-  return mergeRunsByLevel<S>({
-    summaries, parentOf: (s: S) => parentOf(s), queued, position, held, pending: [],
-    spanBase: config.mergeMaxSourceSpanMessages, mergeK: config.mergeThreshold, planning,
-  }, top);
+  return {
+    input: {
+      summaries, parentOf: (s: S) => parentOf(s), queued, position, held, pending: [],
+      spanBase: config.mergeMaxSourceSpanMessages, mergeK: config.mergeThreshold, planning,
+    },
+    top,
+    byId,
+  };
+}
+
+/**
+ * What the strategy's carry rule (`carryStrandedSummaries`) would take up a
+ * level from `summaries`, by level, as its merge check reads them
+ * (merge-runs.ts carriesAtLevel): from the holes the stored state names (a
+ * held summary, and the messages of each chunk record a compression
+ * quarantine holds) and each summary's leaves through the L1s that are
+ * ownership, those a chunk record names (every L1 where none does, as
+ * `view` reads them), with an L1 the plan projects for released or pending
+ * messages counted among them. The check carries at the levels below the
+ * highest it reads.
+ */
+function carriesIn<S extends RepairSummary>(
+  summaries: readonly S[],
+  records: readonly RepairRecord[],
+  inputs: Pick<RepairInputs, 'mergeQueue' | 'mergeQuarantine' | 'compressionQuarantined'>,
+  position: ReadonlyMap<string, number>,
+  config: RepairRunsConfig,
+  queue: 'stored' | 'drained',
+  planning: boolean,
+  runs?: ReadonlyMap<number, LevelRuns<S>>,
+): Map<number, Placed<S>[]> {
+  const out = new Map<number, Placed<S>[]>();
+  if (!config.carryStrandedSummaries) return out;
+  const { input, top, byId } = runsInput(summaries, inputs, position, config, queue, planning);
+  const holes: RunHole[] = [];
+  for (const id of input.held) {
+    const held = byId.get(id);
+    const at = held && !parentOf(held) && typeof held.level === 'number' ? placeOf(held, position) : undefined;
+    if (at) holes.push({ first: at[0], last: at[1], level: held!.level });
+  }
+  const quarantined = new Set(inputs.compressionQuarantined ?? []);
+  const named = new Set<string>();
+  for (const r of records) {
+    if (!isIdList(r.sourceIds)) continue;
+    if (typeof r.summaryId === 'string' && byId.has(r.summaryId)) named.add(r.summaryId);
+    if (r.compressed || !quarantined.has(r.id)) continue;
+    const at = r.sourceIds.map((id) => position.get(id)).filter((p): p is number => p !== undefined);
+    if (at.length > 0) holes.push({ first: Math.min(...at), last: Math.max(...at), level: 0 });
+  }
+  const leaves = (s: S, trail = new Set<string>()): string[] => {
+    if ((s.level ?? 1) <= 1) {
+      const owns = named.size === 0 || named.has(s.id) || s.releasedFrom !== undefined || s.pendingFrom !== undefined;
+      return owns ? [...(s.sourceIds ?? [])] : [];
+    }
+    if (trail.has(s.id)) return [];
+    trail.add(s.id);
+    const rows: string[] = [];
+    for (const id of s.sourceIds ?? []) { const child = byId.get(id); if (child) for (const leaf of leaves(child, trail)) rows.push(leaf); }
+    return rows;
+  };
+  for (let level = 1; level < top; level++) {
+    const picked = carriesAtLevel(input, level, holes, (s) => leaves(s), runs?.get(level));
+    if (picked.length > 0) out.set(level, picked);
+  }
+  return out;
 }
 
 function heldIn<S extends RepairSummary>(
@@ -334,8 +420,14 @@ function heldIn<S extends RepairSummary>(
 }
 
 export function strandedInStore(inputs: RepairInputs, runs: Partial<RepairRunsConfig> = {}): Array<{ id: string; level: number }> {
-  const summaries = settleStoredSummaries<RepairSummary>(inputs.summaries, loadedChunkRecords<RepairRecord>(inputs.records)).summaries;
-  return strandedInSummaries(summaries, inputs, listedPositions(inputs), runsConfigOf(runs))
+  const records = loadedChunkRecords<RepairRecord>(inputs.records);
+  const summaries = settleStoredSummaries<RepairSummary>(inputs.summaries, records).summaries;
+  const config = runsConfigOf(runs);
+  const position = listedPositions(inputs);
+  // One the carry rule takes at the next merge check is not stranded, as the strategy's own list reads it.
+  const carried = new Set([...carriesIn(summaries, records, inputs, position, config, 'stored', false).values()].flatMap((at) => at.map(({ s }) => s.id)));
+  return strandedInSummaries(summaries, inputs, position, config)
+    .filter(({ s }) => !carried.has(s.id))
     .map(({ s }) => ({ id: s.id, level: s.level ?? 1 }));
 }
 
@@ -567,11 +659,12 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       const out: Projected[] = state.map((s) => ({ ...s }));
       const byId = new Map(out.map((s) => [s.id, s] as const));
       let made = 0;
-      const land = (level: number, group: readonly Projected[]): void => {
+      const land = (level: number, group: readonly Projected[], carried = false): void => {
         const spans = group.map((s) => placeOf(s, position)!);
         const parent: Projected = {
           id: `#refold-${made++}`, level, sourceIds: group.map((s) => s.id), projected: true,
           sourceRange: { first: messageAt(Math.min(...spans.map((x) => x[0]))), last: messageAt(Math.max(...spans.map((x) => x[1]))) },
+          ...(carried ? { carriedFrom: group[0]!.id } : {}),
         };
         out.push(parent);
         byId.set(parent.id, parent);
@@ -584,9 +677,17 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
         }
       }
       if (!(runsConfig.mergeThreshold >= 2)) return out;
+      // As the drain's merge check goes: the lowest level with work first,
+      // and at a level the carries, then its groups.
       for (let grew = true; grew;) {
         grew = false;
-        for (const [level, { runs }] of runsInSummaries(out, inputs, position, runsConfig, 'drained', true)) {
+        const found = runsInSummaries(out, inputs, position, runsConfig, 'drained', true);
+        const carried = carriesIn(out, records, inputs, position, runsConfig, 'drained', true, found);
+        for (const [level, { runs }] of found) {
+          for (const { s } of carried.get(level) ?? []) {
+            land(level + 1, [s], true);
+            grew = true;
+          }
           for (const run of runs) {
             for (const group of runGroups(run, runsConfig.mergeThreshold)) {
               land(level + 1, group);
@@ -924,7 +1025,7 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     while (changed) {
       changed = false;
       for (const s of alive()) {
-        if (s.level < 2 || s.sourceIds.length >= 2) continue;
+        if (s.level < 2 || s.sourceIds.length >= 2 || carries(s)) continue;
         const [childId] = s.sourceIds;
         const child = childId ? v.byId.get(childId) : undefined;
         if (child) setParent(child, undefined);
@@ -984,7 +1085,7 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
     while (changed) {
       changed = false;
       for (const s of alive()) {
-        if (s.level < 2 || s.sourceIds.length >= 2) continue;
+        if (s.level < 2 || s.sourceIds.length >= 2 || carries(s)) continue;
         const [childId] = s.sourceIds;
         const child = childId ? v.byId.get(childId) : undefined;
         if (child) setParent(child, undefined);

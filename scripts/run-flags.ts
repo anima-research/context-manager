@@ -5,7 +5,9 @@ export const RUNS_USAGE =
   '    --merge-max-span <n>         mergeMaxSourceSpanMessages (1500)\n' +
   '    --merge-hold <id,id,…>       mergeHoldSummaryIds (none)\n' +
   '    --no-speculative-production  for a resident without adaptive resolution: its merge check reads L1 and L2 only\n' +
-  '                                 (speculativeProduction off; adaptive residents, connectome-host\'s default, have it on)';
+  '                                 (speculativeProduction off; adaptive residents, connectome-host\'s default, have it on)\n' +
+  '    --carry-stranded-summaries   for a resident with carryStrandedSummaries set: its merge check carries a summary\n' +
+  '                                 no merge can take up a level (off unless given)';
 
 export const RUN_VALUE_FLAGS = ['--merge-threshold', '--merge-max-span', '--merge-hold'] as const;
 
@@ -43,18 +45,22 @@ export function runsFromArgs(args: readonly string[]): RepairRunsConfig | { erro
   if (typeof mergeMaxSourceSpanMessages !== 'number') return mergeMaxSourceSpanMessages;
   const holds = flagValue(args, '--merge-hold');
   if (typeof holds === 'object') return holds;
-  if (args.some((a) => a.startsWith('--no-speculative-production='))) return { error: '--no-speculative-production takes no value' };
-  if (args.filter((a) => a === '--no-speculative-production').length > 1) return { error: '--no-speculative-production is given more than once' };
+  for (const name of ['--no-speculative-production', '--carry-stranded-summaries']) {
+    if (args.some((a) => a.startsWith(`${name}=`))) return { error: `${name} takes no value` };
+    if (args.filter((a) => a === name).length > 1) return { error: `${name} is given more than once` };
+  }
   return {
     mergeThreshold,
     mergeMaxSourceSpanMessages,
     mergeHoldSummaryIds: (holds ?? '').split(',').map((id) => id.trim()).filter(Boolean),
     speculativeProduction: !args.includes('--no-speculative-production'),
+    carryStrandedSummaries: args.includes('--carry-stranded-summaries'),
   };
 }
 
 export function runsLine(runs: RepairRunsConfig): string {
   return `run settings the stray rule read: mergeThreshold ${runs.mergeThreshold}, mergeMaxSourceSpanMessages ${runs.mergeMaxSourceSpanMessages}, ` +
     `mergeHoldSummaryIds ${runs.mergeHoldSummaryIds.length ? runs.mergeHoldSummaryIds.join(',') : 'none'}, ` +
-    `speculativeProduction ${runs.speculativeProduction ? 'on' : 'off'} (pass the resident's own; see --help)`;
+    `speculativeProduction ${runs.speculativeProduction ? 'on' : 'off'} ` +
+    `(carryStrandedSummaries ${runs.carryStrandedSummaries ? 'on' : 'off'}; pass the resident's own; see --help)`;
 }

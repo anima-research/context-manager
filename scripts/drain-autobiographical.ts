@@ -99,6 +99,7 @@ const passthroughKeys = [
   'recoverLiteralThinkingWrappedCompression',
   'mergeHoldSummaryIds',
   'mergeMaxSourceSpanMessages',
+  'carryStrandedSummaries',
   'l1HoldbackChunks',
   'summaryTargetTokens',
   'identityReminder',
@@ -125,6 +126,8 @@ class DrainStrategy extends AutobiographicalStrategy {
       mergeHoldSummaryIds: c.mergeHoldSummaryIds ?? [],
       speculativeProduction: c.speculativeProduction !== false,
       l1HoldbackChunks: c.l1HoldbackChunks ?? 1,
+      // Named only when the recipe sets it, as a plan made with --carry-stranded-summaries read it.
+      ...(c.carryStrandedSummaries === true ? { carryStrandedSummaries: true } : {}),
     };
   }
 }

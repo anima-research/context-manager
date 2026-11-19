@@ -43,8 +43,9 @@ import type {
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
 import {
-  adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
-  type LevelRuns, type PendingFill, type StoreRunsInput,
+  adjacentRuns, carriesAtLevel, frontierEnds, holesBeside, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, projectLadder,
+  queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
+  type LadderStep, type LevelRuns, type PendingFill, type RunHole, type StoreRunsInput,
 } from './merge-runs.js';
 import {
   hasSummaryText, isIdList, isReadableRange, loadedChunkRecords, releasedRecordsLine, releaseUnsummarizedRecords,
@@ -242,6 +243,14 @@ function strandedSummariesFailedMessage(cause: unknown): string {
     `Cause: ${causeText(cause)}`,
     "Effect: it can't say which summaries no merge can take. Merging itself may be running normally.",
     'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
+  ].join('\n');
+}
+
+function carryPreviewFailedMessage(cause: unknown): string {
+  return [
+    'The carry preview could not be made.',
+    `Cause: ${causeText(cause)}`,
+    'Effect: nothing is listed, and the store is as it was.',
   ].join('\n');
 }
 
@@ -2160,7 +2169,8 @@ type SelectPricing = {
  * named as each), with its `side` and the `level` of what it holds (0 for a
  * chunk). It is empty when no such hole lies between it and the summaries
  * beside it, as when what stands there is a summary of its level that
- * already has a parent.
+ * already has a parent. With `carryStrandedSummaries` set, a summary the
+ * next merge check carries up a level is not listed: it is not stranded.
  */
 export interface StrandedSummary {
   id: string;
@@ -3985,7 +3995,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const levelsFilter = query.levels && query.levels.length > 0 ? new Set(query.levels) : null;
 
     const results: SearchResult[] = [];
-    for (const s of this.summaries) {
+    // Read as a select reads them (pastCarries): a carried entry repeats the
+    // text of the summary it carries, which is listed in its place.
+    for (const s of this.pastCarries(this.summaries)) {
       if (!includeMerged && s.mergedInto) continue;
       if (levelsFilter && !levelsFilter.has(s.level)) continue;
       const matches = matcher(s.content);
@@ -4066,7 +4078,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
 
     const out: TimeRangeSummaryEntry[] = [];
-    for (const entry of this.summaries) {
+    // Read as a select reads them (pastCarries), as searchSummaries does.
+    for (const entry of this.pastCarries(this.summaries)) {
       if (opts.level !== undefined && entry.level !== opts.level) continue;
 
       // Resolve the source span to wall-clock time via the message store.
@@ -9782,11 +9795,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private summariesNotAcross(across: ReadonlySet<SummaryId>): SummaryEntry[] {
-    if (across.size === 0) return this.summaries;
-    return this.summaries.flatMap((s) => {
+    if (across.size === 0) return this.pastCarries(this.summaries);
+    return this.pastCarries(this.summaries.flatMap((s) => {
       if (across.has(s.id)) return [];
       const parentId = getSummaryParentId(s);
       return [parentId !== undefined && across.has(parentId as SummaryId) ? { ...s, parentId: undefined, mergedInto: undefined } : s];
+    }));
+  }
+
+  /**
+   * The summaries as a select reads them: without the entries that carry a
+   * summary up a level unchanged (`carriedFrom`, see
+   * `carryStrandedSummaries`). Such an entry holds the text of the summary
+   * it carries, so it is no deeper fold of those messages, and a solver that
+   * read it as one would be wrong about it: kv-stable takes a level above a
+   * chunk as proof the chunk can still fold, and lowers every younger,
+   * deeper chunk to re-fold them in order (kv-control.ts, the seeded cut),
+   * and the solvers' cache models key a rendered unit by its summary's id,
+   * so a move between the entry and the summary it carries would count as a
+   * change where no byte changes. So the summary carried stands in the
+   * entry's place: under the entry's own parent (none, until a merge takes
+   * the entry), which lists it where it listed the entry. Until that merge
+   * lands, a select reads the store as it read it before the carry. Once it
+   * has, the summary's lineage skips the levels it was carried through,
+   * which every solver reads past (SummaryTree.ancestorAt). The lists a
+   * host shows an agent read them the same way (searchSummaries,
+   * listSummariesInRange), so no memory is listed twice.
+   */
+  private pastCarries(summaries: SummaryEntry[]): SummaryEntry[] {
+    if (!summaries.some((s) => s.carriedFrom !== undefined)) return summaries;
+    const byId = new Map(summaries.map((s) => [s.id, s] as const));
+    const carrying = (id: string | undefined): SummaryEntry | undefined => {
+      const entry = id === undefined ? undefined : byId.get(id);
+      return entry?.carriedFrom !== undefined ? entry : undefined;
+    };
+    return summaries.flatMap((s) => {
+      if (s.carriedFrom !== undefined) return [];
+      // A parent sits above its summary, and a source below the summary that
+      // lists it (the load repair keeps no other), so both walks end.
+      let parent = getSummaryParentId(s);
+      for (let above = carrying(parent); above; above = carrying(parent)) parent = getSummaryParentId(above);
+      let sourceIds = s.sourceIds;
+      if (s.level > 1 && sourceIds.some((id) => carrying(id))) {
+        sourceIds = sourceIds.map((id) => {
+          for (let entry = carrying(id); entry; entry = carrying(id)) id = entry.sourceIds[0]!;
+          return id;
+        });
+      }
+      if (parent === getSummaryParentId(s) && sourceIds === s.sourceIds) return [s];
+      return [{ ...s, parentId: undefined, mergedInto: parent, sourceIds }];
     });
   }
 
@@ -10042,7 +10099,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * pair if nothing else does, or, for a hole below its level, only if what
    * lands there merges up beside it. One that stays, or that has no hole
    * beside it, needs
-   * `repair-topology --mode rebuild` to give it partners. It reads the
+   * `repair-topology --mode rebuild` to give it partners, unless
+   * `carryStrandedSummaries` is set and a higher summary stands beside it:
+   * the next merge check carries that one up a level, so it isn't listed
+   * (`previewCarries` lists it). It reads the
    * compression quarantine ledger afresh to name the quarantined chunks a
    * stray stands beside.
    *
@@ -10077,11 +10137,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const input = { ...this.mergeRunsInput(order), queued, planning: false };
     let top = 2;
     if (this.config.speculativeProduction) for (const s of this.summaries) top = Math.max(top, s.level ?? 1);
+    const byLevel = mergeRunsByLevel(input, top);
     const strays: Array<{ s: SummaryEntry; first: number; last: number }> = [];
-    for (const { runs } of mergeRunsByLevel(input, top).values()) strays.push(...strandedIn(runs));
+    for (const { runs } of byLevel.values()) strays.push(...strandedIn(runs));
     if (strays.length === 0) return [];
 
-    const holes: Array<{ first: number; last: number; level: number; beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> = [];
+    const holes = this.mergeHoles(order, input.held, quarantined);
+    // A stray the carry rule takes at the next merge check is not stranded:
+    // at the levels that check carries from, below the highest it reads.
+    const carried = new Set<string>();
+    if (this.config.carryStrandedSummaries) {
+      for (const [level, found] of byLevel) {
+        if (level >= top) continue;
+        for (const { s } of carriesAtLevel(input, level, holes, (x) => this.ownedLeafRows(x), found)) carried.add(s.id);
+      }
+    }
+    const ends = frontierEnds(input);
+    const out: StrandedSummary[] = [];
+    for (const { s, first, last } of strays) {
+      if (carried.has(s.id)) continue;
+      const level = s.level ?? 1;
+      const beside = holesBeside(ends, holes, level, first, last).map(({ hole, side }) => ({ ...hole.beside, side, level: hole.level }));
+      out.push({ id: s.id, level, tokens: s.tokens ?? 0, beside });
+    }
+    return out;
+  }
+
+  /**
+   * The holes in the frontier that held-up work could still fill, each with
+   * what holds it up (StrandedSummary's `beside`): the messages of a chunk
+   * the compression quarantine holds (level 0), and each unparented summary
+   * held out of merges, as an operator hold and as the source of each
+   * quarantined merge that holds it.
+   */
+  private mergeHoles(
+    order: ReadonlyMap<MessageId, number>,
+    heldIds: ReadonlySet<string>,
+    quarantined: ReadonlyMap<string, ActiveCompressionQuarantine>,
+  ): Array<RunHole & { beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> {
+    const holes: Array<RunHole & { beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> = [];
     if (quarantined.size > 0) {
       const byHash = new Map(this.chunks.filter((chunk) => !chunk.compressed)
         .map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk] as const));
@@ -10101,7 +10195,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const operatorHeld = new Set(this.config.mergeHoldSummaryIds ?? []);
     const holding = [...this.mergeQuarantine.values()].filter((record) => this.mergeRecordHolds(record, order));
-    for (const id of input.held) {
+    for (const id of heldIds) {
       const held = this.summaryById(id);
       if (!held || getSummaryParentId(held) || typeof held.level !== 'number') continue;
       const at = placeOf(held, order);
@@ -10111,33 +10205,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (record.sourceIds.includes(id)) holes.push({ first: at[0], last: at[1], level: held.level, beside: { kind: 'merge-quarantine', id: record.key } });
       }
     }
-    const from = new Map<number, { to: number; level: number }>();
-    const to = new Map<number, { from: number; level: number }>();
-    for (const s of this.summaries) {
-      if (getSummaryParentId(s)) continue;
-      const at = placeOf(s, order);
-      if (!at) continue;
-      const level = typeof s.level === 'number' ? s.level : Number.POSITIVE_INFINITY;
-      from.set(at[0], { to: at[1], level });
-      to.set(at[1], { from: at[0], level });
-    }
-    const out: StrandedSummary[] = [];
-    for (const { s, first, last } of strays) {
-      const level = s.level ?? 1;
-      const walk = (start: number, step: 1 | -1): StrandedSummary['beside'] => {
-        let at = start;
-        for (;;) {
-          const here = holes.filter((h) => h.level <= level && h.first <= at && at <= h.last);
-          if (here.length > 0) return here.map((h) => ({ ...h.beside, side: step === 1 ? 'after' : 'before', level: h.level }));
-          const lower = step === 1 ? from.get(at) : to.get(at);
-          if (!lower || lower.level >= level) return [];
-          at = (step === 1 ? (lower as { to: number }).to : (lower as { from: number }).from) + step;
-        }
-      };
-      const beside = [...walk(first - 1, -1), ...walk(last + 1, 1)];
-      out.push({ id: s.id, level, tokens: s.tokens ?? 0, beside });
-    }
-    return out;
+    return holes;
   }
 
   /** Logs a debt report that couldn't read something, once: when one first fails,
@@ -13649,6 +13717,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   so it merges as an interior run, as the plan projected. Off, the
    *   level's last run reads as the newest, and a run of seven takes five
    *   and leaves two to wait for growth that won't come beside them.
+   * - **Carries wait with the picks:** with `carryStrandedSummaries` set, the
+   *   check carries at a level only once nothing below it is left to land,
+   *   and reads which summaries stand alone as the planner does, so a
+   *   summary alone in a level's last run is carried where a higher summary
+   *   follows it. The plan projects the same carries when it is made with
+   *   the setting (`RepairRunsConfig.carryStrandedSummaries`).
    */
   protected landsAsPlanned(): boolean {
     return false;
@@ -13673,6 +13747,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     const threshold = this.config.mergeThreshold ?? 6;
+
+    // This check reads L1 and L2, so an L1 is the one level a carry lands
+    // where a merge can take it.
+    if (this.config.carryStrandedSummaries) this.carryStranded(1, this.mergePositionIndex());
 
     // IDs that are already part of a queued merge — exclude them from
     // eligibility so we don't re-enqueue.
@@ -13743,7 +13821,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of this.summaries) {
       if (s.level > maxLevel) maxLevel = s.level;
     }
+    // Carries come first at each level, lowest level first: what one makes
+    // stands a level up, where this pass reads it next.
+    const carryAt = this.config.carryStrandedSummaries ? this.mergePositionIndex() : undefined;
     for (let level = 1; level <= maxLevel; level++) {
+      if (carryAt) this.carryStranded(level, carryAt);
       const queued = queuedSources.get(level) ?? new Set();
       const unmerged = this.summaries.filter(
         s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
@@ -13756,6 +13838,150 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (this.landsAsPlanned() && this.mergeQueue.length > 0) return;
       }
+    }
+  }
+
+  /**
+   * The carry rule (`carryStrandedSummaries`) at one level: each summary of
+   * `level` the rule takes (merge-runs.ts carriesAtLevel) gets a parent a
+   * level up that is the same memory, with no model call (carry). It runs to
+   * a fixed point, since a carry can put a higher summary beside another
+   * that had none. The merge check calls it before it picks at `level`, from
+   * the lowest level up, so a carried entry is read at its new level in the
+   * same pass: there it joins a run and merges as any summary does, or
+   * stands alone again and is carried again, never above the highest summary
+   * beside it. Under a drain the check waits for both queues first
+   * (landsAsPlanned), so a carry never comes before work below it lands.
+   *
+   * Nothing is carried while the compression quarantine can't be read, since
+   * the holes beside a summary can't be named then, or where the store holds
+   * a candidate differently from this instance: another instance sharing the
+   * store parented or dropped it, and this one takes that up when its next
+   * merge or compression reads the store.
+   */
+  private carryStranded(level: number, position: Map<MessageId, number>): void {
+    for (;;) {
+      const input = this.mergeRunsInput(position);
+      const found = runsAtLevel(input, level);
+      if (found.wide.length === 0 && strandedIn(found.runs).length === 0) return;
+      let holes: RunHole[];
+      try {
+        holes = this.mergeHoles(position, input.held, this.readCompressionQuarantineProjection());
+      } catch {
+        return;
+      }
+      const sources = carriesAtLevel(input, level, holes, (s) => this.ownedLeafRows(s), found).map((x) => x.s);
+      if (sources.length === 0 || !this.unparentedInStore(sources)) return;
+      for (const source of sources) this.carry(source);
+    }
+  }
+
+  /**
+   * Write the parent that carries `source` up a level: the same memory under
+   * a new id (its text, its verbatim response blocks, its token count, its
+   * range, when it was written and by which request), with `source` as its
+   * one source and `carriedFrom` naming it. The source is marked merged into
+   * it, as a merge marks its sources. No model is called, so nothing here
+   * counts as a compression call, a landing or a failure, and since it keeps
+   * `created`, the debt report's last mint doesn't move.
+   */
+  private carry(source: SummaryEntry): void {
+    const { parentId: _parentId, mergedInto: _mergedInto, ...memory } = source;
+    const entry: SummaryEntry = {
+      ...memory,
+      id: `L${source.level + 1}-${this.nextSummaryIdCounter()}`,
+      level: source.level + 1,
+      sourceLevel: source.level,
+      sourceIds: [source.id],
+      sourceRange: { first: source.sourceRange.first, last: source.sourceRange.last },
+      ...(source.responseContent ? { responseContent: [...source.responseContent] } : {}),
+      carriedFrom: source.id,
+    };
+    this.pushSummary(entry);
+    this.setMergedInto(source, entry.id);
+    logCompressionCall({
+      event: 'summary:carried',
+      metadata: { summary_id: entry.id, carried_from: source.id, level: entry.level, tokens: entry.tokens },
+    }, this.ns);
+  }
+
+  /**
+   * The messages a summary stands for: its leaves through the L1s that are
+   * ownership (liveL1Ids), as the load-time audit reads them. A superseded
+   * L1 generation stands for none.
+   */
+  private ownedLeafRows(summary: SummaryEntry): MessageId[] {
+    const live = this.liveL1Ids();
+    const rows: MessageId[] = [];
+    const seen = new Set<string>();
+    const walk = (s: SummaryEntry): void => {
+      if (seen.has(s.id)) return;
+      seen.add(s.id);
+      if (s.sourceLevel === 0 || s.level === 1) {
+        if (live.has(s.id)) for (const id of s.sourceIds) rows.push(id);
+        return;
+      }
+      for (const id of s.sourceIds) {
+        const child = this.summaryById(id);
+        if (child) walk(child);
+      }
+    };
+    walk(summary);
+    return rows;
+  }
+
+  /** Whether the store's summary list holds each of `sources`, none with a parent (true without a list to read). */
+  private unparentedInStore(sources: readonly SummaryEntry[]): boolean {
+    const stored = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) return true;
+    const ids = new Set(sources.map((source) => source.id));
+    const listed = new Set<string>();
+    for (const item of stored as Array<SummaryEntry | null>) {
+      if (!item || typeof item.id !== 'string' || !ids.has(item.id)) continue;
+      if (getSummaryParentId(item)) return false;
+      listed.add(item.id);
+    }
+    return listed.size === ids.size;
+  }
+
+  /**
+   * What the carry rule would do from the store as it stands, whether or not
+   * `carryStrandedSummaries` is set: each carry it would make and each merge
+   * that would then land, in order, with no call failing and nothing new
+   * arriving (merge-runs.ts projectLadder). A step names what it makes
+   * (`as`), which a later step can take: `L3-7^4` is L3-7 carried to L4, and
+   * `merge#1` the first merge listed. A merge's `sourceTokens` are what its
+   * sources hold together; the tokens of a source an earlier listed merge
+   * writes aren't known, so they aren't counted, and `unwritten` says how
+   * many such sources it has. `alreadyQueued` marks a merge the stored queue
+   * holds, which runs with or without the rule.
+   *
+   * `asDrain` reads the store as a drain does (landsAsPlanned): a run with a
+   * higher summary after it can't grow, and picks go one at a time from the
+   * lowest level. Otherwise it reads as a resident's own merge check does,
+   * where each level's last run is the newest and waits to grow, so a
+   * summary alone in it is not carried. It reads the compression quarantine
+   * ledger afresh, as getStrandedSummaries does, and where that or the
+   * projection fails it returns an `error` in place of the list. It writes
+   * nothing, and never throws.
+   */
+  previewCarries(options: { asDrain?: boolean } = {}): { steps: LadderStep[] } | { steps: null; error: string } {
+    try {
+      const order = this.mergePositionIndex();
+      const input = { ...this.mergeRunsInput(order), planning: options.asDrain ?? this.landsAsPlanned() };
+      const queue = this.mergeQueue.filter((m) => queuedMergeRuns(m, (id) => this.summaryById(id), getSummaryParentId, order, input.held));
+      return {
+        steps: projectLadder(input, {
+          threshold: this.config.mergeThreshold ?? 6,
+          everyLevel: !!this.config.speculativeProduction,
+          carry: true,
+          holes: this.mergeHoles(order, input.held, this.readCompressionQuarantineProjection()),
+          leaves: (s) => this.ownedLeafRows(s),
+          queue,
+        }),
+      };
+    } catch (thrown) {
+      return { steps: null, error: carryPreviewFailedMessage(thrown) };
     }
   }
 
@@ -19519,8 +19745,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Gather top summaries for broader context
+    // A carried entry repeats the text of the summary it carries, so it
+    // isn't one of these.
     const topSummaries = this.summaries
-      .filter(s => s.level >= 2)
+      .filter(s => s.level >= 2 && s.carriedFrom === undefined)
       .slice(-3)
       .map(s => s.content)
       .join('\n\n---\n\n');
