@@ -54,4 +54,5 @@
     one. A carried entry a repair gives a second source (an adoption, a
     re-homed fragment) keeps `carriedFrom` and is read from then as a
     summary of its level over both, by the selects and the lists too.
-    `inspect-store` marks carried entries in its summary tree.
+    `inspect-store` marks carried entries in its summary tree, and
+    `export-picker-inputs` exports the summaries as a select reads them.
