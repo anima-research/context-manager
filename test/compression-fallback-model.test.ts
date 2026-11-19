@@ -67,7 +67,7 @@ function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
 
-interface L1Opts { fallbackModel?: string; split?: boolean; path?: string }
+interface L1Opts { fallbackModel?: string; split?: boolean; path?: string; contextBudget?: number }
 function l1Config(opts: L1Opts) {
   return {
     compressionModel: OWN, targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
@@ -75,6 +75,7 @@ function l1Config(opts: L1Opts) {
     compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
     ...(opts.split ? { compressionSplitFallback: true } : {}),
     ...(opts.fallbackModel ? { compressionFallbackModel: opts.fallbackModel } : {}),
+    ...(opts.contextBudget ? { compressionContextBudgetTokens: opts.contextBudget } : {}),
   } as never;
 }
 function chunkOf(manager: ContextManager, ids: string[]): Chunk {
@@ -232,7 +233,7 @@ describe('fallback-model rung: L1', () => {
     await fx.manager.close();
   });
 
-  it('setting the option gives an already-quarantined chunk a fresh attempt without a manual clear', async () => {
+  it('setting the option gives an already-quarantined chunk a fresh attempt without a manual clear, though its old regime has filled the shape cap', async () => {
     const path = freshPath();
     const first = byModel({ [OWN]: [REFUSAL] });
     const a = await buildL1(first.membrane, { path });
@@ -243,17 +244,31 @@ describe('fallback-model rung: L1', () => {
     assert.equal(first.calls.length, 2);
     await a.manager.close();
 
-    const second = byModel({ [OWN]: [REFUSAL], [OTHER]: [ok('fresh family')] });
-    const strategy = new ProbeStrategy(l1Config({ fallbackModel: OTHER }));
-    const manager = await ContextManager.open({ path, strategy, membrane: second.membrane });
-    const target = chunkOf(manager, a.ids);
-    await strategy.run(target, managerContext(manager));
-    assert.deepEqual(second.models(), [OWN, OWN, OTHER], 'the whole ladder again, then the fallback model');
-    const entry = strategy.entries().at(-1)!;
+    const reopened = async (opts: L1Opts, script: Parameters<typeof byModel>[0]) => {
+      const mock = byModel(script);
+      const strategy = new ProbeStrategy(l1Config(opts));
+      const manager = await ContextManager.open({ path, strategy, membrane: mock.membrane });
+      await strategy.run(chunkOf(manager, a.ids), managerContext(manager));
+      return { mock, strategy, manager };
+    };
+    // Each context budget is another request shape of the same chunk: with
+    // the first, three fill the regime's cap, which then holds a fourth.
+    for (const contextBudget of [101_000, 102_000]) {
+      const shape = await reopened({ contextBudget }, { [OWN]: [REFUSAL] });
+      assert.equal(shape.mock.calls.length, 2, `premise: the shape at ${contextBudget} is attempted`);
+      await shape.manager.close();
+    }
+    const held = await reopened({ contextBudget: 103_000 }, { [OWN]: [REFUSAL] });
+    assert.equal(held.mock.calls.length, 0, 'premise: a fourth shape without the option is held by the cap');
+    await held.manager.close();
+
+    const fresh = await reopened({ contextBudget: 103_000, fallbackModel: OTHER }, { [OWN]: [REFUSAL], [OTHER]: [ok('fresh family')] });
+    assert.deepEqual(fresh.mock.models(), [OWN, OWN, OTHER], 'the whole ladder again, then the fallback model');
+    const entry = fresh.strategy.entries().at(-1)!;
     assert.equal(entry.content, 'fresh family');
     assert.equal(entry.provenance?.model, OTHER);
-    assert.equal(strategy.getCompressionQuarantineStatus().count, 0, 'the debt is paid');
-    await manager.close();
+    assert.equal(fresh.strategy.getCompressionQuarantineStatus().count, 0, 'the debt is paid');
+    await fresh.manager.close();
   });
 });
 
