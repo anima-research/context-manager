@@ -866,4 +866,30 @@ describe('the rebuild plan and a drain, with the option on', () => {
     assert.deepEqual([kept?.sourceIds, plan.result.summaries.find((x) => x.id === 's')?.mergedInto], [['s'], 'c2']);
     assert.deepEqual(plan.remaining, []);
   });
+
+  it('a carried entry a repair gave a second source is read as a summary of its level, over both', () => {
+    // A crossed L2 whose detached half a compact repair re-homes under the carried entry beside it.
+    const at = (i: number) => `m-${i}`;
+    const l1 = (id: string, first: number, last: number, parent?: string): SummaryEntry => tower(id, 1, first, last, at, parent)[0]!;
+    const summaries: SummaryEntry[] = [
+      l1('z0', 0, 1, 'z'), l1('y', 2, 5), l1('z1', 6, 7, 'z'),
+      { ...l1('z', 0, 7), level: 2, sourceLevel: 1, sourceIds: ['z0', 'z1'] } as SummaryEntry,
+      l1('s', 8, 9, 'c2'),
+      { ...l1('c2', 8, 9), level: 2, sourceLevel: 1, sourceIds: ['s'], carriedFrom: 's' } as SummaryEntry,
+    ];
+    const plan = planTopologyRepair({ summaries: summaries as unknown as RepairSummary[], records: recordsOf(summaries), messages: messages(10) }, { mode: 'compact' });
+    assert.deepEqual(plan.rehomed.map((r) => [r.id, r.into]), [['z1', 'c2']], 'premise: the repair gives the carried entry a second source');
+    const written = plan.result.summaries.find((x) => x.id === 'c2')!;
+    assert.deepEqual([written.sourceIds, written.carriedFrom], [['z1', 's'], 's'], 'premise: which keeps the mark it was written with');
+
+    // As the selects and the lists read the repaired store, once a merge has taken the entry.
+    const p = new Probe();
+    (p as unknown as { summaries: SummaryEntry[] }).summaries = [
+      ...(structuredClone(plan.result.summaries) as unknown as SummaryEntry[]).map((x) => (x.id === 'c2' ? { ...x, mergedInto: 'M' } : x)),
+      { ...l1('M', 6, 9), level: 3, sourceLevel: 2, sourceIds: ['c2'] } as SummaryEntry,
+    ];
+    const read = new Map(p.searchSummaries({ includeMerged: true }).map(({ summary }) => [summary.id, summary] as const));
+    assert.deepEqual(read.get('c2')?.sourceIds, ['z1', 's'], 'it stands in the view, over both sources');
+    assert.deepEqual([read.get('z1')?.mergedInto, read.get('s')?.mergedInto, read.get('M')?.sourceIds], ['c2', 'c2', ['c2']], 'so neither source drops out of the merge above it');
+  });
 });

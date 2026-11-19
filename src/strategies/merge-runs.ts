@@ -203,6 +203,18 @@ export function strandedIn<S>(runs: readonly MergeRun<S>[]): Placed<S>[] {
   return runs.filter((r) => r.members.length === 1 && !r.newest && !r.waiting).map((r) => r.members[0]!);
 }
 
+/**
+ * Whether `s` is an entry that carries a summary up a level unchanged
+ * (`carriedFrom`, the strategy's `carryStrandedSummaries`): one whose one
+ * source is still the summary it was written to carry. A repair can give
+ * such an entry another source (an adoption, a re-homed fragment) and leave
+ * the mark on it; from then it is a summary of its level over every source
+ * it lists, as any summary a repair adds a source to.
+ */
+export function carriesItsSource(s: { sourceIds?: readonly string[] | null; carriedFrom?: string }): boolean {
+  return s.carriedFrom !== undefined && s.sourceIds?.length === 1 && s.sourceIds[0] === s.carriedFrom;
+}
+
 export function frontierEnds<S extends RunSummary>(input: Pick<StoreRunsInput<S>, 'summaries' | 'parentOf' | 'position'>): FrontierEnds {
   const from = new Map<number, { to: number; level: number }>();
   const to = new Map<number, { from: number; level: number }>();

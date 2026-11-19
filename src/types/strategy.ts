@@ -3107,6 +3107,11 @@ export interface SummaryEntry {
    * one source. Its text, `responseContent`, `tokens`, `created` and
    * `provenance` are that summary's own, so `provenance` names the request
    * that authored the text, at the level it was written for.
+   *
+   * The entry is a carry only while that summary is its one source. A
+   * topology repair can give it another (an adoption, a re-homed fragment)
+   * and leaves this field: it then reads as any summary of its level over
+   * the sources it lists.
    */
   carriedFrom?: string;
 }

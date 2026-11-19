@@ -44,4 +44,7 @@
     carries the drain makes, so it dissolves no tower to partner a summary
     the drain will carry. With or without it, a repair no longer dissolves a
     parent that carries its one source as it dissolves a merge left with
-    one. `inspect-store` marks such entries in its summary tree.
+    one. A carried entry a repair gives a second source (an adoption, a
+    re-homed fragment) keeps `carriedFrom` and is read from then as a
+    summary of its level over both, by the selects and the lists too.
+    `inspect-store` marks carried entries in its summary tree.

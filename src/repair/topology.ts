@@ -41,7 +41,7 @@
 
 import { isDeepStrictEqual } from 'node:util';
 import {
-  carriesAtLevel, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn,
+  carriesAtLevel, carriesItsSource, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, strandedIn,
   type LevelRuns, type Placed, type RunHole, type StoreRunsInput,
 } from '../strategies/merge-runs.js';
 import {
@@ -262,8 +262,11 @@ interface View {
 }
 
 const parentOf = (s: RepairSummary): string | undefined => s.mergedInto ?? s.parentId;
-/** A parent written with one source, the summary it carries up a level (`carriedFrom`): whole as it stands, where a merge left with one source is not. */
-const carries = (s: RepairSummary): boolean => s.sourceIds.length === 1 && s.carriedFrom === s.sourceIds[0];
+/**
+ * A parent written with one source, the summary it carries up a level (`carriedFrom`): whole as it stands, where a merge left with one
+ * source is not. One this repair gives a second source keeps the mark and is no carry while it has both (merge-runs.ts carriesItsSource).
+ */
+const carries = (s: RepairSummary): boolean => carriesItsSource(s);
 const setParent = (s: RepairSummary, id: string | undefined): void => {
   if (id === undefined) { delete s.mergedInto; delete s.parentId; return; }
   if ('parentId' in s && s.mergedInto === undefined) s.parentId = id; else s.mergedInto = id;

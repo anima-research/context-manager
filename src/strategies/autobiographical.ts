@@ -43,8 +43,8 @@ import type {
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
 import {
-  adjacentRuns, carriesAtLevel, frontierEnds, holesBeside, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, projectLadder,
-  queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
+  adjacentRuns, carriesAtLevel, carriesItsSource, frontierEnds, holesBeside, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf,
+  projectLadder, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
   type LadderStep, type LevelRuns, type PendingFill, type RunHole, type StoreRunsInput,
 } from './merge-runs.js';
 import {
@@ -9821,16 +9821,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * which every solver reads past (SummaryTree.ancestorAt). The lists a
    * host shows an agent read them the same way (searchSummaries,
    * listSummariesInRange), so no memory is listed twice.
+   *
+   * An entry is read as a carry only while the summary it carries is its one
+   * source (carriesItsSource). One a repair gave a second source keeps its
+   * `carriedFrom` and stands here as a summary of its level over both: left
+   * out, it would take the source the repair gave it out of every summary
+   * above it.
    */
   private pastCarries(summaries: SummaryEntry[]): SummaryEntry[] {
-    if (!summaries.some((s) => s.carriedFrom !== undefined)) return summaries;
+    if (!summaries.some(carriesItsSource)) return summaries;
     const byId = new Map(summaries.map((s) => [s.id, s] as const));
     const carrying = (id: string | undefined): SummaryEntry | undefined => {
       const entry = id === undefined ? undefined : byId.get(id);
-      return entry?.carriedFrom !== undefined ? entry : undefined;
+      return entry && carriesItsSource(entry) ? entry : undefined;
     };
     return summaries.flatMap((s) => {
-      if (s.carriedFrom !== undefined) return [];
+      if (carriesItsSource(s)) return [];
       // A parent sits above its summary, and a source below the summary that
       // lists it (the load repair keeps no other), so both walks end.
       let parent = getSummaryParentId(s);
@@ -19748,7 +19754,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A carried entry repeats the text of the summary it carries, so it
     // isn't one of these.
     const topSummaries = this.summaries
-      .filter(s => s.level >= 2 && s.carriedFrom === undefined)
+      .filter(s => s.level >= 2 && !carriesItsSource(s))
       .slice(-3)
       .map(s => s.content)
       .join('\n\n---\n\n');
