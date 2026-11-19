@@ -46,7 +46,10 @@
  * the same request for it: a text written for a request whose history or
  * recalled memories have changed since (another import or an edit landed,
  * the resident ran) isn't its answer, and the request is exported again.
- * A dry run builds the request and makes the same checks. The text
+ * A dry run builds the request and makes the same checks. The text is
+ * stored as the file holds it, less the whitespace that ends it (so for
+ * `edit`): nothing is read out of it or stripped from it, and the line
+ * printed gives the length and sha256 of what is stored. It
  * takes the place of the provider's answer, so the summary is written as a
  * native one is, its sources parented, its chunk record marked and the
  * quarantine of its chunk or merge paid off, and the merge check runs after

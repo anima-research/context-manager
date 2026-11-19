@@ -15,13 +15,15 @@
     the strategy's, and a text written for a request whose history or
     recalled memories have changed since is refused. A dry run builds the
     request and makes the same checks. The text takes the place of the
-    provider's answer, so the
-    summary is written as a native one is (lineage, its sources' parent, the
-    chunk record, tokens stamped from the text, the quarantine of its chunk
-    or merge paid off). It carries no reasoning.
-  - `edit` replaces the text of one summary by id: lineage untouched, tokens
-    stamped from the new text, its verbatim response blocks dropped. The
-    summaries merged over the old text are reported and left as they are.
+    provider's answer, so the summary is written as a native one is
+    (lineage, its sources' parent, the chunk record, tokens stamped from the
+    text, the quarantine of its chunk or merge paid off). It is stored as
+    the file holds it, less the whitespace that ends it: no thinking wrapper
+    is read out of it as out of a model's answer. It carries no reasoning.
+  - `edit` replaces the text of one summary by id, with the file's text
+    stored the same way: lineage untouched, tokens stamped from the new
+    text, its verbatim response blocks dropped. The summaries merged over
+    the old text are reported and left as they are.
 
   `SummaryEntry.external` (`{ by, at, note? }`, optional) records who
   supplied such a text; entries without it are unchanged, nothing renders

@@ -121,7 +121,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         ...(tools.length > 0 ? { tools } : {}),
       };
     } else {
-      body = readFileSync(options.get('--body-file')!, 'utf8').trim();
+      // The text as the file holds it, less the whitespace that ends it.
+      body = readFileSync(options.get('--body-file')!, 'utf8').trimEnd();
       if (body.length === 0) throw new Error(`${options.get('--body-file')} holds no text`);
       if (command === 'import') {
         const file = JSON.parse(readFileSync(options.get('--descriptor')!, 'utf8')) as Partial<ExportFile>;

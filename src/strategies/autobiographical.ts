@@ -13140,6 +13140,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map(b => b.text)
           .join('\n');
+        // An operator's text (externalWork) is stored as given: only a
+        // model's answer is read for a thinking wrapper, so no text of
+        // theirs strips to an empty answer the ladder would record.
+        if (this.externalWork?.by) return { text: rawText, recoveredWholeWrapper: false };
         // The opt-in reads an answer of text blocks alone; one with native
         // reasoning beside its text is read as before.
         const onlyTextBlocks = r.content.every((block) => block.type === 'text');
@@ -14549,7 +14553,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // are captured for replay — see the L1 site / captureResponseContent.
       const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
       const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
-      const mergeExtraction = extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      // An operator's text (externalWork) is stored as given, as at the L1 site.
+      const mergeExtraction = this.externalWork?.by
+        ? { text: assessment.text, recoveredWholeWrapper: false }
+        : extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
       const mergedText = mergeExtraction.text;
       const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
       // A recovered answer has text blocks alone, so it stores no carrier,
@@ -14842,7 +14849,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * first the work sends, so the summary is written as a native one is: its
    * lineage, its sources' parent, its chunk record, its token stamp from the
    * text (no usage comes with it), and the quarantine of its chunk or merge
-   * paid off. It carries no reasoning, `external` says who supplied it, and
+   * paid off. The text is stored as given, with no thinking wrapper read
+   * out of it as out of a model's answer. It carries no reasoning,
+   * `external` says who supplied it, and
    * its provenance names no model. Without `apply` the work is run to its
    * request as exportMemoryRequest runs it, the same checks are made, and
    * nothing is written.

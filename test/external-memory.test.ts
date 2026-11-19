@@ -342,6 +342,22 @@ describe('external-memory', () => {
     assert.match(again.stderr, /compressed already/);
   });
 
+  it('stores the text as the file holds it: nothing is read out of it as out of a model\'s answer', async () => {
+    const path = await residentStore((request) => (said(request).includes('POISON') ? refuses(request) : answers(request)));
+    const record = read(path, (store) => store.getStateJson(`${NS}/autobio:chunks`) as Array<{ id: string; compressed: boolean }>)
+      .find((r) => !r.compressed)!;
+    assert.ok(record, 'setup: the refused chunk is uncompressed');
+    const { file } = await exported(path, ['--chunk', record.id]);
+    // A model's answer of this shape strips to nothing, which the chunk's ladder records as an unusable answer.
+    const text = '  <thinking>What the first stretch held, as worked out elsewhere.</thinking>';
+    const applied = await run(['import', path, '--namespace', NS, '--descriptor', file, '--body-file', bodyFile(text), '--by', 'operator', '--apply']);
+    assert.equal(applied.code, 0, applied.stderr);
+    assert.ok(applied.stdout.includes(`text: ${text.length} chars, sha256 ${sha256(text)}`), 'the line printed is of the text stored');
+    const l1 = summariesOf(path).find((s) => s.external)!;
+    assert.equal(l1.content, text, 'wrapper and leading whitespace as given, the file\'s last newline dropped');
+    assert.equal(l1.level, 1);
+  });
+
   it('edits one summary\'s text: lineage kept, carrier dropped, parents reported and left alone', async () => {
     const path = await residentStore();
     await asResident(path, answers, (manager) => manager.tick());
