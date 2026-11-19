@@ -322,7 +322,7 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
     manager.close();
   });
 
-  it('flag on: non-text content (e.g., tool_use blocks) is preserved on first shard', async () => {
+  it('flag on: a tool_use, every non-text block after it and the thinking before it go on the last shard', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
       compressionModel: 'mock',      adaptiveResolution: true,
@@ -333,23 +333,19 @@ describe('AutobiographicalStrategy — ingestion-time chunking', () => {
       strategy,
       membrane: mock as any,
     });
-    // A big text payload + a tool_use-like non-text block
     const bigText = 'paragraph. '.repeat(2000);
-    manager.addMessage('User', [
-      { type: 'text', text: bigText },
-      // A simulated non-text block; the chunker passes it through.
-      { type: 'tool_use', id: 'tool-1', name: 'search', input: { q: 'test' } } as any,
-    ]);
+    const thinking = { type: 'thinking', thinking: 'pondering', signature: 'sig' } as any;
+    const toolUse = { type: 'tool_use', id: 'tool-1', name: 'search', input: { q: 'test' } } as any;
+    const toolResult = { type: 'tool_result', toolUseId: 'tool-1', content: 'found' } as any;
+    manager.addMessage('Agent', [thinking, { type: 'text', text: bigText }, toolUse, toolResult]);
 
     const all = manager.getAllMessages();
-    assert.ok(all.length > 1, 'should be sharded');
-    // First shard should carry the non-text block(s)
-    const firstNonText = all[0].content.filter((b: any) => b.type !== 'text');
-    assert.equal(firstNonText.length, 1, 'first shard should carry the tool_use block');
-    // Other shards should not
-    for (let idx = 1; idx < all.length; idx++) {
-      const nonText = all[idx].content.filter((b: any) => b.type !== 'text');
-      assert.equal(nonText.length, 0, `shard ${idx} should not carry tool_use`);
+    assert.ok(all.length > 2, 'should be sharded');
+    const nonText = (idx: number) => all[idx].content.filter((b: any) => b.type !== 'text');
+    assert.deepEqual(nonText(0), [], 'the first shard carries text alone');
+    assert.deepEqual(nonText(all.length - 1), [thinking, toolUse, toolResult], 'the last shard carries the call, the thinking before it and what follows it');
+    for (let idx = 1; idx < all.length - 1; idx++) {
+      assert.equal(nonText(idx).length, 0, `shard ${idx} carries text alone`);
     }
     manager.close();
   });

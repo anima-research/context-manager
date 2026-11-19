@@ -177,7 +177,7 @@ describe('a system change, written and priced', () => {
     const cm = await open(new PassthroughStrategy());
     const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
     cm.addMessage('User', [text('Summarize this and look it up.')]);
-    // Ingress sharding puts a message's non-text blocks on its body's first shard.
+    // A body stored with its call on its first shard, as ingress stored a split message before.
     const first = store.append('Claude', [text('part one '), toolUse('t1')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 0, shardCount: 2 });
     store.append('Claude', [text('part two')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 1, shardCount: 2 });
     assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${first.id} holds a tool_use \\(t1\\) with no result between it and this change`));
