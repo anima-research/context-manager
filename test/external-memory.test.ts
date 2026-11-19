@@ -89,10 +89,14 @@ function read<T>(path: string, body: (store: JsStore) => T): T {
   try { return body(store); } finally { store.close(); }
 }
 const summariesOf = (path: string): SummaryEntry[] => read(path, (store) => store.getStateJson(`${NS}/autobio:summaries`) as SummaryEntry[]);
-/** The memory the store holds: its summaries, chunk records, merge queue and merge quarantine, and the item count of every strategy state. */
+/**
+ * The memory the store holds: its summaries, chunk records, merge queue and merge quarantine, the item count of every
+ * strategy state, and the store's sequence, which any write to any state moves.
+ */
 const memory = (path: string): string => read(path, (store) => JSON.stringify([
   ...STATES.map((state) => store.getStateJson(`${NS}/autobio:${state}`)),
   store.listStates().filter((s) => s.id.startsWith(`${NS}/autobio:`)).map((s) => [s.id, s.itemCount ?? null]).sort(),
+  store.currentSequence(),
 ]));
 
 async function run(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -240,6 +244,28 @@ describe('external-memory', () => {
     assert.equal(parent.content, BODY);
     assert.deepEqual(parent.sourceIds, held.sourceIds);
     assert.deepEqual(read(path, (store) => store.getStateJson(`${NS}/autobio:merge-quarantine`)), [], 'the record is gone');
+  });
+
+  it('refuses to read a request where the strategy would change its own state first, and changes nothing', async () => {
+    const path = await residentStore();
+    await asResident(path, refuses, async (manager, strategy) => {
+      await manager.tick();
+      assert.equal(strategy.getMergeQuarantineStatus().count, 1, 'setup: the merge is quarantined');
+    });
+    const held = read(path, (store) => store.getStateJson(`${NS}/autobio:merge-quarantine`) as Array<{ level: number; sourceIds: string[] }>)[0]!;
+    // An operator hold on one of its sources: the strategy would skip the group, and queue the merge beside it instead.
+    const holding = join(dir, 'holding-recipe.json');
+    writeFileSync(holding, JSON.stringify({ agent: { strategy: { ...RECIPE_STRATEGY, mergeHoldSummaryIds: [held.sourceIds[1]] } } }));
+    const out = join(dir, `export-${files++}.json`);
+    const before = memory(path);
+    const refused = await run([
+      'export-request', path, '--namespace', NS, '--level', String(held.level), '--out', out,
+      '--model', MODEL, '--participant', 'Ada', '--recipe', holding,
+    ]);
+    assert.equal(refused.code, 1);
+    assert.equal(memory(path), before, 'nothing in the store changed: the merge queue is as it was');
+    assert.match(refused.stderr, /would change its own state first \(checkMergeThreshold\)/);
+    assert.equal(existsSync(out), false, 'and no request is written');
   });
 
   it('installs the L1 of a quarantined chunk, which clears its quarantine', async () => {

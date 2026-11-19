@@ -5,7 +5,10 @@
   - `export-request` writes the request the strategy would send now for one
     piece of work, the next merge into a level or the L1 of a chunk record
     (quarantined or not), with a descriptor of the work. Nothing is sent or
-    written to the memory.
+    written to the memory: work the strategy would only reach by changing
+    its own state first (say a group with a held source, which it would
+    skip, queuing the merge beside it) is refused, and the change isn't
+    made.
   - `import` installs a text as the summary of that work, and only while the
     strategy would still do the same work: the tree's shape stays the
     strategy's. The text takes the place of the provider's answer, so the

@@ -5269,6 +5269,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private requireBranchMutation(entrypoint: string): void {
+    // Work an operator runs only to read its request (externalWork with no
+    // `by`) changes nothing: it ends at the first change the strategy would
+    // make to its own state before the call.
+    if (this.externalWork && !this.externalWork.by) {
+      throw new Error(
+        `the strategy would send no request for this work as it stands: it would change its own state first (${entrypoint}); ` +
+          'its warnings say why',
+      );
+    }
     if (
       this.isBranchIdentityCurrent(this.loadedBranchIdentity) ||
       this.isBranchIdentityCurrent(this.initializingBranchIdentity)
@@ -14685,8 +14694,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Set while an operator's work runs (exportMemoryRequest,
-   * importExternalMemory). `by` stamps the summary the work writes;
-   * `mergeRecordKey` is the merge-quarantine record whose own group it is.
+   * importExternalMemory). `by` stamps the summary the work writes; without
+   * it the work is run only to read its request, and every change the
+   * strategy would make to its own state on the way is refused
+   * (requireBranchMutation). `mergeRecordKey` is the merge-quarantine record
+   * whose own group it is. It is the instance's, not the call's: compression
+   * running beside the work would read it too, so the work is for a
+   * strategy with no tick or other compression in progress.
    */
   private externalWork: { by?: ExternalMemoryProvenance; mergeRecordKey?: string } | null = null;
 
@@ -14802,7 +14816,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * which is withdrawn (CompressionWithdrawn) in place of being made, so
    * nothing is sent, counted or written. A quarantine of the work itself
    * doesn't stop it. An error when the strategy would make no request for
-   * it as it stands, say while it waits on the host's tool definitions.
+   * it as it stands: while it waits on the host's tool definitions, or
+   * where it would change its own state first (skip a group holding a held
+   * source and queue what stands beside it, adopt a summary the store
+   * already holds), a change that is refused, not made.
    */
   async exportMemoryRequest(target: MemoryWorkTarget, ctx: StrategyContext): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }> {
     const work = this.externalWorkFor(target, ctx);

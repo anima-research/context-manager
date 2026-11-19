@@ -175,10 +175,18 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
 
     const strategy = new AutobiographicalStrategy({ ...settings.strategy, ...AUDIT_OPEN });
     const membrane = { complete: async () => { throw new Error('external-memory makes no model call'); } };
+    const unopened = store.currentSequence();
     const manager = await ContextManager.open({
       store, strategy, membrane: membrane as never, namespace, ...(slot === 'isolated' ? { isolate: true } : {}),
     });
     try {
+      // What the lines below say was written is the command's; the open's own writes are said here.
+      if (store.currentSequence() !== unopened) {
+        console.error(
+          `note: opening the store wrote the load-time repairs any open of it makes (see auditOnly): ` +
+            `its sequence went from ${unopened} to ${store.currentSequence()}.`,
+        );
+      }
       if (settings.tools) manager.setToolDefinitions(settings.tools);
       if (settings.systemPrompt) manager.setSystemPrompt(settings.systemPrompt);
       const describe = (item: MemoryWorkItem): string =>

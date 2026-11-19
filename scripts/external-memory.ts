@@ -57,8 +57,12 @@
  * to read the summaries state at (chronicle's getStateJsonAt).
  *
  * The store is opened audit-only (no frontier chunking), under a lock, and
- * the open still writes what any audit-only open does (see `auditOnly`); a
- * dry run writes nothing else. Back the store up before --apply.
+ * the open still writes what any audit-only open does (see `auditOnly`),
+ * with a note on stderr when it wrote; export-request and a dry run write
+ * nothing else. Work the strategy would reach only by changing its own state
+ * first (a merge group with a held source, which it would skip, queuing the
+ * merge beside it) is refused with that reason, and the change isn't made.
+ * Back the store up before --apply.
  *
  * Exit codes: 0 = done (or a dry run that would be); 2 = the store doesn't
  * settle the namespace or its message slot; 1 = a malformed invocation, an
