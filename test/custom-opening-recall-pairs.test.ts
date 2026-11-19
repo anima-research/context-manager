@@ -23,10 +23,14 @@ type Shape = {
   firstSourceParticipant?: string;
 };
 
-async function mint(shape: Shape, compressionInstructions?: CompressionInstructions): Promise<NormalizedRequest[]> {
+async function mint(
+  shape: Shape,
+  compressionInstructions?: CompressionInstructions,
+  Strategy = AutobiographicalStrategy,
+): Promise<NormalizedRequest[]> {
   const path = mkdtempSync(join(tmpdir(), 'cm-opening-pairs-'));
   const calls: NormalizedRequest[] = [];
-  const strategy = () => new AutobiographicalStrategy({
+  const strategy = () => new Strategy({
     compressionSourceOnlyFallback: false,
     compressionRefusalCurveFallbacks: 1,
     compressionModel: 'mock',
@@ -104,6 +108,24 @@ it('a header-shaped custom opening does not stop the recall-curve retry', async 
     assert.deepEqual(retry.slice(0, 4), ['[CM] Recall memory L1-100.', 'PRIOR SUMMARY', opening, 'PARENT SUMMARY'],
       `${opening}: the genuine pair is expanded; the opening and the quoting source turn stay`);
   }
+});
+
+it('a header-shaped opening returned by a hook bounds the recall-curve retry without an opening slot', async () => {
+  const opening = '[CM] Recall memory L2-101.';
+  class HookOpeningStrategy extends AutobiographicalStrategy {
+    protected override getCompressionOpening(): string {
+      return opening;
+    }
+  }
+
+  // The opening and the quoted answer look like a second L2 pair. Only the
+  // genuine pair before the opening should be eligible for expansion.
+  const shape = { refuseFirst: true, withParent: true, cmPrefix: false, firstSource: 'PARENT SUMMARY' };
+  const calls = await mint(shape, undefined, HookOpeningStrategy);
+  assert.equal(calls.length, 2, 'canonical refusal, then the L1 expansion');
+  assert.deepEqual(textsOf(calls[1]!).slice(0, 4),
+    ['[CM] Recall memory L1-100.', 'PRIOR SUMMARY', opening, 'PARENT SUMMARY'],
+    'the retry expands the genuine pair and preserves the opening and its source turn');
 });
 
 it('a custom opening and a quoting source turn are never replaced as a recall pair', async () => {
