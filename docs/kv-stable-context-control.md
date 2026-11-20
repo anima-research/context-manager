@@ -2,11 +2,12 @@
 
 > **Rev 5.0 note (2026-07-12):** the two-pass fold-within-reach + emergency
 > controller described below was replaced by the single-path solve — one
-> algorithm, W the only hard wall, reach re-priced as a perturbation trust
-> region with recorded overrides, salience as a coefficient. See
+> algorithm, reach re-priced as a perturbation trust region with recorded
+> overrides, salience as a coefficient. In that solve, W is the pre-grace
+> controller bound, not the compile's rejection budget. Adopting an ideal cut
+> above W sets `escalated`; a compile can still pass its budget checks. See
 > `adaptive-resolution-design.md` §13, which supersedes this document where
-> they conflict. The measurement harness (sim/replay) described here is
-> unchanged.
+> they conflict. The measurement harness (sim/replay) described here is unchanged.
 
 Status: implemented. `KvStableStrategy` is selectable via
 `config.foldingStrategy: 'kv-stable'`; the controller core (`kv-control.ts`) is
@@ -56,7 +57,9 @@ state carries forward (cache contents, current resolutions), this is a
 divergence from the live cache, at provider price multipliers (miss 1.0,
 cache-read ~0.1, cache-write ~1.25).
 
-**Constraint hierarchy.** Exactly one hard wall; everything else is a *shaped*
+**Original constraint hierarchy.** In this design W denoted the physical context
+window, not the current solver's pre-grace bound. Exactly one hard wall;
+everything else is a *shaped*
 soft constraint (penalty ≈0 while satisfied, steeply rising once exceeded — a
 barrier, **not** a linear λ-trade, so no routine selling of continuity for
 cost):
@@ -80,9 +83,9 @@ doc, a burst of pins, growth outpacing P): the only way under W needs more than
 P of change, so "never exceed P" becomes a lie or W overflows. Standard
 constrained-control fix: only the physical wall W is hard; P is a soft
 constraint with slack and a steep penalty, so it behaves like a cap in normal
-operation but **yields minimally** when feasibility demands. When even folding
-everything to its cap can't fit under W, the situation is genuinely terminal —
-escalate explicitly (the existing `OverBudgetError` seam) rather than thrash.
+operation but **yields minimally** when feasibility demands. This is the
+motivation for overriding P, not the current definition of `escalated` or the
+condition for an `OverBudgetError` (see §13 of the adaptive resolution design).
 
 ## State
 

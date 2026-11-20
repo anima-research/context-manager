@@ -21,13 +21,14 @@
  *   plan names its floor and the relief the queue holds, when the floor was
  *   computed. Outside kv-unified the floor counts no lock, so a lock a pin
  *   overrides doesn't take it away; under kv-unified it counts every lock. A
- *   floor that can't be computed is said once per cause.
+ *   floor that can't be computed is reported with bounded deduplication per lane.
  */
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import { Picker } from '../src/adaptive/picker.js';
 import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -407,6 +408,162 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
       floor.restore();
     }
     reader.manager.close();
+  });
+
+  it('deduplicates dry and live floor warnings independently through polling and refusals', async (t) => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const forest = CanonicalSummaryForest.prototype;
+    const minimumTokens = forest.minimumTokens;
+    let cause = 'original floor failure';
+    const failures: string[] = [];
+    const breakIt = () => { forest.minimumTokens = () => { failures.push(cause); throw new Error(cause); }; };
+    const floor = collectFloorWarnings();
+    const failsFloor = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+      const before = failures.length;
+      const result = await fn();
+      assert.ok(failures.length > before, 'this select actually attempted and failed the floor');
+      assert.ok(failures.slice(before).every((failure) => failure === cause), 'the expected cause failed');
+      return result;
+    };
+    const warned = (...causes: string[]) => {
+      assert.deepStrictEqual(floor.warnings.map((line) => line.split('until it is: Error: ')[1]?.replace(/ ns=default$/, '')), causes);
+    };
+    try {
+      breakIt();
+      await failsFloor(() => reader.manager.compile(budget, undefined, { dryRun: true }));
+      warned(cause);
+      for (let i = 0; i < 5; i++) await failsFloor(() => reader.manager.previewContext(budget));
+      warned(cause);
+      const run = Picker.prototype.run;
+      const pick = t.mock.method(Picker.prototype, 'run', function (this: Picker, ...args: Parameters<Picker['run']>) {
+        return { ...run.apply(this, args), finalTokens: budget.maxTokens * 2 };
+      });
+      await failsFloor(() => assert.rejects(reader.manager.compile(budget, undefined, { dryRun: true }), /Adaptive plan check/));
+      const preview = (await failsFloor(() => reader.manager.previewContext(budget)))!;
+      assert.strictEqual(preview.fits, false);
+      pick.mock.restore();
+      warned(cause);
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause); // The preview never silences the first live warning.
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause);
+      forest.minimumTokens = minimumTokens;
+      const recovered = await reader.manager.compile(budget, undefined, { dryRun: true });
+      assert.ok(recovered.renderStats?.planVsActual?.floorTokens !== undefined);
+      breakIt();
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned(cause, cause, cause); // Dry recovery clears its own original cause.
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause, cause); // Dry recovery never clears live suppression.
+      cause = 'different dry failure';
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause);
+      cause = 'original floor failure';
+      await failsFloor(() => reader.manager.compile(budget));
+      warned(cause, cause, cause, 'different dry failure');
+      // Live recovery must not clear the separate dry record either.
+      forest.minimumTokens = minimumTokens;
+      const liveRecovery = await reader.manager.compile(budget);
+      assert.ok(liveRecovery.renderStats?.planVsActual?.floorTokens !== undefined, 'the live floor is back');
+      breakIt();
+      cause = 'different dry failure';
+      await failsFloor(() => reader.manager.previewContext(budget));
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause);
+      await failsFloor(() => reader.manager.compile(budget));
+      warned('original floor failure', 'original floor failure', 'original floor failure', cause, cause);
+    } finally {
+      forest.minimumTokens = minimumTokens;
+      floor.restore();
+      reader.manager.close();
+    }
+  });
+
+  it('deduplicates UUID variants of a floor failure without merging different causes or lanes', async (t) => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const firstId = '85f817eb-aaaa-4a1a-9bb2-5a83f64bdabc';
+    const nextId = 'bbec2b82-CCCC-4DD4-AEE5-80C813F08CF1';
+    let cause = '';
+    const attempt = t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+      throw new Error(cause);
+    });
+    const floor = collectFloorWarnings();
+    try {
+      for (const dryRun of [true, false]) {
+        const lane = dryRun ? 'dry' : 'live';
+        const before = floor.warnings.length;
+        cause = `live chunk id ${firstId} occurs more than once`;
+        await reader.manager.compile(budget, undefined, { dryRun });
+        assert.equal(floor.warnings.length, before + 1);
+        assert.ok(floor.warnings.at(-1)!.includes(`floor not computed (${lane})`));
+        assert.ok(floor.warnings.at(-1)!.includes(cause), 'the log retains the original ID');
+
+        const calls = attempt.mock.callCount();
+        cause = `live chunk id ${nextId} occurs more than once`;
+        await reader.manager.compile(budget, undefined, { dryRun });
+        assert.ok(attempt.mock.callCount() > calls, 'the next failure was attempted');
+        assert.equal(floor.warnings.length, before + 1, 'same structural cause with a different UUID');
+
+        cause = `chunk ${nextId} has invalid raw cost 16`;
+        await reader.manager.compile(budget, undefined, { dryRun });
+        assert.equal(floor.warnings.length, before + 2, 'a different structural cause warns');
+        assert.ok(floor.warnings.at(-1)!.includes(cause));
+      }
+    } finally {
+      floor.restore();
+      reader.manager.close();
+    }
+  });
+
+  it('bounds retained floor-warning keys and evicts the oldest in each lane', async (t) => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const { floorFailures, dryFloorFailures } = reader.strategy as unknown as {
+      floorFailures: Set<string>;
+      dryFloorFailures: Set<string>;
+    };
+    // The letters remain distinct after numeric and hex normalization.
+    const causes = Array.from({ length: 65 }, (_, i) =>
+      `floor failure ${i.toString(3).replace(/[012]/g, (digit) => 'xyz'[Number(digit)]!)} ${'long text '.repeat(200)}`);
+    let cause = '';
+    const attempt = t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+      throw new Error(cause);
+    });
+    const floor = collectFloorWarnings();
+    try {
+      for (const dryRun of [true, false]) {
+        const keys = dryRun ? dryFloorFailures : floorFailures;
+        const otherKeys = [...(dryRun ? floorFailures : dryFloorFailures)];
+        const before = floor.warnings.length;
+        const failWith = async (text: string) => {
+          cause = text;
+          const calls = attempt.mock.callCount();
+          await reader.manager.compile(budget, undefined, { dryRun });
+          assert.ok(attempt.mock.callCount() > calls, 'the floor was attempted');
+        };
+        for (const text of causes.slice(0, -1)) await failWith(text);
+        await failWith(causes[0]!);
+        await failWith(causes.at(-1)!);
+        assert.equal(floor.warnings.length - before, 65, 'all distinct causes warn');
+        assert.equal(keys.size, 64, 'retention is capped');
+        for (const key of keys) assert.match(key, /^[0-9a-f]{64}$/, 'only a fixed-size digest is retained');
+        await failWith(causes[1]!);
+        assert.equal(floor.warnings.length - before, 65, 'an unevicted cause stays suppressed');
+        await failWith(causes[0]!);
+        assert.equal(floor.warnings.length - before, 66, 'the oldest cause warns again after eviction');
+        assert.deepEqual([...(dryRun ? floorFailures : dryFloorFailures)], otherKeys, 'eviction is lane-local');
+      }
+    } finally {
+      floor.restore();
+      reader.manager.close();
+    }
   });
 
   it('says once that a floor whose computation fails is missing, again when it recurs or the store is opened again, and the compile goes on', async () => {

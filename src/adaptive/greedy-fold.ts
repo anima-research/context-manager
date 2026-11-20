@@ -154,8 +154,9 @@ function solutionOf(engine: GreedyEngine, produced: ProduceRequest[], budget: Fo
   return {
     frontier: engine.snapshotResolutions(),
     produced,
-    // Greedy exhaustion: folded until out of moves (and nothing to produce),
-    // yet still above the soft target — see FoldingSolution.exhausted.
+    // Greedy exhaustion: no production requested after search, still above
+    // the soft target. May replay cheaper raw even with summaries available
+    // — see FoldingSolution.exhausted.
     exhausted: produced.length === 0 && engine.tokenCount() > budget.targetBudget,
   };
 }

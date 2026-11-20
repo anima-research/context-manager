@@ -4109,7 +4109,11 @@ export class ContextManager {
 
   /**
    * Non-committing preview of the layout at a hypothetical budget and/or
-   * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
+   * settings. With AutobiographicalStrategy this does not save layout or
+   * queue compression, but can update dry floor-warning deduplication.
+   * That strategy reports selection budget refusals as `fits: false` without
+   * `entries` or `stats`, even with `opts.render: true`; an over-budget plan
+   * is refused before rendering.
    * Returns null when the active strategy has no fold plan to preview: one
    * without `previewContext`, or `AutobiographicalStrategy`'s hierarchical
    * path when its select succeeds, where the strategy's own method throws

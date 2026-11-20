@@ -562,15 +562,15 @@ export interface ContextStrategy {
    * Select and order context entries for compilation.
    * This is the core method that determines what goes in the context window.
    *
-   * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
-   * what a real compile at this budget would produce, but no fold resolutions
-   * or chunk records are persisted, no compression/merge work is enqueued, no transition
-   * bookkeeping is advanced, and what a select leaves for the next one or for
-   * observers (its cache-marker baseline, transition status, render stats,
-   * and calibration's estimate and arming) stays as the last committing
-   * select left it. Implementations that cannot
-   * honour it must ignore it only if they are already side-effect-free; any
-   * path that commits state MUST gate on it.
+   * `opts.dryRun` requests a non-committing layout calculation: do not persist
+   * fold resolutions or chunk records, enqueue compression or merge work, or
+   * advance live bookkeeping (the cache-marker baseline, transition status,
+   * render stats, and calibration estimate and arming). This is not
+   * side-effect-free: adaptive dry floor-warning keys can persist across dry
+   * selects and leave probes, independently of live suppression. A dry
+   * compile can also release an expired hold before selecting. See
+   * `SelectOptions.dryRun`. Paths that commit layout or enqueue work
+   * must honor the option.
    */
   select(
     store: MessageStoreView,
@@ -729,39 +729,37 @@ export interface RenderedSummaryInfo {
  * `dryRun` exists because a select is NOT side-effect-free: it commits fold
  * resolutions and chunk records to Chronicle, enqueues real compression work,
  * and leaves state the next compile and observers read. An operator UI that
- * previews a hypothetical budget must change none of it, or every slider drag
- * would rewrite the fold plan, spend LLM tokens and change what the next real
- * compile sends. The field's doc gives the whole contract.
+ * previews a hypothetical budget must not rewrite the fold plan, spend LLM
+ * tokens or change what the next real compile sends. See the field's contract
+ * for the diagnostic and expired-hold exceptions.
  */
 export interface SelectOptions {
   /**
-   * Compute the layout without committing anything: no resolution persistence,
+   * Compute the layout without persisting it or scheduling work for it.
+   * For AutobiographicalStrategy this means no resolution persistence,
    * no chunk record and no compression queued for a chunk the select's
    * rebuild closes, no produce/merge enqueue, no shadow production pick, no
-   * transition bookkeeping, and nothing a select leaves for the next one or for
-   * observers (the cache-marker baseline, the transition status, the render
-   * stats, calibration's estimate, arming and store view, the store order, the
-   * head-window memo, and whether chunk records are trusted), all on every
-   * path out, throws included.
+   * transition bookkeeping left for later selects, and no changes to the
+   * live cache-marker baseline, transition status, render stats, calibration
+   * (including arming and store view), store order, head-window memo, or
+   * chunk-record trust on any path out, throws included.
    *
-   * What a dry select refuses is what a real compile refuses, with one
-   * exception: an over-budget plan is not thrown at the plan check. A plain
-   * dry compile then returns that plan's entries with no verdict, and
-   * `previewContext` is where infeasibility is reported. The head-and-tail
-   * check before the plan check, and any later stage that can't fit, still
-   * throw as for a real compile, leaving nothing behind; `previewContext`
-   * reports an over-budget throw, as the plan's own preview when the plan was
-   * already over the budget (the live compile refuses it at the plan check),
-   * and passes any other throw through. The passthrough strategies throw
-   * none of their budget refusals on a dry select: it returns what they would
-   * send, over the budget or without the newest message, with no verdict,
-   * and they have no `previewContext` report.
+   * Dry selects can log diagnostics. Adaptive floor-warning deduplication
+   * retains keys across dry selects (including leave probes) until dry-lane
+   * floor recovery, FIFO eviction, or branch initialization. This does not
+   * read, suppress, or clear live warnings.
    *
-   * A compression hold ends at its deadline, whoever looks: the manager
-   * releases an expired hold at any compile or hold query, a dry compile
-   * included, and that release is the one thing a dry compile can leave.
-   * The release's rebuild commits; the dry select then restores the state it
-   * found after that rebuild.
+   * On a dry select, both passthrough strategies skip their own
+   * context-budget refusals. Passthrough can return just the system changes
+   * without the newest conversation message; windowed passthrough can
+   * return an over-budget window, including when it keeps the newest
+   * message to make progress. Neither gives a `previewContext` verdict.
+   * These exemptions do not bypass `ContextManager.compile`'s
+   * `requestLimitTokens` check.
+   *
+   * After validating options, the manager releases expired compression
+   * holds before selecting, even in a dry compile. This can trigger a
+   * committing rebuild before the strategy takes its dry-run snapshot.
    */
   dryRun?: boolean;
   /**
@@ -899,21 +897,25 @@ export interface SelectOptions {
   /** The most the whole request may hold, in tokens, as the provider limits
    * it: the selected window, the message injections, `requestOverhead` and
    * the budget's `reserveForResponse` together, with any tool-result stubs
-   * an AutobiographicalStrategy's pairing repair adds to the window. Given,
-   * the select keeps that sum within it, in the window's units at the
-   * compile's multiplier (for a strategy that doesn't calibrate, such as the
-   * passthrough strategies, as the store's estimator prices it), the
-   * strategy's over-budget grace included; while an AutobiographicalStrategy's
-   * multiplier is provisional, it keeps the sum within it priced at the
-   * calibration's ceiling, by scaling its price at the provisional
-   * multiplier. The store rounds each block's price at that multiplier, by
-   * up to half a token, so at a true rate up to the ceiling the request can
-   * pass the limit by up to half a token a block, scaled by the ceiling over
-   * the multiplier. A select whose sum would still pass it, or whose
-   * limit leaves the window no room, refuses with an `OverBudgetError`.
+   * an AutobiographicalStrategy's pairing repair adds to the window. The
+   * stock strategies use the limit to constrain the window budget. A
+   * successful `ContextManager.compile` keeps the estimated sum within the
+   * limit, in the window's units at the compile's multiplier (for a
+   * strategy that doesn't calibrate, such as the passthrough strategies,
+   * as the store's estimator prices it), the strategy's over-budget grace
+   * included. While an AutobiographicalStrategy's multiplier is
+   * provisional, the estimate uses the calibration's ceiling, by scaling
+   * the price at the provisional multiplier. The store rounds each block's
+   * price at that multiplier by up to half a token, so at a true rate up
+   * to the ceiling the request can pass the limit by up to half a token
+   * a block, scaled by the ceiling over the multiplier. The stock
+   * strategies refuse with `OverBudgetError` if the limit leaves the
+   * window no room.
    * It needs `requestOverhead`: one given without it, or one that isn't a
    * positive finite number, is refused with a `TypeError` before anything is
-   * selected. */
+   * selected. After selection, `ContextManager.compile` checks the estimated
+   * request total and throws `OverBudgetError` if it exceeds the limit, even
+   * if a dry passthrough select returned over-limit entries. */
   requestLimitTokens?: number;
 }
 
@@ -949,8 +951,14 @@ export interface PreviewResult {
   requestAllowanceTokens?: number;
   /** True when the layout fits under the hard budget. */
   fits: boolean;
-  /** True when the picker could not fold any further, and when the request
-   *  limit leaves the window no room at any fold. */
+  /** The plan's exhaustion flag (see `OverBudgetDiagnostics.pickerExhausted`
+   *  for the picker normalization) when reporting a plan, including one
+   *  already over budget, or a tool-pairing stub refusal after a fitting plan.
+   *  Otherwise a refusal reports true: both before planning, where no solver
+   *  ran, and after a fitting plan, including a late emission refusal even
+   *  when the solver reported false. A stub refusal without a plan also
+   *  reports true. Not proof that nothing can be folded: read `clearedBy`
+   *  and `producedCount` for compression work. */
   exhausted: boolean;
   /**
    * When the layout doesn't fit: what clears that refusal besides a larger
@@ -983,12 +991,14 @@ export interface PreviewResult {
   /**
    * The rendered context this layout would produce. Only present when the
    * caller asked for it (`{render:true}`) — on a large store these entries are
-   * megabytes, so they are opt-in rather than always returned.
+   * megabytes, so they are opt-in rather than always returned. Absent on
+   * budget refusal, including an over-budget plan refused before rendering.
    */
   entries?: ContextEntry[];
   /**
    * Segment breakdown (head / middle / tail / summaries-by-level) for the
-   * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
+   * HYPOTHETICAL compile. Also `{render:true}` only, and absent on budget
+   * refusal, including a plan refused before rendering. Distinct from
    * `getRenderStats()`, which describes the last live compile, or is null
    * before one.
    */
@@ -2930,22 +2940,18 @@ export interface AutobiographicalConfig {
   speculativeProduction?: boolean;
 
   /**
-   * Standing production target (tokens): keep the summary forest deep enough
-   * that a compile would fit under THIS budget, even while the live compile
-   * budget is higher. Each adaptive compile runs an extra shadow pick against
-   * this budget — pure CPU, no LLM call, no state commit — and enqueues the
-   * folds it demands through the normal drain queues. Once the forest has
-   * converged, the live budget can be lowered to the target in one move: no
-   * fold-storm, a single KV invalidation ("produce first, fold once").
-   * If the shadow pick runs out of folds and produce requests with its plan
-   * still over the target's soft line, the compile warns, giving the plan's
-   * size and the line above which the plan check of a compile at the target
-   * refuses it with OverBudgetError, and calls the target unreachable with
-   * the summaries the store has then only when the plan is over that line:
-   * the plan check refuses a compile at the target only while it is, though
-   * a later stage can refuse it as at any budget. Shadow demand is
-   * speculative and never bypasses the `l1HoldbackChunks` window. Must be
-   * positive; no effect unless lower than the live compile budget.
+   * Standing production target (tokens): prepare summaries for a lower live
+   * budget. On each live adaptive attempt that reaches the picker with an
+   * available input budget above this positive target, the strategy runs an extra
+   * shadow pick and routes its production requests through the normal drain
+   * queues. Dry selection skips the shadow pick.
+   * If the shadow pick reports exhaustion with no production requested, the
+   * warning reports the selected plan's token count, that no production was
+   * requested, and whether the plan exceeds the shadow rejection bound.
+   * When calibration is provisional, it includes the multiplier used for
+   * that pick. It does not predict which gate would refuse a live compile.
+   * Shadow demand is speculative and never bypasses the `l1HoldbackChunks`
+   * window.
    */
   productionBudgetTokens?: number;
 

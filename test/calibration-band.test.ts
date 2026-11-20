@@ -15,6 +15,9 @@ import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
+import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
+import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
+import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import { JsStore } from '@animalabs/chronicle';
 
 const dir = mkdtempSync(join(tmpdir(), 'calibration-band-'));
@@ -929,11 +932,55 @@ describe('estimator calibration band', () => {
     }
   });
 
-  it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async () => {
-    // The picker's over-budget throw is dry-run-guarded (a preview reports
-    // `fits: false` instead), so a preview under a provisional 1.45 said the
-    // window doesn't fit where the real compile drops to 1 and fits. Store B's
-    // signature ("Adaptive picker exhausted ...") is this path. It needs the
+  for (const method of ['renderAsNewest', 'previewContext'] as const) {
+    it(`keeps a dry calibration retry in the dry warning lane after a nested ${method}`, async (t) => {
+      const { cm, internals } = await openManager(`fallback-nested-${method}`, { recentWindowTokens: 1_000 });
+      try {
+        const raw = cm.previewContext(BUDGET)!.finalTokens;
+        const tight = { maxTokens: Math.ceil(raw * 1.2) + 500, reserveForResponse: 500 };
+        internals.store!.setStateJson(internals.calibrationStateId, { multiplier: 1.45, at: 1 });
+
+        const floor = t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+          throw new Error('test floor failure');
+        });
+        const warnings: string[] = [];
+        const id = cm.getAllMessages()[0]!.id;
+        let nestedSucceeded = false;
+        t.mock.method(console, 'warn', (...args: unknown[]) => {
+          const line = args.join(' ');
+          if (!line.includes('floor not computed')) return;
+          warnings.push(line);
+          if (warnings.length === 1) {
+            nestedSucceeded = method === 'previewContext'
+              ? cm.previewContext(BUDGET)?.fits === true
+              : Boolean(cm.renderAsNewest([id])?.[0]?.length);
+          }
+        });
+
+        const dry = await cm.compile(tight, undefined, { dryRun: true });
+        assert.ok(nestedSucceeded, `the warning handler completed ${method}`);
+        assert.equal(dry.renderStats!.calibration!.reset?.discardedMultiplier, 1.45);
+        if (method === 'renderAsNewest') {
+          assert.equal(floor.mock.callCount(), 2, 'both dry attempts hit the same floor failure');
+        }
+        assert.equal(warnings.length, 1, 'the retry deduplicates in the dry lane');
+        assert.match(warnings[0]!, /floor not computed \(dry\)/);
+
+        await cm.compile(tight);
+        assert.equal(warnings.length, 2, 'the dry compile did not suppress the first live warning');
+        assert.match(warnings[1]!, /floor not computed \(live\)/);
+      } finally {
+        cm.close();
+      }
+    });
+  }
+
+  it('a preview takes the fallback at the picker\'s refusal too, not only at head/tail', async (t) => {
+    // The picker used to skip its over-budget throw in dry runs, so a preview
+    // under a provisional 1.45 reported `fits: false` where the real compile
+    // dropped to 1 and fit. Dry runs now take the same gate and calibration
+    // retry as live compiles, before previewContext reports a refusal. Store B's
+    // signature ("Adaptive plan check (…): ...") is this path. It needs the
     // picker over and the emitter under, so that the picker's refusal is the
     // only one the preview can fall back at. The strategy's own prices don't
     // give that for a body of text, since the middle counts a body's raw
@@ -989,7 +1036,7 @@ describe('estimator calibration band', () => {
     control.cm.close();
     const controlReopened = await openSharded('picker-control', false);
     assert.equal(controlReopened.cm.previewContext(tight)!.fits, false);
-    await assert.rejects(controlReopened.cm.compile(tight), /Adaptive picker exhausted/);
+    await assert.rejects(controlReopened.cm.compile(tight), /Adaptive plan check \([^)]+\): /);
     controlReopened.cm.close();
 
     const first = await openSharded('picker', true);
@@ -998,12 +1045,72 @@ describe('estimator calibration band', () => {
     first.internals.store!.setStateJson(first.internals.calibrationStateId, unstamped);
     first.cm.close();
     const reopened = await openSharded('picker', false);
+    const trackCalibration = ({ cm, strategy }: Awaited<ReturnType<typeof openSharded>>) => {
+      const state = strategy as unknown as Internals & {
+        _calibrationArmed: boolean;
+        _calibrationLoaded: boolean;
+        _calibrationReset: { discardedMultiplier: number; fromEpoch: number | null; at: number } | null;
+        _calibrationDeclared: boolean;
+        loadCalibration(store: MessageStoreView, options: { dryRun: boolean }): void;
+      };
+      const { messageStore } = cm as unknown as { messageStore: MessageStoreView };
+      state.loadCalibration(messageStore, { dryRun: true });
+      assert.equal(state._calibration, 1.45, 'premise: the provisional multiplier is already loaded');
+      assert.deepEqual(state._calibrationProvisional, { fromEpoch: null });
+      // Non-default marks ensure accidental resets are visible after the select.
+      state._calibrationReset = { discardedMultiplier: 1.6, fromEpoch: 0, at: 123 };
+      state._calibrationDeclared = true;
+      assert.equal(messageStore.getTokenCalibration!(), 1.45);
+      return () => structuredClone({
+        armed: state._calibrationArmed,
+        loaded: state._calibrationLoaded,
+        multiplier: state._calibration,
+        provisional: state._calibrationProvisional,
+        reset: state._calibrationReset,
+        declared: state._calibrationDeclared,
+        storeMultiplier: messageStore.getTokenCalibration!(),
+        persisted: state.store!.getStateJson(state.calibrationStateId),
+      });
+    };
+    const fittingCalibration = trackCalibration(reopened);
+    const beforeFit = fittingCalibration();
+    assert.equal(beforeFit.armed, false, 'premise: the reopened strategy has not armed a sample');
+    assert.equal(beforeFit.loaded, true, 'premise: the provisional record is loaded');
+    const originalRun = Picker.prototype.run;
+    const flags: boolean[] = [];
+    const runs = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = originalRun.call(this, inputs, budget);
+      const exhausted = flags.length > 0;
+      flags.push(exhausted);
+      return { ...result, exhausted };
+    });
     const dry = await calibrationWarnings(async () => reopened.cm.previewContext(tight, undefined, { render: true })!);
+    assert.deepEqual(flags, [false, true], 'discarded provisional pick, then fitting retry');
+    assert.equal(dry.result.exhausted, true, 'a fitting retry retains its true solver flag');
+    runs.mock.restore();
     assert.equal(dry.result.fits, true, 'the preview says what the real compile will do');
     assert.deepEqual([dry.result.stats!.calibration!.multiplier, dry.result.stats!.calibration!.reset?.discardedMultiplier], [1, 1.45]);
     assert.deepEqual(dry.lines, []);
-    assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), unstamped, 'a preview writes nothing');
-    assert.equal(reopened.internals._calibration, 1, 'put back');
+    assert.deepEqual(fittingCalibration(), beforeFit, 'a fitting retry restores all calibration state');
+
+    const retryError = new Error('non-budget failure in the retry');
+    const multipliers: number[] = [];
+    const exploding = t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      multipliers.push(reopened.internals._calibration);
+      if (multipliers.length === 2) throw retryError;
+      return originalRun.call(this, inputs, budget);
+    });
+    try {
+      assert.throws(() => reopened.cm.previewContext(tight), (error) => error === retryError);
+      assert.deepEqual(multipliers, [1.45, 1], 'the error was raised after the preview dropped the multiplier');
+      assert.deepEqual(fittingCalibration(), beforeFit, 'the throwing preview restores all calibration state');
+      multipliers.length = 0;
+      await assert.rejects(reopened.cm.compile(tight, undefined, { dryRun: true }), (error) => error === retryError);
+      assert.deepEqual(multipliers, [1.45, 1], 'ordinary dry compile also reached the dropped-multiplier retry');
+      assert.deepEqual(fittingCalibration(), beforeFit, 'the throwing dry compile restores all calibration state');
+    } finally {
+      exploding.mock.restore();
+    }
     await reopened.cm.compile(tight);
     assert.equal(reopened.internals._calibration, 1);
     assert.equal(reopened.cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 1.45);
@@ -1016,9 +1123,25 @@ describe('estimator calibration band', () => {
     stillOver.internals.store!.setStateJson(stillOver.internals.calibrationStateId, unstamped);
     stillOver.cm.close();
     const stillOverReopened = await openSharded('picker-over', false);
+    const calibrationState = trackCalibration(stillOverReopened);
+    const beforeRefusal = calibrationState();
+    flags.length = 0;
+    t.mock.method(Picker.prototype, 'run', function (this: Picker, inputs: PickerInputs, budget: FoldingBudget) {
+      const result = originalRun.call(this, inputs, budget);
+      const exhausted = flags.length === 0;
+      flags.push(exhausted);
+      return { ...result, exhausted };
+    });
     const overPreview = stillOverReopened.cm.previewContext(over)!;
+    assert.deepEqual(flags, [true, false]);
+    assert.equal(overPreview.exhausted, false, 'the over-budget retry owns the flag too');
     assert.equal(overPreview.fits, false);
     assert.ok(overPreview.finalTokens < P * 1.1, `reported at the dropped multiplier: ${overPreview.finalTokens} vs ${P} at 1.0`);
+    assert.deepEqual(calibrationState(), beforeRefusal, 'both refused preview attempts restore all calibration state');
+    flags.length = 0;
+    await assert.rejects(stillOverReopened.cm.compile(over, undefined, { dryRun: true }), /Adaptive plan check/);
+    assert.deepEqual(flags, [true, false], 'ordinary dry compilation also retries then refuses at the plan gate');
+    assert.deepEqual(calibrationState(), beforeRefusal, 'throwing dry compilation restores all calibration state too');
     stillOverReopened.cm.close();
   });
 
