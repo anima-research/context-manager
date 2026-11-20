@@ -499,6 +499,79 @@ describe("another handle's writes to the window", () => {
     other.close();
     cm.close();
   });
+
+  /** console.warn's lines while `fn` runs. */
+  function warnedDuring(fn: () => unknown): string[] {
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    try {
+      fn();
+    } finally {
+      console.warn = warn;
+    }
+    return warned;
+  }
+
+  // What another version's handle sharing the store may append to the index:
+  // its own format's header, or an item this version can't read. Each read
+  // whole gives a warning naming it.
+  const strange = [
+    ["another format's header", { v: 2 }, /is in format 2, which this version \(format 1\) doesn't read/],
+    ["an item this version can't read", { zz: 1 }, /holds 1 item\(s\) this version can't read; each is left out of the window as a hole/],
+  ] as const;
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): readOn applies only
+  // items this version reads as its own, so read's warning names the rest.
+  for (const [label, item, says] of strange) {
+    it(`a reading another handle extended with ${label} is read whole, with the warning a whole read gives`, async () => {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const store = cm.getStore();
+      cm.presentRows([]);
+      const p = cm.addMessage('alice', [text('p')]);
+      cm.presentRows([p]);
+      assert.deepEqual(ids(cm.getPresentedMessages()), [p], `${label}, setup: cm's reading holds p`);
+      store.appendToStateJsonWithIdentity(INDEX, item, 'by', 'at');
+      const counted = countWholeReads(store);
+      let warned: string[];
+      try {
+        warned = warnedDuring(() => cm.getPresentedMessages());
+        assert.equal(counted.reads(), 1, `${label}: cm reads the index whole`);
+      } finally {
+        counted.restore();
+      }
+      assert.ok(warned.some((line) => says.test(line)), `${label}: the read warns, naming it: ${warned.join('\n')}`);
+      cm.close();
+    });
+  }
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): readOn doesn't
+  // extend a reading of a state another format keeps, or with items this
+  // version can't read, so each read after the state moves gives read's
+  // warning again.
+  for (const [label, item, says] of strange) {
+    it(`a reading that holds ${label} is read whole again once the state moves, with the warning a whole read gives`, async () => {
+      const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new PassthroughStrategy() });
+      const store = cm.getStore();
+      cm.presentRows([]);
+      const [p, q] = ['p', 'q'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+      cm.presentRows([p]);
+      store.appendToStateJsonWithIdentity(INDEX, item, 'by', 'at');
+      assert.ok(warnedDuring(() => cm.getPresentedMessages()).some((line) => says.test(line)), `${label}, setup: cm's reading holds it`);
+      // That handle appends again, one of this version's items.
+      store.appendToStateJsonWithIdentity(INDEX, { id: q }, 'by', 'at');
+      const counted = countWholeReads(store);
+      let warned: string[];
+      try {
+        warned = warnedDuring(() => cm.getPresentedMessages());
+        assert.equal(counted.reads(), 1, `${label}: cm reads the index whole again`);
+      } finally {
+        counted.restore();
+      }
+      assert.ok(warned.some((line) => says.test(line)), `${label}: the read warns again: ${warned.join('\n')}`);
+      cm.close();
+    });
+  }
 });
 
 describe('branchAt and the window', () => {
