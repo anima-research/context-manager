@@ -145,6 +145,9 @@ export type {
   SweepPassReport,
   SweepPass,
   SweepReceipt,
+  OldSummaryLevel,
+  OldSummaryCost,
+  SweptRows,
 } from './sweep.js';
 
 // Accepted rounds and fold receipts

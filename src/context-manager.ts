@@ -72,8 +72,8 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
-import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, runSweepPass, sweepBodyOf, sweepsApplied, textLength } from './sweep.js';
-import type { ListedBody, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake } from './sweep.js';
+import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, runSweepPass, sweepBodyOf, sweepsApplied, sweptRows, textLength } from './sweep.js';
+import type { ListedBody, OldSummaryCost, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake, SweptRows } from './sweep.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   recordedThrough,
@@ -2004,11 +2004,14 @@ export class ContextManager {
    * no content, and one whose rewrite the store or the strategy refuses, as
    * the refusal reads. Later shards that a pass listed are no body: the next
    * pass removes them. A show's changes never give the old text, and a show
-   * writes nothing, also while a taken sweep waits to be applied. Refused
-   * while a sharded addMessage of this manager stores its shards.
+   * writes nothing, also while a taken sweep waits to be applied. It counts
+   * the strategy's summaries that a pass of the changes would leave old
+   * (oldSummaryCost): each summary over a changed body, but for one over a
+   * later shard, which the pass's removal drops. Refused while a sharded
+   * addMessage of this manager stores its shards.
    */
   showSweep(entry: SweepEntry): SweepShow {
-    this.requireOpen('showSweep');
+    this.requireInitialized('showSweep');
     if (this.writingShards) {
       throw new Error(
         'ContextManager.showSweep refused: a sharded addMessage is storing its shards, and a show now would read part of its body. ' +
@@ -2027,7 +2030,56 @@ export class ContextManager {
         newLength: textLength(content),
       })),
       failures: failed,
+      oldSummaries: this.oldSummariesOver({
+        rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])),
+        removed: new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id))),
+      }).summaries,
     };
+  }
+
+  /**
+   * What the second act of the sweep `name` (dropOldSummaries) would drop
+   * from this manager's strategy, on the open branch: its old summaries at
+   * each level, the chunk records that its compression would fold again,
+   * and the estimated tokens of the rows under them, which render raw until
+   * it has. An old summary is an L1 written before a pass listed a row it
+   * covers, or a summary above one. It writes nothing.
+   */
+  oldSummaryCost(name: string): OldSummaryCost {
+    this.requireInitialized('oldSummaryCost');
+    return this.oldSummariesOver(this.sweptRowsOf(name));
+  }
+
+  /**
+   * The second act of the sweep `name`: this manager's strategy drops its
+   * old summaries over the rows that the sweep's passes rewrote on the open
+   * branch (oldSummaryCost), with every summary above them, and gives what
+   * it dropped. It is done when this returns: no compile after it, dry or
+   * live, holds one of them. Each chunk record under them keeps its rows,
+   * and the strategy's compression folds it again, at the cost of its
+   * summarizer calls; until then its rows render raw, and a compile whose
+   * budget can't hold them refuses. A second call drops nothing. Other
+   * namespaces keep theirs. Where it dropped any, it then appends to the
+   * branch's applied list that this namespace dropped them, so another
+   * instance of the namespace takes up the store.
+   */
+  dropOldSummaries(name: string): OldSummaryCost {
+    this.requireInitialized('dropOldSummaries');
+    if (!this.strategy.dropOldSummaries) return { summaries: [], records: 0, rawTokens: 0 };
+    const dropped = this.strategy.dropOldSummaries(this.sweptRowsOf(name), this.createStrategyContext());
+    if (dropped.summaries.length > 0) {
+      appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
+    }
+    return dropped;
+  }
+
+  private sweptRowsOf(name: string): SweptRows {
+    const slot = this.messageSlot();
+    return sweptRows(sweepsApplied(this.store).items.filter((item) => item.slot === slot && item.name === name));
+  }
+
+  private oldSummariesOver(rows: SweptRows): OldSummaryCost {
+    return this.strategy.oldSummaryCost?.(rows, this.createStrategyContext()) ?? { summaries: [], records: 0, rawTokens: 0 };
   }
 
   /**
@@ -2077,7 +2129,9 @@ export class ContextManager {
           'Ask for the pass once that call has returned.',
       );
     }
-    return runSweepPass(() => this.sweepPass(entries));
+    const report = runSweepPass(() => this.sweepPass(entries));
+    if (report.stopped === null) this.strategy.afterSweepPass?.(this.createStrategyContext());
+    return report;
   }
 
   private sweepPass(entries: readonly SweepEntry[]): SweepPassReport {
@@ -2302,11 +2356,12 @@ export class ContextManager {
   /**
    * Where the sweep `name` stands for the slot this manager writes, on the
    * open branch: the store's newest take of it, whether this branch
-   * finished that take, and each pass the branch's applied list holds, with
-   * the bodies it listed. It never gives the old text.
+   * finished that take, each pass the branch's applied list holds, with the
+   * bodies it listed, and the strategy's old summaries over the rows those
+   * passes rewrote (oldSummaryCost). It never gives the old text.
    */
   sweepReceipt(name: string): SweepReceipt {
-    this.requireOpen('sweepReceipt');
+    this.requireInitialized('sweepReceipt');
     const slot = this.messageSlot();
     const take = newestTakes(this.store).takes.find((each) => each.name === name) ?? null;
     const items = sweepsApplied(this.store).items.filter((item) => item.slot === slot && item.name === name);
@@ -2315,6 +2370,7 @@ export class ContextManager {
       take,
       finished: take !== null && items.some((item) => item.kind === 'finished' && item.take === take.take),
       passes: items.flatMap((item) => (item.kind === 'listed' ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies }] : [])),
+      oldSummaries: this.oldSummariesOver(sweptRows(items)).summaries,
     };
   }
 

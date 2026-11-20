@@ -114,6 +114,7 @@ import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
 import { SWEEPS_APPLIED_STATE_ID, listedLaterShards, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
+import type { OldSummaryCost, SweptRows } from '../sweep.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -2393,7 +2394,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
-  protected get sweepCursorStateId(): string { return `${this.ns}/autobio:sweep-cursor`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
   /** A persisted kv-unified receipt was found while loading under another
@@ -2917,7 +2917,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `${ns}/autobio:locks`,
         `${ns}/autobio:calibration`,
         `${ns}/autobio:merge-quarantine`,
-        `${ns}/autobio:sweep-cursor`,
         `${ns}/kvunified:presentation-receipt`,
       ],
       statePrefixes: [],
@@ -3188,8 +3187,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.registerStates();
       if (abortIfStale()) return;
       this.loadPersistedState();
-      const cursor: unknown = ctx.store.getStateJson(this.sweepCursorStateId);
-      this.sweepCursor = typeof cursor === 'number' && Number.isInteger(cursor) && cursor >= 0 ? cursor : 0;
       if (abortIfStale()) return;
       await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
       if (abortIfStale()) return;
@@ -3537,10 +3534,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
     registerState({
       id: this.calibrationStateId,
-      strategy: 'snapshot',
-    });
-    registerState({
-      id: this.sweepCursorStateId,
       strategy: 'snapshot',
     });
     registerState({
@@ -8529,30 +8522,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const store = this.store;
     if (!ctx || !store || this.config.auditOnly || sweepPassRunning()) return;
     try {
-      const listLength = store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0;
-      if (this.sweepCursor > listLength) {
-        this.diag.warn(
-          `[autobiographical] the sweep cursor stands at ${this.sweepCursor}, past the end of the branch's applied list (${listLength} items): ` +
-            'reading the list from its start, before ' + operation,
-        );
-        store.setStateJson(this.sweepCursorStateId, 0);
-        this.sweepCursor = 0;
-      }
-      if (listLength <= this.sweepCursor) return;
+      if ((store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0) <= this.sweepCursor) return;
       const { items, length, unreadable } = sweepsApplied(store, this.sweepCursor);
       if (unreadable.length > 0) {
         this.diag.warn(
-          `[autobiographical] item(s) [${unreadable.join(', ')}] of the branch's applied list don't parse: the rows they list, if any, ` +
-            `are not let go of, and the summaries over them stay; this reader's cursor moves past them, and doesn't read them again, ` +
-            `before ${operation}`,
+          `[autobiographical] item(s) [${unreadable.join(', ')}] of the branch's applied list don't parse: a removed shard they list, ` +
+            `if any, keeps the summaries over it; this reader moves past them, and doesn't read them again, before ${operation}`,
         );
+      }
+      if (items.some((item) => item.kind === 'dropped' && item.namespace === this.ns) && this.storeWrittenElsewhere()) {
+        this.takeUpStoreState();
       }
       const listed = listedRows(items);
       if (listed.size > 0) {
-        if (this.storeWrittenElsewhere()) this.takeUpStoreBeforeLetGo(listed, ctx);
-        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldSweptRows(listed, listedLaterShards(items)));
+        const leaving = listedLaterShards(items);
+        if (leaving.size > 0 && this.storeWrittenElsewhere()) {
+          for (const id of this.takeUpStoreBeforeLetGo(leaving, ctx)) listed.add(id);
+        }
+        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldRowsThatLeft(leaving, ctx));
       }
-      store.setStateJson(this.sweepCursorStateId, length);
       this.sweepCursor = length;
     } catch (err) {
       this.diag.warn(`[autobiographical] letting go of rows a sweep's pass listed, before ${operation}, failed: ${describeThrown(err)}`);
@@ -8593,7 +8581,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Let go of what covers the rows `leaving` names, rows that left the
-   * window (windowLost, releaseRowsThatLeft): each L1 holding one among
+   * window (windowLost, releaseRowsThatLeft) or later shards that a sweep's
+   * pass listed to remove (letGoOfSweptRows): each L1 holding one among
    * its sources, the L1 of each chunk record holding one, and (in unfold)
    * every summary above them, go; each such record is compressed again
    * over the rows it keeps, and one left with none goes. A row that left
@@ -8649,13 +8638,97 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
-  private unfoldSweptRows(
-    listed: ReadonlySet<MessageId>,
-    laterShards: ReadonlySet<MessageId>,
-  ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
-    return this.unfold(this.summariesFolding(listed), (record) =>
-      record.sourceIds.some((id) => listed.has(id)) ? record.sourceIds.filter((id) => !laterShards.has(id)) : undefined,
-    );
+  /** Read the branch's applied list of sweeps: the manager asks it as its pass ends. */
+  afterSweepPass(ctx: StrategyContext): void {
+    this.letGoOfSweptRows(ctx, 'the end of a pass');
+  }
+
+  oldSummaryCost(rows: SweptRows, ctx: StrategyContext): OldSummaryCost {
+    this.requireLoadedBranch('oldSummaryCost');
+    return this.costOf(this.oldSummaries(rows), ctx);
+  }
+
+  /**
+   * The second act of a sweep. It takes up the store where another
+   * instance wrote it, then drops the old summaries over `rows` as a row's
+   * let-go drops what covers it (unfold): each chunk record under a dropped
+   * L1 keeps its rows and is compressed again, a summary left without its
+   * parent renders again, and a queued merge of a dropped summary goes. An
+   * audit-only instance writes nothing, so it refuses.
+   */
+  dropOldSummaries(rows: SweptRows, ctx: StrategyContext): OldSummaryCost {
+    this.requireLoadedBranch('dropOldSummaries');
+    if (this.config.auditOnly) {
+      throw new Error('AutobiographicalStrategy.dropOldSummaries refused: an audit-only instance writes nothing.');
+    }
+    if (this.storeWrittenElsewhere()) this.takeUpStoreState();
+    const old = this.oldSummaries(rows);
+    const cost = this.costOf(old, ctx);
+    if (old.size === 0) return cost;
+    const under = new Set<MessageId>();
+    for (const summary of this.summaries) if (summary.level === 1 && old.has(summary.id)) for (const id of summary.sourceIds) under.add(id);
+    for (const record of this.chunkRecords) if (record.summaryId && old.has(record.summaryId)) for (const id of record.sourceIds) under.add(id);
+    this.letGoOf(under, ctx, 'are under the old summaries that the second act drops', () => this.unfold(old, () => undefined));
+    return cost;
+  }
+
+  private oldSummaries(rows: SweptRows): Set<string> {
+    const going = this.summariesAbove(this.summariesFolding(rows.removed));
+    const seeds = new Set<string>();
+    const consider = (summary: SummaryEntry | undefined, sources: readonly MessageId[]): void => {
+      if (summary?.level !== 1) return;
+      const created: unknown = summary.created;
+      for (const id of sources) {
+        const at = rows.rewritten.get(id);
+        if (at !== undefined && !(typeof created === 'number' && created > at)) {
+          seeds.add(summary.id);
+          return;
+        }
+      }
+    };
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
+    for (const summary of this.summaries) consider(summary, summary.sourceIds);
+    for (const record of this.chunkRecords) if (record.summaryId) consider(byId.get(record.summaryId), record.sourceIds);
+    const old = this.summariesAbove(seeds);
+    for (const id of going) old.delete(id);
+    return old;
+  }
+
+  private costOf(old: ReadonlySet<string>, ctx: StrategyContext): OldSummaryCost {
+    const levels = new Map<number, number>();
+    const under = new Set<MessageId>();
+    for (const summary of this.summaries) {
+      if (!old.has(summary.id)) continue;
+      levels.set(summary.level, (levels.get(summary.level) ?? 0) + 1);
+      if (summary.level === 1) for (const id of summary.sourceIds) under.add(id);
+    }
+    let records = 0;
+    for (const record of this.chunkRecords) {
+      if (!record.summaryId || !old.has(record.summaryId)) continue;
+      records++;
+      for (const id of record.sourceIds) under.add(id);
+    }
+    const view = ctx.messageStore;
+    let rawTokens = 0;
+    for (const id of under) {
+      const message = view.get(id);
+      if (message) rawTokens += view.estimateTokens(this.prunedForSend(view, message));
+    }
+    return { summaries: [...levels].sort(([a], [b]) => a - b).map(([level, count]) => ({ level, count })), records, rawTokens };
+  }
+
+  private summariesAbove(seeds: ReadonlySet<string>): Set<string> {
+    const above = new Set(seeds);
+    for (let grew = above.size > 0; grew;) {
+      grew = false;
+      for (const summary of this.summaries) {
+        if (!above.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => above.has(id))) {
+          above.add(summary.id);
+          grew = true;
+        }
+      }
+    }
+    return above;
   }
 
   private summariesFolding(rows: ReadonlySet<MessageId>): Set<string> {
@@ -8700,16 +8773,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     seeds: ReadonlySet<string>,
     sourcesOf: (record: ChunkRecord) => MessageId[] | undefined,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
-    const dropped = new Set(seeds);
-    for (let grew = dropped.size > 0; grew;) {
-      grew = false;
-      for (const summary of this.summaries) {
-        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
-          dropped.add(summary.id);
-          grew = true;
-        }
-      }
-    }
+    const dropped = this.summariesAbove(seeds);
 
     const refolded: string[] = [];
     const emptied: string[] = [];

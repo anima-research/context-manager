@@ -71,11 +71,45 @@ export interface ListedBody {
  * `slot`, or the later shards that an earlier pass left standing and that
  * this pass will remove, with the branch's `sequence` before that write,
  * where the old text can be read (getMessageAt). `finished`: the branch
- * finished `take` for `slot`.
+ * finished `take` for `slot`. `dropped`: the strategy of `namespace`
+ * dropped the old summaries of the sweep (dropOldSummaries), so another
+ * instance of that namespace takes up what the store holds.
  */
 export type SweepApplied =
   | { v: 1; kind: 'listed'; name: string; take: string; slot: string; at: string; sequence: number; bodies: ListedBody[] }
-  | { v: 1; kind: 'finished'; name: string; take: string; slot: string; at: string };
+  | { v: 1; kind: 'finished'; name: string; take: string; slot: string; at: string }
+  | { v: 1; kind: 'dropped'; name: string; slot: string; namespace: string; at: string };
+
+/**
+ * The old summaries at one level. An old summary is an L1 written before a
+ * pass rewrote a row that it covers, or a summary above such an L1.
+ */
+export interface OldSummaryLevel {
+  level: number;
+  count: number;
+}
+
+/**
+ * What the second act (ContextManager.dropOldSummaries) drops: the old
+ * summaries at each level, with each level that has none left out; the
+ * chunk records that the strategy's compression then folds again; and the
+ * estimated tokens of the rows that render raw until it does.
+ */
+export interface OldSummaryCost {
+  summaries: OldSummaryLevel[];
+  records: number;
+  rawTokens: number;
+}
+
+/**
+ * The rows that a sweep's passes rewrote on a branch, each with the time in
+ * ms of the newest list item that lists it, and the later shards that its
+ * passes removed.
+ */
+export interface SweptRows {
+  rewritten: ReadonlyMap<MessageId, number>;
+  removed: ReadonlySet<MessageId>;
+}
 
 export const SWEEP_TAKE_RECORD = 'context-manager/sweep-take';
 export const SWEEPS_APPLIED_STATE_ID = 'context-manager/sweeps-applied';
@@ -105,6 +139,8 @@ export interface SweepShow {
    * content that the entry gave.
    */
   failures: SweepFailure[];
+  /** The summaries that would be old once a pass rewrote the changes. */
+  oldSummaries: OldSummaryLevel[];
 }
 
 /**
@@ -161,6 +197,8 @@ export interface SweepReceipt {
   take: SweepTake | null;
   finished: boolean;
   passes: SweepPass[];
+  /** The old summaries over the rows that its passes rewrote. */
+  oldSummaries: OldSummaryLevel[];
 }
 
 /**
@@ -197,6 +235,26 @@ export function listedRows(items: readonly SweepApplied[]): Set<MessageId> {
     }
   }
   return ids;
+}
+
+/**
+ * The rows that the `listed` items of `items` rewrote, each with its newest
+ * listing's time, and the later shards they removed. A time that doesn't
+ * parse is read as later than any summary.
+ */
+export function sweptRows(items: readonly SweepApplied[]): SweptRows {
+  const rewritten = new Map<MessageId, number>();
+  const removed = new Set<MessageId>();
+  for (const item of items) {
+    if (item.kind !== 'listed') continue;
+    const parsed = Date.parse(item.at);
+    const at = Number.isNaN(parsed) ? Infinity : parsed;
+    for (const body of item.bodies) {
+      rewritten.set(body.id, Math.max(rewritten.get(body.id) ?? -Infinity, at));
+      for (const shard of body.laterShards) removed.add(shard);
+    }
+  }
+  return { rewritten, removed };
 }
 
 export function listedLaterShards(items: readonly SweepApplied[]): Set<MessageId> {
@@ -337,10 +395,11 @@ function isSweepApplied(value: unknown): value is SweepApplied {
   if (typeof value !== 'object' || value === null) return false;
   if (!('v' in value) || value.v !== 1) return false;
   if (!('name' in value) || typeof value.name !== 'string') return false;
-  if (!('take' in value) || typeof value.take !== 'string') return false;
   if (!('slot' in value) || typeof value.slot !== 'string') return false;
   if (!('at' in value) || typeof value.at !== 'string') return false;
   if (!('kind' in value)) return false;
+  if (value.kind === 'dropped') return 'namespace' in value && typeof value.namespace === 'string';
+  if (!('take' in value) || typeof value.take !== 'string') return false;
   if (value.kind === 'finished') return true;
   return (
     value.kind === 'listed' &&
