@@ -39,12 +39,17 @@ import type {
   DerivationManifest,
   DerivationManifestOptions,
   RenderedSummaryInfo,
+  ExternalMemoryProvenance,
+  MemoryWorkItem,
+  MemoryWorkTarget,
+  SummaryTextEdit,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
 import {
-  adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
-  type LevelRuns, type PendingFill, type StoreRunsInput,
+  adjacentRuns, carriesAtLevel, carriesItsSource, frontierEnds, holesBeside, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf,
+  projectLadder, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
+  type LadderStep, type LevelRuns, type PendingFill, type RunHole, type StoreRunsInput,
 } from './merge-runs.js';
 import {
   hasSummaryText, isIdList, isReadableRange, loadedChunkRecords, releasedRecordsLine, releaseUnsummarizedRecords,
@@ -95,7 +100,7 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
-import { isCompressionWithdrawn } from '../compression-withdrawn.js';
+import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import {
@@ -255,6 +260,15 @@ function strandedSummariesFailedMessage(cause: unknown): string {
     `Cause: ${causeText(cause)}`,
     "Effect: it can't say which summaries no merge can take. Merging itself may be running normally.",
     'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
+  ].join('\n');
+}
+
+function carryPreviewFailedMessage(cause: unknown): string {
+  return [
+    'The carry preview could not be made.',
+    `Cause: ${causeText(cause)}`,
+    'Effect: nothing is listed, and the store is as it was.',
+    'Fix: fix what the cause names in the store or its quarantine ledger, then ask again. If it names neither, this is a fault in context-manager or in its options: report it.',
   ].join('\n');
 }
 
@@ -1051,9 +1065,10 @@ interface CompressionFamilyProgress {
 /**
  * In-process pacing of the compression lane after a failure that says
  * nothing about the request (see compressionFailureKind). Scoped to the
- * membrane instance and compression model it was observed on: a different
- * provider or model ignores and clears it. A durable, restart-stable provider
- * deadline is the caller's (agent-framework's provider admission).
+ * membrane instance and model it was observed on, the compression model or
+ * the fallback-model rung's: a different provider or model ignores and clears
+ * it. A durable, restart-stable provider deadline is the caller's
+ * (agent-framework's provider admission).
  */
 interface CompressionLanePause {
   /** The lane's own backoff: 5 s doubling per failure, capped at 10 min. */
@@ -1112,6 +1127,9 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
   if (Number.isFinite(until)) return `until ${new Date(until).toISOString()}`;
   return 'until a restart, a change of model, or an explicit release (the provider stated a wait that cannot be held as an instant)';
 };
+/** How a long hold of the fallback model reads in its line (see fallbackModelHeldUntil). */
+const heldUntilText = (until: number): string =>
+  Number.isFinite(until) ? `until ${new Date(until).toISOString()}` : 'with no end stated';
 /**
  * The model each failed compression call was dispatched with, keyed by its
  * error: the pause describes the call that failed, even if the configured
@@ -1132,6 +1150,8 @@ interface CompressionRefusalNormalizedConfig {
   sourceOnlyFallbackRequestHash?: string;
   /** Normalized tool-prose hoist options; absent when the rung is off. */
   toolProseFallback?: ToolProseHoistOptions;
+  /** `compressionFallbackModel`; absent when the rung is off. */
+  fallbackModel?: string;
 }
 
 type CompressionAttemptOutcome =
@@ -1312,8 +1332,10 @@ const CANONICAL_STAGE_LABELS = new Set(['canonical', 'canonical-no-tools', 'cano
 
 /**
  * A rung decided by its failures (COMPRESSION_PERSISTENT_FAILURES transient
- * failures, the first and each later one after a landing): the policy's
- * outcome, `persistent-<class>`, not an answer any provider gave.
+ * failures, the first and each later one after a landing, or the
+ * fallback-model rung's one failure that says its model is held for long:
+ * fallbackModelHeldUntil): the policy's outcome, `persistent-<class>`, not an
+ * answer any provider gave.
  */
 function isFailureDecision(entry: { outcome: string; errorType?: string }): boolean {
   return entry.outcome === 'provider_error' && typeof entry.errorType === 'string' && entry.errorType.startsWith('persistent-');
@@ -1679,6 +1701,8 @@ interface CompressionAttemptTrace {
   errorType?: string;
   admittedTokens?: number;
   budgetTokens?: number;
+  /** The model the attempt was sent to, where it isn't the compression model (the fallback-model rung). */
+  model?: string;
 }
 
 /** What kv-unified's cache check rebuilt at a compile's solve, for the
@@ -2206,7 +2230,8 @@ type SelectPricing = {
  * named as each), with its `side` and the `level` of what it holds (0 for a
  * chunk). It is empty when no such hole lies between it and the summaries
  * beside it, as when what stands there is a summary of its level that
- * already has a parent.
+ * already has a parent. With `carryStrandedSummaries` set, a summary the
+ * next merge check carries up a level is not listed: it is not stranded.
  */
 export interface StrandedSummary {
   id: string;
@@ -2390,7 +2415,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // Hierarchical state
   protected summaries: SummaryEntry[] = [];
   protected summaryIdCounter = 0;
-  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }> = [];
+  protected mergeQueue: Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean }> = [];
 
   /**
    * Live merge-quarantine records keyed by sha256(sourceIds). Loaded from
@@ -3708,7 +3733,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
-      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }>)
+      ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     const storedMergeRecords = Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [];
@@ -3981,6 +4006,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Look up a single summary by id. Returns null if not found.
+   *
+   * This is the stored entry as it is, where `searchSummaries` and
+   * `listSummariesInRange` read the summaries past carried entries
+   * (`carryStrandedSummaries`): it returns an entry marked `carriedFrom` for
+   * that entry's id, the parent it gives a carried summary is the entry
+   * that carries it, and a merge's `sourceIds` name the carried entry it
+   * took. Follow `carriedFrom` down, or the parent up, to reach what the
+   * lists show.
    */
   getSummary(id: string): SummaryEntry | null {
     this.requireLoadedBranch('getSummary');
@@ -4031,7 +4064,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const levelsFilter = query.levels && query.levels.length > 0 ? new Set(query.levels) : null;
 
     const results: SearchResult[] = [];
-    for (const s of this.summaries) {
+    // Read as a select reads them (pastCarries): a carried entry repeats the
+    // text of the summary it carries, which is listed in its place.
+    for (const s of this.pastCarries(this.summaries)) {
       if (!includeMerged && s.mergedInto) continue;
       if (levelsFilter && !levelsFilter.has(s.level)) continue;
       const matches = matcher(s.content);
@@ -4112,7 +4147,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
 
     const out: TimeRangeSummaryEntry[] = [];
-    for (const entry of this.summaries) {
+    // Read as a select reads them (pastCarries), as searchSummaries does.
+    for (const entry of this.pastCarries(this.summaries)) {
       if (opts.level !== undefined && entry.level !== opts.level) continue;
 
       // Resolve the source span to wall-clock time via the message store.
@@ -5265,7 +5301,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // keys in another order than toolProseHoistOptions builds them in
       // (0.5.1 and later keep the written order, chronicle #67).
       canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
+        canonicalJson(record.normalizedConfig.toolProseFallback ?? null) &&
+      // And for the fallback-model rung: naming a model, or another one, is a
+      // request-family change.
+      active.record.normalizedConfig?.fallbackModel === record.normalizedConfig.fallbackModel,
     );
     return projection.get(record.key)
       ?? sameRegime.find((active) => active.record.familyKey === record.familyKey)
@@ -5332,6 +5371,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private requireBranchMutation(entrypoint: string): void {
+    // Work an operator runs only to read its request (externalWork with no
+    // `by`) changes nothing: it ends at the first change the strategy would
+    // make to its own state before the call.
+    if (this.externalWork && !this.externalWork.by) {
+      throw new Error(
+        `the strategy would send no request for this work as it stands: it would change its own state first (${entrypoint}); ` +
+          'its warnings say why',
+      );
+    }
     if (
       this.isBranchIdentityCurrent(this.loadedBranchIdentity) ||
       this.isBranchIdentityCurrent(this.initializingBranchIdentity)
@@ -6412,14 +6460,57 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The compression lane's pause, if one binds this membrane and compression
-   * model now. A pause observed on another membrane instance or model says
-   * nothing about this one, so it is ignored and cleared.
+   * Whether `pause` is on a model the lane calls: the compression model, or
+   * the fallback-model rung's (`compressionFallbackModel`). A failed call to
+   * the fallback model paces the lane as the compression model's does, or
+   * each tick would send that rung's request again, inside the backoff and
+   * the provider's stated wait. Only a short wait gets this far: a long hold
+   * of the fallback model ends its rung and pauses nothing
+   * (fallbackModelHeldUntil).
+   */
+  private pauseOnLaneModel(pause: CompressionLanePause): boolean {
+    const fallbackModel = this.config.compressionFallbackModel;
+    return pause.model === this.config.compressionModel || (!!fallbackModel && pause.model === fallbackModel);
+  }
+
+  /**
+   * Until when a failed call to the fallback model says that model is held,
+   * where that is longer than its rung waits: the provider's stated wait, or
+   * the deadline of the caller's provider admission, when it ends after the
+   * lane's own backoff ceiling (COMPRESSION_PAUSE_MAX_BACKOFF_MS), and
+   * Infinity for one with no end (a wait that can't be held as an instant, or
+   * a deferral that gives no deadline). Undefined for a shorter wait or none
+   * stated, which pause the lane as the compression model's do, the ladder
+   * resuming at the rung.
+   *
+   * The rung is a last resort for one request, and every other chunk and
+   * merge needs only the compression model: a hold of hours or days on the
+   * fallback model must not stop them. So on such a hold the rung gives up
+   * for its request, decided as a rung its failures decided
+   * (`persistent-<class>`), with no pause, and the request goes on as after
+   * the fallback model's refusal. `error` is one that says nothing about the
+   * request (compressionFailureKind's 'transient').
+   */
+  private fallbackModelHeldUntil(error: unknown): number | undefined {
+    const stated = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+    const wait = typeof stated === 'number' && !Number.isNaN(stated) && stated >= 0
+      ? stated
+      : isAdmissionDeferral(error) ? Number.POSITIVE_INFINITY : undefined;
+    if (wait === undefined || wait <= AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS) return undefined;
+    const until = Date.now() + wait;
+    return until <= MAX_DATE_MS ? until : Number.POSITIVE_INFINITY;
+  }
+
+  /**
+   * The compression lane's pause, if one binds this membrane and a model the
+   * lane calls now (pauseOnLaneModel). A pause observed on another membrane
+   * instance or model says nothing about this one, so it is ignored and
+   * cleared.
    */
   private activeCompressionPause(ctx: StrategyContext): CompressionLanePause | null {
     const pause = this.compressionPause;
     if (!pause) return null;
-    if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
+    if (pause.membrane !== ctx.membrane || !this.pauseOnLaneModel(pause)) {
       this.compressionPause = null;
       return null;
     }
@@ -7047,6 +7138,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Conditionally spread: with the rung off the record, its key and its
       // family stay byte-identical to what they were before the rung existed.
       ...(toolProseFallback ? { toolProseFallback } : {}),
+      ...(this.config.compressionFallbackModel ? { fallbackModel: this.config.compressionFallbackModel } : {}),
     };
     const familyKey = sha256Json({
       model,
@@ -7095,6 +7187,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
     this.requireBranchMutation('setMergedInto');
     entry.mergedInto = mergedIntoId;
+    this.writeStoredSummary(entry, 'setMergedInto', 'merge state');
+  }
+
+  /** Write a summary this instance changed in memory over every stored copy of it. */
+  private writeStoredSummary(entry: SummaryEntry, operation: string, what: string): void {
     if (!this.store) return;
     // Resolve the log position by ID against the PERSISTED array — never by
     // in-memory index. loadPersistedState now drops empty and unreadable
@@ -7123,7 +7220,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!found) {
       this.heldAsStoredAt.delete(this.summariesStateId);
       this.diag.warn(
-        `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
+        `[autobiographical] ${operation}: ${entry.id} not found in persisted summary log — ${what} not persisted`,
       );
     }
   }
@@ -7188,13 +7285,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * merge that would form after it at its level, and froze a resident's whole
    * pyramid for 16 days (322 L1s never attempted, zero merge calls).
    * `position` is the merge position index, when the caller has one.
+   * `exceptRecord` is the key of a merge-quarantine record left out: the one
+   * whose own group an operator runs by hand (externalWork).
    */
-  protected mergeHeldSourceIds(position?: ReadonlyMap<MessageId, number>): Set<string> {
+  protected mergeHeldSourceIds(position?: ReadonlyMap<MessageId, number>, exceptRecord?: string): Set<string> {
     const ids = new Set<string>(this.config.mergeHoldSummaryIds ?? []);
     if (this.mergeQuarantine.size === 0) return ids;
     const order = position ?? this.mergePositionIndex();
     for (const record of this.mergeQuarantine.values()) {
-      if (!this.mergeRecordHolds(record, order)) continue;
+      if (record.key === exceptRecord || !this.mergeRecordHolds(record, order)) continue;
       for (const id of record.sourceIds) ids.add(id);
     }
     return ids;
@@ -7791,7 +7890,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never silent loss.
    */
   protected recordMergeRejection(
-    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean },
+    merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; hadNonRefusal?: boolean; fallbackModel?: boolean },
     rejection: MergeDispositionRejection,
   ): void {
     this.requireBranchMutation('recordMergeRejection');
@@ -7807,10 +7906,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // an intervening rejection had a different stop reason (prevents the
     // raw→refusal→fallback→tool_use→raw oscillation).
     if (rejection.stopReason === 'refusal') merge.hadRefusal = true;
+    if (rejection.outcome !== 'refusal') merge.hadNonRefusal = true;
     const limit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     // Synced, like the transient path's run write: a crash must not undo the
     // attempt the policy counts, the run's end, or a quarantine.
     if (merge.attempts >= limit) {
+      // Fallback-model rung (compressionFallbackModel): every attempt the
+      // compression model made was refused, so the entry gets one more, which
+      // executeMerge sends as the first attempt's request with only the model
+      // changed. Whatever rejects that one quarantines the group.
+      if (this.config.compressionFallbackModel && !merge.fallbackModel && !merge.hadNonRefusal) {
+        merge.fallbackModel = true;
+        this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+        this.store?.sync();
+        return;
+      }
       this.dequeueMerge();
       this.quarantineMerge(merge, rejection, limit);
       this.store?.sync();
@@ -8245,11 +8355,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The pause binds the membrane instance and model of the call that
       // failed. Readiness has no context to name the membrane, so a pause
       // bound to another instance shows until the next tick drops it; one
-      // bound to another model doesn't show. It names what failed last and
-      // its class: how long compression has been behind is
-      // getCompressionDebt's oldest pending age.
+      // bound to a model the lane doesn't call (pauseOnLaneModel) doesn't
+      // show. It names what failed last and its class: how long compression
+      // has been behind is getCompressionDebt's oldest pending age.
       const pause = this.compressionPause &&
-        this.compressionPause.model === this.config.compressionModel &&
+        this.pauseOnLaneModel(this.compressionPause) &&
         Date.now() < pauseUntil(this.compressionPause)
         ? this.compressionPause
         : null;
@@ -8931,6 +9041,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * L1s that can't merge count toward the cap: a pruned source, the wide-span
    * quarantine, a lone interior summary, or a held one (mergeHeldSourceIds: an
    * operator hold, or a group a merge-quarantine record holds out of merges).
+   * One that `carryStrandedSummaries` carried no longer counts, as one a
+   * merge took doesn't: it has a parent, and waits for no L1 merge.
    * And under `hierarchical: false` tick runs no merge, though
    * checkMergeThreshold can still queue one.
    */
@@ -9222,8 +9334,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // entry wrote nothing.
       let merged = false;
       // executeMerge builds its request before its first await, so this is
-      // the model the call names.
-      const mergeModel = this.config.compressionModel;
+      // the model the call names: the fallback model on that rung.
+      const mergeFallbackModel = merge.fallbackModel === true ? this.config.compressionFallbackModel : undefined;
+      const mergeModel = mergeFallbackModel ?? this.config.compressionModel;
       const mergeMembrane = ctx.membrane;
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
       let mergeToolsDeferred = false;
@@ -9271,6 +9384,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // before the queued L1s, where it did (#415).
           this.diag.warn(
             `[autobiographical] L${merge.level} merge landed over ${merge.sourceIds.length} summaries` +
+              (mergeFallbackModel ? `, written by the fallback model ${mergeFallbackModel}` : '') +
               (mergeTurn ? `, ahead of queued L1 work (${mergeTurn})` : ''),
           );
         }
@@ -9349,6 +9463,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // interrupt, the run is decided before any pause: the failure that
         // decides it is the merge's own, not the lane's, so it pauses nothing.
         if (failureKind === 'transient') {
+          // The fallback-model rung doesn't wait out a long hold of its model
+          // (fallbackModelHeldUntil): its attempt is rejected as one its
+          // failures decided, which quarantines the group as the fallback
+          // model's refusal does. Nothing is thrown and the lane isn't paused.
+          const heldUntil = mergeFallbackModel !== undefined && this.isCompressionBranchCurrent(sourceBranch)
+            ? this.fallbackModelHeldUntil(error)
+            : undefined;
+          if (heldUntil !== undefined) {
+            const failureClass = compressionFailureClass(error);
+            this.diag.warn(
+              `[autobiographical] fallback model ${mergeFallbackModel} is held ${heldUntilText(heldUntil)}: its rung is skipped for ` +
+                `the L${merge.level} merge of ${merge.sourceIds.length} summaries, which goes on as after its refusal (no pause)`,
+            );
+            this.mergeFailureOrder.delete(mergeFailureKey(merge));
+            this.recordMergeRejection(
+              merge,
+              new MergeDispositionRejection(
+                merge.level,
+                'provider_error',
+                sha256Json({ level: merge.level, sourceIds: merge.sourceIds, transport: `persistent-${failureClass}` }),
+                undefined,
+                `persistent-${failureClass}`,
+              ),
+            );
+            return;
+          }
           if (!isAdmissionDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
             const failureClass = compressionFailureClass(error);
             const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? mergeModel;
@@ -9849,11 +9989,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private summariesNotAcross(across: ReadonlySet<SummaryId>): SummaryEntry[] {
-    if (across.size === 0) return this.summaries;
-    return this.summaries.flatMap((s) => {
+    if (across.size === 0) return this.pastCarries(this.summaries);
+    return this.pastCarries(this.summaries.flatMap((s) => {
       if (across.has(s.id)) return [];
       const parentId = getSummaryParentId(s);
       return [parentId !== undefined && across.has(parentId as SummaryId) ? { ...s, parentId: undefined, mergedInto: undefined } : s];
+    }));
+  }
+
+  /**
+   * The summaries as a select reads them: without the entries that carry a
+   * summary up a level unchanged (`carriedFrom`, see
+   * `carryStrandedSummaries`). Such an entry holds the text of the summary
+   * it carries, so it is no deeper fold of those messages, and a solver that
+   * read it as one would be wrong about it: kv-stable takes a level above a
+   * chunk as proof the chunk can still fold, and lowers every younger,
+   * deeper chunk to re-fold them in order (kv-control.ts, the seeded cut),
+   * and the solvers' cache models key a rendered unit by its summary's id,
+   * so a move between the entry and the summary it carries would count as a
+   * change where no byte changes. So the summary carried stands in the
+   * entry's place: under the entry's own parent (none, until a merge takes
+   * the entry), which lists it where it listed the entry. Until that merge
+   * lands, a select reads the store as it read it before the carry. Once it
+   * has, the summary's lineage skips the levels it was carried through,
+   * which every solver reads past (SummaryTree.ancestorAt). The lists a
+   * host shows an agent read them the same way (searchSummaries,
+   * listSummariesInRange), so no memory is listed twice.
+   *
+   * An entry is read as a carry only while the summary it carries is its one
+   * source (carriesItsSource). One a repair gave a second source keeps its
+   * `carriedFrom` and stands here as a summary of its level over both: left
+   * out, it would take the source the repair gave it out of every summary
+   * above it.
+   */
+  private pastCarries(summaries: SummaryEntry[]): SummaryEntry[] {
+    if (!summaries.some(carriesItsSource)) return summaries;
+    const byId = new Map(summaries.map((s) => [s.id, s] as const));
+    const carrying = (id: string | undefined): SummaryEntry | undefined => {
+      const entry = id === undefined ? undefined : byId.get(id);
+      return entry && carriesItsSource(entry) ? entry : undefined;
+    };
+    return summaries.flatMap((s) => {
+      if (carriesItsSource(s)) return [];
+      // A parent sits above its summary, and a source below the summary that
+      // lists it (the load repair keeps no other), so both walks end.
+      let parent = getSummaryParentId(s);
+      for (let above = carrying(parent); above; above = carrying(parent)) parent = getSummaryParentId(above);
+      let sourceIds = s.sourceIds;
+      if (s.level > 1 && sourceIds.some((id) => carrying(id))) {
+        sourceIds = sourceIds.map((id) => {
+          for (let entry = carrying(id); entry; entry = carrying(id)) id = entry.sourceIds[0]!;
+          return id;
+        });
+      }
+      if (parent === getSummaryParentId(s) && sourceIds === s.sourceIds) return [s];
+      return [{ ...s, parentId: undefined, mergedInto: parent, sourceIds }];
     });
   }
 
@@ -10109,7 +10299,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * pair if nothing else does, or, for a hole below its level, only if what
    * lands there merges up beside it. One that stays, or that has no hole
    * beside it, needs
-   * `repair-topology --mode rebuild` to give it partners. It reads the
+   * `repair-topology --mode rebuild` to give it partners, unless
+   * `carryStrandedSummaries` is set and a higher summary stands beside it:
+   * the next merge check carries that one up a level, so it isn't listed
+   * (`previewCarries` lists it). That is read from the store as it stands,
+   * one pass: a stray the check reaches only after it has carried another
+   * (one beside a lower stray that is carried up to it, or beside a wide
+   * summary) is still listed until that check has run, and `previewCarries`
+   * follows every step. It reads the
    * compression quarantine ledger afresh to name the quarantined chunks a
    * stray stands beside.
    *
@@ -10144,11 +10341,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const input = { ...this.mergeRunsInput(order), queued, planning: false };
     let top = 2;
     if (this.config.speculativeProduction) for (const s of this.summaries) top = Math.max(top, s.level ?? 1);
+    const byLevel = mergeRunsByLevel(input, top);
     const strays: Array<{ s: SummaryEntry; first: number; last: number }> = [];
-    for (const { runs } of mergeRunsByLevel(input, top).values()) strays.push(...strandedIn(runs));
+    for (const { runs } of byLevel.values()) strays.push(...strandedIn(runs));
     if (strays.length === 0) return [];
 
-    const holes: Array<{ first: number; last: number; level: number; beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> = [];
+    const holes = this.mergeHoles(order, input.held, quarantined);
+    // A stray the carry rule takes at the next merge check is not stranded:
+    // at the levels that check carries from, below the highest it reads.
+    const carried = new Set<string>();
+    if (this.config.carryStrandedSummaries) {
+      for (const [level, found] of byLevel) {
+        if (level >= top) continue;
+        for (const { s } of carriesAtLevel(input, level, holes, (x) => this.ownedLeafRows(x), found)) carried.add(s.id);
+      }
+    }
+    const ends = frontierEnds(input);
+    const out: StrandedSummary[] = [];
+    for (const { s, first, last } of strays) {
+      if (carried.has(s.id)) continue;
+      const level = s.level ?? 1;
+      const beside = holesBeside(ends, holes, level, first, last).map(({ hole, side }) => ({ ...hole.beside, side, level: hole.level }));
+      out.push({ id: s.id, level, tokens: s.tokens ?? 0, beside });
+    }
+    return out;
+  }
+
+  /**
+   * The holes in the frontier that held-up work could still fill, each with
+   * what holds it up (StrandedSummary's `beside`): the messages of a chunk
+   * the compression quarantine holds (level 0), and each unparented summary
+   * held out of merges, as an operator hold and as the source of each
+   * quarantined merge that holds it.
+   */
+  private mergeHoles(
+    order: ReadonlyMap<MessageId, number>,
+    heldIds: ReadonlySet<string>,
+    quarantined: ReadonlyMap<string, ActiveCompressionQuarantine>,
+  ): Array<RunHole & { beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> {
+    const holes: Array<RunHole & { beside: Pick<StrandedSummary['beside'][number], 'kind' | 'id'> }> = [];
     if (quarantined.size > 0) {
       const byHash = new Map(this.chunks.filter((chunk) => !chunk.compressed)
         .map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk] as const));
@@ -10168,7 +10399,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const operatorHeld = new Set(this.config.mergeHoldSummaryIds ?? []);
     const holding = [...this.mergeQuarantine.values()].filter((record) => this.mergeRecordHolds(record, order));
-    for (const id of input.held) {
+    for (const id of heldIds) {
       const held = this.summaryById(id);
       if (!held || getSummaryParentId(held) || typeof held.level !== 'number') continue;
       const at = placeOf(held, order);
@@ -10178,33 +10409,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (record.sourceIds.includes(id)) holes.push({ first: at[0], last: at[1], level: held.level, beside: { kind: 'merge-quarantine', id: record.key } });
       }
     }
-    const from = new Map<number, { to: number; level: number }>();
-    const to = new Map<number, { from: number; level: number }>();
-    for (const s of this.summaries) {
-      if (getSummaryParentId(s)) continue;
-      const at = placeOf(s, order);
-      if (!at) continue;
-      const level = typeof s.level === 'number' ? s.level : Number.POSITIVE_INFINITY;
-      from.set(at[0], { to: at[1], level });
-      to.set(at[1], { from: at[0], level });
-    }
-    const out: StrandedSummary[] = [];
-    for (const { s, first, last } of strays) {
-      const level = s.level ?? 1;
-      const walk = (start: number, step: 1 | -1): StrandedSummary['beside'] => {
-        let at = start;
-        for (;;) {
-          const here = holes.filter((h) => h.level <= level && h.first <= at && at <= h.last);
-          if (here.length > 0) return here.map((h) => ({ ...h.beside, side: step === 1 ? 'after' : 'before', level: h.level }));
-          const lower = step === 1 ? from.get(at) : to.get(at);
-          if (!lower || lower.level >= level) return [];
-          at = (step === 1 ? (lower as { to: number }).to : (lower as { from: number }).from) + step;
-        }
-      };
-      const beside = [...walk(first - 1, -1), ...walk(last + 1, 1)];
-      out.push({ id: s.id, level, tokens: s.tokens ?? 0, beside });
-    }
-    return out;
+    return holes;
   }
 
   /** Logs a debt report that couldn't read something, once: when one first fails,
@@ -11766,7 +11971,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       throw new CompressionQuarantineUnreadableError(error);
     }
-    const durableActive = this.durableQuarantineFor(durableQuarantine, quarantineRecord);
+    // Work an operator runs by hand (externalWork) passes a quarantine of its
+    // own family: the text comes from outside, or the request isn't sent.
+    const durableActive = this.externalWork ? undefined : this.durableQuarantineFor(durableQuarantine, quarantineRecord);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       if (!this.warnedQuarantineSkips.has(quarantineRecord.chunkSourceHash)) {
@@ -12329,6 +12536,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         endRungRuns(outcome.curveLabel);
         persistProgress();
       };
+      /** Until when the fallback model is held, where its rung gave up on that hold (Infinity: no end stated). */
+      let fallbackModelHeld: number | undefined;
       /**
        * A failure that is not a rejection says nothing about the request by its
        * kind: keep what the ladder has learned and rethrow (the outer catch
@@ -12349,6 +12558,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         requestHash: string,
         stripped: boolean = false,
       ): CompressionRefusalOutcomeRecord => {
+        // The fallback-model rung doesn't wait out a long hold of its model
+        // (fallbackModelHeldUntil): it ends here with a decided outcome, so
+        // nothing is thrown, the lane isn't paused, and the ladder goes on as
+        // after the fallback model's refusal. ladderStep, the rung's only
+        // caller, has checked that the branch is current.
+        if (curveLabel === 'fallback-model') {
+          fallbackModelHeld = this.fallbackModelHeldUntil(error);
+          if (fallbackModelHeld !== undefined) {
+            return { curveLabel, requestHash, outcome: 'provider_error', errorType: `persistent-${compressionFailureClass(error)}` };
+          }
+        }
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
           // Unsettled stripped provider failures have their own run. Once
           // the provider answers, later local failures use the unstripped
@@ -12479,6 +12699,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
             .map(b => b.text)
             .join('\n');
+          // An operator's text (externalWork) is stored as given: only a
+          // model's answer is read for a thinking wrapper, so no text of
+          // theirs strips to an empty answer the ladder would record.
+          if (this.externalWork?.by) return { text: rawText, recoveredWholeWrapper: false };
           // The opt-in reads an answer of text blocks alone; one with native
           // reasoning beside its text is read as before.
           const onlyTextBlocks = r.content.every((block) => block.type === 'text');
@@ -12991,6 +13215,80 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
           }
         }
+        // ---- fallback-model rung (compressionFallbackModel) ----
+        // Every rung that keeps the agent's own model writing the memory in
+        // full was refused: send the canonical request once more with only
+        // its model changed. Refusal-gated on the whole ladder so far: a rung
+        // that ended any other way (a provider error, a truncated or empty
+        // generation) keeps the ladder as it was. A recall variant or hoist
+        // that admission kept from being sent answered nothing, and the
+        // transport's rejection of reasoning carriers is followed by the same
+        // rung's stripped request, so neither stands in the way. Its answer is
+        // persisted as any rung's is, but as text alone, without its reasoning
+        // blocks; the entry's provenance names the model. A failure of its
+        // call that says nothing about the request pauses the lane and the
+        // ladder resumes here, unless it says the model is held for long: then
+        // the rung is decided at once and the ladder goes on (interrupt).
+        const fallbackModel = this.config.compressionFallbackModel;
+        if (
+          !fallbackResponse && fallbackModel && canonicalOutcome === 'refusal' &&
+          familyRecord.every((noted) =>
+            noted.outcome === 'refusal' || noted.outcome === 'admission_rejected' || noted.curveLabel.endsWith(':carrier-rejected'))
+        ) {
+          const curveLabel = 'fallback-model';
+          const fallbackModelRequest: NormalizedRequest = { ...request, config: { ...request.config, model: fallbackModel } };
+          const requestHash = sha256Json(fallbackModelRequest);
+          if (!knownOutcomes.has(`${curveLabel}\u0000${requestHash}`)) {
+            this.diag.warn(
+              `[autobiographical] L1 compression of chunk ${chunk.index} refused on every rung by ${model}: ` +
+                `sending the canonical request to compressionFallbackModel ${fallbackModel}`,
+            );
+          }
+          const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
+            fallbackModelRequest, curveLabel, canonicalRecallIds, canonicalRecallLevels, canonicalCoverageHash,
+          ));
+          let rungOutcome: string;
+          if (result.kind === 'decided') {
+            rungOutcome = result.outcome.outcome;
+          } else {
+            const trace = attemptTraces[attemptTraces.length - 1]!;
+            trace.model = fallbackModel;
+            const assessment = this.assessFallbackCompressionResponse(result.response);
+            if (assessment.outcome === 'valid') {
+              trace.outcome = 'success';
+              fallbackResponse = assessment.response;
+              response = assessment.response;
+              successfulTrace = trace;
+            } else {
+              trace.outcome = assessment.outcome;
+              noteOutcome({
+                curveLabel, requestHash, outcome: assessment.outcome,
+                ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
+                ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
+              });
+            }
+            rungOutcome = trace.outcome;
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+          }
+          if (result.kind === 'answered' || !result.reused) {
+            this.diag.warn(
+              fallbackModelHeld !== undefined
+                ? `[autobiographical] fallback model ${fallbackModel} is held ${heldUntilText(fallbackModelHeld)}: its rung is skipped for ` +
+                  `chunk ${chunk.index}, which goes on as after its refusal (no pause)`
+                : `[autobiographical] fallback model ${fallbackModel} for chunk ${chunk.index}: ${rungOutcome}`,
+            );
+            logCompressionCall({
+              event: 'compression:fallback-model',
+              operation: 'compress_l1',
+              metadata: {
+                quarantine_key: quarantineRecord.key, model, fallback_model: fallbackModel, requestHash, outcome: rungOutcome,
+                ...(fallbackModelHeld !== undefined
+                  ? { held_until: Number.isFinite(fallbackModelHeld) ? new Date(fallbackModelHeld).toISOString() : null }
+                  : {}),
+              },
+            }, this.ns);
+          }
+        }
         // ---- split-stitch rung (compressionSplitFallback) ----
         // Last rung before quarantine. Observed 2026-09-05 (princess, Bedrock/Sonnet-4.5):
         // chunks refused whole in every presentation while sub-ranges folded cleanly; the
@@ -13351,10 +13649,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // source-only-final's, which can come after the canonical's incomplete
       // answer. The plain-prose retry below resends the canonical with one
       // more line, which mends neither a refusal nor a truncation, so it
-      // would be a burned call.
+      // would be a burned call. The same holds after the fallback-model rung,
+      // which follows the canonical's refusal.
       const toolProseWonTrace =
         successfulTrace?.curveLabel === 'tool-prose-hoist' ||
-        successfulTrace?.curveLabel === 'source-only-tool-prose-hoist'
+        successfulTrace?.curveLabel === 'source-only-tool-prose-hoist' ||
+        successfulTrace?.curveLabel === 'fallback-model'
           ? successfulTrace
           : undefined;
       const proseRequest = withPlainProseLine(request);
@@ -13407,7 +13707,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // A recovered answer has text blocks alone, so it stores no carrier, as
       // any text-only answer; replay reads its unwrapped `content`.
-      const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
+      // The fallback model's answer stores none either: a carrier is replayed
+      // to the agent's model in the live window and to the compression model
+      // in later recall, and neither can be given reasoning another model
+      // signed. Its `tokens` stays the provider's output count, an upper bound
+      // on the text replayed, as a stitched entry's is.
+      const responseContent = successfulTrace?.model !== undefined
+        ? undefined
+        : captureResponseContent(acceptedResponse?.content ?? []);
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -13533,16 +13840,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance: which request authored this
         // memory and how the generation ended (always 'end_turn' post-gate;
-        // the field's presence marks the entry as gate-verified).
-        ...(successfulTrace
-          ? {
-              provenance: {
-                stopReason: successfulTrace.stopReason ?? 'end_turn',
-                requestHash: successfulTrace.requestHash,
-                model,
-              },
-            }
-          : {}),
+        // the field's presence marks the entry as gate-verified). A text an
+        // operator installed (externalWork) has none, since no model's
+        // answer passed the gate: `external` names the request it answers.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, ...(successfulTrace ? { requestHash: successfulTrace.requestHash } : {}) } }
+          : successfulTrace
+            ? {
+                provenance: {
+                  stopReason: successfulTrace.stopReason ?? 'end_turn',
+                  requestHash: successfulTrace.requestHash,
+                  // The fallback model, where its rung wrote the memory.
+                  model: successfulTrace.model ?? model,
+                },
+              }
+            : {}),
       };
 
       // Provenance the auditor can READ: store the accepted request under the
@@ -13569,7 +13881,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: 'compress_l1',
-          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length, summary_id: entry.id },
+          metadata: { model: successfulTrace?.model ?? model, chunk_size: chunk.messages.length, summary_id: entry.id },
         }, this.ns, quarantineRecord.chunkSourceHash);
       }
       this._compressionCount++;
@@ -13577,7 +13889,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The L1 is pushed and its chunk record marked: it has landed, on the
       // branch that compressed it (noted before the await below, which a
       // branch switch may cross).
-      this.noteCompressionLanded(ctx.membrane, model);
+      this.noteCompressionLanded(ctx.membrane, successfulTrace?.model ?? model);
       // Success pays off quarantine debt recorded against this chunk under
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
@@ -13686,7 +13998,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           has_doc_context: docContext !== null,
           doc_context: docContext,
           target_tokens: targetTokens,
-          model,
+          // The model whose answer the ladder took: the fallback model where
+          // its rung wrote the summary, as the entry's provenance says.
+          model: successfulTrace?.model ?? model,
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
           ...(logWithdrawn ? { withdrawn: true } : {}),
@@ -13860,6 +14174,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   so it merges as an interior run, as the plan projected. Off, the
    *   level's last run reads as the newest, and a run of seven takes five
    *   and leaves two to wait for growth that won't come beside them.
+   * - **Carries wait with the picks:** with `carryStrandedSummaries` set, the
+   *   check carries at a level only once nothing below it is left to land,
+   *   and reads which summaries stand alone as the planner does, so a
+   *   summary alone in a level's last run is carried where a higher summary
+   *   follows it. The plan projects the same carries when it is made with
+   *   the setting (`RepairRunsConfig.carryStrandedSummaries`).
    */
   protected landsAsPlanned(): boolean {
     return false;
@@ -13884,6 +14204,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     const threshold = this.config.mergeThreshold ?? 6;
+
+    // This check reads L1 and L2, so an L1 is the one level a carry lands
+    // where a merge can take it.
+    if (this.config.carryStrandedSummaries) this.carryStranded(1, this.mergePositionIndex());
 
     // IDs that are already part of a queued merge — exclude them from
     // eligibility so we don't re-enqueue.
@@ -13954,7 +14278,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of this.summaries) {
       if (s.level > maxLevel) maxLevel = s.level;
     }
+    // Carries come first at each level, lowest level first: what one makes
+    // stands a level up, where this pass reads it next.
+    const carryAt = this.config.carryStrandedSummaries ? this.mergePositionIndex() : undefined;
     for (let level = 1; level <= maxLevel; level++) {
+      if (carryAt) this.carryStranded(level, carryAt);
       const queued = queuedSources.get(level) ?? new Set();
       const unmerged = this.summaries.filter(
         s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
@@ -13967,6 +14295,174 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (this.landsAsPlanned() && this.mergeQueue.length > 0) return;
       }
+    }
+  }
+
+  /**
+   * The carry rule (`carryStrandedSummaries`) at one level: each summary of
+   * `level` the rule takes (merge-runs.ts carriesAtLevel) gets a parent a
+   * level up that is the same memory, with no model call (carry). It runs to
+   * a fixed point, since a carry can put a higher summary beside another
+   * that had none. The merge check calls it before it picks at `level`, from
+   * the lowest level up, so a carried entry is read at its new level in the
+   * same pass: there it joins a run and merges as any summary does, or
+   * stands alone again and is carried again, never above the highest summary
+   * beside it. Under a drain the check waits for both queues first
+   * (landsAsPlanned), so a carry never comes before work below it lands.
+   *
+   * Nothing is carried while the compression quarantine can't be read, since
+   * the holes beside a summary can't be named then, or where the store holds
+   * a candidate differently from this instance: another instance sharing the
+   * store parented or dropped it, and this one takes that up when its next
+   * merge or compression reads the store.
+   */
+  private carryStranded(level: number, position: Map<MessageId, number>): void {
+    for (;;) {
+      const input = this.mergeRunsInput(position);
+      const found = runsAtLevel(input, level);
+      if (found.wide.length === 0 && strandedIn(found.runs).length === 0) return;
+      let holes: RunHole[];
+      try {
+        holes = this.mergeHoles(position, input.held, this.readCompressionQuarantineProjection());
+      } catch {
+        return;
+      }
+      const sources = carriesAtLevel(input, level, holes, (s) => this.ownedLeafRows(s), found).map((x) => x.s);
+      if (sources.length === 0 || !this.unparentedInStore(sources)) return;
+      for (const source of sources) this.carry(source);
+    }
+  }
+
+  /**
+   * Write the parent that carries `source` up a level: the same memory under
+   * a new id (its text, its verbatim response blocks, its token count, its
+   * range, when it was written and by which request), with `source` as its
+   * one source and `carriedFrom` naming it. The source is marked merged into
+   * it, as a merge marks its sources. No model is called, so nothing here
+   * counts as a compression call, a landing or a failure, and since it keeps
+   * `created`, the debt report's last mint doesn't move.
+   */
+  private carry(source: SummaryEntry): void {
+    const { parentId: _parentId, mergedInto: _mergedInto, ...memory } = source;
+    const entry: SummaryEntry = {
+      ...memory,
+      id: `L${source.level + 1}-${this.nextSummaryIdCounter()}`,
+      level: source.level + 1,
+      sourceLevel: source.level,
+      sourceIds: [source.id],
+      sourceRange: { first: source.sourceRange.first, last: source.sourceRange.last },
+      ...(source.responseContent ? { responseContent: [...source.responseContent] } : {}),
+      carriedFrom: source.id,
+    };
+    this.pushSummary(entry);
+    this.setMergedInto(source, entry.id);
+    logCompressionCall({
+      event: 'summary:carried',
+      metadata: { summary_id: entry.id, carried_from: source.id, level: entry.level, tokens: entry.tokens },
+    }, this.ns);
+  }
+
+  /**
+   * The messages a summary stands for: its leaves through the L1s that are
+   * ownership (liveL1Ids), as the load-time audit reads them. A superseded
+   * L1 generation stands for none.
+   */
+  private ownedLeafRows(summary: SummaryEntry): MessageId[] {
+    const live = this.liveL1Ids();
+    const rows: MessageId[] = [];
+    const seen = new Set<string>();
+    const walk = (s: SummaryEntry): void => {
+      if (seen.has(s.id)) return;
+      seen.add(s.id);
+      if (s.sourceLevel === 0 || s.level === 1) {
+        if (live.has(s.id)) for (const id of s.sourceIds) rows.push(id);
+        return;
+      }
+      for (const id of s.sourceIds) {
+        const child = this.summaryById(id);
+        if (child) walk(child);
+      }
+    };
+    walk(summary);
+    return rows;
+  }
+
+  /** Whether the store's summary list holds each of `sources`, none with a parent (true without a list to read). */
+  private unparentedInStore(sources: readonly SummaryEntry[]): boolean {
+    const stored = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(stored)) return true;
+    const ids = new Set(sources.map((source) => source.id));
+    const listed = new Set<string>();
+    for (const item of stored as Array<SummaryEntry | null>) {
+      if (!item || typeof item.id !== 'string' || !ids.has(item.id)) continue;
+      if (getSummaryParentId(item)) return false;
+      listed.add(item.id);
+    }
+    return listed.size === ids.size;
+  }
+
+  /**
+   * What the carry rule would do from the store as it stands, whether or not
+   * `carryStrandedSummaries` is set: each carry it would make and each merge
+   * that would then land, in order, with no call failing and nothing new
+   * arriving (merge-runs.ts projectLadder). A step names what it makes
+   * (`as`), which a later step can take: `L3-7^4` is L3-7 carried to L4, and
+   * `merge#1` the first merge listed. A merge's `sourceTokens` are what its
+   * sources hold together; the tokens of a source an earlier listed merge
+   * writes aren't known, so they aren't counted, and `unwritten` says how
+   * many such sources it has. `alreadyQueued` marks a merge the stored queue
+   * holds, which runs with or without the rule.
+   *
+   * `asDrain` reads the store as a drain does (landsAsPlanned): a run with a
+   * higher summary after it can't grow, and picks go one at a time from the
+   * lowest level. Otherwise it reads as a resident's own merge check does,
+   * where each level's last run is the newest and waits to grow, so a
+   * summary alone in it is not carried. It reads the compression quarantine
+   * ledger afresh, as getStrandedSummaries does, and where that or the
+   * projection fails it returns an `error` in place of the list. It writes
+   * nothing, and never throws.
+   *
+   * A drain compresses every chunk its compression queue holds before its
+   * merge check carries or picks anything, and the steps don't project the
+   * L1s those chunks land. So read as a drain, `chunksWaiting` counts the
+   * queued chunks no compression quarantine holds, when there are any: the
+   * steps are then provisional, since an L1 that lands beside a summary
+   * listed here gives it a partner, or stands alone beside it, and what
+   * follows differs. Preview again once they have landed. It counts the
+   * chunks this instance queued when it opened the store; messages no chunk
+   * record holds yet, which a drain chunks and compresses too, aren't
+   * counted. A resident's own check waits for no chunk, so that reading
+   * gives no count.
+   */
+  previewCarries(options: { asDrain?: boolean } = {}): { steps: LadderStep[]; chunksWaiting?: number } | { steps: null; error: string } {
+    try {
+      const order = this.mergePositionIndex();
+      const asDrain = options.asDrain ?? this.landsAsPlanned();
+      const input = { ...this.mergeRunsInput(order), planning: asDrain };
+      const queue = this.mergeQueue.filter((m) => queuedMergeRuns(m, (id) => this.summaryById(id), getSummaryParentId, order, input.held));
+      const holes = this.mergeHoles(order, input.held, this.readCompressionQuarantineProjection());
+      // A quarantined chunk is a hole of level 0 over its messages: it lands nothing.
+      const quarantined = (chunk: Chunk): boolean => chunk.messages.some((message) => {
+        const at = order.get(message.id);
+        return at !== undefined && holes.some((hole) => hole.level === 0 && hole.first <= at && at <= hole.last);
+      });
+      const chunksWaiting = !asDrain ? 0 : this.compressionQueue.filter((index) => {
+        const chunk = this.chunks[index];
+        return chunk !== undefined && !chunk.compressed && !quarantined(chunk);
+      }).length;
+      return {
+        steps: projectLadder(input, {
+          threshold: this.config.mergeThreshold ?? 6,
+          everyLevel: !!this.config.speculativeProduction,
+          carry: true,
+          holes,
+          leaves: (s) => this.ownedLeafRows(s),
+          queue,
+        }),
+        ...(chunksWaiting > 0 ? { chunksWaiting } : {}),
+      };
+    } catch (thrown) {
+      return { steps: null, error: carryPreviewFailedMessage(thrown) };
     }
   }
 
@@ -14083,7 +14579,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // retried only by clearMergeQuarantine, which deletes the record first.
     this.refreshStoreOrder(ctx.messageStore.getAll());
     const position = this.mergePositionIndex();
-    const held = this.mergeHeldSourceIds(position);
+    const held = this.mergeHeldSourceIds(position, this.externalWork?.mergeRecordKey);
     const heldSources = sources.filter((source) => held.has(source.id));
     if (heldSources.length > 0) {
       this.diag.warn(
@@ -14118,8 +14614,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
     const participant = this.config.summaryParticipant ?? 'Claude';
+    // The fallback-model rung (see recordMergeRejection) sends the request of
+    // a first attempt, so it counts as one for everything an attempt count
+    // changes below.
+    const fallbackModel = this.mergeQueue[0]?.sourceIds === sourceIds && this.mergeQueue[0]?.fallbackModel === true
+      ? this.config.compressionFallbackModel
+      : undefined;
     const mergeAttempts =
-      this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
+      !fallbackModel && this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
     const mergeAttemptLimit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     const mergeSourceOnly = this.config.compressionMergeSourceOnly === true ||
       (this.config.compressionMergeSourceOnlyFallback === true &&
@@ -14370,6 +14872,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // fidelity loss only on the degraded retry, and the summaries shown are
     // the agent's own words, so nothing is falsified.
     const refusalFallback =
+      !fallbackModel &&
       this.mergeQueue[0]?.sourceIds === sourceIds &&
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       (this.mergeQueue[0]?.hadRefusal === true ||
@@ -14548,6 +15051,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // this merge is authored under — and a merge re-summarizes summaries,
     // so an omission here compounds upward through every level of the
     // pyramid.
+    const requestModel = fallbackModel ?? this.requireCompressionModel();
+    if (fallbackModel) {
+      this.diag.warn(
+        `[autobiographical] L${targetLevel} merge refused on every attempt by ${this.config.compressionModel}: ` +
+          `sending the first attempt's request to compressionFallbackModel ${fallbackModel}`,
+      );
+      logCompressionCall({
+        event: 'merge:fallback-model',
+        operation: `merge_l${targetLevel}`,
+        metadata: { target_level: targetLevel, source_ids: sourceIds, model: this.config.compressionModel, fallback_model: fallbackModel },
+      }, this.ns);
+    }
     const request: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than
@@ -14573,7 +15088,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // must keep its pre-seam shape (canonical hash, quarantine identity).
       ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
-        model: this.requireCompressionModel(),
+        model: requestModel,
         // Generous output ceiling so a memory-write is never truncated mid-thought:
         // targetTokens is a *target*, not a cap, and adaptive models routinely
         // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
@@ -14725,7 +15240,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             stop_reason: stopReason ?? null,
             error_type: errorType ?? null,
             request_hash: requestHash,
-            model: this.requireCompressionModel(),
+            model: requestModel,
           },
         }, this.ns);
         throw new MergeDispositionRejection(
@@ -14737,12 +15252,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // are captured for replay — see the L1 site / captureResponseContent.
       const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
       const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
-      const mergeExtraction = extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      // An operator's text (externalWork) is stored as given, as at the L1 site.
+      const mergeExtraction = this.externalWork?.by
+        ? { text: assessment.text, recoveredWholeWrapper: false }
+        : extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
       const mergedText = mergeExtraction.text;
       const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
       // A recovered answer has text blocks alone, so it stores no carrier,
-      // as any text-only answer; replay reads its unwrapped `content`.
-      const responseContent = captureResponseContent(assessment.response.content);
+      // as any text-only answer; replay reads its unwrapped `content`. The
+      // fallback model's answer stores none either (see the L1 site).
+      const responseContent = fallbackModel ? undefined : captureResponseContent(assessment.response.content);
       logResponse = mergedText;
 
       // The disposition gate guarantees nonempty PRE-strip text; a
@@ -14787,11 +15306,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(responseContent ? { responseContent } : {}),
         // Terminal-disposition provenance (see SummaryEntry.provenance):
         // always 'end_turn' post-gate; presence marks the entry gate-verified.
-        provenance: {
-          stopReason: 'end_turn',
-          requestHash,
-          model: this.requireCompressionModel(),
-        },
+        // A text an operator installed has none, as at the L1 site. The
+        // model is the fallback model, where its rung wrote the merge.
+        ...(this.externalWork?.by
+          ? { external: { ...this.externalWork.by, requestHash } }
+          : { provenance: { stopReason: 'end_turn', requestHash, model: requestModel } }),
       };
       logNewSummaryId = newEntry.id;
 
@@ -14817,7 +15336,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: `merge_l${targetLevel}`,
-          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length, summary_id: newEntry.id },
+          metadata: { model: requestModel, source_count: sourceIds.length, summary_id: newEntry.id },
         }, this.ns);
       }
 
@@ -14861,7 +15380,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           source_level: sources[0]?.level ?? null,
           source_level_shown: sourceLevelShown,
           target_tokens: targetTokens,
-          model: this.requireCompressionModel(),
+          model: requestModel,
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
           ...(logWithdrawn ? { withdrawn: true } : {}),
@@ -14870,6 +15389,255 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: logError,
       }, this.ns);
     }
+  }
+
+  // ===========================================================================
+  // External memories: text written outside this strategy's compression
+  // calls, for work the provider refuses on every attempt. The tree's shape
+  // stays the strategy's: an operator supplies the text of work the strategy
+  // would do itself, and the text enters where a provider's answer would.
+  // ===========================================================================
+
+  /**
+   * Set while an operator's work runs (exportMemoryRequest,
+   * importExternalMemory). `by` stamps the summary the work writes; without
+   * it the work is run only to read its request, and every change the
+   * strategy would make to its own state on the way is refused
+   * (requireBranchMutation). `mergeRecordKey` is the merge-quarantine record
+   * whose own group it is. It is the instance's, not the call's: compression
+   * running beside the work would read it too, so the work is for a
+   * strategy with no tick or other compression in progress.
+   */
+  private externalWork: { by?: ExternalMemoryProvenance; mergeRecordKey?: string } | null = null;
+
+  /**
+   * The work `target` names, as the strategy would do it now, or an error
+   * saying why it would do none.
+   *
+   * A chunk record's L1: the record's chunk, not yet covered by an L1, and
+   * not one the thin-chunk guard stubs without a request. A quarantined
+   * chunk is such a chunk.
+   *
+   * The next merge into a level, the first of: the group of the oldest
+   * merge-quarantine record at that level that holds its sources
+   * (mergeRecordHolds), in store order, as clearMergeQuarantine would queue
+   * it; the first queued merge into that level that executeMerge would
+   * still run; the group the merge check would queue now
+   * (contiguousMergeCandidates over the level's unparented, unqueued
+   * summaries).
+   */
+  private externalWorkFor(target: MemoryWorkTarget, ctx: StrategyContext): {
+    item: Omit<MemoryWorkItem, 'requestHash'>;
+    mergeRecordKey?: string;
+    run: (ctx: StrategyContext) => Promise<void>;
+  } {
+    this.requireLoadedBranch('externalWorkFor');
+    if ('chunkRecordId' in target) {
+      const chunk = this.chunks.find((c) => c.recordId === target.chunkRecordId);
+      if (!chunk) throw new Error(`no chunk record ${target.chunkRecordId}`);
+      const covered = new Set(this.summaries.filter((s) => s.level === 1).flatMap((s) => s.sourceIds));
+      if (chunk.compressed || chunk.messages.some((m) => covered.has(m.id))) {
+        throw new Error(`chunk ${target.chunkRecordId} is compressed already, or an L1 covers a message of it`);
+      }
+      if (this.thinChunkChars(chunk) !== undefined) {
+        throw new Error(`chunk ${target.chunkRecordId} is a quiet stretch, which the strategy stubs without a request`);
+      }
+      const ids = chunk.messages.map((m) => m.id);
+      return {
+        item: { level: 1, sourceLevel: 0, sourceIds: ids, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! }, chunkRecordId: target.chunkRecordId },
+        run: (runCtx) => this.compressChunkHierarchical(chunk, runCtx),
+      };
+    }
+
+    const level = target.level;
+    this.refreshStoreOrder(ctx.messageStore.getAll());
+    const position = this.mergePositionIndex();
+    const record = [...this.mergeQuarantine.values()]
+      .filter((r) => r.level === level && this.mergeRecordHolds(r, position))
+      .sort((a, b) => a.quarantinedAt - b.quarantinedAt)[0];
+    const held = this.mergeHeldSourceIds(position);
+    const runnable = (ids: readonly string[]): SummaryEntry[] | null => {
+      const sources = ids.map((id) => this.summaryById(id));
+      if (sources.some((s) => !s || getSummaryParentId(s) || held.has(s.id))) return null;
+      return this.mergeTopologyProblem(level, sources as SummaryEntry[], position) === null ? sources as SummaryEntry[] : null;
+    };
+    const queued = record ? undefined : this.mergeQueue.find((m) => m.level === level && runnable(m.sourceIds));
+    let sources: SummaryEntry[] | null | undefined;
+    if (record) {
+      [sources] = this.contiguousSourceRuns(record.sourceIds.map((id) => this.summaryById(id)!), position);
+    } else if (queued) {
+      sources = runnable(queued.sourceIds);
+    } else if (this.config.speculativeProduction || level <= 3) {
+      const inQueue = new Set(this.mergeQueue.flatMap((m) => m.sourceIds));
+      sources = this.contiguousMergeCandidates(
+        this.summaries.filter((s) => s.level === level - 1 && !getSummaryParentId(s) && !inQueue.has(s.id)),
+        this.config.mergeThreshold ?? 6,
+      );
+    }
+    if (!sources || sources.length === 0) throw new Error(`the strategy would merge nothing into L${level} now`);
+    // A queued entry keeps its own list: executeMerge reads its retry state by it.
+    const sourceIds = queued ? queued.sourceIds : sources.map((s) => s.id);
+    return {
+      item: {
+        level,
+        sourceLevel: level - 1,
+        sourceIds: [...sourceIds],
+        sourceRange: { first: sources[0]!.sourceRange.first, last: sources[sources.length - 1]!.sourceRange.last },
+      },
+      ...(record ? { mergeRecordKey: record.key } : {}),
+      run: async (runCtx) => {
+        if (!await this.executeMerge(level, sourceIds, runCtx)) return;
+        // What tick does after a merge it ran lands: the entry leaves the
+        // queue, and a record the merge paid off is swept.
+        const at = queued ? this.mergeQueue.indexOf(queued) : -1;
+        if (at >= 0) {
+          this.mergeQueue.splice(at, 1);
+          this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+        }
+        if (record) this.sweepPaidOffMergeQuarantine();
+      },
+    };
+  }
+
+  /** Run the work with `complete` standing where the provider's call would; a withdrawal it throws ends the work quietly. */
+  private async runExternalWork(
+    work: ReturnType<AutobiographicalStrategy['externalWorkFor']>,
+    ctx: StrategyContext,
+    by: ExternalMemoryProvenance | undefined,
+    complete: (request: NormalizedRequest) => Promise<NormalizedResponse>,
+  ): Promise<void> {
+    this.externalWork = { ...(by ? { by } : {}), ...(work.mergeRecordKey ? { mergeRecordKey: work.mergeRecordKey } : {}) };
+    try {
+      await work.run({ ...ctx, membrane: { complete } as unknown as Membrane });
+    } catch (error) {
+      if (!isCompressionWithdrawn(error)) throw error;
+    } finally {
+      this.externalWork = null;
+    }
+  }
+
+  /**
+   * The request the strategy would send now for one piece of work, and the
+   * work it is for. The work runs as tick would run it, up to the call,
+   * which is withdrawn (CompressionWithdrawn) in place of being made, so
+   * nothing is sent, counted or written. A quarantine of the work itself
+   * doesn't stop it. An error when the strategy would make no request for
+   * it as it stands: while it waits on the host's tool definitions, or
+   * where it would change its own state first (skip a group holding a held
+   * source and queue what stands beside it, adopt a summary the store
+   * already holds), a change that is refused, not made.
+   */
+  async exportMemoryRequest(target: MemoryWorkTarget, ctx: StrategyContext): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }> {
+    const work = this.externalWorkFor(target, ctx);
+    let request: NormalizedRequest | undefined;
+    await this.runExternalWork(work, ctx, undefined, async (sent) => {
+      request ??= structuredClone(sent);
+      throw new CompressionWithdrawn('request exported, not sent');
+    });
+    if (!request) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
+    return { item: { ...work.item, requestHash: sha256Json(request) }, request };
+  }
+
+  /**
+   * Install `body` as the summary of `item`, a work item exportMemoryRequest
+   * gave. Refused unless the strategy would do that same work now, the
+   * same level, sources in the same order and range, and builds for it the
+   * request it built then (`item.requestHash`): a text written for a request
+   * whose history, recall or settings have changed since isn't its answer.
+   * The text takes the place of the provider's answer to that request, the
+   * first the work sends, so the summary is written as a native one is: its
+   * lineage, its sources' parent, its chunk record, its token stamp from the
+   * text (no usage comes with it), and the quarantine of its chunk or merge
+   * paid off. The text is stored as given, with no thinking wrapper read
+   * out of it as out of a model's answer. It carries no reasoning and no
+   * `provenance`, which is a model call's: `external` says who supplied it
+   * and names the request it answers. Without `apply` the work is run to
+   * its request as exportMemoryRequest runs it, the same checks are made,
+   * and nothing is written.
+   */
+  async importExternalMemory(
+    item: MemoryWorkItem,
+    body: string,
+    by: Omit<ExternalMemoryProvenance, 'at'>,
+    ctx: StrategyContext,
+    options: { apply?: boolean } = {},
+  ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }> {
+    const work = this.externalWorkFor(item.chunkRecordId !== undefined ? { chunkRecordId: item.chunkRecordId } : { level: item.level }, ctx);
+    const now = work.item;
+    if (
+      now.level !== item.level || now.sourceLevel !== item.sourceLevel ||
+      now.sourceRange.first !== item.sourceRange?.first || now.sourceRange.last !== item.sourceRange?.last ||
+      now.sourceIds.length !== item.sourceIds?.length || now.sourceIds.some((id, i) => id !== item.sourceIds[i])
+    ) {
+      throw new Error(
+        `the work described is not what the strategy would do now, which is an L${now.level} over ` +
+          `[${now.sourceIds.join(', ')}] (${now.sourceRange.first}..${now.sourceRange.last}); export its request again`,
+      );
+    }
+    if (body.trim().length === 0) throw new Error('the memory text is empty');
+
+    const before = new Set(this.summaries.map((s) => s.id));
+    const stamp = options.apply ? { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) } : undefined;
+    /** The first request the work sends now, hashed as the export hashed its own. */
+    let requestHash: string | undefined;
+    await this.runExternalWork(work, ctx, stamp, async (request) => {
+      // One answer: a text the strategy turns down must not answer its next request too.
+      if (requestHash !== undefined) throw new CompressionWithdrawn('external memory text already given');
+      requestHash = sha256Json(request);
+      if (requestHash !== item.requestHash) throw new CompressionWithdrawn('not the request the text was written for');
+      if (!stamp) throw new CompressionWithdrawn('dry run: the text is not given');
+      return { content: [{ type: 'text', text: body }], stopReason: 'end_turn', usage: { inputTokens: 0, outputTokens: 0 } } as unknown as NormalizedResponse;
+    });
+    if (requestHash === undefined) throw new Error('the strategy made no request for this work as it stands; its warnings say why');
+    if (requestHash !== item.requestHash) {
+      throw new Error(
+        `the request the strategy builds for this work now (sha256 ${requestHash}) is not the one exported ` +
+          `(${item.requestHash ?? 'none recorded'}): what it shows has changed since; export its request again`,
+      );
+    }
+    const described = { ...now, requestHash };
+    if (!stamp) return { item: described, applied: false, tokens: Math.ceil(body.length / 3) };
+    const entry = this.summaries.find((s) => !before.has(s.id) && s.external !== undefined);
+    if (!entry) throw new Error('the strategy did not store the text; its warnings say why');
+    return { item: described, applied: true, tokens: entry.tokens, summaryId: entry.id };
+  }
+
+  /**
+   * Replace the text of one summary. Its lineage stays as it is; its tokens
+   * are stamped from the new text; what described the call that wrote the
+   * old text goes, since it no longer matches: the verbatim response blocks
+   * it carried, its `provenance` and its split-stitch record (`stitched`);
+   * and `external` says who supplied the text. The store's history keeps
+   * the entry as it was. Summaries merged over the old text are reported
+   * and left alone. Without `apply` nothing is written.
+   */
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
+    this.requireLoadedBranch('editSummaryText');
+    const entry = this.summaries.find((s) => s.id === id);
+    if (!entry) throw new Error(`no summary ${id}`);
+    if (body.trim().length === 0) throw new Error('the memory text is empty');
+    const parents: SummaryTextEdit['parents'] = [];
+    for (let parent = this.summaryById(getSummaryParentId(entry) ?? ''); parent; parent = this.summaryById(getSummaryParentId(parent) ?? '')) {
+      parents.push({ id: parent.id, level: parent.level });
+    }
+    const edit: SummaryTextEdit = {
+      id,
+      level: entry.level,
+      applied: options.apply === true,
+      prior: { sha256: createHash('sha256').update(entry.content, 'utf8').digest('hex'), length: entry.content.length, tokens: entry.tokens },
+      tokens: Math.ceil(body.length / 3),
+      droppedResponseBlocks: entry.responseContent?.length ?? 0,
+      parents,
+    };
+    if (!options.apply) return edit;
+    entry.content = body;
+    entry.tokens = edit.tokens;
+    delete entry.responseContent;
+    delete entry.provenance;
+    delete entry.stitched;
+    entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    this.writeStoredSummary(entry, 'editSummaryText', 'new text');
+    return edit;
   }
 
   /** Inventory, not solver eligibility: pins, locks, and geometry can prevent using these summaries. */
@@ -19730,8 +20498,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Gather top summaries for broader context
+    // A carried entry repeats the text of the summary it carries, so it
+    // isn't one of these.
     const topSummaries = this.summaries
-      .filter(s => s.level >= 2)
+      .filter(s => s.level >= 2 && !carriesItsSource(s))
       .slice(-3)
       .map(s => s.content)
       .join('\n\n---\n\n');
@@ -22506,10 +23276,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * envelope the result, rather than truncating an already-enveloped body.
    */
   protected summaryAnswerProse(summary: SummaryEntry): ContentBlock[] {
-    if (summary.responseContent && summary.responseContent.length > 0) {
-      return [...summary.responseContent];
+    const memory = this.carriedMemory(summary);
+    if (memory.responseContent && memory.responseContent.length > 0) {
+      return [...memory.responseContent];
     }
-    return [{ type: 'text', text: summary.content }];
+    return [{ type: 'text', text: memory.content }];
+  }
+
+  /**
+   * The summary whose text answers for `entry`: the entry itself, or, for
+   * one that carries a summary up a level (`carryStrandedSummaries`), the
+   * summary a summarizer wrote under it, through each entry that carries
+   * it. A compile reads that summary in the entry's place (pastCarries), and
+   * a summarizer request that names the entry (a merge over it, a recall
+   * before a chunk or a merge) answers with the same text, as it stands
+   * now: a repair that rewrites a summary in place reaches every entry that
+   * carries it, and the copy an entry was written with stands only where
+   * this instance doesn't hold the summary under it.
+   */
+  private carriedMemory(entry: SummaryEntry): SummaryEntry {
+    for (let under: SummaryEntry | undefined; carriesItsSource(entry) && (under = this.summaryById(entry.sourceIds[0]!)); ) entry = under;
+    return entry;
   }
 
   /**
