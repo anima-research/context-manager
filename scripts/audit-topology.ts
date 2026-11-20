@@ -9,14 +9,23 @@
  * It runs the same audit as `initialize` (topologyPolicy).
  *
  * Usage:
- *   node dist/scripts/audit-topology.js <store-path> [--namespace <ns>] [--json] [run settings]
+ *   node dist/scripts/audit-topology.js <store-path> [--namespace <ns>] [--json] [--carry-preview[=drain]] [run settings]
  *
  * It also lists the summaries no merge can take as the store stands
  * (`getStrandedSummaries()`), by the run rule, which reads the resident's run
  * settings; the store doesn't hold them, so pass them as the resident has
  * them (--merge-threshold, --merge-max-span and --merge-hold, each also as
- * --flag=value, and --no-speculative-production; see --help). The text
- * output prints the values it used.
+ * --flag=value, --no-speculative-production and --carry-stranded-summaries;
+ * see --help). The text output prints the values it used.
+ *
+ * --carry-preview lists what the carry rule (`carryStrandedSummaries`) would
+ * do to the store as it stands under those settings, whether or not the
+ * resident has it set: each carry and each merge that would then land, in
+ * order (`previewCarries()`). It reads the store as the resident's own merge
+ * check does; --carry-preview=drain reads it as drain-autobiographical does,
+ * and says so when chunks still wait for compression: a drain lands those
+ * first, so the steps are provisional until they have (`chunksWaiting`).
+ * It writes nothing more than the audit-only open already does.
  *
  * Exit code 0 = no topology violation, 2 = violations found, 1 = could not
  * open. Stranded summaries, and a stranded check that couldn't run, are
@@ -34,8 +43,10 @@ import { flagValue, positionalArg, runsFromArgs, runsLine, RUN_VALUE_FLAGS, RUNS
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const usage = 'Usage: audit-topology <store-path> [--namespace <ns>] [--json]\n' +
-    '  the stray list reads these resident settings (pass them as the resident has them):\n' + RUNS_USAGE;
+  const usage = 'Usage: audit-topology <store-path> [--namespace <ns>] [--json] [--carry-preview[=drain]]\n' +
+    '  --carry-preview lists what carryStrandedSummaries would do to the store as it stands: each carry, and each merge that\n' +
+    '  would then land, in order, read as the resident\'s own merge check reads the store (=drain: as drain-autobiographical does)\n' +
+    '  the stray list and the preview read these resident settings (pass them as the resident has them):\n' + RUNS_USAGE;
   if (args.includes('--help')) { console.log(usage); process.exit(0); }
   const namespace = flagValue(args, '--namespace');
   if (typeof namespace === 'object') { console.error(namespace.error); process.exit(1); }
@@ -48,6 +59,11 @@ async function main(): Promise<void> {
   const runs = runsFromArgs(args);
   if ('error' in runs) { console.error(runs.error); process.exit(1); }
   const json = args.includes('--json');
+  const previewAs = args.find((a) => a === '--carry-preview' || a.startsWith('--carry-preview='));
+  if (previewAs !== undefined && previewAs !== '--carry-preview' && previewAs !== '--carry-preview=drain') {
+    console.error(`--carry-preview takes no value, or drain; got ${previewAs}`);
+    process.exit(1);
+  }
   const strategy = new AutobiographicalStrategy({
     adaptiveResolution: true,
     hierarchical: true,
@@ -58,6 +74,7 @@ async function main(): Promise<void> {
     mergeMaxSourceSpanMessages: runs.mergeMaxSourceSpanMessages,
     mergeHoldSummaryIds: runs.mergeHoldSummaryIds,
     speculativeProduction: runs.speculativeProduction,
+    carryStrandedSummaries: runs.carryStrandedSummaries,
   });
   const membrane = { complete: async () => ({ content: [{ type: 'text', text: '[audit]' }] }) };
   const manager = await ContextManager.open({
@@ -67,6 +84,7 @@ async function main(): Promise<void> {
     const violations = strategy.getTopologyViolations();
     const debt = strategy.getCompressionDebt();
     const stranded = strategy.getStrandedSummaries();
+    const preview = previewAs === undefined ? undefined : strategy.previewCarries({ asDrain: previewAs === '--carry-preview=drain' });
     const internals = strategy as unknown as { summaries: Array<{ level: number }>; chunks: Array<{ summaryId?: string }> };
     const levels: Record<string, number> = {};
     for (const s of internals.summaries) levels[`L${s.level}`] = (levels[`L${s.level}`] ?? 0) + 1;
@@ -78,7 +96,7 @@ async function main(): Promise<void> {
         `check the namespace (--namespace agents/<Name>) and that the copy carries the strategy state.`);
     }
     if (json) {
-      console.log(JSON.stringify({ store: storePath, namespace, messages: manager.getMessageCount(), summaries: internals.summaries.length, levels, chunks: internals.chunks.length, linkedChunks: linked, runs, violations, debt, stranded }, null, 2));
+      console.log(JSON.stringify({ store: storePath, namespace, messages: manager.getMessageCount(), summaries: internals.summaries.length, levels, chunks: internals.chunks.length, linkedChunks: linked, runs, violations, debt, stranded, ...(preview ? { carryPreview: preview } : {}) }, null, 2));
     } else {
       console.log(`${storePath}${namespace ? ` (${namespace})` : ''}: ${manager.getMessageCount()} messages, ${seen}, ` +
         `${violations.length} topology violation(s), compression debt ${debt.state}`);
@@ -114,6 +132,27 @@ async function main(): Promise<void> {
             ? `nothing quarantined or held beside it, so ${rebuild}`
             : `${sides.join('; ')}; if it is still listed after that, ${rebuild}`;
         console.log(`  stranded L${s.level} ${s.id}: ${s.tokens} tokens, ${beside}`);
+      }
+      if (preview) {
+        const reading = previewAs === '--carry-preview=drain' ? 'as a drain reads the store' : 'as the resident\'s own merge check reads the store';
+        if (preview.steps === null) {
+          console.log('  carry preview: not made:');
+          for (const line of preview.error.split('\n')) console.log(`    ${line}`);
+        } else {
+          const carries = preview.steps.filter((step) => step.kind === 'carry').length;
+          console.log(`  carry preview (${reading}): ${carries} carr${carries === 1 ? 'y' : 'ies'}, ${preview.steps.length - carries} merge(s), in order`);
+          if (preview.chunksWaiting) {
+            console.log(`    provisional: ${preview.chunksWaiting} chunk(s) wait for compression, and a drain lands their L1s before it carries or merges; ` +
+              'where one lands beside a summary listed below, the steps from there differ. Preview again once they have landed.');
+          }
+          for (const step of preview.steps) {
+            console.log(step.kind === 'carry'
+              ? `    carry ${step.id}: L${step.fromLevel} to L${step.toLevel}, no model call (as ${step.as})`
+              : `    merge to L${step.level}: ${step.sourceIds.join(', ')} (${step.sourceTokens} source tokens` +
+                `${step.unwritten ? `, not counting ${step.unwritten} source(s) a merge above writes` : ''}` +
+                `${step.alreadyQueued ? '; already queued' : ''}; as ${step.as})`);
+          }
+        }
       }
       for (const v of violations) {
         console.log(`  L${v.level} ${v.id}: ${v.leafCount} leaves ${v.span.first}..${v.span.last}, ` +

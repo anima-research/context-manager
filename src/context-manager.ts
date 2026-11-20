@@ -1,5 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, NormalizedMessage, ContentBlock, ToolDefinition } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type {
   MessageId,
   Sequence,
@@ -51,8 +51,9 @@ import {
   isHotConfigurableStrategy,
   isRenderingFrontierStrategy,
   isDerivationManifestStrategy,
+  isExternalMemoryStrategy,
 } from './types/index.js';
-import type { DerivationManifestOptions } from './types/index.js';
+import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit } from './types/index.js';
 import { isStateExistsFor } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
@@ -4972,6 +4973,42 @@ export class ContextManager {
     const summary = await this.strategy.generateTransitionSummary(this.createStrategyContext());
     this.requireInitialized('generateTransitionSummary', attempt);
     return summary;
+  }
+
+  // ==========================================================================
+  // External memories: text written outside the strategy's compression calls
+  // (see AutobiographicalStrategy). For a resident that isn't running: call
+  // them only with no tick, compression or other such call in progress on
+  // this manager. None of them waits for, holds off or is kept apart from
+  // compression in flight, whose summaries would take the work's stamp, and
+  // none is checked again after a branch switch or a strategy replaced
+  // while it waited.
+  // ==========================================================================
+
+  private externalMemoryStrategy(operation: string): ExternalMemoryStrategy {
+    this.requireInitialized(operation);
+    if (!isExternalMemoryStrategy(this.strategy)) throw new Error('Active strategy does not take external memories');
+    return this.strategy;
+  }
+
+  /** The request the strategy would send now for one piece of work, and the work it is for. Nothing is sent or written. */
+  exportMemoryRequest(target: MemoryWorkTarget): Promise<{ item: MemoryWorkItem; request: NormalizedRequest }> {
+    return this.externalMemoryStrategy('exportMemoryRequest').exportMemoryRequest(target, this.createStrategyContext());
+  }
+
+  /** Install `body` as the summary of a work item `exportMemoryRequest` gave, if the strategy would still do that work from the same request. */
+  importExternalMemory(
+    item: MemoryWorkItem,
+    body: string,
+    by: Omit<ExternalMemoryProvenance, 'at'>,
+    options?: { apply?: boolean },
+  ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }> {
+    return this.externalMemoryStrategy('importExternalMemory').importExternalMemory(item, body, by, this.createStrategyContext(), options);
+  }
+
+  /** Replace the text of one summary, leaving its lineage and the summaries merged over it as they are. */
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: { apply?: boolean }): SummaryTextEdit {
+    return this.externalMemoryStrategy('editSummaryText').editSummaryText(id, body, by, options);
   }
 
   /**
