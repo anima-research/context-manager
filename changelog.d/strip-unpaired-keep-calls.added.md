@@ -1,0 +1,1 @@
+- `stripUnpairedToolBlocks(messages, { keepCalls: true })` leaves every tool call and removes only the tool results that answer no call before them, returning each message it leaves whole as itself and each it changes as a copy with the new content.
