@@ -248,16 +248,18 @@ cross-process coalescing if that boundary is bypassed. A process crash before
 exhaustion leaves no durable claim and therefore cannot suppress the family
 forever.
 
-The logical ledger is finitely retained. At 256 events, mutation under the same
-branch-pinned lock appends an active-projection checkpoint first, then redacts
-the preceding event range and asks Chronicle to compact the state. The
-append-first order makes both crash gaps replay-equivalent and avoids an unsafe
-read/replace whole-array snapshot. A checkpoint retains the newest 1,024 active
-exhausted families; older families expire and may make a new canonical-first
-attempt. Between checkpoints at most 128 two-event exhaustion/pending-alert
-groups can accumulate, so both active state and event history have a finite
-bound. Within that window, a family remains until its key changes, an
-exact-generation operator clear, or its ledger entry is found unusable.
+At 256 events, mutation under the same branch-pinned lock appends an
+active-projection checkpoint first, then redacts the preceding event range and
+asks Chronicle to compact the state. The append-first order makes both crash
+gaps replay-equivalent and avoids an unsafe read/replace whole-array snapshot.
+A checkpoint retains every active exhausted family and its generation; it does
+not expire older families or cap active state at 1,024 families. Checkpointing
+bounds accumulated event history when redaction and compaction succeed, not the
+number of active holds or checkpoint bytes. Persistent hygiene failure can append
+repeated full checkpoints and grow replay history; the warning is once per load. A hold remains until an exact-generation operator clear, an automatic
+paid-off/orphan sweep or successful-compression clear, or its ledger entry is
+found unusable. Changing request keys does not remove old holds; they can still
+count toward the same-source/regime shape cap.
 
 ## Observability
 
@@ -358,7 +360,9 @@ Suggested trace events:
 10. No thinking/private/tool payload is removed or altered by fallback construction.
 11. All-refused writes durable quarantine and stores no summary.
 12. Same unchanged request after restart makes no provider call.
-13. Changed frontier/chunk/model invalidates quarantine and permits retry.
+13. Changed frontier/model changes the request key but retains same-source/regime
+    holds: retry is permitted only below the shape cap. Changed chunk membership
+    changes the source identity; it does not delete old holds.
 14. Duplicate/concurrent producers still store only one L1 summary.
 
 ### Integration

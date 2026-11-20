@@ -131,3 +131,6 @@ npm run typecheck
 ## License
 
 MIT, as `package.json` declares.
+
+See [selected L1 quarantine waiver](docs/keyed-compression-quarantine.md) for the optional
+metadata-only inspection and generation-fenced library capability.

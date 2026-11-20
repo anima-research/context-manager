@@ -368,7 +368,9 @@ export interface ContextStrategy {
    * While the manager is in legacy mode its window is the record, so a row
    * enters it when this manager stores it: the call comes from inside the
    * addMessage that stored it, after a holdCompression hold is placed, and
-   * its synchronous part runs before addMessage returns. A sharded add is
+   * its synchronous part normally runs before addMessage returns. For the
+   * onNewMessage adapter, a failed scope/window-mode observation leaves the
+   * notification pending for a later notification on this manager. A sharded add is
    * told once, after every shard is stored, with every shard, as a
    * presentRows gives a body; a strategy with only onNewMessage hears each
    * shard in turn at that point. A sharded write that fails tells the
@@ -525,7 +527,12 @@ export interface ContextStrategy {
    * form of onPresented, called only for a strategy without onPresented, at
    * the points onPresented says. While the manager is in legacy mode, that
    * is after a message is added to the store, inside the write that stored
-   * it, so its synchronous part runs before addMessage returns. Once a host
+   * it, so its synchronous part normally runs before addMessage returns.
+   * If the adapter cannot read its scope or window mode, the rows remain
+   * pending in memory on this manager until a later notification; close
+   * discards them. The failure is logged once per episode, and
+   * `ContextManager.stats().pendingStrategyNotifications` counts what waits.
+   * Once a host
    * presents rows on the branch, it is from presentRows, once per row
    * presented, in window order, and no longer at the add: a row stored and
    * not presented isn't in the window the context reads. Each row's call
@@ -1618,6 +1625,13 @@ export interface CompressionQuarantineStatus {
    * its all-clear nor calls its handler until a read succeeds.
    */
   unreadable?: true;
+  /**
+   * Optional episode-end intent, never proof of coverage or debt payment.
+   * `quarantine-empty` means only no held records (sweeps also clear orphans).
+   * `operator-waiver-requested` is known only in the observing live episode;
+   * a write may still have failed. Absent/unknown reasons remain neutral.
+   */
+  clearReason?: 'quarantine-empty' | 'operator-waiver-requested';
 }
 
 /** Why a load's repair dropped a summary that held text (LoadRepairReport). */
@@ -1685,7 +1699,7 @@ export interface LoadRepairReport {
   emptyDropped: number;
 }
 
-/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+/** One held span; retained records can outlive raw debt after cleanup failures. */
 export interface CompressionQuarantineSpan {
   /** The span's identity: the hash of its chunk's message ids. */
   chunkSourceHash: string;
@@ -1694,12 +1708,12 @@ export interface CompressionQuarantineSpan {
   lastMessageId: string | null;
   /**
    * How long since its chunk closed, from the newest of its messages'
-   * timestamps: how long it has stayed raw. Null when unknown.
+   * timestamps. Not proof it is still raw; cleanup may have failed. Null when unknown.
    */
   closedAgeMs: number | null;
   /**
    * When its earliest record was made (ms since the epoch): how long it has
-   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * been refused, where `closedAgeMs` measures time since chunk closure. The
    * alarm line shows it as "refusing since". A re-cut chunk's records start
    * over.
    */
@@ -1883,8 +1897,11 @@ export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
    * registered handler) while ANY chunk is quarantined. Quarantined chunks
-   * are a guaranteed eventual outage — the alarm repeats until the
-   * quarantine empties. Default 15 min; 0 disables (tests only).
+   * can exhaust the context budget while raw; stale holds can remain after
+   * best-effort cleanup failures, so the alarm is not proof of debt. It repeats until the
+   * quarantine empties, checked only when tick runs (no independent timer).
+   * Unreadable status suppresses the normal notification. Default 15 min;
+   * 0 disables (tests only).
    */
   quarantineAlarmIntervalMs?: number;
   /** Target tokens per chunk (~3000) */
@@ -2650,8 +2667,9 @@ export interface AutobiographicalConfig {
    * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
    * the summarizer is the agent, and it must never be shown itself using a tool
    * it does not have. Enabling (or changing) this is a new request regime, so
-   * already-quarantined chunks earn a fresh bounded attempt without a manual
-   * clear. See `tool-prose-hoist.ts` for the canary record.
+   * a previously unseen regime can allow a fresh bounded attempt without a
+   * manual clear. Returning to a used regime is still subject to its retained
+   * exact-key, family and shape-cap holds. See `tool-prose-hoist.ts` for the canary record.
    */
   compressionToolProseFallback?: {
     /** Declared name of the real note-taking tool that receives the prose. */
