@@ -235,6 +235,9 @@ describe('a take and its pass', () => {
     const good = note(cm, `good ${OLD}`);
     const bad = note(cm, `bad ${OLD}`);
     const named = note(cm, `named ${OLD}`);
+    const posing = note(cm, `posing ${OLD}`);
+    const trapped = note(cm, `trapped ${OLD}`);
+    const proxied = note(cm, `proxied ${OLD}`);
     const entry = rewords();
     const throwing: SweepEntry = {
       ...entry,
@@ -245,15 +248,27 @@ describe('a take and its pass', () => {
           error.name = textOfBlocks(body.content);
           throw error;
         }
+        if (body.id === posing) {
+          const error = new SyntaxError('no message');
+          Object.defineProperty(error, 'constructor', { value: { name: textOfBlocks(body.content) } });
+          throw error;
+        }
+        if (body.id === trapped) {
+          const error = new Error('no message');
+          Object.defineProperty(error, 'constructor', { get: () => { throw new Error(textOfBlocks(body.content)); } });
+          throw error;
+        }
+        if (body.id === proxied) throw new Proxy({}, { getPrototypeOf: () => { throw new Error(textOfBlocks(body.content)); } });
         return entry.mend(body);
       },
     };
     cm.takeSweep('rewords-test');
     const report = cm.applySweeps([throwing]);
     assert.equal(report.sweeps[0]!.outcome, 'owed');
-    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [bad, named]);
+    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [bad, named, posing, trapped, proxied]);
     assert.match(report.sweeps[0]!.failed[0]!.error, /TypeError/, 'the report names the error\'s type');
     assert.match(report.sweeps[0]!.failed[1]!.error, /RangeError/, 'by its class, whatever its name says');
+    assert.match(report.sweeps[0]!.failed[2]!.error, /SyntaxError/, 'or its constructor says');
     assert.ok(!JSON.stringify(report).includes(OLD), 'and never its text, which can hold the old text');
     assert.ok(!JSON.stringify(cm.showSweep(throwing)).includes(OLD), 'nor does the show');
     assert.ok(textOfBlocks(cm.getMessage(good)!.content).includes(NEW), 'the other body is mended');
@@ -1121,6 +1136,26 @@ describe('what runs beside a pass', () => {
     store.close();
   });
 
+  it('S58: a listener that edits a body back after its rewrite leaves the take owed, and the next pass mends the body', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const id = note(cm, `a note ${OLD}`);
+    cm.takeSweep('rewords-test');
+    let reverted = false;
+    cm.onMessage((event) => {
+      if (event.type !== 'edit' || event.messageId !== id || reverted) return;
+      reverted = true;
+      cm.editMessage(id, [text(`a note ${OLD} again`)]);
+    });
+    const report = cm.applySweeps([rewords()]);
+    assert.ok(reverted, 'premise: the listener edited the note back');
+    assert.equal(report.sweeps[0]!.outcome, 'owed');
+    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [id], 'the report names the body');
+    assert.equal(cm.sweepReceipt('rewords-test').finished, false, 'the take is not finished');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.equal(textOfBlocks(cm.getMessage(id)!.content), `a note ${NEW} again`, 'the next pass mends the body as the listener left it');
+    cm.close();
+  });
+
   it('S55: a write to the applied list that throws stops the pass, which reports what it did, and a later pass finishes', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     const id = note(cm, `a note ${OLD}`);
@@ -1310,6 +1345,33 @@ describe('readers that keep summaries', () => {
     assert.ok(!summariesOf(two).some((s) => s.content.includes(OLD)), 'and keeps no summary of it');
     second.close();
     first.close();
+    store.close();
+  });
+
+  it('S59: a list item that is not JSON is named, and neither a show, a pass nor a reader\'s let-go stops at it', async (t) => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const writer = await ContextManager.open({ store, namespace: 'w', strategy: new PassthroughStrategy() });
+    const id = note(writer, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) writer.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const reader = await ContextManager.open({ store, namespace: 'r', strategy: folding(), membrane: mockMembrane() });
+    await drain(reader);
+    writer.takeSweep('rewords-test');
+    writer.applySweeps([{ ...rewords(), mend: () => null }]);
+    store.appendToState(SWEEPS_APPLIED_STATE_ID, Buffer.from('not json{'));
+    const at = (store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0) - 1;
+    writer.takeSweep('rewords-test');
+    assert.deepEqual(writer.showSweep(rewords()).changes.map((c) => c.id), [id], 'a show reads past it');
+    const report = writer.applySweeps([rewords()]);
+    assert.ok(report.unreadable.items.includes(at), `the pass names it: ${JSON.stringify(report.unreadable.items)}`);
+    assert.equal(report.sweeps[0]!.outcome, 'finished');
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); });
+    await reader.compile(BIG);
+    assert.ok(warnings.some((w) => w.includes(String(at)) && w.includes("don't parse")), warnings.join('\n'));
+    assert.ok(!warnings.some((w) => w.includes('failed')), 'the let-go read the list and did not fail');
+    reader.close();
+    writer.close();
     store.close();
   });
 

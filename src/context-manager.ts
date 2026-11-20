@@ -2224,6 +2224,13 @@ export class ContextManager {
       }
       if (!stillHere()) return;
     }
+    for (const { body, written } of mended) {
+      if (!outcome.rewritten.includes(body.id) || JSON.stringify(this.messageStore.get(body.id)?.content) === JSON.stringify(written)) continue;
+      outcome.failed.push({
+        id: body.id,
+        error: `${body.id} changed during this pass, after its rewrite: it stays as it is now, and the next pass reads it again.`,
+      });
+    }
     if (outcome.failed.length === 0 && list({ v: 1, kind: 'finished', name: take.name, take: take.take, slot, at: new Date().toISOString() })) {
       outcome.outcome = 'finished';
     }
@@ -2241,8 +2248,8 @@ export class ContextManager {
   private sweepCandidates(
     entry: SweepEntry,
     skip: ReadonlySet<MessageId>,
-  ): { mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[] }>; failed: SweepFailure[] } {
-    const mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[] }> = [];
+  ): { mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[]; written: ContentBlock[] }>; failed: SweepFailure[] } {
+    const mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[]; written: ContentBlock[] }> = [];
     const failed: SweepFailure[] = [];
     for (const rows of this.messageStore.bodiesAsStored()) {
       const first = rows[0]!;
@@ -2263,22 +2270,23 @@ export class ContextManager {
         failed.push({ id: body.id, error: asked.error });
         continue;
       }
+      let written: ContentBlock[];
       try {
-        this.refuseRewrite(body, rows, asked.content);
+        written = this.refuseRewrite(body, rows, asked.content);
       } catch (error) {
         failed.push({ id: body.id, error: describeThrown(error) });
         continue;
       }
-      mended.push({ body, rows, content: asked.content });
+      mended.push({ body, rows, content: asked.content, written });
     }
     return { mended, failed };
   }
 
-  private refuseRewrite(body: SweepBody, rows: readonly StoredMessageInternal[], content: StoredContentBlock[]): void {
+  private refuseRewrite(body: SweepBody, rows: readonly StoredMessageInternal[], content: StoredContentBlock[]): ContentBlock[] {
     const written = this.messageStore.checkRewrite(body.id, content);
-    if (!this.wouldShard(body.participant, written)) return;
+    if (!this.wouldShard(body.participant, written)) return written;
     const old = rows.length === 1 ? this.messageStore.get(body.id)?.content : undefined;
-    if (old !== undefined && this.wouldShard(body.participant, old)) return;
+    if (old !== undefined && this.wouldShard(body.participant, old)) return written;
     throw new Error(
       `Rewrite of ${body.id} refused: the strategy would store its new content as shards, and nothing shards a stored row ` +
         'again, so a rewrite never makes one row of it. The body stays as it is, and each pass refuses it again while the ' +

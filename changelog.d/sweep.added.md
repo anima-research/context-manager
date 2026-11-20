@@ -10,7 +10,10 @@
   that form up, so a spread block never replays its old text. An opaque
   carrier keeps its raw item, which is its whole content: an entry mends one
   by its `rawItem`. An entry can't empty a body: a result with no block, or
-  with only text blocks that hold nothing, is reported.
+  with only text blocks that hold nothing, is reported. A sweep repairs what
+  the store gives and erases nothing: the old text stays readable at each
+  listed item's `sequence` (`getMessageAt`), on every branch cut before the
+  pass, and in the summaries that the second limit below names.
   - `ContextManager.showSweep(entry)` lists what the entry would change in
     the slot the manager writes, on the open branch, read as the store holds
     it and not through the manager's view, and names each body that a pass
@@ -20,7 +23,11 @@
     gave.
   - `ContextManager.takeSweep(name)` records once, for the whole store, that
     it took the sweep: a `context-manager/sweep-take` typed record, which
-    every branch sees. It rewrites nothing.
+    every branch sees. It rewrites nothing. No call takes a take back, so
+    an entry stays in its host's code while any store that took it may
+    still have a branch, a derived context or a slot that hasn't finished
+    it: where the entry no longer ships, each pass there reports the sweep
+    `unknown`.
   - `ContextManager.applySweeps(entries)` makes a pass for the slot the
     manager writes, on a branch that hasn't finished the sweep's newest
     take. Before it rewrites, it appends what it will rewrite to the

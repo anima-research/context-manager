@@ -34,7 +34,11 @@ export interface SweepBody {
  * An entry can't remove or empty a body: a result with no block, or with
  * only text blocks that hold nothing, is reported, and the body stays as it
  * is. What an entry throws is reported by its class alone, since its message
- * and its name can quote the body.
+ * and its name can quote the body. A sweep repairs what the store gives and
+ * erases nothing: the old text stays readable at each listed item's
+ * `sequence` (getMessageAt), and on every branch cut before the pass. No
+ * call takes a take back, so an entry ships while any store that took it
+ * may still owe it; where it no longer ships, a pass reports `unknown`.
  */
 export interface SweepEntry {
   name: string;
@@ -170,7 +174,12 @@ export function sweepsApplied(store: JsStore, from = 0): { items: SweepApplied[]
   const items: SweepApplied[] = [];
   const unreadable: number[] = [];
   for (let i = Math.max(0, from); i < length; i++) {
-    const item: unknown = store.getStateItemJson(SWEEPS_APPLIED_STATE_ID, i);
+    let item: unknown;
+    try {
+      item = store.getStateItemJson(SWEEPS_APPLIED_STATE_ID, i);
+    } catch {
+      item = undefined;
+    }
     if (isSweepApplied(item)) items.push(item);
     else unreadable.push(i);
   }
@@ -260,7 +269,7 @@ export function askEntry(
   try {
     content = entry.mend(body);
   } catch (error) {
-    const type = error instanceof Error ? error.constructor.name : typeof error;
+    const type = errorClass(error);
     return { kind: 'threw', error: `${entry.name} threw ${type} on ${body.id}; its message and name are left out, since they can quote the body` };
   }
   if (content === null) return { kind: 'left' };
@@ -271,6 +280,16 @@ export function askEntry(
     };
   }
   return { kind: 'mended', content: releaseEditedRawForms(body.content, content) };
+}
+
+const ERROR_CLASSES = [TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError, Error];
+
+function errorClass(error: unknown): string {
+  try {
+    return ERROR_CLASSES.find((intrinsic) => error instanceof intrinsic)?.name ?? 'a value that is no Error';
+  } catch {
+    return 'a value';
+  }
 }
 
 export function textLength(content: readonly StoredContentBlock[]): number {
