@@ -12,6 +12,274 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.28.0 — 2026-11-19
+
+### Added
+
+- **`carryStrandedSummaries` lets a summary no merge can take fold deeper**
+  (off unless set; a strategy that doesn't set it merges as before). Merges
+  take only neighbours of one level, so a summary left between higher
+  summaries never merged again and parted the runs on its two sides, and so
+  did one left out of merges as too wide for its level
+  (`mergeMaxSourceSpanMessages`). With the option set, the merge check gives
+  each such summary a parent one level up that is the same memory: its text,
+  verbatim response blocks, token count, range, date and authoring request,
+  with that summary as its one source and `carriedFrom` naming it
+  (`SummaryEntry.carriedFrom`). No model is called. At the new level the
+  entry joins a run and merges as any summary does, with an ordinary
+  summarizer call over the run, or it is carried again; it stops at the
+  level of the highest summary beside it.
+  - A summary is carried only where an unparented summary of a higher level
+    stands strictly beside it, nothing that held-up work could still fill
+    stands beside it (a quarantined chunk, a quarantined merge, a hold: the
+    `beside` of a stranded summary), and it is the one form of every message
+    in its span. So a summary with another's messages inside its span, which
+    the span limit exists to keep out of merges, is never carried to a level
+    where that limit would pass it, nor is a superseded L1 generation.
+  - A resident's own merge check reads each level's last run as the newest,
+    which waits to grow, so a summary alone in it is not carried there.
+    `drain-autobiographical` reads a run with a higher summary after it as
+    one that can't grow, and carries it, when its recipe sets the option.
+  - A compile never renders a carried entry. The selects read the summaries
+    without them, the summary carried standing in the entry's place, so the
+    window is what it was before the carry until a merge over the entry
+    lands, and that merge's summary is then the next level those messages
+    fold to. `searchSummaries` and `listSummariesInRange` read them the same
+    way, so no memory is listed twice. A summarizer request names a carried
+    entry by its own id, as it names any summary of that level, and answers
+    with the text of the summary it carries as that summary stands. The
+    entry's own copy of the text is not kept in step with it, so a repair
+    that rewrites a carried summary in place edits that summary, and not the
+    entries that carry it. The request for a transition summary leaves
+    carried entries out, since they repeat a summary's text.
+  - What reads the stored entries as they are: `getSummary` returns a
+    carried entry for its id, names it as the parent of the summary it
+    carries, and lists it among the sources of the merge that took it, where
+    the two lists above name the summary carried in its place (so there a
+    source can sit more than one level below its parent). The counts by
+    level (`getStats`, `getProgressSnapshot`, the debt report's
+    `unmergedFrontier`, `audit-topology`) count a carried entry at its level
+    and the summary it carries as merged, as the merge check reads them, so
+    a carry moves one from a level's count to the next with no change in
+    what a compile sends. A carried L1 no longer counts toward
+    `maxSpeculativeL1s`, as one a merge took doesn't.
+  - A store that holds carried entries needs a context-manager that knows
+    them. An earlier release reads each as an ordinary summary of its level,
+    a deeper fold of those messages: it lists the entry, and can render it
+    under its own id and level, where the summary it carries stood, and
+    kv-stable re-plans around the new level. So going back to one can change
+    what a compile sends. Turning the option off does not: the entries stay,
+    and are read as above.
+  - `getStrandedSummaries()` no longer lists a summary the next merge check
+    carries when the option is set. It reads the store as it stands, in one
+    pass: a summary that check reaches only after carrying another beside it
+    stays listed until the check has run, and `previewCarries()` follows
+    every step.
+  - `previewCarries()` lists what the rule would do to a store as it stands,
+    writing nothing: each carry and each merge that would then land, in
+    order, with the merge's sources and their tokens. The `--carry-preview`
+    flag of `audit-topology` prints it, as the resident's own merge check
+    reads the store, and `--carry-preview=drain` as a drain does. A drain
+    compresses the chunks that wait before it carries or merges, and the
+    preview doesn't project the L1s they land: read as a drain it counts
+    those chunks (`chunksWaiting`, and a `provisional` line in the text
+    output), and its steps are provisional until they have landed. Preview
+    again then.
+  - `repair-topology`, `audit-topology` and the planner
+    (`RepairRunsConfig.carryStrandedSummaries`) take the setting as
+    `--carry-stranded-summaries`. A rebuild planned with it projects the
+    carries the drain makes, so it dissolves no tower to partner a summary
+    the drain will carry. With or without it, a repair no longer dissolves a
+    parent that carries its one source as it dissolves a merge left with
+    one. A carried entry a repair gives a second source (an adoption, a
+    re-homed fragment) keeps `carriedFrom` and is read from then as a
+    summary of its level over both, by the selects and the lists too.
+    `inspect-store` marks carried entries in its summary tree, and
+    `export-picker-inputs` exports the summaries as a select reads them.
+
+- **`compressionFallbackModel`** (unset by default; a deployment that leaves
+  it unset compresses as before) names a model to ask once the compression
+  model has refused on every rung that keeps it writing the memory in full.
+  For an L1 the rung comes after the canonical request, the tool-prose hoist,
+  the recall variants and source-only-final with its hoist, and before the
+  split rung and quarantine; for a merge it comes after the last of
+  `mergeAttemptLimit` attempts, in place of quarantine, as one more attempt.
+  It sends the canonical request (a merge's first attempt) with only the
+  model changed, so the fallback model takes the same `max_tokens`, tools and
+  reasoning carriers, and nothing is added to what either model reads.
+  - Only refusals lead to it: where any rung or merge attempt ended in a
+    provider error or a truncated or empty generation, the ladder runs as
+    before, and an overload interrupts it as before. A recall variant that admission kept from
+    being sent doesn't stand in the way.
+  - An overload of the fallback model, or any other failure of its call that
+    says nothing about the request, pauses the compression lane as the
+    compression model's does, and the rung is asked again once the pause
+    ends, where the wait is short: none stated, or one that ends within the
+    lane's backoff ceiling of 10 minutes. Where a provider's stated wait or
+    the caller's provider admission holds the fallback model for longer, or
+    with no end, the rung gives up for that request instead: nothing is
+    paused, the outcome is recorded as `provider_error:persistent-<class>`,
+    and the request goes on as after the fallback model's refusal, so a hold
+    on the fallback model never stops other compression.
+  - Its memory is stored as text alone: the reasoning blocks of its answer
+    aren't kept (the entry has no `responseContent`), since a memory's
+    reasoning is replayed to the agent's model and to the compression model,
+    and neither can be given reasoning another model signed. The entry's
+    existing `provenance.model` names the fallback model. If it refuses too,
+    the split rung (where on) and quarantine follow as before.
+  - Setting or changing it is a new request regime for L1 compression, so a
+    chunk already in the compression quarantine gets a fresh bounded attempt,
+    which runs the compression model's rungs again first. A merge in the
+    merge quarantine is not retried by it: `clearMergeQuarantine` is.
+  - It logs `compression:fallback-model` with the outcome for an L1, and
+    `merge:fallback-model` when a merge's rung runs; each attempt's receipt
+    names the model it was sent to, and the receipt that carries the
+    summary's id names the model that wrote it.
+  - The memory is then written in the agent's voice by another model, which
+    this library never does unless told to: set it knowing that.
+
+- **kv-unified can price what a change of layout costs** (all off unless
+  set; a deployment that sets none solves as before):
+  - `kvUnified.policy.rewriteLambda` prices cache churn linearly, per
+    `cacheScale`, in place of the quadratic `cacheLambda` term, which at the
+    scales in use is nearly flat where layouts differ by a few hundred
+    thousand tokens of rewrite. With it the layout last accepted is cheaper
+    than any change by that change's whole rewrite, and a change that keeps
+    the earlier cache breakpoints is cheaper by what stands before them, so
+    a transition folds new history without also re-leveling old summaries
+    or folding a stray old message, unless that is worth its rewrite (old
+    history still returns to a shallower level where it is). On a copy of
+    one resident's store, with a transition forced by a steeper over-budget
+    penalty than deployments run, the first changed token moved from 3k to
+    232k (a rewrite of 262k tokens instead of 505k), and the layout held
+    four turns longer, moving at 590k instead of 564k. The same copy kept its first
+    change at the new fold with `cacheScale` lowered to 10,000 or 20,000
+    and no code change, so the quadratic's scale is the other remedy; it
+    was not measured what that does to which merges are demanded.
+  - `kvUnified.thinkingLambda` (with `thinkingHalfLifeTokens`, 50,000
+    unless set) prices the thinking a change would drop, on a compile for a
+    model that binds thinking (`SelectOptions.thinkingBinding.binds`). Any
+    change of layout drops all of the thinking still in play, wherever the
+    change begins, so the cost is the same for every change and is added
+    to `adoptEpsilon` for that compile: it decides whether to change, never
+    which change. It is counted from what the branch's binding record still
+    vouches for, weighted by how far back each reply is, so it is zero
+    once the thinking is gone anyway (another system text or tool list),
+    and a transition that was waiting comes then. A reply stored past the
+    record's end doesn't count: until a host notes it as a row its stream
+    sent (`noteRequestSent`), the next compile sends it without its
+    thinking whatever it selects. `[plan-vs-actual]` shows the cost as
+    `changePenalty=`, and `RenderStats.planVsActual.changePenalty` carries
+    it. It is an upper bound: a change that begins after some raw replies
+    keeps their thinking, and they are priced all the same. A
+    `thinkingLambda` that isn't a finite number of 0 or more is refused at
+    the compile, not read as off, and so is a half-life that isn't above 0
+    while thinking is priced.
+  - The context manager gives the select of a binding compile what the
+    record says of its replies' thinking before anything is selected
+    (`SelectOptions.thinkingStanding`, a new `ThinkingStanding`), as it
+    gives `messageInjections`: a caller's value is dropped. It does so
+    only for a strategy that says it reads it
+    (`ContextStrategy.readsThinkingStanding`, which the memory strategy
+    answers true to while `thinkingLambda` is set), and a binding preview
+    always gets it, priced under the record's own head, since its overrides
+    may be what prices thinking. It changes nothing about what a compile
+    leaves out.
+  - The binding record says how far it reaches: `through`, the sequence of
+    the newest stored body its compile sent, and `continuedThrough`, the
+    newest row a note vouches for after that, counted only while each row
+    the note names is the window's next one (a message another writer
+    stored mid-stream ends it). Both are new and optional,
+    are written for every binding compile whether or not thinking is
+    priced, and an earlier release reads a record that has them.
+  - Latent demand is decided without either price, so the same merges are
+    demanded as without them. A change's fixed cost alone costs demand no
+    solve: the ranking reads the live solve's pool, which that cost
+    doesn't alter. With `rewriteLambda`, where the live solve was not
+    certified and a merge can be produced, demand solves the base once
+    more without the rewrite's price.
+  - The hysteresis certificate counts the least rewrite a change pays
+    (`certificate.rewriteFloor`), which is the rewrite of the recent
+    window, so it decides more of the compiles in which a priced layout
+    holds. A compile it can't decide runs the full solve, as before, and
+    its bound is well under what a change really costs: on the copy above
+    the full solve ran, at about half a second more per compile, on each
+    turn between where the unpriced policy would have moved and where the
+    priced one did.
+  - Not changed: where a transition lands (`budgetHighRatio`), the hard
+    wall, and which summaries may be taken (a summary over messages a
+    window sends raw has been left out since 0.24.1).
+
+### Changed
+
+- **Hosts:** context-manager accepts `@animalabs/chronicle`
+  `^0.6.0 || ^0.7.0` (was `^0.6.0`), so a host whose own chronicle is 0.7.0
+  shares it with context-manager, where before context-manager installed its
+  own 0.6.0 beside it. A lockfile's 0.6.0 is still admitted. A host with no
+  chronicle of its own now gets 0.7.0 on a fresh install, where it got
+  0.6.0, and opens its existing store with it: 0.7.0 opens and reads a store
+  0.6.0 wrote, and context-manager stores no chunked blob, so a store it
+  writes on 0.7.0 still opens on 0.6.0. chronicle 0.7.0's notes say what its
+  breaking changes ask of a host. context-manager's own code checks no
+  chronicle error's `code`, and matches none of the messages those changes
+  rename.
+
+- **The `beforeUser` position of `ContextInjection` is deprecated**
+  (anima-research/agent-framework#171). `compile()` places a `beforeUser`
+  injection again before the last user message at every compile, so it moves
+  as newer user messages arrive: the request misses the prompt cache from its
+  old place on, a model that binds a reply's thinking to everything before it
+  drops the thinking of every reply after that place, and since a tool's
+  result is carried in a user message, after a tool call it lands between the
+  call and its result. Store such content as an ordinary message
+  (`addMessage`) instead. Behavior is unchanged: `beforeUser` injections are
+  still accepted and placed as before. `system` and `afterUser` injections
+  remain supported, and `ContextInjection.position` now says what each costs:
+  a `system` injection's changed text misses the cache from the system prompt
+  on and, on a model that binds thinking, drops the thinking of every earlier
+  reply, and an `afterUser` one moves as `beforeUser` does, which suits text
+  that must stay near the end, such as instructions.
+
+- **No live image is stripped by default.** `maxLiveImages` (was 6),
+  `imageStripDepthTokens` (was 30000) and `maxLiveImageBytes` (was 20 MiB)
+  now default to 0 in the memory strategy and in windowed passthrough, so an
+  image stays in the window until its message is folded or leaves the
+  window. Replacing an already-sent image with the placeholder edits the
+  prompt mid-history: the request misses the prompt cache from that message
+  on, and a model that binds a reply's thinking to everything before it
+  drops the thinking of every later reply, at each new image once a limit
+  binds. The ceilings are unchanged (`imageCeiling` 500 images,
+  `imageByteCeiling` 24 MiB) and still strip when a window reaches them. An
+  image costs about 1,600 tokens of the budget while it is live. A host that
+  wants the old behavior sets the three options to their old values;
+  `imageStripHysteresisRatio` still spaces the strips of any limit that is
+  set.
+
+### Fixed
+
+- **A recalibration no longer moves a window's edge over messages a chunk
+  owns.** The head window's end and the recent window's start are counted in
+  tokens at the live calibration multiplier, so a fall of a few percent let
+  either count reach one more message, one a chunk already owned. Sent raw
+  from the window, that message left out every summary over it (the rule of
+  0.24.1): the rest of its chunk went out raw, and each summary above gave way
+  to the ones it had merged. At the head's end that changed the request from
+  the head on, so it missed the prompt cache there, and a model that binds a
+  reply's thinking to everything before it dropped the thinking of every
+  reply. Chunks are only cut outside both windows, so chunk records say
+  where each edge was when they were cut, and both edges now hold there: the
+  head ends at the first message a chunk owns (it already extended to that
+  message when a rise left it short, #122), and the recent window starts
+  after the last. Each hold is bounded by a factor of two of the window's
+  setting, so a window that was really widened takes what its count says: a
+  `headWindowTokens` or `recentWindowTokens` raised to more than twice what
+  the chunks left applies at once. A smaller raise of `recentWindowTokens`
+  now fills from new messages, and a smaller change of `headWindowTokens`
+  moves nothing. Neither hold parts a tool call from its result, and the
+  head's doesn't apply where it would move a message no chunk owns out of
+  the head, to be chunked late. A subclass turns the holds off by
+  overriding `windowsHoldAtCoverage`.
+
 ## 0.27.0 — 2026-11-09
 
 ### Changed

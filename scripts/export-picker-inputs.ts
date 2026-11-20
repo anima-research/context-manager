@@ -80,7 +80,11 @@ async function main() {
   const messages = manager.getAllMessages().filter((message) =>
     at === undefined || message.timestamp.getTime() <= at,
   );
-  const availableSummaries = (((strategy as unknown as { summaries: SummaryEntry[] }).summaries) ?? [])
+  // As a select reads them: past the entries that carry a summary up a level
+  // (pastCarries), which no compile renders and which keep the date of the
+  // summary they carry.
+  const view = strategy as unknown as { summaries: SummaryEntry[]; pastCarries(summaries: SummaryEntry[]): SummaryEntry[] };
+  const availableSummaries = view.pastCarries(view.summaries ?? [])
     .filter((summary) => at === undefined || summary.created <= at);
   const availableSummaryIds = new Set(availableSummaries.map((summary) => summary.id));
   const summaries = availableSummaries.map((summary) => {

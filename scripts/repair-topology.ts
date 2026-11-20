@@ -35,8 +35,13 @@
  * its own first.
  * The rule reads the resident's run settings, which the store doesn't hold:
  * pass them as the resident has them (--merge-threshold, --merge-max-span and
- * --merge-hold, each also as --flag=value, and --no-speculative-production);
- * the plan prints the values it used. The stored merge queue and
+ * --merge-hold, each also as --flag=value, --no-speculative-production and
+ * --carry-stranded-summaries); the plan prints the values it used. With
+ * --carry-stranded-summaries the plan projects the carries a drain's merge
+ * check makes (`carryStrandedSummaries`), so a summary the drain will carry
+ * up to its neighbours' level is no stray, and no tower is dissolved to
+ * partner it; the drain makes them when its recipe sets the option. The
+ * stored merge queue and
  * merge-quarantine records are read as the strategy reads them at open, and
  * each queued merge that can still run is taken to land before the ladder
  * forms new merges, as it drains, and so is each chunk recorded and not yet
