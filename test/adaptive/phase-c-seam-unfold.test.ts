@@ -39,7 +39,7 @@ function setup() {
 function plan(s: ReturnType<typeof setup>, target: number, W: number) {
   return planControlledFrontier(s.inputs, s.tree, {
     previous: new Map(), foldAtTokens: W, expandAtTokens: target, targetTokens: target,
-    windowTokens: W, rawZone: s.tail, now: s.now, mergeThreshold: 6,
+    windowTokens: W, rawZone: s.tail, attendedChunks: s.tail.size, now: s.now, mergeThreshold: 6,
   });
 }
 
@@ -123,7 +123,7 @@ test('phase C: a singleton group after excision steps all the way down before an
   let now = 0; for (const c of chunks) if (c.sequence > now) now = c.sequence;
   const p = planControlledFrontier(inputs, tree, {
     previous: new Map(), foldAtTokens: 806, expandAtTokens: 506, targetTokens: 506,
-    windowTokens: 806, rawZone: tail, now, mergeThreshold: 6,
+    windowTokens: 806, rawZone: tail, attendedChunks: tail.size, now, mergeThreshold: 6,
   });
   assert.equal(p.resolutions.get(survivor.id) ?? 0, 0, 'youngest survivor is raw');
   for (const id of ch.chunks.slice(0, 36).map((c) => c.id)) {
@@ -190,7 +190,7 @@ function growthReplay(opts: {
     let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
     const params = (prev: ReadonlyMap<ChunkId, number>) => ({
       previous: prev, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
-      rawZone: tail, now, mergeThreshold: 6,
+      rawZone: tail, attendedChunks: tail.size, now, mergeThreshold: 6,
       ...(opts.seedFromCarried === undefined ? {} : { seedFromCarried: opts.seedFromCarried }),
       ...(opts.pinCaps ? { pinCaps: opts.pinCaps } : {}),
     });
@@ -299,7 +299,7 @@ test('seeded ideal: past a small trust region, the quality-gap override adopts a
   const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, extra: { seedFromCarried?: boolean; reachTokens?: number } = {}) =>
     planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: W, expandAtTokens: target, targetTokens: target, windowTokens: W,
-      rawZone: tail, now, mergeThreshold: 6, ...extra,
+      rawZone: tail, attendedChunks: tail.size, now, mergeThreshold: 6, ...extra,
     });
   const levels = (F: ReadonlyMap<ChunkId, number>) => ch.chunks.map((c) => F.get(c.id) ?? 0).join('');
   const tight = solve(new Map(), 400, 450);
@@ -331,7 +331,7 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
   const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, seedFromCarried?: boolean, reachTokens?: number) =>
     planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: W, expandAtTokens: target, targetTokens: target, windowTokens: W,
-      rawZone: tail, now, mergeThreshold: 6, ...(seedFromCarried === undefined ? {} : { seedFromCarried }),
+      rawZone: tail, attendedChunks: tail.size, now, mergeThreshold: 6, ...(seedFromCarried === undefined ? {} : { seedFromCarried }),
       ...(reachTokens === undefined ? {} : { reachTokens }),
     });
   const hist = (F: ReadonlyMap<ChunkId, number>) => {
@@ -420,7 +420,7 @@ function phaseCRuns(shape: 'plain' | 'bigYoungGroup' | 'shortThirds') {
     const target = bigYoungGroup ? 64_600 : shape === 'shortThirds' ? 50_400 : 64_800;
     plan = planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: 70_000, expandAtTokens: target, targetTokens: target, windowTokens: 70_000,
-      rawZone: tail, now, mergeThreshold: 6, diagnostics,
+      rawZone: tail, attendedChunks: tail.size, now, mergeThreshold: 6, diagnostics,
     });
   } finally {
     if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
@@ -485,7 +485,7 @@ test('phase C: a group it couldn\'t take returns to the walk once an accept move
     }));
   const inputs = { chunks, summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() } as unknown as PickerInputs;
   const tree = new SummaryTree(inputs);
-  const common = { rawZone: new Set(['m19', 'm20']), now: 26, mergeThreshold: 2, seedFromCarried: true };
+  const common = { rawZone: new Set(['m19', 'm20']), attendedChunks: 2, now: 26, mergeThreshold: 2, seedFromCarried: true };
   const levels = (F: ReadonlyMap<ChunkId, number>) => chunks.map((c) => F.get(c.id) ?? 0).join('');
   const boot = planControlledFrontier(inputs, tree, {
     ...common, previous: new Map(), targetTokens: 327, foldAtTokens: 577, windowTokens: 4206, reachTokens: 4206,
@@ -527,7 +527,7 @@ test('phase C: a group returns to the walk once an accept moves a leaf of a summ
   const tree = new SummaryTree(inputs);
   const plan = planControlledFrontier(inputs, tree, {
     previous: new Map([['b', 3], ['a', 2], ['c', 2]]), targetTokens: 190, foldAtTokens: 100_000, windowTokens: 100_000, reachTokens: 100_000,
-    rawZone: new Set(), now: chunks.length, mergeThreshold: 2, seedFromCarried: true,
+    rawZone: new Set(), attendedChunks: 0, now: chunks.length, mergeThreshold: 2, seedFromCarried: true,
   });
   assert.deepEqual(Object.fromEntries(chunks.map((c) => [c.id, plan.resolutions.get(c.id) ?? 0])), { b: 1, a: 1, c: 1 });
   assert.equal(plan.tokens, 180);
@@ -574,7 +574,7 @@ test('phase C: a cleared key relists its parked chunks in O(log n) steps each, n
   try {
     planControlledFrontier(inputs, tree, {
       previous: new Map(chunks.map((c) => [c.id, c.id.startsWith('b') ? 1 : 2] as const)), targetTokens: target, foldAtTokens: 4 * target, windowTokens: 8 * target, reachTokens: 8 * target,
-      rawZone: new Set(), now: chunks.length, mergeThreshold: 2, seedFromCarried: true, diagnostics,
+      rawZone: new Set(), attendedChunks: 0, now: chunks.length, mergeThreshold: 2, seedFromCarried: true, diagnostics,
     });
   } finally {
     if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
@@ -628,7 +628,7 @@ test('phase C: a declined group isn\'t tried again when an accept moves a leaf i
   try {
     planControlledFrontier(inputs, tree, {
       previous: new Map(chunks.map((c) => [c.id, 1] as const)), targetTokens: target, foldAtTokens: 4 * target, windowTokens: 8 * target, reachTokens: 8 * target,
-      rawZone: new Set(), now: chunks.length, mergeThreshold: 2, seedFromCarried: true, diagnostics,
+      rawZone: new Set(), attendedChunks: 0, now: chunks.length, mergeThreshold: 2, seedFromCarried: true, diagnostics,
     });
   } finally {
     if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;

@@ -68,7 +68,7 @@ test('a ghost member does not veto the group-atomic raise (phase A)', () => {
     expandAtTokens: 8_000,
     targetTokens: 8_000,
     windowTokens: 1_000_000,
-    rawZone: new Set(),
+    rawZone: new Set(), attendedChunks: 0,
     now: 89,
     mergeThreshold: 6,
   });

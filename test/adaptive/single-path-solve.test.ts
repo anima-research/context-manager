@@ -69,7 +69,7 @@ test('bootstrap solve is age-monotone — the inversion is unconstructible from 
   const plan = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 30_000, expandAtTokens: 24_000, targetTokens: 24_000,
-    windowTokens: 60_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 60_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   assert.equal(plan.override, 'bootstrap', 'empty F_prev → bootstrap override');
   assert.ok(plan.tokens <= 30_000, `fits the operating band (${plan.tokens})`);
@@ -94,7 +94,7 @@ test('inverted carried profile in the dead band self-heals (quality-gap override
   // the OLD solver would hold it forever (dead band → zero perturbation).
   const band = {
     foldAtTokens: 55_000, expandAtTokens: 20_000, targetTokens: 40_000,
-    windowTokens: 60_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 60_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   } as const;
 
   // Default trust region (= W): the misallocation is detected THROUGH the dead
@@ -122,13 +122,13 @@ test('a WELL-allocated in-band profile still holds (dead band preserved)', () =>
   const first = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 55_000, expandAtTokens: 20_000, targetTokens: 40_000,
-    windowTokens: 60_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 60_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   // …then feed it back: nothing should move, zero perturbation.
   const second = planControlledFrontier(inputs, tree, {
     previous: first.resolutions,
     foldAtTokens: 55_000, expandAtTokens: 20_000, targetTokens: 40_000,
-    windowTokens: 60_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 60_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   assert.equal(second.perturbation, 0, 'quiet turn: zero perturbation');
   assert.ok(!second.folded && !second.expanded, 'quiet turn: no movement');
@@ -147,7 +147,7 @@ test('low-salience chunks fold before equally-aged high-salience ones', () => {
   const plan = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 85_000, expandAtTokens: 84_500, targetTokens: 84_500,
-    windowTokens: 200_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 200_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   const lowSalLevel = plan.resolutions.get('c-0060') ?? 0;
   const oldHighSalLevel = plan.resolutions.get('c-0000') ?? 0;
@@ -171,7 +171,7 @@ test('trust region binds → suffix adoption: newest changes only, perturbation 
   const plan = planControlledFrontier(inputs, tree, {
     previous: carried,
     foldAtTokens: 30_000, expandAtTokens: 24_000, targetTokens: 24_000,
-    windowTokens: 200_000, reachTokens: P, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 200_000, reachTokens: P, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   assert.equal(plan.override, undefined, 'trust region honored — no override');
   assert.ok(plan.perturbation <= P, `perturbation ${plan.perturbation} ≤ P ${P}`);
@@ -185,7 +185,7 @@ test('trust region binds → suffix adoption: newest changes only, perturbation 
     const next = planControlledFrontier(inputs, tree, {
       previous: prev,
       foldAtTokens: 30_000, expandAtTokens: 24_000, targetTokens: 24_000,
-      windowTokens: 200_000, reachTokens: P, rawZone, now: 89, mergeThreshold: 6,
+      windowTokens: 200_000, reachTokens: P, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
     });
     assert.ok(
       next.override !== undefined || next.perturbation <= P,
@@ -207,7 +207,7 @@ test('P below the physical floor cannot stall: no-progress partial is overridden
   const plan = planControlledFrontier(inputs, tree, {
     previous: carried,
     foldAtTokens: 30_000, expandAtTokens: 24_000, targetTokens: 24_000,
-    windowTokens: 200_000, reachTokens: 2_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 200_000, reachTokens: 2_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   assert.ok(plan.override !== undefined, 'no-progress plan is overridden');
   assert.ok(plan.tokens <= 30_000, `sheds to the band anyway (${plan.tokens})`);
@@ -225,7 +225,7 @@ test('strict transition pace below the physical floor blocks instead of jumping'
     windowTokens: 200_000,
     reachTokens: 2_000,
     strictReach: true,
-    rawZone,
+    rawZone, attendedChunks: rawZone.size,
     now: 89,
     mergeThreshold: 6,
   });
@@ -247,7 +247,7 @@ test('strict transition reports when the protected raw floor exceeds the target 
     windowTokens: 200_000,
     reachTokens: 200_000,
     strictReach: true,
-    rawZone,
+    rawZone, attendedChunks: rawZone.size,
     now: 89,
     mergeThreshold: 6,
   });
@@ -263,7 +263,7 @@ test('infeasible within P → override, feasibility beats the trust region', () 
   const plan = planControlledFrontier(inputs, tree, {
     previous: carried,
     foldAtTokens: 40_000, expandAtTokens: 30_000, targetTokens: 30_000,
-    windowTokens: 50_000, reachTokens: 1_000, rawZone, now: 89, mergeThreshold: 6,
+    windowTokens: 50_000, reachTokens: 1_000, rawZone, attendedChunks: rawZone.size, now: 89, mergeThreshold: 6,
   });
   assert.ok(
     plan.override === 'infeasible' || plan.override === 'quality-gap',

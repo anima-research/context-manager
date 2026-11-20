@@ -56,7 +56,7 @@ test('pin-at-level-k: fixed at exactly k under BOTH generous and tight budgets',
   const loose = planControlledFrontier(inputs, tree, {
     previous: new Map(fixedLevels),
     foldAtTokens: 200_000, expandAtTokens: 200_000, targetTokens: 200_000,
-    windowTokens: 200_000, rawZone: new Set(), fixedLevels, now: NOW, mergeThreshold: 6,
+    windowTokens: 200_000, rawZone: new Set(), attendedChunks: 0, fixedLevels, now: NOW, mergeThreshold: 6,
   });
   assert.equal(loose.resolutions.get(pinned), 2, 'pinned held at L2 under generous budget (not un-folded)');
   assert.equal(loose.resolutions.get(outside), 0, 'un-pinned old chunk un-folds to raw');
@@ -66,7 +66,7 @@ test('pin-at-level-k: fixed at exactly k under BOTH generous and tight budgets',
   const tight = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 12_000, expandAtTokens: 0, targetTokens: 12_000,
-    windowTokens: 90_000, rawZone: new Set(), fixedLevels, now: NOW, mergeThreshold: 6,
+    windowTokens: 90_000, rawZone: new Set(), attendedChunks: 0, fixedLevels, now: NOW, mergeThreshold: 6,
   });
   assert.equal(tight.resolutions.get(pinned), 2, 'pinned fixed at L2 under tight budget');
 });
@@ -78,7 +78,7 @@ test('pin-at-level clamps to the deepest produced level (no phantom L_k)', () =>
   const r = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 12_000, expandAtTokens: 0, targetTokens: 12_000,
-    windowTokens: 90_000, rawZone: new Set(), fixedLevels: new Map([[pinned, 5]]),
+    windowTokens: 90_000, rawZone: new Set(), attendedChunks: 0, fixedLevels: new Map([[pinned, 5]]),
     now: NOW, mergeThreshold: 6,
   });
   assert.equal(r.resolutions.get(pinned), 2, 'clamped to the deepest available level (L2)');
@@ -95,7 +95,7 @@ test('pin-max-level: a HARD fold-depth cap, enforced even under the W emergency'
   const r = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 1_500, expandAtTokens: 0, targetTokens: 1_200,
-    windowTokens: 2_000, rawZone: new Set(), pinCaps, now: NOW, mergeThreshold: 6,
+    windowTokens: 2_000, rawZone: new Set(), attendedChunks: 0, pinCaps, now: NOW, mergeThreshold: 6,
   });
   assert.ok((r.resolutions.get(capped) ?? 0) <= 1, `capped chunk never folds past L1 (got L${r.resolutions.get(capped)})`);
   // An un-capped neighbor in a DIFFERENT L2 group is free to fold to L2 under
@@ -120,7 +120,7 @@ test('pin-max-level un-folds a carried resolution deeper than the cap (on pin-ad
   const r = planControlledFrontier(inputs, tree, {
     previous,
     foldAtTokens: 200_000, expandAtTokens: 0, targetTokens: 200_000,
-    windowTokens: 200_000, rawZone: new Set(), pinCaps: new Map([[capped, 1]]),
+    windowTokens: 200_000, rawZone: new Set(), attendedChunks: 0, pinCaps: new Map([[capped, 1]]),
     now: NOW, mergeThreshold: 6,
   });
   assert.equal(r.resolutions.get(capped), 1, 'carried L2 clamped down to the L1 cap at plan start');
@@ -154,7 +154,7 @@ test('pinned-at-level render survives a full budget sweep (no oscillation)', () 
     const r = planControlledFrontier(inputs, tree, {
       previous: prev,
       foldAtTokens: budget, expandAtTokens: budget * 0.9, targetTokens: budget * 0.9,
-      windowTokens: 90_000, rawZone: new Set(), fixedLevels, now: NOW, mergeThreshold: 6,
+      windowTokens: 90_000, rawZone: new Set(), attendedChunks: 0, fixedLevels, now: NOW, mergeThreshold: 6,
     });
     assert.equal(r.resolutions.get(pinned), 1, `pinned held at L1 at budget ${budget}`);
     prev = r.resolutions;

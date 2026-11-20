@@ -71,7 +71,7 @@ test('a lineage-disagreeing leaf does not un-fold its group (overlap tolerance)'
   const plan = planControlledFrontier(inputs, tree, {
     previous: new Map(),
     foldAtTokens: 2_000, expandAtTokens: 1_000, targetTokens: 1_000,
-    windowTokens: 2_000, rawZone: new Set(), now: 89, mergeThreshold: 6,
+    windowTokens: 2_000, rawZone: new Set(), attendedChunks: 0, now: 89, mergeThreshold: 6,
   });
 
   // The physics hold: W is the only wall. (Old code: the projection avalanche
@@ -239,7 +239,7 @@ function ownLeafFoldedAbove(): { inputs: PickerInputs; tree: SummaryTree } {
   );
 }
 
-const trio = { targetTokens: 50, windowTokens: 1_000, reachTokens: 1_000, rawZone: new Set<ChunkId>(), now: 1_000 };
+const trio = { targetTokens: 50, windowTokens: 1_000, reachTokens: 1_000, rawZone: new Set<ChunkId>(), attendedChunks: 0, now: 1_000 };
 
 for (const [kind, build, foldAtTokens, folded, pinCaps] of [
   ['whose own lineage stops below the summary', disagreeingTrio, 100, ['recall:A', 'recall:G'], undefined],
@@ -444,7 +444,7 @@ test('phase C un-folds the leaves of a summary\'s own lineage: tree 228 settles 
     [message('m0', 0, 48, 'R-1'), message('m1', 1, 94, 'L1-0'), message('m2', 2, 41, 'L1-0')],
     [summary('L1-0', 1, ['m0', 'm1', 'm2'], 43), summary('R-1', 1, ['m0', 'm1'], 13)],
   );
-  const params = { targetTokens: 80, foldAtTokens: 130, windowTokens: 366, reachTokens: 366, rawZone: new Set<ChunkId>(), now: 3 };
+  const params = { targetTokens: 80, foldAtTokens: 130, windowTokens: 366, reachTokens: 366, rawZone: new Set<ChunkId>(), attendedChunks: 0, now: 3 };
   const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, first.resolutions)), ['raw:m0', 'recall:L1-0']);
   assert.equal(first.tokens, 91);
@@ -970,7 +970,7 @@ function randomNonNested(rng: () => number): {
     inputs, tree, corruptions,
     params: {
       targetTokens, foldAtTokens: Math.floor(targetTokens * (1 + rng())), windowTokens: rawTotal * 2,
-      rawZone, pinCaps, fixedLevels, frozen, now: n,
+      rawZone, attendedChunks: rawZone.size, pinCaps, fixedLevels, frozen, now: n,
     },
   };
 }
@@ -1152,7 +1152,7 @@ test('a re-pointed L1 across carried growth: each leaf renders through a summary
     const tree = new SummaryTree(inputs);
     const params = (prev: ReadonlyMap<ChunkId, number>) => ({
       previous: prev, foldAtTokens: 2150, expandAtTokens: 1600, targetTokens: 1600, windowTokens: 2150,
-      rawZone: tail, now: n - 1, mergeThreshold: 6,
+      rawZone: tail, attendedChunks: tail.size, now: n - 1, mergeThreshold: 6,
     });
     const plan = planControlledFrontier(inputs, tree, params(previous));
     for (const c of inputs.chunks) {
