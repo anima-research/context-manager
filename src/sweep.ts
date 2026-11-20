@@ -1,13 +1,14 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { MessageId, MessageMetadata, StoredContentBlock } from './types/message.js';
 import { registerStateIfAbsent } from './state-registration.js';
-import { releaseEditedRawForms } from './raw-forms.js';
+import { isEmptyTextBlock, releaseEditedRawForms } from './raw-forms.js';
 
 /**
  * One stored message, as the store holds it, read without blobs: media is
- * its `blob_ref`. A body stored as shards is given whole: one text block
- * that joins its shards' text, then its shards' other blocks, as ingress
- * stores them.
+ * its `blob_ref`. A body stored as shards is given whole: its shards' other
+ * blocks, then one text block that joins their text, in the order in which
+ * AutobiographicalStrategy renders a sharded body in its head and recent
+ * windows.
  */
 export interface SweepBody {
   /** The body's first row: the id a rewrite keeps. */
@@ -28,10 +29,12 @@ export interface SweepBody {
  * that the store holds. A block it gives back unchanged, as the same object,
  * keeps its raw replay forms; every block that shares a raw form with a
  * block it changed or left out gives that form up (raw-forms.ts), so a
- * spread block never replays its old text. An entry can't remove or empty a
- * body: a result with no block is reported, and the body stays as it is.
- * What an entry throws is reported by its type alone, since its text can
- * quote the body.
+ * spread block never replays its old text. An opaque carrier keeps its raw
+ * item, which is its whole content: an entry mends one by its `rawItem`.
+ * An entry can't remove or empty a body: a result with no block, or with
+ * only text blocks that hold nothing, is reported, and the body stays as it
+ * is. What an entry throws is reported by its class alone, since its message
+ * and its name can quote the body.
  */
 export interface SweepEntry {
   name: string;
@@ -61,9 +64,10 @@ export interface ListedBody {
 
 /**
  * An item of a branch's applied list. `listed`: what a pass will rewrite in
- * `slot`, with the branch's `sequence` before the rewrite, where the old
- * text can be read (getMessageAt). `finished`: the branch finished `take`
- * for `slot`.
+ * `slot`, or the later shards that an earlier pass left standing and that
+ * this pass will remove, with the branch's `sequence` before that write,
+ * where the old text can be read (getMessageAt). `finished`: the branch
+ * finished `take` for `slot`.
  */
 export type SweepApplied =
   | { v: 1; kind: 'listed'; name: string; take: string; slot: string; at: string; sequence: number; bodies: ListedBody[] }
@@ -89,15 +93,22 @@ export interface SweepFailure {
 
 export interface SweepShow {
   changes: SweepChange[];
-  /** Bodies that the entry would mend and a pass would not rewrite, and why. */
+  /**
+   * Bodies that a pass would not rewrite, and why: a body stored short,
+   * whatever the entry would give, and a body the entry would mend where the
+   * entry throws, gives no content, or gives content that the store or the
+   * strategy refuses. A refusal is given as it reads, and can quote the
+   * content that the entry gave.
+   */
   failures: SweepFailure[];
 }
 
 /**
  * What a pass did for one sweep. `finished`: the branch has finished its
- * newest take for the slot. `owed`: not yet, and a later pass is asked
- * again. `unknown`: the store took it, and no entry of that name was given,
- * so nothing was asked of any body.
+ * newest take for the slot. `owed`: not yet, or later shards that a pass of
+ * any take of it listed still stand, and a later pass is asked again; its
+ * receipt can then say the take is finished. `unknown`: the store took it,
+ * and no entry of that name was given, so nothing was asked of any body.
  */
 export interface SweepPassOutcome {
   name: string;
@@ -115,8 +126,9 @@ export interface SweepPassReport {
   sweeps: SweepPassOutcome[];
   /**
    * Why the pass stopped before it was done, or null: a listener of one of
-   * its writes moved the store to another branch or closed the manager. It
-   * wrote nothing after that write, and what it hadn't done is owed.
+   * its writes moved the store to another branch or closed the manager, or
+   * a write to the branch's applied list threw. It wrote nothing after that
+   * write, and what it hadn't done is owed.
    */
   stopped: string | null;
   /**
@@ -208,24 +220,24 @@ export function newestTakes(store: JsStore): { takes: SweepTake[]; unreadable: s
   return { takes: [...newest.values()], unreadable };
 }
 
-const passesRunning = new WeakSet<JsStore>();
+let passRunning = false;
 
-export function sweepPassRunning(store: JsStore): boolean {
-  return passesRunning.has(store);
+export function sweepPassRunning(): boolean {
+  return passRunning;
 }
 
-export function runSweepPass<T>(store: JsStore, pass: () => T): T {
-  if (passesRunning.has(store)) {
+export function runSweepPass<T>(pass: () => T): T {
+  if (passRunning) {
     throw new Error(
-      'ContextManager.applySweeps refused: a pass is running on this store, and one of its writes asked for another. ' +
+      'ContextManager.applySweeps refused: a pass is running, and one of its writes asked for another. ' +
         'Ask for the pass once that one has returned.',
     );
   }
-  passesRunning.add(store);
+  passRunning = true;
   try {
     return pass();
   } finally {
-    passesRunning.delete(store);
+    passRunning = false;
   }
 }
 
@@ -248,14 +260,14 @@ export function askEntry(
   try {
     content = entry.mend(body);
   } catch (error) {
-    const type = error instanceof Error ? error.name : typeof error;
-    return { kind: 'threw', error: `${entry.name} threw ${type} on ${body.id}; its message is left out, since it can quote the body` };
+    const type = error instanceof Error ? error.constructor.name : typeof error;
+    return { kind: 'threw', error: `${entry.name} threw ${type} on ${body.id}; its message and name are left out, since they can quote the body` };
   }
   if (content === null) return { kind: 'left' };
-  if (!Array.isArray(content) || content.length === 0) {
+  if (!Array.isArray(content) || content.every((block) => block.type === 'text' && isEmptyTextBlock(block))) {
     return {
       kind: 'threw',
-      error: `${entry.name} gave no content for ${body.id}, and the body stays as it is: an entry gives null to leave a body, or content of one block or more`,
+      error: `${entry.name} gave no content for ${body.id}, and the body stays as it is: an entry gives null to leave a body, or content that holds something`,
     };
   }
   return { kind: 'mended', content: releaseEditedRawForms(body.content, content) };
@@ -275,8 +287,8 @@ export function sweepBodyOf(
     rows.length === 1
       ? first.content
       : [
-          { type: 'text', text: rows.map((row) => row.content.map((block) => (block.type === 'text' ? block.text : '')).join('')).join('') },
           ...rows.flatMap((row) => row.content.filter((block) => block.type !== 'text')),
+          { type: 'text', text: rows.map((row) => row.content.map((block) => (block.type === 'text' ? block.text : '')).join('')).join('') },
         ];
   return {
     id: first.id,

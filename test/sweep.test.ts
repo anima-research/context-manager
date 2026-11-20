@@ -234,13 +234,26 @@ describe('a take and its pass', () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     const good = note(cm, `good ${OLD}`);
     const bad = note(cm, `bad ${OLD}`);
+    const named = note(cm, `named ${OLD}`);
     const entry = rewords();
-    const throwing: SweepEntry = { ...entry, mend: (body) => { if (body.id === bad) throw new TypeError(`entry broke on ${OLD}`); return entry.mend(body); } };
+    const throwing: SweepEntry = {
+      ...entry,
+      mend: (body) => {
+        if (body.id === bad) throw new TypeError(`entry broke on ${OLD}`);
+        if (body.id === named) {
+          const error = new RangeError('no message');
+          error.name = textOfBlocks(body.content);
+          throw error;
+        }
+        return entry.mend(body);
+      },
+    };
     cm.takeSweep('rewords-test');
     const report = cm.applySweeps([throwing]);
     assert.equal(report.sweeps[0]!.outcome, 'owed');
-    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [bad]);
+    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [bad, named]);
     assert.match(report.sweeps[0]!.failed[0]!.error, /TypeError/, 'the report names the error\'s type');
+    assert.match(report.sweeps[0]!.failed[1]!.error, /RangeError/, 'by its class, whatever its name says');
     assert.ok(!JSON.stringify(report).includes(OLD), 'and never its text, which can hold the old text');
     assert.ok(!JSON.stringify(cm.showSweep(throwing)).includes(OLD), 'nor does the show');
     assert.ok(textOfBlocks(cm.getMessage(good)!.content).includes(NEW), 'the other body is mended');
@@ -250,17 +263,22 @@ describe('a take and its pass', () => {
     cm.close();
   });
 
-  it('S25: an entry that gives no content can\'t empty a body: the report names it, and the body stays', async () => {
+  it('S25: an entry that gives no content, or only empty text, can\'t empty a body: the report names it, and the body stays', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     const id = note(cm, `a note ${OLD}`);
-    const emptying: SweepEntry = { ...rewords(), mend: (body) => (body.id === id ? [] : null) };
+    const blank = note(cm, `a blank note ${OLD}`);
+    const emptying: SweepEntry = {
+      ...rewords(),
+      mend: (body) => (body.id === id ? [] : body.id === blank ? [{ type: 'text', text: '' }, { type: 'text', text: '' }] : null),
+    };
     cm.takeSweep('rewords-test');
     const report = cm.applySweeps([emptying]);
     assert.equal(report.sweeps[0]!.outcome, 'owed');
-    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [id]);
-    assert.match(report.sweeps[0]!.failed[0]!.error, /null/, 'the failure says what an entry gives instead');
+    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [id, blank]);
+    for (const failure of report.sweeps[0]!.failed) assert.match(failure.error, /null/, 'the failure says what an entry gives instead');
     assert.ok(textOfBlocks(cm.getMessage(id)!.content).includes(OLD), 'the body is as it was');
-    assert.deepEqual(cm.showSweep(emptying).failures.map((f) => f.id), [id], 'the show names it too');
+    assert.ok(textOfBlocks(cm.getMessage(blank)!.content).includes(OLD), 'and so is the one given empty text');
+    assert.deepEqual(cm.showSweep(emptying).failures.map((f) => f.id), [id, blank], 'the show names them too');
     cm.close();
   });
 
@@ -614,6 +632,44 @@ describe('summaries made from a mended row', () => {
     assert.ok(!(await compiledText(cm)).includes(OLD));
     cm.close();
   });
+
+  it('S50: leftover shards that a tick folds after a stop leave no summary once the next pass removes them', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const long = longNote(cm, 'LONG');
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const shards = bodyRows(cm, long);
+    assert.ok(shards.length > 1, 'premise: the note is stored as shards');
+    cm.takeSweep('rewords-test');
+    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
+    cm.applySweeps([rewords()]);
+    stop.restore();
+    assert.ok(cm.getMessage(shards[1]!), 'premise: the later shards stayed');
+    await drain(cm);
+    assert.ok(summariesOf(strategy).some((s) => s.content.includes(OLD)), 'premise: a tick summarized a leftover shard\'s old text');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    await drain(cm);
+    assert.ok(!summariesOf(strategy).some((s) => s.content.includes(OLD)), 'no summary of the old text stays');
+    assert.ok(!(await compiledText(cm)).includes(OLD), 'the compile holds none of the old text');
+    cm.close();
+  });
+
+  it('S57: after a long note\'s pass, no chunk record names a shard the pass removed', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const long = longNote(cm, 'LONG');
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const shards = bodyRows(cm, long);
+    await drain(cm);
+    const recordsOf = () => (strategy as unknown as { chunkRecords: Array<{ id: string; sourceIds: MessageId[] }> }).chunkRecords;
+    assert.ok(recordsOf().some((r) => r.sourceIds.includes(shards[shards.length - 1]!)), 'premise: a record holds a later shard');
+    cm.takeSweep('rewords-test');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    await drain(cm);
+    const named = recordsOf().flatMap((r) => r.sourceIds.filter((id) => cm.getMessage(id) === null).map((id) => `${r.id}:${id}`));
+    assert.deepEqual(named, [], 'every row a record names is stored');
+    cm.close();
+  });
 });
 
 describe('branches', () => {
@@ -754,9 +810,11 @@ describe('what a pass reads and refuses', () => {
     const report = cm.applySweeps([rewords(), other]);
     stop.restore();
     assert.ok(cm.getMessage(shards[1]!), 'premise: the later shards stayed');
+    const otherOutcome = report.sweeps.find((s) => s.name === 'rewords-other');
+    assert.ok(otherOutcome && seen.length > 0, 'premise: the other sweep ran, and its entry was asked');
     assert.ok(seen.every((body) => !shards.slice(1).includes(body.id)), 'the other sweep is asked of no later shard');
-    assert.deepEqual(report.sweeps.find((s) => s.name === 'rewords-other')?.rewritten ?? [], [], 'nor rewrites one');
-    assert.deepEqual(report.sweeps.find((s) => s.name === 'rewords-other')?.failed ?? [], [], 'nor names one as a failure: they are no body');
+    assert.deepEqual(otherOutcome.rewritten, [], 'nor rewrites one');
+    assert.deepEqual(otherOutcome.failed, [], 'nor names one as a failure: they are no body');
     const next = cm.applySweeps([rewords(), other]);
     assert.equal(next.sweeps.find((s) => s.name === 'rewords-test')?.outcome, 'finished');
     for (const shard of shards.slice(1)) assert.equal(cm.getMessage(shard), null, `${shard} is removed`);
@@ -836,6 +894,30 @@ describe('what a pass reads and refuses', () => {
     reader.close();
     cm.close();
   });
+
+  it('S53: a sharded body is given with its other blocks first, as a compile of its recent window gives it, and a rewrite that keeps them keeps that order', async () => {
+    const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true, recentWindowTokens: 1_000_000 });
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const image: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG } };
+    const id = cm.addMessage('system', [text(`LONG ${FILLER.repeat(120)}${OLD} in the middle ${MORE_FILLER.repeat(120)}end of LONG`), image], { writer: 'faulty' });
+    assert.ok(bodyRows(cm, id).length > 1, 'premise: the note is stored as shards');
+    const compiledTypes = async (): Promise<string[]> => {
+      const result = await cm.compile(BIG);
+      const message = result.messages.find((m) => textOfBlocks(m.content as { type: string; text?: string }[]).includes('end of LONG'));
+      assert.ok(message, 'premise: the compile gives the note');
+      return (message.content as { type: string }[]).map((block) => block.type);
+    };
+    const before = await compiledTypes();
+    assert.deepEqual(before, ['image', 'text'], 'premise: a compile gives the image, then the text');
+    const seen: SweepBody[] = [];
+    cm.showSweep(rewords(seen));
+    assert.deepEqual(seen.find((body) => body.id === id)!.content.map((block) => block.type), ['blob_ref', 'text'], 'the entry is given the body in that order');
+    cm.takeSweep('rewords-test');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.deepEqual(bodyRows(cm, id), [id], 'premise: the note is one row');
+    assert.deepEqual(await compiledTypes(), before, 'a compile gives its blocks in the order it gave them before');
+    cm.close();
+  });
 });
 
 describe('what runs beside a pass', () => {
@@ -901,6 +983,7 @@ describe('what runs beside a pass', () => {
     cm.applySweeps([rewords()]);
     assert.ok(ticking, 'premise: the listener started a tick');
     await ticking;
+    assert.ok(summariesOf(strategy).some((s) => s.id === l1!.id), 'the tick let go of nothing: the summary stands until the next select');
     await drain(cm);
     assert.ok(!(await compiledText(cm)).includes(OLD), 'the compile holds none of the old text');
     assert.ok(covered(strategy).has(a) && covered(strategy).has(b), 'both notes are folded again');
@@ -989,6 +1072,83 @@ describe('what runs beside a pass', () => {
       cm.close();
     });
   }
+
+  it('S51: a listener\'s edit of a body that the pass rewrites later stands: the pass names that body and leaves it, and the next pass reads it again', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const first = note(cm, `first ${OLD}`);
+    const second = note(cm, `second ${OLD}`);
+    cm.takeSweep('rewords-test');
+    let edited = false;
+    cm.onMessage((event) => {
+      if (event.type !== 'edit' || event.messageId !== first || edited) return;
+      edited = true;
+      cm.editMessage(second, [text(`second ${OLD} as a listener wrote it`)]);
+    });
+    const report = cm.applySweeps([rewords()]);
+    assert.ok(edited, 'premise: the listener edited the second note');
+    assert.equal(textOfBlocks(cm.getMessage(second)!.content), `second ${OLD} as a listener wrote it`, 'the listener\'s edit stands');
+    assert.deepEqual(report.sweeps[0]!.failed.map((f) => f.id), [second], 'the report names the body');
+    assert.equal(report.sweeps[0]!.outcome, 'owed');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.equal(textOfBlocks(cm.getMessage(second)!.content), `second ${NEW} as a listener wrote it`, 'the next pass mends the body as the listener left it');
+    cm.close();
+  });
+
+  it('S52: a manager on another handle of the branch, ticked by a listener during a pass, lets go of nothing until the pass ends', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const cm = await ContextManager.open({ store, namespace: 'w', strategy: new PassthroughStrategy() });
+    cm.addMessage('User', [text(`chat ${'words '.repeat(60)}`)]);
+    const a = note(cm, `first ${OLD}`);
+    const b = note(cm, `second ${OLD}`);
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const strategy = folding();
+    const reader = await ContextManager.open({ store: store.view(store.currentBranch().name), namespace: 'r', strategy, membrane: mockMembrane() });
+    await drain(reader);
+    const l1 = summariesOf(strategy).find((s) => s.level === 1 && s.sourceIds.includes(a));
+    assert.ok(l1?.sourceIds.includes(b), 'premise: one summary folds both notes');
+    cm.takeSweep('rewords-test');
+    let ticking: Promise<void> | undefined;
+    cm.onMessage((event) => { if (event.type === 'edit' && !ticking) ticking = reader.tick(); });
+    cm.applySweeps([rewords()]);
+    assert.ok(ticking, 'premise: the listener started the reader\'s tick');
+    await ticking;
+    assert.ok(summariesOf(strategy).some((s) => s.id === l1!.id), 'the tick let go of nothing: the summary stands until the next select');
+    await drain(reader);
+    assert.ok(!(await compiledText(reader)).includes(OLD), 'the reader\'s compile holds none of the old text');
+    reader.close();
+    cm.close();
+    store.close();
+  });
+
+  it('S55: a write to the applied list that throws stops the pass, which reports what it did, and a later pass finishes', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const id = note(cm, `a note ${OLD}`);
+    cm.takeSweep('rewords-test');
+    const target = cm.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = target.appendToStateJson!;
+    const failListOn = (on: number) => {
+      let calls = 0;
+      target.appendToStateJson = function (this: unknown, ...args: unknown[]) {
+        if (args[0] === SWEEPS_APPLIED_STATE_ID && ++calls === on) throw new Error('test: the list write failed');
+        return real.apply(this, args);
+      };
+    };
+    failListOn(1);
+    const beforeList = cm.applySweeps([rewords()]);
+    assert.match(beforeList.stopped ?? '', /applied list/, 'a failed list write stops the pass');
+    assert.deepEqual(beforeList.sweeps[0]!.rewritten, [], 'and nothing is rewritten');
+    assert.ok(textOfBlocks(cm.getMessage(id)!.content).includes(OLD));
+    failListOn(2);
+    const afterRewrite = cm.applySweeps([rewords()]);
+    assert.match(afterRewrite.stopped ?? '', /applied list/, 'a failed finish stops the pass too');
+    assert.deepEqual(afterRewrite.sweeps[0]!.rewritten, [id], 'and the report names what it rewrote');
+    assert.equal(afterRewrite.sweeps[0]!.outcome, 'owed');
+    target.appendToStateJson = real;
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.ok(textOfBlocks(cm.getMessage(id)!.content).includes(NEW));
+    cm.close();
+  });
 });
 
 describe('readers that keep summaries', () => {
@@ -1089,5 +1249,142 @@ describe('readers that keep summaries', () => {
     assert.ok(!(await compiledText(child)).includes(OLD), 'the child\'s compile holds none of the old text');
     child.close();
     cm.close();
+  });
+
+  it('S47: a summary in flight in one instance is not written once another instance let go of a row it folds, and an instance that opens later compiles none of the old text', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const first = await ContextManager.open({ store, namespace: 'a', strategy: folding(), membrane: mockMembrane() });
+    note(first, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) first.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const gated = gatedMembrane();
+    const two = folding();
+    const second = await ContextManager.open({ store, namespace: 'a', strategy: two, membrane: gated.membrane });
+    await second.compile(BIG);
+    const ticking = second.tick();
+    await until(() => gated.waiting() > 0, 'premise: the second instance is compressing');
+    first.takeSweep('rewords-test');
+    first.applySweeps([rewords()]);
+    await first.compile(BIG);
+    assert.equal(store.getStateJson('a/autobio:sweep-cursor'), sweepsApplied(store).length, 'premise: the first instance let go, and its cursor is past the list');
+    gated.open();
+    await ticking;
+    assert.ok(!summariesOf(two).some((s) => s.content.includes(OLD)), 'the second writes no summary of the old text');
+    second.close();
+    first.close();
+    const later = await ContextManager.open({ store, namespace: 'a', strategy: folding(), membrane: mockMembrane() });
+    assert.ok(!(await compiledText(later)).includes(OLD), 'an instance that opens later compiles none of the old text');
+    later.close();
+    store.close();
+  });
+
+  it('S48: an instance that opens while another lets go of a listed row lets go of the summaries it loaded', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const one = folding();
+    const first = await ContextManager.open({ store, namespace: 'a', strategy: one, membrane: mockMembrane() });
+    const id = note(first, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) first.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(first);
+    assert.ok(covered(one).has(id), 'premise: the note is folded');
+    first.takeSweep('rewords-test');
+    const target = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = target.getStateJson!;
+    let lettingGo: Promise<void> | undefined;
+    target.getStateJson = function (this: unknown, ...args: unknown[]) {
+      const value = real.apply(this, args);
+      if (args[0] === 'a/autobio:summaries' && !lettingGo) {
+        lettingGo = Promise.resolve().then(() => {
+          first.applySweeps([rewords()]);
+          return first.tick();
+        });
+      }
+      return value;
+    };
+    const two = folding();
+    const second = await ContextManager.open({ store, namespace: 'a', strategy: two, membrane: mockMembrane() });
+    target.getStateJson = real;
+    assert.ok(lettingGo, 'premise: the first instance let go while the second opened');
+    await lettingGo;
+    assert.ok(!(await compiledText(second)).includes(OLD), 'the second compiles none of the old text');
+    assert.ok(!summariesOf(two).some((s) => s.content.includes(OLD)), 'and keeps no summary of it');
+    second.close();
+    first.close();
+    store.close();
+  });
+
+  it('S56: an instance that opens after its namespace let go of a pass\'s rows keeps the summaries made since', async () => {
+    const path = freshPath();
+    const strategy = folding();
+    const cm = await ContextManager.open({ path, strategy, membrane: mockMembrane() });
+    const id = note(cm, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(cm);
+    cm.takeSweep('rewords-test');
+    cm.applySweeps([rewords()]);
+    await drain(cm);
+    const made = summariesOf(strategy).map((s) => s.id);
+    assert.ok(covered(strategy).has(id), 'premise: the note is folded again');
+    cm.close();
+    const later = folding();
+    const reopened = await ContextManager.open({ path, strategy: later, membrane: mockMembrane() });
+    await reopened.compile(BIG);
+    assert.deepEqual(summariesOf(later).map((s) => s.id), made, 'the summaries made since stand');
+    reopened.close();
+  });
+
+  it('S49: a sweep cursor past the end of an empty list is set back, so the list is read once it grows, in an open instance and after a restart', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const b = await ContextManager.open({ store, namespace: 'b', strategy: folding(), membrane: mockMembrane() });
+    note(b, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) b.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(b);
+    b.close();
+    const c = await ContextManager.open({ store, namespace: 'c', strategy: folding(), membrane: mockMembrane() });
+    await drain(c);
+    c.close();
+    store.setStateJson('b/autobio:sweep-cursor', 2);
+    store.setStateJson('c/autobio:sweep-cursor', 2);
+    const closesFirst = await ContextManager.open({ store, namespace: 'b', strategy: folding(), membrane: mockMembrane() });
+    closesFirst.close();
+    const open = await ContextManager.open({ store, namespace: 'c', strategy: folding(), membrane: mockMembrane() });
+    assert.ok((await compiledText(open)).includes(OLD), 'premise: a summary of the old text is compiled');
+    const a = await ContextManager.open({ store, namespace: 'a', strategy: new PassthroughStrategy() });
+    a.takeSweep('rewords-test');
+    a.applySweeps([rewords()]);
+    assert.equal(sweepsApplied(store).length, 2, 'premise: the list grew to the old cursor');
+    assert.ok(!(await compiledText(open)).includes(OLD), 'the open instance compiles none of the old text');
+    const restarted = await ContextManager.open({ store, namespace: 'b', strategy: folding(), membrane: mockMembrane() });
+    assert.ok(!(await compiledText(restarted)).includes(OLD), 'nor does one that opens after a restart');
+    restarted.close();
+    open.close();
+    a.close();
+    store.close();
+  });
+
+  it('S54: a chunk record whose row a pass listed keeps a row that the view hides', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const writer = await ContextManager.open({ store, namespace: 'w', strategy: new PassthroughStrategy() });
+    writer.addMessage('User', [text(`chat ${'words '.repeat(60)}`)]);
+    const hidden = writer.addMessage('User', [text('a row the view will hide')], { hidden: true });
+    const listed = note(writer, `a note ${OLD}`);
+    for (let i = 0; i < 4; i++) writer.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const all = await ContextManager.open({ store, namespace: 'r', strategy: folding(), membrane: mockMembrane() });
+    await drain(all);
+    all.close();
+    const recordsOf = (strategy: AutobiographicalStrategy) => (strategy as unknown as { chunkRecords: Array<{ sourceIds: MessageId[] }> }).chunkRecords;
+    const strategy = folding();
+    const filtered = await ContextManager.open({ store, namespace: 'r', strategy, membrane: mockMembrane(), viewFilter: (m) => m.metadata?.hidden !== true });
+    assert.ok(recordsOf(strategy).some((r) => r.sourceIds.includes(hidden) && r.sourceIds.includes(listed)), 'premise: one record holds the hidden row and the note');
+    writer.takeSweep('rewords-test');
+    writer.applySweeps([rewords()]);
+    await filtered.compile(BIG);
+    const record = recordsOf(strategy).find((r) => r.sourceIds.includes(listed));
+    assert.ok(record?.sourceIds.includes(hidden), 'the record keeps the hidden row');
+    filtered.close();
+    writer.close();
+    store.close();
   });
 });

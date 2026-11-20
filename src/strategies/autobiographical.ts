@@ -113,7 +113,7 @@ import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
-import { SWEEPS_APPLIED_STATE_ID, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
+import { SWEEPS_APPLIED_STATE_ID, listedLaterShards, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -2230,7 +2230,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * ordinal, so while the length stands no row has left the window since.
    */
   private windowLengthLooked: number | undefined;
-  private sweepCursor: number | undefined;
+  private sweepCursor = 0;
   protected _compressionCount = 0;
   /**
    * Monotonic counter of queue items consumed by tick(): compression, merges,
@@ -3157,7 +3157,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
     this.windowLengthLooked = undefined;
-    this.sweepCursor = undefined;
+    this.sweepCursor = 0;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -3188,6 +3188,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.registerStates();
       if (abortIfStale()) return;
       this.loadPersistedState();
+      const cursor: unknown = ctx.store.getStateJson(this.sweepCursorStateId);
+      this.sweepCursor = typeof cursor === 'number' && Number.isInteger(cursor) && cursor >= 0 ? cursor : 0;
       if (abortIfStale()) return;
       await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
       if (abortIfStale()) return;
@@ -8525,33 +8527,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private letGoOfSweptRows(ctx: StrategyContext | null, operation: string): void {
     const store = this.store;
-    if (!ctx || !store || this.config.auditOnly || sweepPassRunning(store)) return;
+    if (!ctx || !store || this.config.auditOnly || sweepPassRunning()) return;
     try {
-      if (this.sweepCursor === undefined) {
-        const stored: unknown = store.getStateJson(this.sweepCursorStateId);
-        this.sweepCursor = typeof stored === 'number' && Number.isInteger(stored) && stored >= 0 ? stored : 0;
-      }
-      let from = this.sweepCursor;
       const listLength = store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0;
-      if (from > listLength) {
+      if (this.sweepCursor > listLength) {
         this.diag.warn(
-          `[autobiographical] the sweep cursor stands at ${from}, past the end of the branch's applied list (${listLength} items): ` +
+          `[autobiographical] the sweep cursor stands at ${this.sweepCursor}, past the end of the branch's applied list (${listLength} items): ` +
             'reading the list from its start, before ' + operation,
         );
-        from = 0;
+        store.setStateJson(this.sweepCursorStateId, 0);
+        this.sweepCursor = 0;
       }
-      if (listLength <= from) return;
-      const { items, length, unreadable } = sweepsApplied(store, from);
+      if (listLength <= this.sweepCursor) return;
+      const { items, length, unreadable } = sweepsApplied(store, this.sweepCursor);
       if (unreadable.length > 0) {
         this.diag.warn(
           `[autobiographical] item(s) [${unreadable.join(', ')}] of the branch's applied list don't parse: the rows they list, if any, ` +
-            `are not let go of, before ${operation}`,
+            `are not let go of, and the summaries over them stay; this reader's cursor moves past them, and doesn't read them again, ` +
+            `before ${operation}`,
         );
       }
       const listed = listedRows(items);
       if (listed.size > 0) {
         if (this.storeWrittenElsewhere()) this.takeUpStoreBeforeLetGo(listed, ctx);
-        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldSweptRows(listed, ctx));
+        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldSweptRows(listed, listedLaterShards(items)));
       }
       store.setStateJson(this.sweepCursorStateId, length);
       this.sweepCursor = length;
@@ -8652,11 +8651,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private unfoldSweptRows(
     listed: ReadonlySet<MessageId>,
-    ctx: StrategyContext,
+    laterShards: ReadonlySet<MessageId>,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
-    const view = ctx.messageStore;
     return this.unfold(this.summariesFolding(listed), (record) =>
-      record.sourceIds.some((id) => listed.has(id)) ? record.sourceIds.filter((id) => view.get(id) !== null) : undefined,
+      record.sourceIds.some((id) => listed.has(id)) ? record.sourceIds.filter((id) => !laterShards.has(id)) : undefined,
     );
   }
 
@@ -13330,6 +13328,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // record again, over the rows it keeps.
       if (this._spanLeftWindow.has(chunk)) {
         this.diag.warn('[autobiographical] discarding L1: a row of its span left the window mid-request');
+        return;
+      }
+      this.letGoOfSweptRows(ctx, 'writing an L1');
+      if (this._spanLeftWindow.has(chunk)) {
+        this.diag.warn("[autobiographical] discarding L1: a sweep's pass listed a row of its span mid-request");
         return;
       }
 

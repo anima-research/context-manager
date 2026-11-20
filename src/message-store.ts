@@ -1022,15 +1022,31 @@ export class MessageStore {
     const bodies: StoredMessageInternal[][] = [];
     for (let i = 0; i < all.length; ) {
       const to = bodyEnd(all.length, at, i);
-      bodies.push(
-        all.slice(i, to + 1).map((row) => {
-          const content = wellFormedContent(row.content, `message ${row.id}`, this.malformedLogged, this.log);
-          return content === row.content ? row : { ...row, content };
-        }),
-      );
+      bodies.push(all.slice(i, to + 1).map((row) => this.asStored(row)));
       i = to + 1;
     }
     return bodies;
+  }
+
+  /**
+   * The body whose first row is `messageId`, as bodiesAsStored gives it, or
+   * null when the slot holds no such row.
+   */
+  bodyAsStored(messageId: MessageId): StoredMessageInternal[] | null {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return null;
+    const at = (i: number) => this.getInternal(i);
+    const rows: StoredMessageInternal[] = [];
+    for (let i = index, to = bodyEnd(this.length(), at, index); i <= to; i++) {
+      const row = at(i);
+      if (row) rows.push(this.asStored(row));
+    }
+    return rows;
+  }
+
+  private asStored(row: StoredMessageInternal): StoredMessageInternal {
+    const content = wellFormedContent(row.content, `message ${row.id}`, this.malformedLogged, this.log);
+    return content === row.content ? row : { ...row, content };
   }
 
   private writeEdit(

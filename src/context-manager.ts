@@ -73,7 +73,7 @@ import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-pr
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, runSweepPass, sweepBodyOf, sweepsApplied, textLength } from './sweep.js';
-import type { ListedBody, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake } from './sweep.js';
+import type { ListedBody, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake } from './sweep.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   recordedThrough,
@@ -2000,12 +2000,12 @@ export class ContextManager {
    * branch. Each body is read as the store holds it, not through this
    * manager's view, and without blobs (MessageStore.bodiesAsStored), and the
    * entry gives its new content. A body that a pass would not rewrite is a
-   * failure here too: one stored short, one on which the entry threw, and one
-   * whose rewrite the store or the strategy refuses. Later shards that a pass
-   * listed are no body: the next pass removes them. A show never gives the
-   * old text, and writes nothing, also while a taken sweep waits to be
-   * applied. Refused while a sharded addMessage of this manager stores its
-   * shards.
+   * failure here too: one stored short, one on which the entry threw or gave
+   * no content, and one whose rewrite the store or the strategy refuses, as
+   * the refusal reads. Later shards that a pass listed are no body: the next
+   * pass removes them. A show's changes never give the old text, and a show
+   * writes nothing, also while a taken sweep waits to be applied. Refused
+   * while a sharded addMessage of this manager stores its shards.
    */
   showSweep(entry: SweepEntry): SweepShow {
     this.requireOpen('showSweep');
@@ -2048,23 +2048,26 @@ export class ContextManager {
    * sweep the store took whose newest take this branch hasn't finished for
    * the slot. First it removes the later shards an earlier pass listed and
    * left standing after their first shard was rewritten, with no entry
-   * asked. Then, for each owed sweep, it asks the entry of that name in
-   * `entries` of each body, read as showSweep reads them; a sweep with no
-   * entry there is reported `unknown` and left. Before it rewrites, it
-   * appends to the branch's applied list the bodies it will rewrite: a body
-   * that showSweep names as a failure is reported and not listed. A body
-   * stored as one row is edited; a body stored as shards is written whole
-   * at its first shard, which keeps its id and place, and its later shards
-   * are then removed as removeMessages removes rows. A rewrite never makes
-   * one row of content that the strategy would store as shards
+   * asked, and lists them again before it removes them, so a strategy that
+   * folded them since lets go of that. Then, for each owed sweep, it asks the
+   * entry of that name in `entries` of each body, read as showSweep reads
+   * them; a sweep with no entry there is reported `unknown` and left. Before
+   * it rewrites, it appends to the branch's applied list the bodies it will
+   * rewrite: a body that showSweep names as a failure is reported and not
+   * listed. A body stored as one row is edited; a body stored as shards is
+   * written whole at its first shard, which keeps its id and place, and its
+   * later shards are then removed as removeMessages removes rows. A body that
+   * changed after the pass read it is reported and left as it is. A rewrite
+   * never makes one row of content that the strategy would store as shards
    * (chunkIngressMessage), unless the body was such a row already. Once
    * every listed body is rewritten and no body failed, it appends that the
    * branch finished the take.
    *
    * Synchronous, so no turn can start between its reads and its writes, and
-   * one pass at a time runs on the store: a listener of its writes that asks
-   * for another is refused. A listener that moves the store to another
-   * branch or closes the manager stops it after that write (`stopped`).
+   * one pass at a time runs: a listener of its writes that asks for another,
+   * on any store, is refused. A listener that moves the store to another
+   * branch or closes the manager stops it after that write, and so does a
+   * write to the applied list that throws (`stopped`).
    */
   applySweeps(entries: readonly SweepEntry[]): SweepPassReport {
     this.requireInitialized('applySweeps');
@@ -2074,7 +2077,7 @@ export class ContextManager {
           'Ask for the pass once that call has returned.',
       );
     }
-    return runSweepPass(this.store, () => this.sweepPass(entries));
+    return runSweepPass(() => this.sweepPass(entries));
   }
 
   private sweepPass(entries: readonly SweepEntry[]): SweepPassReport {
@@ -2098,19 +2101,40 @@ export class ContextManager {
       return report.stopped === null;
     };
     const done = (): SweepPassReport => ({ ...report, sweeps: [...outcomes.values()] });
+    const list = (item: SweepApplied): boolean => {
+      try {
+        appendApplied(this.store, item);
+        return true;
+      } catch (error) {
+        report.stopped = `writing to the branch's applied list threw, and the write may have landed: ${describeThrown(error)}`;
+        return false;
+      }
+    };
 
-    const list = sweepsApplied(this.store);
-    report.unreadable.items = list.unreadable;
-    const applied = list.items.filter((item) => item.slot === slot);
+    const read = sweepsApplied(this.store);
+    report.unreadable.items = read.unreadable;
+    const applied = read.items.filter((item) => item.slot === slot);
     const listed = listedLaterShards(applied);
     for (const item of applied) {
       if (item.kind !== 'listed') continue;
       for (const body of item.bodies) {
+        let leftover: MessageId[];
         try {
-          const removed = this.removeLeftoverShards(body);
-          if (removed.length > 0) outcomeOf(item.name, item.take).removed.push(...removed);
+          leftover = this.leftoverShards(body);
         } catch (error) {
           outcomeOf(item.name, item.take).failed.push({ id: body.id, error: describeThrown(error) });
+          continue;
+        }
+        if (leftover.length === 0) continue;
+        if (!list({ ...item, at: new Date().toISOString(), sequence: this.store.currentSequence(), bodies: [{ ...body, laterShards: leftover }] })) return done();
+        try {
+          this.removeMessages(leftover[0]!, leftover[leftover.length - 1]!);
+          outcomeOf(item.name, item.take).removed.push(...leftover);
+        } catch (error) {
+          outcomeOf(item.name, item.take).failed.push({
+            id: body.id,
+            error: `${describeThrown(error)}. The removal may have landed before that; the next pass removes any of these shards that stand.`,
+          });
         }
         if (!stillHere()) return done();
       }
@@ -2130,7 +2154,7 @@ export class ContextManager {
       }
       const owed = outcomeOf(take.name, take.take);
       owed.take = take.take;
-      this.applyTake(take, entries, slot, owed, listed, stillHere);
+      this.applyTake(take, entries, slot, owed, listed, stillHere, list);
       if (report.stopped !== null) break;
     }
     return done();
@@ -2143,6 +2167,7 @@ export class ContextManager {
     outcome: SweepPassOutcome,
     listed: Set<MessageId>,
     stillHere: () => boolean,
+    list: (item: SweepApplied) => boolean,
   ): void {
     const entry = entries.find((each) => each.name === take.name);
     if (!entry) {
@@ -2152,7 +2177,7 @@ export class ContextManager {
     const { mended, failed } = this.sweepCandidates(entry, listed);
     outcome.failed.push(...failed);
     if (mended.length > 0) {
-      appendApplied(this.store, {
+      const listing = list({
         v: 1,
         kind: 'listed',
         name: take.name,
@@ -2167,9 +2192,17 @@ export class ContextManager {
           laterShards: rows.slice(1).map((row) => row.id),
         })),
       });
+      if (!listing) return;
       for (const { rows } of mended) for (const row of rows.slice(1)) listed.add(row.id);
     }
     for (const { body, rows, content } of mended) {
+      if (!this.storedAsRead(rows)) {
+        outcome.failed.push({
+          id: body.id,
+          error: `${body.id} changed during this pass, after the pass read it: it stays as it is now, and the next pass reads it again.`,
+        });
+        continue;
+      }
       try {
         this.write(() => this.messageStore.rewriteBody(body.id, content));
         outcome.rewritten.push(body.id);
@@ -2184,14 +2217,25 @@ export class ContextManager {
         this.removeMessages(rows[1]!.id, rows[rows.length - 1]!.id);
         outcome.removed.push(...rows.slice(1).map((row) => row.id));
       } catch (error) {
-        outcome.failed.push({ id: body.id, error: `${describeThrown(error)}. The list names its later shards, and the next pass removes them.` });
+        outcome.failed.push({
+          id: body.id,
+          error: `${describeThrown(error)}. The removal may have landed before that; the list names its later shards, and the next pass removes any that stand.`,
+        });
       }
       if (!stillHere()) return;
     }
-    if (outcome.failed.length === 0) {
-      appendApplied(this.store, { v: 1, kind: 'finished', name: take.name, take: take.take, slot, at: new Date().toISOString() });
+    if (outcome.failed.length === 0 && list({ v: 1, kind: 'finished', name: take.name, take: take.take, slot, at: new Date().toISOString() })) {
       outcome.outcome = 'finished';
     }
+  }
+
+  private storedAsRead(rows: readonly StoredMessageInternal[]): boolean {
+    const now = this.messageStore.bodyAsStored(rows[0]!.id);
+    return (
+      now !== null &&
+      now.length === rows.length &&
+      now.every((row, i) => row.id === rows[i]!.id && JSON.stringify(row.content) === JSON.stringify(rows[i]!.content))
+    );
   }
 
   private sweepCandidates(
@@ -2237,7 +2281,8 @@ export class ContextManager {
     if (old !== undefined && this.wouldShard(body.participant, old)) return;
     throw new Error(
       `Rewrite of ${body.id} refused: the strategy would store its new content as shards, and nothing shards a stored row ` +
-        'again, so a rewrite never makes one row of it. The body stays as it is.',
+        'again, so a rewrite never makes one row of it. The body stays as it is, and each pass refuses it again while the ' +
+        'entry gives this content: the sweep stays owed until the entry gives shorter content or the body is removed.',
     );
   }
 
@@ -2269,12 +2314,11 @@ export class ContextManager {
     return MessageStore.registrationFor(this.slots.messageNamespace).id;
   }
 
-  private removeLeftoverShards(body: ListedBody): MessageId[] {
+  private leftoverShards(body: ListedBody): MessageId[] {
     const stored = body.laterShards.filter((id) => this.messageStore.sequenceOf(id) !== undefined);
     if (stored.length === 0) return [];
     const run = this.bodyRunOf(stored[0]!);
     if (!run || run[0]!.id === body.id) return [];
-    this.removeMessages(run[0]!.id, run[run.length - 1]!.id);
     return run.map((row) => row.id);
   }
 
