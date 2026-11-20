@@ -28,6 +28,24 @@ export interface MessageStoreView {
    */
   sequenceOf?(id: MessageId): number | undefined;
   /**
+   * Whether this branch's messages chain holds the message the id names:
+   * true for a message in the view, one a view filter hides, one removed
+   * since, and one the branch inherited through a fork; false for one
+   * another branch wrote after the fork, for one in a chain a lost state
+   * index left behind (chronicle before 0.5.0 began a new chain then), and
+   * for an id the store never gave a message (optional — MessageStore
+   * provides it). It reads the messages state as it stood at the message's
+   * append, which costs in proportion to that state, and throws where a
+   * read fails. A filtered view answers for the messages it hides, a merged
+   * view for every source when each source can, and the window a
+   * ContextManager presents (presentedMessageView) as the view under it
+   * does. The autobiographical strategy's chain-break guard asks it to tell
+   * a removal or a filter from a broken chain; a view without it stops
+   * compression of new conversation wherever the store holds three or more
+   * chunk records and most name no message in the view.
+   */
+  onBranch?(id: MessageId): boolean;
+  /**
    * A message's position in `getAll()`, undefined when the listing doesn't
    * hold it, without reading the message where the view can (optional).
    * The window a ContextManager gives its strategy and its compile answers
