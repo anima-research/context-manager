@@ -1025,6 +1025,331 @@ describe('every rung keeps its own identity across a resume', () => {
     fx.manager.close();
   });
 
+  for (const logging of [false, true]) for (const hoist of [false, true]) {
+    it(`fallback outcome tracing does not re-read text: logging=${logging}, hoist=${hoist}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const mock = scripted([REFUSAL as never, OK('assessed memory')]);
+      const fx = await build(mock.membrane, { hoist, sourceOnlyFallback: true });
+      const seam = fx.strategy as unknown as {
+        assessFallbackCompressionResponse(response: unknown): { outcome: string; response?: { content: Array<{ text: string }> } };
+      };
+      const assess = seam.assessFallbackCompressionResponse;
+      let reads = 0;
+      seam.assessFallbackCompressionResponse = function (response) {
+        const result = assess.call(this, response);
+        if (result.outcome === 'valid') Object.defineProperty(result.response!.content[0]!, 'text', {
+          get() {
+            reads++;
+            if (reads > 1) throw new Error('extra extraction consumed the answer');
+            return 'persisted memory';
+          },
+        });
+        return result;
+      };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        await fx.strategy.run(fx.target(), managerContext(fx.manager));
+        assert.equal(mock.calls.length, 2, 'canonical refusal, then the selected fallback');
+        assert.equal(reads, 1, 'only the required summary extraction reads the live text');
+        assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted memory'));
+      } finally {
+        seam.assessFallbackCompressionResponse = assess;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
+  for (const logging of [false, true]) {
+    it(`attempt receipt id getters cannot replace a provider failure: logging=${logging}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const original = failure('server');
+      const mock = scripted([{ throw: failure('invalid_request') }, { throw: original }]);
+      const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+      const chunk = fx.target();
+      const seam = fx.strategy as unknown as { diag: { error(...args: unknown[]): void } };
+      const error = seam.diag.error;
+      let reads = 0;
+      seam.diag.error = (...args) => {
+        if (String(args[0]).startsWith('Failed to compress chunk')) Object.defineProperty(chunk.messages[1]!, 'id', {
+          get() { reads++; throw new Error('attempt receipt id getter failed'); },
+        });
+        error.apply(seam.diag, args);
+      };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        await assert.rejects(fx.strategy.run(chunk, managerContext(fx.manager)), err => err === original);
+        assert.equal(mock.calls.length, 2, 'the rejected canonical has a failed-attempt trace before source-only interrupts');
+        assert.equal(reads, logging ? 2 : 0, 'attempt and final receipts exercise their guarded getters only with logging');
+      } finally {
+        seam.diag.error = error;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
+  for (const logging of [false, true]) for (const success of [false, true]) {
+    it(`receipt getters cannot replace compression result: logging=${logging}, success=${success}`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const original = failure('server');
+      let dispatched: NormalizedRequest | undefined;
+      const poison = () => Object.defineProperty(dispatched!.messages[0]!, 'content', {
+        get() { throw new Error('receipt content getter failed'); },
+      });
+      const membrane = { complete: async (request: NormalizedRequest) => {
+        dispatched = request;
+        if (!success) { poison(); throw original; }
+        return OK('persisted memory');
+      } };
+      const fx = await build(membrane);
+      const seam = fx.strategy as unknown as { noteCompressionLanded(...args: unknown[]): void };
+      const land = seam.noteCompressionLanded;
+      seam.noteCompressionLanded = function (...args) { land.apply(this, args); poison(); };
+      try {
+        if (logging) process.env.CONTEXT_MANAGER_COMPRESSION_LOG = freshPath();
+        else delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        if (success) {
+          await fx.strategy.run(fx.target(), managerContext(fx.manager));
+          assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted memory'));
+        } else await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === original);
+      } finally {
+        seam.noteCompressionLanded = land;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+  }
+
+  it('a carrier-shaped unstripped resume warning still takes the stripping retry', async () => {
+    const mock = scripted([OK('unstripped memory'), OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    const local = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    let resumedWarnings = 0;
+    try {
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after') && ++resumedWarnings === 1) throw local;
+        warn.apply(seam.diag, args);
+      };
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(mock.calls.length, 2, 'main retries the carrier-shaped local error once');
+      assert.ok(carriesThinking(mock.calls[0]!) && !carriesThinking(mock.calls[1]!));
+      assert.ok(fx.strategy.summariesView().some(s => s.content === 'stripped memory'));
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
+
+  it('a reused resume-warning error is attributed to the current dispatched model', async () => {
+    const original = failure('server');
+    const mock = scripted([{ throw: original }, OK('memory')]);
+    const fx = await build(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), err => err === original);
+      assert.equal(fx.strategy.pause()?.model, 'same-model', 'premise: this error has an earlier attribution');
+      fx.strategy.setCompressionModel('model-B');
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after')) throw original;
+        warn.apply(seam.diag, args);
+      };
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), err => err === original);
+      assert.equal(mock.calls[1]!.config?.model, 'model-B');
+      assert.equal(fx.strategy.pause()?.model, 'model-B', 'the local catch refreshes attribution as on main');
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
+
+  it('main reset-order regression: repeated successful unstripped answers with failing resume warnings', async () => {
+    const mock = scripted([OK('memory')]);
+    const fx = await build(mock.membrane);
+    const seam = fx.strategy as unknown as { diag: { warn(...args: unknown[]): void } };
+    const warn = seam.diag.warn;
+    const local = new Error('local resumed warning sink failed');
+    const counts: number[] = [];
+    try {
+      fx.strategy.notePause(failure('server'), managerContext(fx.manager));
+      seam.diag.warn = (...args) => {
+        if (String(args[0]).includes('compression resumed after')) throw local;
+        warn.apply(seam.diag, args);
+      };
+      for (let i = 1; i <= 7; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === local);
+        counts.push(l1RunsOf(fx.strategy)[0]!.failures);
+      }
+      assert.deepEqual(counts, [1, 2, 3, 4, 5, 6, 7], 'same failure-run counts as main, not repeated ones');
+      fx.strategy.land(mock.membrane);
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(mock.calls.length, 8, 'one paid unstripped call per failure, then the persistent bound');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1);
+      assert.ok(JSON.stringify(progressSlot(fx.manager)).includes('persistent-') ||
+        JSON.stringify(fx.strategy.getCompressionQuarantineStatus()).includes('persistent-'));
+      assert.deepEqual(l1RunsOf(fx.strategy), [], 'the persistent decision ends the run');
+    } finally { seam.diag.warn = warn; fx.manager.close(); }
+  });
+
+  it('a fresh carrier rejection preserves the old run when its progress write fails', async () => {
+    const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: failure('server') }, { throw: rejected }]);
+    const fx = await withCarriers(mock.membrane);
+    const localError = new Error('local progress write failed');
+    const seam = fx.strategy as unknown as { recordCompressionFamilyProgress(...args: unknown[]): void };
+    const write = seam.recordCompressionFamilyProgress;
+    let writeHits = 0;
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      l1RunsOf(fx.strategy)[0]!.failures = 3;
+      fx.strategy.land(mock.membrane);
+      seam.recordCompressionFamilyProgress = function (...args) {
+        if (writeHits++ === 0) throw localError;
+        write.apply(this, args);
+      };
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      assert.ok(writeHits > 0);
+      assert.equal(mock.calls.length, 2, 'no stripped call after the local write failure');
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 4, 'as on main, the local write extends the shared run');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally { seam.recordCompressionFamilyProgress = write; fx.manager.close(); }
+  });
+
+  it('a sibling carrier rejection ends an older provider-failure run before local inspection fails', async () => {
+    const rejected = Object.assign(new Error('thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const fx = await withCarriers(mock.membrane);
+    const peer = new ProbeStrategy(config({}));
+    const peerMock = scripted([{ throw: rejected }, { throw: new CompressionWithdrawn() }]);
+    const peerManager = await ContextManager.open({ store: fx.manager.getStore(), strategy: peer, membrane: peerMock.membrane });
+    peerManager.setToolDefinitions(['skip_reply', 'journal'].map(tool));
+    (peer as unknown as { summaries: SummaryEntry[] }).summaries = structuredClone(fx.strategy.summariesView());
+    const localError = failure('network');
+    const seam = fx.strategy as unknown as { compressionResponseStopReason(response: unknown): string | undefined };
+    const inspect = seam.compressionResponseStopReason;
+    try {
+      for (let i = 0; i < 7; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      }
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 7);
+      await assert.rejects(peer.run(fx.target(), managerContext(peerManager)), error => error instanceof CompressionWithdrawn);
+      assert.equal(peerMock.calls.length, 2);
+      assert.ok(progressSlot(fx.manager).some(entry => JSON.stringify(entry).includes('canonical:carrier-rejected')));
+      const answered = scripted([OK('stripped memory')]);
+      // Keep the same domain; only replace the provider's behavior.
+      (mock.membrane as unknown as { complete: unknown }).complete = (answered.membrane as unknown as { complete: unknown }).complete;
+      seam.compressionResponseStopReason = () => { throw localError; };
+      fx.strategy.land(mock.membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      assert.equal(answered.calls.length, 1);
+      assert.ok(!carriesThinking(answered.calls[0]!));
+      assert.equal(l1RunsOf(fx.strategy)[0]?.failures, 1, 'the local error must not become the eighth old provider failure');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally {
+      seam.compressionResponseStopReason = inspect;
+      fx.manager.close();
+    }
+  });
+
+  it('repeated local inspection failures restart after reused carrier rejections', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: rejected }, OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    const localError = failure('network');
+    let inspections = 0;
+    const internals = fx.strategy as unknown as { compressionResponseStopReason(response: unknown): string | undefined };
+    const inspect = internals.compressionResponseStopReason;
+    internals.compressionResponseStopReason = () => { inspections++; throw localError; };
+    try {
+      // Reuse must reset the shared unstripped key: it might still contain
+      // provider failures from before a sibling recorded the carrier rejection.
+      // Without a distinct local-error identity, repeated local errors reset too.
+      for (let i = 0; i < 8; i++) {
+        fx.strategy.land(mock.membrane);
+        await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), error => error === localError);
+      }
+      assert.equal(inspections, 8, 'each provider answer reached the failing local inspection');
+      assert.equal(mock.calls.length, 9, 'one carrier rejection, then eight stripped answers');
+      assert.ok(carriesThinking(mock.calls[0]!) && mock.calls.slice(1).every(request => !carriesThinking(request)));
+      // Pin current reuse accounting, not a guarantee that local failures should never accumulate.
+      assert.deepEqual(l1RunsOf(fx.strategy).map(({ key, failures }) => ({ key, failures })), [{
+        key: runKey(fx.target().messages, 'canonical', false), failures: 1,
+      }], 'each reused carrier rejection restarts the shared unstripped run');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'local errors alone do not reach the bound here');
+    } finally {
+      internals.compressionResponseStopReason = inspect;
+      fx.manager.close();
+    }
+  });
+
+  for (const shared of [failure('server', { httpStatus: 503 }), 'primitive failure']) {
+    it(`concurrent stripped and unstripped failures keep attempt-local attribution (${typeof shared})`, async () => {
+      const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+        type: 'invalid_request', retryable: false, httpStatus: 400,
+      });
+      let releasePlain!: () => void;
+      let releaseStripped!: () => void;
+      const plainGate = new Promise<void>(resolve => { releasePlain = resolve; });
+      const strippedGate = new Promise<void>(resolve => { releaseStripped = resolve; });
+      const stripped = scripted([{ throw: rejected }, { gate: strippedGate, then: { throw: shared } }]);
+      const plain = scripted([{ gate: plainGate, then: { throw: shared } }]);
+      const a = await withCarriers(stripped.membrane);
+      const b = await withCarriers(plain.membrane);
+      try {
+        const pending = Promise.allSettled([
+          a.strategy.run(a.target(), managerContext(a.manager)),
+          b.strategy.run(b.target(), managerContext(b.manager)),
+        ]);
+        await until(() => stripped.calls.length === 2 && plain.calls.length === 1, 'both conflicting failures gated');
+        // Release both failures together: each attempt must retain its own
+        // stripped attribution even when they throw the same value.
+        releasePlain();
+        releaseStripped();
+        const results = await pending;
+        assert.ok(results.every(result => result.status === 'rejected' && result.reason === shared));
+        assert.equal(stripped.calls.length, 2);
+        assert.ok(carriesThinking(stripped.calls[0]!) && !carriesThinking(stripped.calls[1]!));
+        assert.deepEqual(l1RunsOf(a.strategy).map(run => run.key), [runKey(a.target().messages, 'canonical', true)]);
+        assert.deepEqual(l1RunsOf(b.strategy).map(run => run.key), [runKey(b.target().messages, 'canonical', false)]);
+      } finally { releasePlain(); releaseStripped(); a.manager.close(); b.manager.close(); }
+    });
+  }
+
+  it('an unserializable stripped failure still uses the stripped run key', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), {
+      type: 'invalid_request', retryable: false, httpStatus: 400,
+    });
+    const mock = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
+    const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+    const complete = membrane.complete;
+    membrane.complete = async request => {
+      if (!carriesThinking(request)) Object.defineProperty(request, 'toJSON', {
+        value: () => { throw new Error('cannot serialize stripped request'); },
+      });
+      return complete(request);
+    };
+    const fx = await withCarriers(mock.membrane);
+    try {
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+      assert.deepEqual(l1RunsOf(fx.strategy).map(run => run.key),
+        [runKey(fx.target().messages, 'canonical', true)]);
+    } finally { fx.manager.close(); }
+  });
+
   it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
@@ -1338,6 +1663,44 @@ describe('compression lane: failures are evidence only by the company they keep'
       'the merge ran ahead of the failed chunk');
     assert.equal(fx.strategy.compressionQueueView().length, 1, 'the failed chunk is still queued');
     fx.manager.close();
+  });
+
+  it('an answered merge preserves its old run when a resume warning fails', async () => {
+    const mock = scripted([{ throw: failure('server') }, OK('merged memory')]);
+    const fx = await queued(mock.membrane, { config: { hierarchical: true } });
+    const ids = fx.manager.queryMessages({}).messages.map(m => m.id);
+    for (const [id, first, last] of [['L1-a', 0, 3], ['L1-b', 4, 7]] as const) fx.strategy.seed({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    const seam = fx.strategy as unknown as {
+      enqueueMerge(merge: { level: number; sourceIds: string[] }): void;
+      mergeFailureRuns: Map<string, { failures: number }>;
+      resumeCompressionLane(...args: unknown[]): void;
+    };
+    seam.enqueueMerge({ level: 2, sourceIds: ['L1-a', 'L1-b'] });
+    const resume = seam.resumeCompressionLane;
+    const localError = new Error('local merge resume warning failed');
+    let resumeHits = 0;
+    try {
+      // Covered L1 chunks may be skipped before the queued merge gets its turn.
+      for (let i = 0; i < 4 && mock.calls.length === 0; i++) {
+        try { await fx.strategy.tick(managerContext(fx.manager)); }
+        catch (error) { assert.match(String(error), /zz server failure/); }
+      }
+      assert.equal(mock.calls.length, 1);
+      assert.equal(seam.mergeFailureRuns.size, 1);
+      [...seam.mergeFailureRuns.values()][0]!.failures = 3;
+      fx.strategy.land(mock.membrane);
+      fx.strategy.expirePause();
+      seam.resumeCompressionLane = () => { resumeHits++; throw localError; };
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), error => error === localError);
+      assert.equal(resumeHits, 1);
+      assert.equal(mock.calls.length, 2);
+      assert.equal([...seam.mergeFailureRuns.values()][0]?.failures, 4, 'as on main, local resume error extends the shared run');
+      assert.equal(laneOf(fx.strategy).mergeQueue.length, 1, 'merge stays queued, not persistently rejected');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    } finally { seam.resumeCompressionLane = resume; fx.manager.close(); }
   });
 
   it('a failing chunk and a failing merge take turns, least recently failed first', async () => {
@@ -2571,7 +2934,7 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     });
   }
 
-  it("a carrier rejection reused from progress ends the run of the request that carried them", async () => {
+  it("a carrier rejection reused from progress ends the shared unstripped run", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const withdrawn = new CompressionWithdrawn();
     const mock = scripted([{ throw: rejected }, { throw: failure('network') }, { throw: withdrawn }]);
@@ -2584,12 +2947,13 @@ describe("a rung's answer ends its runs, whether it came now or is reused from p
     const ctx = managerContext(fx.manager);
     await assert.rejects(fx.strategy.run(fx.target(), ctx), /zz network failure/);
     assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the carrier request was rejected, and its stripped retry failed');
+    // The shared key may represent either old provider failures or local errors.
     seedRung(fx.strategy, fx.target(), 'canonical', false);
     // The stripped request is withdrawn, which records nothing and ends no run.
     await assert.rejects(fx.strategy.run(fx.target(), ctx), (error) => error === withdrawn);
     assert.equal(mock.calls.length, 3, 'premise: one more call');
     assert.ok(!carries(mock.calls[2]!), 'premise: the known-rejected carrier request was not sent again');
-    assert.deepEqual(l1RunsOf(fx.strategy), [], "the reused rejection ended the carrier request's run");
+    assert.deepEqual(l1RunsOf(fx.strategy), [], 'reuse ends the shared unstripped run');
     fx.manager.close();
   });
 

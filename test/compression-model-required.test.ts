@@ -129,6 +129,6 @@ describe('AutobiographicalStrategy compression model contract', () => {
         process.env.CONTEXT_MANAGER_COMPRESSION_LOG = priorLogPath;
       }
     }
-    assert.ok(warnings.includes('compression log write failed: ns=agents/tern'), warnings.join('\n'));
+    assert.ok(warnings.includes('compression log write failed: event=no-compression-model rung=n/a chunk=n/a ns=agents/tern'), warnings.join('\n'));
   });
 });

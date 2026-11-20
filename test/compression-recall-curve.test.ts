@@ -4180,6 +4180,1281 @@ describe('tool-prose hoist admission', () => {
     );
     fx.manager.close();
   });
+  describe('admission log decomposition', () => {
+    type Admission = {
+      baseCurveLabel: string; accountingSource: string; baseProviderInputTokens: number | null;
+      expansionDeltaTokens: number; boundedInputTokens: number; outputReserveTokens: number;
+      admittedTokens: number; budgetTokens: number; disposition: string;
+    };
+    type Log = { event?: string; metadata?: Record<string, unknown> & { admission?: Admission } };
+    const kinds = ['expansion', 'canonical-hoist', 'source-hoist'] as const;
+    type Kind = typeof kinds[number];
+    const label = (kind: Kind) => kind === 'expansion' ? 'expand:L2-201'
+      : kind === 'canonical-hoist' ? 'tool-prose-hoist' : 'source-only-tool-prose-hoist';
+    const baseLabel = (kind: Kind) => kind === 'source-hoist' ? 'source-only-final' : 'canonical';
+    const options = (kind: Kind, budget: number) => ({
+      compressionContextBudgetTokens: budget,
+      compressionRefusalCurveFallbacks: kind === 'expansion' ? 1 : 0,
+      compressionSourceOnlyFallback: kind === 'source-hoist',
+      ...(kind === 'expansion' ? {} : PROSE),
+    });
+
+    async function capture(fx: Fixture, work = () => fx.strategy.run(fx.target, managerContext(fx.manager))): Promise<Log[]> {
+      const path = `${freshPath()}-admission.jsonl`;
+      paths.push(path);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = path;
+      try {
+        await work();
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+      return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Log);
+    }
+
+    function countChunkKeys(fx: Fixture): () => number {
+      const seam = fx.strategy as unknown as { chunkKey(chunk: unknown): string };
+      const chunkKey = seam.chunkKey;
+      let calls = 0;
+      seam.chunkKey = function (chunk) { calls++; return chunkKey.call(this, chunk); };
+      return () => calls;
+    }
+
+    type FailureRun = { chunkKey: string; run: { key: string; domain: string; failures: number; atLanded: number } };
+    const failureRuns = (fx: Fixture) => (fx.strategy as unknown as {
+      compressionFailureRuns: Map<string, FailureRun>;
+    }).compressionFailureRuns;
+    const failureSnapshot = (fx: Fixture) => [...failureRuns(fx)].map(([subject, entry]) => ({
+      subject, ...entry, run: { ...entry.run, domain: entry.run.domain.split('\u0000').slice(1).join('\u0000') },
+    }));
+    const admissionDecisionChecks = new WeakMap<Fixture, () => number>();
+    async function seedFailureRun(fx: Fixture, membrane: ReturnType<typeof flexibleMembrane>['membrane'], kind?: Kind) {
+      const seam = membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = seam.complete;
+      const outage = Object.assign(new Error('seed provider failure'), { type: 'server_error' });
+      seam.complete = async () => { throw outage; };
+      try {
+        await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage);
+        assert.equal(failureRuns(fx).size, 1);
+        for (const [subject, entry] of failureRuns(fx)) {
+          entry.run.failures = 3;
+          // Keep an open gated-rung history through the canonical answer.
+          if (kind) entry.run.key = createHash('sha256').update(JSON.stringify({
+            runSubject: subject, curveLabel: label(kind), stripped: false,
+          })).digest('hex');
+        }
+      } finally { seam.complete = complete; }
+      if (kind) {
+        const strategy = fx.strategy as unknown as {
+          compressionAdmission(...args: unknown[]): { disposition: string };
+          compressionResponseStopReason(...args: unknown[]): unknown;
+          prepareCompressionCandidate(request: NormalizedRequest, curveLabel: string): NormalizedRequest;
+        };
+        const prepare = strategy.prepareCompressionCandidate;
+        strategy.prepareCompressionCandidate = function (request, curveLabel) {
+          if (curveLabel === label(kind)) assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
+            'the gated rung still has its open history at preparation');
+          return prepare.call(this, request, curveLabel);
+        };
+        const admission = strategy.compressionAdmission;
+        let decisions = 0;
+        let answered = false;
+        const inspect = strategy.compressionResponseStopReason;
+        strategy.compressionResponseStopReason = function (...args) {
+          answered = true;
+          return inspect.apply(this, args);
+        };
+        strategy.compressionAdmission = function (...args) {
+          const result = admission.apply(this, args);
+          if (answered && result.disposition === 'admission_rejected') {
+            decisions++;
+            assert.equal([...failureRuns(fx).values()][0]?.run.failures, 3,
+              'admission rejection preserves the gated rung history at the decision');
+          }
+          return result;
+        };
+        admissionDecisionChecks.set(fx, () => decisions);
+      }
+    }
+
+    async function run(kind: Kind, usage: AttemptHandler, budget: number, carriers = false) {
+      // A truncated canonical skips its hoist, making source-only-final the
+      // source hoist's base. Its count deliberately differs from that base's.
+      const handlers: AttemptHandler[] = kind === 'source-hoist'
+        ? [{ stop: 'max_tokens', inputTokens: 777 }, usage, { stop: 'refusal' }]
+        : [usage, { stop: 'refusal' }];
+      const mock = flexibleMembrane(handlers);
+      const fx = await fixture(mock.membrane, options(kind, budget));
+      if (kind !== 'expansion') hoistableChunk(fx);
+      if (carriers) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+        handlers.unshift({ error: Object.assign(new Error('thinking blocks cannot be modified'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) });
+      }
+      try {
+        const logs = await capture(fx);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label(kind))?.metadata;
+        assert.ok(trace?.admission, `the ${kind} attempt has a decomposition`);
+        const curve = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === label(kind))?.metadata;
+        assert.deepEqual(curve?.admission, trace.admission, 'early and final snapshots agree');
+        assert.equal(curve?.outcome, trace.outcome, 'early and final outcomes agree');
+        assert.equal(trace.admittedTokens, trace.admission.admittedTokens);
+        assert.equal(trace.budgetTokens, trace.admission.budgetTokens);
+        for (const log of logs.filter(log => log.event === 'compression:attempt')) {
+          if (['canonical', 'source-only-final'].includes(String(log.metadata?.curveLabel))) {
+            assert.equal(Object.hasOwn(log.metadata!, 'admission'), false, 'ungated is not a measured zero');
+          }
+        }
+        // None of these log-only fields enters outcomes, progress, plans or keys.
+        const durable = JSON.stringify([
+          quarantineEvents(fx.manager),
+          fx.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+        ]);
+        assert.ok(!/"admission"|"baseCurveLabel"|"baseProviderInputTokens"/.test(durable));
+        const attempts = JSON.stringify(logs.filter(log => log.event === 'compression:attempt'));
+        assert.ok(!/a private note|private-L|sig-L|enc-L|"inputSchema"|"messages"|"content"/.test(attempts), 'no payload in attempt diagnostics');
+        for (const call of mock.calls) {
+          assert.ok(!JSON.stringify(call.request).includes('baseProviderInputTokens'), 'diagnostics never enter a request');
+        }
+        return { fx, mock, logs, trace, admission: trace.admission };
+      } catch (error) {
+        fx.manager.close();
+        throw error;
+      }
+    }
+
+    for (const kind of kinds) {
+      for (const observed of [true, false]) {
+        it(`${kind}: ${observed ? 'provider count including cache' : 'complete bound'}, admitted, equality and rejected`, async () => {
+          const usage: AttemptHandler = observed
+            ? { stop: 'refusal', inputTokens: 0, cacheCreationTokens: 100, cacheReadTokens: 900, topLevelInputTokens: 999_999 }
+            : { stop: 'refusal', omitUsage: true };
+          const roomy = await run(kind, usage, 1_000_000);
+          const baseIndex = kind === 'source-hoist' ? 1 : 0;
+          const base = roomy.mock.calls[baseIndex]!.request;
+          const rewrite = roomy.mock.calls[baseIndex + 1]!.request;
+          const delta = Math.max(1, roomy.fx.strategy.inputBound(rewrite) - roomy.fx.strategy.inputBound(base));
+          const bounded = observed ? 1_000 + delta : roomy.fx.strategy.inputBound(rewrite);
+          const reserve = Math.max(0, Math.ceil(rewrite.config.maxTokens));
+          const expected: Admission = {
+            baseCurveLabel: baseLabel(kind),
+            accountingSource: observed
+              ? kind === 'source-hoist' ? 'source_only_provider_usage_plus_expansion' : 'canonical_provider_usage_plus_expansion'
+              : 'complete_normalized_request_bound',
+            baseProviderInputTokens: observed ? 1_000 : null,
+            expansionDeltaTokens: delta, boundedInputTokens: bounded, outputReserveTokens: reserve,
+            admittedTokens: bounded + reserve, budgetTokens: 1_000_000, disposition: 'provider_attempt',
+          };
+          assert.deepEqual(roomy.admission, expected, 'only bounded numeric/enum fields are added');
+          assert.equal(roomy.trace.requestHash, createHash('sha256').update(JSON.stringify(rewrite)).digest('hex'));
+          assert.notEqual(roomy.trace.estimatedTokens, bounded, 'chars/4 is not the admission bound');
+          const calls = kind === 'source-hoist' ? 3 : 2;
+          assert.equal(roomy.mock.calls.length, calls, 'no diagnostic provider count call');
+          roomy.fx.manager.close();
+
+          const equal = await run(kind, usage, expected.admittedTokens);
+          assert.deepEqual(equal.admission, { ...expected, budgetTokens: expected.admittedTokens });
+          assert.equal(equal.mock.calls.length, calls, 'equality still admits');
+          equal.fx.manager.close();
+
+          const rejected = await run(kind, usage, expected.admittedTokens - 1);
+          assert.deepEqual(rejected.admission, {
+            ...expected, budgetTokens: expected.admittedTokens - 1, disposition: 'admission_rejected',
+          });
+          assert.equal(rejected.mock.calls.length, calls - 1, 'rejected rewrite never sent');
+          assert.equal(rejected.trace.latencyMs, 0);
+          assert.equal(rejected.trace.persisted, false);
+          assert.equal(rejected.trace.admittedTokens, expected.admittedTokens, 'existing total retained');
+          rejected.fx.manager.close();
+        });
+      }
+    }
+
+    it('zero, invalid and missing input usage is unknown, not measured zero', async () => {
+      for (const usage of [
+        { inputTokens: 0 }, { inputTokens: -1 }, { inputTokens: NaN }, { cacheReadTokens: 500 },
+      ]) {
+        const result = await run('canonical-hoist', { raw: { stopReason: 'refusal', content: [], usage } }, 1_000_000);
+        assert.equal(result.admission.baseProviderInputTokens, null);
+        assert.equal(result.admission.accountingSource, 'complete_normalized_request_bound');
+        assert.equal(result.admission.boundedInputTokens, result.fx.strategy.inputBound(result.mock.calls[1]!.request));
+        result.fx.manager.close();
+      }
+    });
+
+    it('a carrier-stripped canonical count is unusable for expansion and hoist admission', async () => {
+      for (const kind of ['expansion', 'canonical-hoist'] as const) {
+        // The rewrite is rejected, so only the canonical's stripped retry is
+        // answered; its positive count must not masquerade as a full-base count.
+        const result = await run(kind, { stop: 'refusal', inputTokens: 100 }, 1, true);
+        assert.equal(result.mock.calls.length, 2);
+        assert.equal(result.admission.baseProviderInputTokens, null);
+        assert.equal(result.admission.accountingSource, 'complete_normalized_request_bound');
+        assert.equal(result.admission.disposition, 'admission_rejected');
+        result.fx.manager.close();
+      }
+    });
+
+    for (const kind of kinds) {
+      for (const fallback of ['empty', 'malformed'] as const) {
+        it(`${kind} keeps extracted-empty outcomes and malformed error types in both logs (${fallback})`, async () => {
+          const answer: AttemptHandler = fallback === 'empty'
+            ? { stop: 'end_turn', text: '<thinking>hidden</thinking>' }
+            : { raw: { stopReason: 'end_turn', content: {} } };
+          const mock = flexibleMembrane(kind === 'source-hoist'
+            ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, answer, { stop: 'refusal' }]
+            : [{ stop: 'refusal' }, answer, { stop: 'refusal' }]);
+          const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') hoistableChunk(fx);
+          try {
+            const logs = await capture(fx);
+            for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+              const trace = logs.find(log => log.event === event && log.metadata?.curveLabel === label(kind))?.metadata;
+              assert.ok(trace, `${event} has the attempted rung`);
+              assert.equal(trace.outcome, fallback === 'empty' ? 'unusable_empty' : 'provider_error');
+              if (fallback === 'malformed') assert.equal(trace.errorType, 'malformed_content');
+            }
+            assert.equal(fx.target.compressed, false);
+          } finally { fx.manager.close(); }
+        });
+      }
+    }
+
+    for (const fallback of ['source-only', 'split'] as const) {
+      for (const malformed of [false, true]) it(`${fallback} assessment traces retain empty outcomes and error types (malformed=${malformed})`, async () => {
+        const answer: AttemptHandler = malformed
+          ? { raw: { stopReason: 'end_turn', content: {} } }
+          : { stop: 'end_turn', text: '<thinking>hidden</thinking>' };
+        const mock = flexibleMembrane([{ stop: 'refusal' }, ...(fallback === 'split' ? [{ stop: 'refusal' } as AttemptHandler] : []), answer, { stop: 'refusal' }]);
+        const fx = await fixture(mock.membrane, {
+          compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+          compressionSplitFallback: fallback === 'split',
+        });
+        try {
+          const logs = await capture(fx);
+          const matches = (log: Log) => fallback === 'split'
+            ? String(log.metadata?.curveLabel).startsWith('split:')
+            : log.metadata?.curveLabel === 'source-only-final';
+          const trace = logs.find(log => log.event === 'compression:attempt' && matches(log))?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.outcome, malformed ? 'provider_error' : fallback === 'split' ? 'success' : 'unusable_empty');
+          if (malformed) assert.equal(trace.errorType, 'malformed_content');
+          if (fallback === 'source-only') {
+            const curve = logs.find(log => log.event === 'compression:curve-attempt' && matches(log))?.metadata;
+            assert.equal(curve?.outcome, trace.outcome);
+            assert.equal(curve?.errorType, trace.errorType);
+          }
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const thinkingFirst of [false, true]) it(`thinking-only split parts trace success with wrapper recovery disabled (thinkingFirst=${thinkingFirst})`, async () => {
+      const hidden = '<thinking>hidden</thinking>';
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { stop: 'refusal' },
+        { stop: 'end_turn', text: thinkingFirst ? hidden : 'first memory' },
+        { stop: 'end_turn', text: thinkingFirst ? 'first memory' : hidden },
+      ]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+        compressionSplitFallback: true, recoverLiteralThinkingWrappedCompression: false,
+      });
+      try {
+        const logs = await capture(fx);
+        const parts = logs.filter(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:'));
+        assert.equal(parts.length, 2);
+        assert.ok(parts.every(log => log.metadata?.outcome === 'success'));
+        assert.equal(fx.target.compressed, true);
+        const memory = fx.strategy.summariesView().find(entry => entry.content.includes('first memory'));
+        assert.ok(memory, 'the raw thinking-only fold does not prevent stitching');
+        // Pins existing extraction behavior; a future fix may remove non-leading thinking blocks.
+        assert.equal(memory.content.includes(hidden), !thinkingFirst,
+          'post-stitch extraction removes only a leading thinking block; fold acceptance is unchanged');
+      } finally { fx.manager.close(); }
+    });
+
+    for (const stage of ['canonical', 'canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`${stage} extraction errors never log success`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = stage === 'canonical' ? []
+          : stage === 'canonical-plain-prose' ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : stage === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const mock = flexibleMembrane([...prior, { raw: { stopReason: 'end_turn' } }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), TypeError));
+          const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === stage)?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.outcome, 'provider_error');
+          assert.equal(trace.errorType, 'malformed_content');
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    it('planned diagnostics add no pre-dispatch request serializations', async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const counts: number[] = [];
+      try {
+        for (const logging of [false, true]) {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const mock = flexibleMembrane([{ stop: 'end_turn', text: 'a memory' }]);
+          const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+          const seam = fx.strategy as unknown as {
+            prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+          };
+          const prepare = seam.prepareCompressionCandidate;
+          let serializations = 0;
+          seam.prepareCompressionCandidate = function (request, label) {
+            const prepared = prepare.call(this, request, label);
+            Object.defineProperty(prepared, 'serializationProbe', {
+              configurable: true, enumerable: true,
+              get() { serializations++; return undefined; },
+            });
+            return prepared;
+          };
+          const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+          const complete = membrane.complete;
+          membrane.complete = async request => {
+            counts.push(serializations);
+            return complete(request);
+          };
+          try {
+            if (logging) await capture(fx);
+            else await fx.strategy.run(fx.target, managerContext(fx.manager));
+            assert.equal(fx.target.compressed, true);
+          } finally { fx.manager.close(); }
+        }
+        assert.equal(counts.length, 2);
+        assert.ok(counts[0]! > 0, 'the request serialization probe was reached');
+        assert.equal(counts[1], counts[0], 'enabled logging adds no pre-dispatch serialization');
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
+    for (const stripped of [false, true]) it(`a decided expansion retains marked planned-request traces when its final diagnostic cannot serialize (stripped=${stripped})`, async () => {
+      const rejection = Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      });
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { error: rejection }, ...(stripped ? [{ error: rejection }] : []), { stop: 'refusal' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      if (stripped) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+      }
+      const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = membrane.complete;
+      membrane.complete = async request => {
+        const mutate = mock.calls.length === (stripped ? 2 : 1);
+        try { return await complete(request); }
+        catch (error) {
+          if (mutate) {
+            request.config.maxTokens = 123;
+            const block = request.messages.flatMap(m => m.content).find(b => b.type === 'text');
+            if (block?.type === 'text') block.text = 'mutated shared content';
+            Object.assign(request, { cycle: request });
+          }
+          throw error;
+        }
+      };
+      try {
+        const logs = await capture(fx);
+        for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+          const trace = logs.find(log => log.event === event && log.metadata?.curveLabel === label('expansion'))?.metadata;
+          assert.ok(trace);
+          assert.equal(trace.requestIdentity, 'planned-fallback');
+          assert.equal(trace.outcome, 'provider_error');
+          assert.equal(trace.errorType, 'invalid_request');
+          assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1]!.request)).digest('hex'));
+          assert.ok(Number(trace.latencyMs) > 0);
+          assert.ok(trace.admission);
+        }
+        const durable = JSON.stringify(quarantineEvents(fx.manager));
+        assert.equal(durable.includes('planned-fallback'), false, 'the fallback marker is log-only');
+        assert.equal(fx.target.compressed, false);
+      } finally { fx.manager.close(); }
+    });
+
+
+    for (const kind of kinds) it(`${kind} preserves interrupted gated failure history across logging modes`, async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      const snapshots: unknown[] = [];
+      try {
+        for (const mode of ['off', 'on', 'diagnostic', 'write'] as const) {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const outage = Object.assign(new Error('gated outage'), { type: 'server_error' });
+          const handlers: AttemptHandler[] = kind === 'source-hoist'
+            ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, { error: outage }]
+            : [{ stop: 'refusal' }, { error: outage }];
+          const mock = flexibleMembrane(handlers);
+          const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') hoistableChunk(fx);
+          const seam = fx.strategy as unknown as {
+            noteCompressionLanded(membrane: unknown, model: string): void;
+            compressionFailedAttemptTrace(...args: unknown[]): unknown;
+          };
+          try {
+            await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === outage);
+            assert.equal(failureRuns(fx).size, 1);
+            const entry = [...failureRuns(fx).values()][0]!;
+            assert.equal(entry.run.key, createHash('sha256').update(JSON.stringify({
+              runSubject: [...failureRuns(fx).keys()][0], curveLabel: label(kind), stripped: false,
+            })).digest('hex'), 'seed the gated rung, not canonical');
+            entry.run.failures = 3;
+            seam.noteCompressionLanded(mock.membrane, MODEL);
+            let diagnosticHits = 0;
+            let warningHits = 0;
+            if (mode === 'diagnostic') seam.compressionFailedAttemptTrace = () => {
+              diagnosticHits++;
+              throw new Error('failed diagnostic');
+            };
+            const path = `${freshPath()}-history.jsonl`;
+            paths.push(path);
+            if (mode !== 'off') process.env.CONTEXT_MANAGER_COMPRESSION_LOG = mode === 'write' ? '/dev/null/history.jsonl' : path;
+            console.warn = (...args) => {
+              if (mode === 'write' && String(args[0]).includes('compression log write failed:')) {
+                warningHits++;
+                throw new Error('warning sink failed');
+              }
+            };
+            await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === outage);
+            assert.equal([...failureRuns(fx).values()][0]!.run.failures, 4, 'interruption preserves and extends the gated run');
+            const interrupted = failureSnapshot(fx);
+            [...failureRuns(fx).values()][0]!.run.failures = 7;
+            seam.noteCompressionLanded(mock.membrane, MODEL);
+            // Only the expansion has a later source-only rung. Let that refuse.
+            handlers.push({ error: outage }, { error: outage }, { stop: 'refusal' });
+            await fx.strategy.run(fx.target, managerContext(fx.manager));
+            const exhausted = quarantineEvents(fx.manager).filter(e => e.kind === 'exhausted').map(e => e.outcomes);
+            assert.ok(JSON.stringify(exhausted).includes('persistent-server_error'), 'the preserved history decides the gated rung');
+            if (mode === 'diagnostic') assert.ok(diagnosticHits > 0, 'throwing diagnostic seam was reached');
+            if (mode === 'write') assert.ok(warningHits > 0, 'throwing warning sink was reached');
+            snapshots.push({ interrupted, final: failureSnapshot(fx), exhausted, requests: mock.calls.map(c => c.request) });
+          } finally { fx.manager.close(); }
+        }
+        for (const snapshot of snapshots.slice(1)) assert.deepEqual(snapshot, snapshots[0]);
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
+    it('logging leaves exact requests, call counts, family keys, plans and outcomes unchanged', async () => {
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      try {
+        for (const kind of kinds) {
+          const handlers: AttemptHandler[] = [{ stop: 'refusal' }];
+          const off = flexibleMembrane(handlers);
+          const a = await fixture(off.membrane, options(kind, 1_000_000));
+          const on = flexibleMembrane(handlers);
+          const b = await fixture(on.membrane, options(kind, 1_000_000));
+          if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
+          try {
+            delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+            await seedFailureRun(a, off.membrane, kind);
+            await seedFailureRun(b, on.membrane, kind);
+            assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+            const aKeys = countChunkKeys(a);
+            const bKeys = countChunkKeys(b);
+            await a.strategy.run(a.target, managerContext(a.manager));
+            await capture(b);
+            assert.equal(bKeys(), aKeys(), 'logging invokes no extra chunkKey overrides');
+            assert.deepEqual(on.calls.map(c => c.request), off.calls.map(c => c.request));
+            const records = (fx: Fixture) => quarantineEvents(fx.manager)
+              .filter(e => e.kind === 'exhausted')
+              .map(e => {
+                const record = e.record as Record<string, unknown>;
+                return { key: record.key, familyKey: record.familyKey, plan: record.plan, outcomes: e.outcomes };
+              });
+            assert.ok(records(a).length > 0);
+            assert.equal(typeof records(a)[0]!.key, 'string');
+            assert.equal(typeof records(a)[0]!.familyKey, 'string');
+            assert.deepEqual(records(b), records(a));
+            assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+          } finally { a.manager.close(); b.manager.close(); }
+        }
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+    });
+
+    for (const mode of ['disabled', 'diagnostic', 'write'] as const) {
+      it(mode === 'diagnostic' ? 'throwing admission diagnostics leave compression identical'
+        : mode === 'write' ? 'log write failures leave compression identical'
+          : 'disabled logging does zero admission diagnostic work', async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        try {
+          for (const kind of kinds) {
+            for (const scenario of ['refusal', 'end_turn', 'provider-rejected', 'admission-rejected'] as const) {
+              const budget = scenario === 'admission-rejected' ? 1 : 1_000_000;
+              const finish: AttemptHandler = scenario === 'provider-rejected'
+                ? { error: Object.assign(new Error('bad request'), {
+                  type: 'invalid_request', httpStatus: 400, retryable: false,
+                }) }
+                : { stop: scenario === 'end_turn' ? 'end_turn' : 'refusal', text: scenario === 'end_turn' ? 'a memory' : '' };
+              const handlers: AttemptHandler[] = kind === 'source-hoist'
+                ? [{ stop: 'max_tokens' }, { stop: 'refusal' }, finish]
+                : [{ stop: 'refusal' }, finish];
+              const control = flexibleMembrane(handlers);
+              const probe = flexibleMembrane(handlers);
+              let controlFixture: Fixture | undefined;
+              let probeFixture: Fixture | undefined;
+              const warn = console.warn;
+              try {
+                const a = controlFixture = await fixture(control.membrane, options(kind, budget));
+                const b = probeFixture = await fixture(probe.membrane, options(kind, budget));
+                if (kind !== 'expansion') { hoistableChunk(a); hoistableChunk(b); }
+                let diagnostics = 0;
+                const warnings: string[] = [];
+                const seam = b.strategy as unknown as { compressionAdmissionTrace: (...args: unknown[]) => unknown };
+                assert.equal(Object.hasOwn(seam, 'compressionAdmissionTrace'), false, 'the seam is a prototype method');
+                const original = seam.compressionAdmissionTrace;
+                seam.compressionAdmissionTrace = function (...args) {
+                  diagnostics++;
+                  if (mode === 'diagnostic') throw new Error('diagnostic failed');
+                  return original.apply(this, args);
+                };
+                console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+                delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+                await seedFailureRun(a, control.membrane, kind);
+                await seedFailureRun(b, probe.membrane, kind);
+                assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+                const aKeys = countChunkKeys(a);
+                const bKeys = countChunkKeys(b);
+                const [baseline] = await Promise.allSettled([a.strategy.run(a.target, managerContext(a.manager))]);
+                const [observed] = await Promise.allSettled([(async () => {
+                  if (mode === 'write') {
+                    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.';
+                    await b.strategy.run(b.target, managerContext(b.manager));
+                  } else if (mode === 'diagnostic') await capture(b);
+                  else await b.strategy.run(b.target, managerContext(b.manager));
+                })()]);
+                assert.equal(observed!.status, baseline!.status);
+                assert.equal(bKeys(), aKeys(), 'diagnostics invoke no extra chunkKey overrides');
+                assert.equal(a.target.compressed, scenario === 'end_turn', 'the control reaches the intended outcome');
+                assert.equal(control.calls.length, (kind === 'source-hoist' ? 3 : 2)
+                  - (scenario === 'admission-rejected' ? 1 : 0));
+                if (scenario === 'provider-rejected' || scenario === 'admission-rejected') {
+                  const outcome = exhaustedOutcomes(a).find(o => o.curveLabel === label(kind));
+                  assert.equal(outcome?.outcome, scenario === 'provider-rejected' ? 'provider_error' : 'admission_rejected',
+                    `${kind}: the control exercises ${scenario}`);
+                }
+                if (scenario === 'admission-rejected') {
+                  assert.ok(admissionDecisionChecks.get(a)!() > 0, 'control inspected the rejected admission');
+                  assert.ok(admissionDecisionChecks.get(b)!() > 0, 'probe inspected the rejected admission');
+                }
+                assert.equal(b.target.compressed, a.target.compressed);
+                assert.deepEqual(probe.calls, control.calls);
+                const records = (fx: Fixture) => quarantineEvents(fx.manager)
+                  .filter(e => e.kind === 'exhausted')
+                  .map(e => {
+                    const r = e.record as Record<string, unknown>;
+                    return { key: r.key, familyKey: r.familyKey, plan: r.plan, outcomes: e.outcomes };
+                  });
+                assert.deepEqual(records(b), records(a));
+                assert.deepEqual(failureSnapshot(b), failureSnapshot(a));
+                assert.deepEqual(
+                  b.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                  a.manager.getStore().getStateJson('default/autobio:compression-family-progress'),
+                );
+                if (mode === 'diagnostic') {
+                  assert.ok(diagnostics > 0, 'the throwing diagnostic was exercised');
+                  assert.ok(warnings.some(w => w.includes(`compression admission diagnostic failed: rung=${label(kind)} chunk=`)));
+                  assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
+                }
+                else if (mode === 'write') {
+                  assert.ok(diagnostics > 0);
+                  assert.ok(warnings.some(w => w.includes(`compression log write failed: event=compression:curve-attempt rung=${label(kind)} chunk=`)));
+                  assert.equal(warnings.some(w => w.includes('compression admission diagnostic failed:')), false);
+                } else assert.equal(diagnostics, 0, 'no diagnostic construction with logging disabled');
+              } finally {
+                console.warn = warn;
+                controlFixture?.manager.close();
+                probeFixture?.manager.close();
+              }
+            }
+          }
+        } finally {
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        }
+      });
+    }
+
+    for (const logging of [false, true]) for (const failure of ['rejection', 'transient'] as const) {
+      it(`failed snapshot is isolated: logging=${logging}, ${failure}`, async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const error = Object.assign(new Error('provider failure'), failure === 'rejection'
+          ? { type: 'invalid_request', httpStatus: 400, retryable: false }
+          : { type: 'server_error' });
+        const mock = flexibleMembrane([{ stop: 'refusal' }, { error }]);
+        const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+        const complete = membrane.complete;
+        let serializations = 0;
+        membrane.complete = async request => {
+          try { return await complete(request); }
+          catch (err) {
+            Object.defineProperty(request, 'toJSON', { value: () => {
+              serializations++;
+              throw new Error('request serialization failed');
+            } });
+            throw err;
+          }
+        };
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        let snapshots = 0;
+        const seam = fx.strategy as unknown as { compressionFailedAttemptTrace(...args: unknown[]): unknown };
+        const snapshot = seam.compressionFailedAttemptTrace;
+        seam.compressionFailedAttemptTrace = function (...args) {
+          snapshots++;
+          return snapshot.apply(this, args);
+        };
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const run = async () => {
+            if (failure === 'transient') {
+              await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), err => err === error);
+            } else {
+              await fx.strategy.run(fx.target, managerContext(fx.manager));
+              assert.equal(exhaustedOutcomes(fx).find(o => o.curveLabel === label('expansion'))?.outcome, 'provider_error');
+            }
+          };
+          if (logging) await capture(fx, run);
+          else await run();
+          assert.equal(mock.calls.length, 2);
+          if (!logging || failure === 'transient') {
+            assert.equal(serializations, 0, 'no serialization for disabled or interrupted diagnostics');
+            assert.equal(snapshots, 0, 'no snapshot construction');
+          } else assert.ok(serializations > 0, 'throwing serialization was exercised without changing classification');
+        } finally {
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
+    for (const throwBeforeDispatch of [false, true]) {
+      it(throwBeforeDispatch ? 'a stripped retry does not serialize the stripped request before dispatch'
+        : 'a successful stripped retry with logging off serializes only for its trace', async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const stringify = JSON.stringify;
+        const mock = flexibleMembrane([
+          { stop: 'refusal' },
+          { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+            type: 'invalid_request', httpStatus: 400, retryable: false,
+          }) },
+          { stop: 'end_turn', text: 'a memory' },
+        ]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+        let serializations = 0;
+        let strippedDispatch = false;
+        let carrierRequest: NormalizedRequest | undefined;
+        const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+        const complete = membrane.complete;
+        membrane.complete = async request => {
+          if (mock.calls.length === 1) carrierRequest = request;
+          if (mock.calls.length === 2) strippedDispatch = true;
+          return complete(request);
+        };
+        JSON.stringify = ((value: unknown, ...args: unknown[]) => {
+          const request = value as NormalizedRequest | undefined;
+          if (carrierRequest && request?.messages && request.messages !== carrierRequest.messages
+            && request.system === carrierRequest.system
+            && !request.messages.some(m => m.content.some(b => b.type === 'thinking' || b.type === 'redacted_thinking'))) {
+            serializations++;
+            if (throwBeforeDispatch && !strippedDispatch) throw new Error('serializer unavailable before dispatch');
+          }
+          return (stringify as (...args: unknown[]) => string)(value, ...args);
+        }) as typeof JSON.stringify;
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          await fx.strategy.run(fx.target, managerContext(fx.manager));
+          assert.equal(mock.calls.length, 3);
+          assert.equal(strippedDispatch, true);
+          assert.equal(fx.target.compressed, true);
+          assert.equal(serializations, 2, 'only the success trace hash and token estimate serialize the stripped request');
+        } finally {
+          JSON.stringify = stringify;
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
+    for (const logging of [false, true]) {
+      it(`recall outcome tracing does not re-read text: logging=${logging}`, async () => {
+        const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'assessed memory' }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        const seam = fx.strategy as unknown as {
+          assessFallbackCompressionResponse(response: unknown): { outcome: string; response?: { content: Array<{ text: string }> } };
+        };
+        const assess = seam.assessFallbackCompressionResponse;
+        let reads = 0;
+        seam.assessFallbackCompressionResponse = function (response) {
+          const result = assess.call(this, response);
+          if (result.outcome === 'valid') Object.defineProperty(result.response!.content[0]!, 'text', {
+            get() {
+              reads++;
+              if (reads > 1) throw new Error('extra extraction consumed the answer');
+              return 'persisted recall memory';
+            },
+          });
+          return result;
+        };
+        try {
+          delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          const run = () => fx.strategy.run(fx.target, managerContext(fx.manager));
+          if (logging) await capture(fx, run);
+          else await run();
+          assert.equal(mock.calls.length, 2, 'canonical refusal, then recall expansion');
+          assert.equal(reads, 1, 'only summary extraction reads the live text');
+          assert.ok(fx.strategy.summariesView().some(s => s.content === 'persisted recall memory'));
+        } finally {
+          seam.assessFallbackCompressionResponse = assess;
+          if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+          else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+          fx.manager.close();
+        }
+      });
+    }
+
+    it('a thinking-only recall expansion logs unusable_empty before the plain-prose retry', async () => {
+      const mock = flexibleMembrane([
+        { stop: 'refusal' }, { stop: 'end_turn', text: '<thinking>hidden memory</thinking>' },
+        { stop: 'end_turn', text: 'plain memory' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      try {
+        const logs = await capture(fx);
+        for (const event of ['compression:curve-attempt', 'compression:attempt']) {
+          assert.equal(logs.find(log => log.event === event && log.metadata?.curveLabel === label('expansion'))?.metadata?.outcome, 'unusable_empty');
+        }
+        assert.equal(mock.calls.length, 3);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const stripped of [false, true]) it(`answered attempts use exact monotonic latency (stripped=${stripped})`, async () => {
+      const rejection = { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) };
+      const mock = flexibleMembrane([...(stripped ? [rejection] : []), { stop: 'end_turn', text: 'memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as { prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest };
+      const prepare = seam.prepareCompressionCandidate;
+      if (stripped) seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      const membrane = mock.membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };
+      const complete = membrane.complete;
+      let time = 100;
+      membrane.complete = async request => {
+        try { return await complete(request); }
+        finally { time += 37.25; }
+      };
+      const now = performance.now;
+      try {
+        performance.now = () => time;
+        const logs = await capture(fx);
+        assert.equal(logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical')?.metadata?.latencyMs, stripped ? 74.5 : 37.25);
+        assert.equal(mock.calls.length, stripped ? 2 : 1);
+      } finally { performance.now = now; fx.manager.close(); }
+    });
+
+    it('local fallback-setup failures do not reuse the carrier provider snapshot', async () => {
+      const mock = flexibleMembrane([{ error: Object.assign(new Error('thinking blocks cannot be modified'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as {
+        prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        recordCompressionFamilyProgress(...args: unknown[]): void;
+      };
+      const prepare = seam.prepareCompressionCandidate;
+      seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      const record = seam.recordCompressionFamilyProgress;
+      let failed = false;
+      seam.recordCompressionFamilyProgress = function (...args) {
+        if (!failed) {
+          failed = true;
+          throw Object.assign(new Error('local setup failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+        }
+        record.apply(this, args);
+      };
+      try {
+        const logs = await capture(fx);
+        assert.ok(failed);
+        assert.equal(mock.calls.length, 1, 'fallback setup failed before the stripped call');
+        assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const persistent of [false, true]) it(`a decided split part logs the dispatched attempt (persistent=${persistent})`, async () => {
+      const error = Object.assign(new Error('split request failed'), persistent
+        ? { type: 'server_error', httpStatus: 503, retryable: true }
+        : { type: 'invalid_request', httpStatus: 400, retryable: false });
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'refusal' }, { error }]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionSplitFallback: true,
+      });
+      try {
+        if (persistent) {
+          const interrupted = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), e => e === error));
+          assert.equal(interrupted.some(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:')), false);
+          const seam = fx.strategy as unknown as {
+            compressionFailureRuns: Map<string, { run: { failures: number } }>;
+            noteCompressionLanded(membrane: unknown, model: string): void;
+          };
+          assert.equal(seam.compressionFailureRuns.size, 1);
+          for (const entry of seam.compressionFailureRuns.values()) entry.run.failures = 7;
+          seam.noteCompressionLanded(mock.membrane, MODEL);
+        }
+        const logs = await capture(fx);
+        const trace = logs.find(log => log.event === 'compression:attempt' && String(log.metadata?.curveLabel).startsWith('split:'))?.metadata;
+        assert.ok(trace);
+        assert.equal(trace.outcome, 'provider_error');
+        assert.equal(trace.errorType, persistent ? 'persistent-server_error:503' : 'invalid_request');
+        assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));
+      } finally { fx.manager.close(); }
+    });
+
+    it('a successful recall expansion carries admission through curve-succeeded', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 1234 }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      try {
+        const logs = await capture(fx);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded')?.metadata;
+        const attempt = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('expansion'))?.metadata;
+        assert.equal(logs.find(log => log.event === 'compression:curve-attempt'
+          && log.metadata?.curveLabel === label('expansion'))?.metadata?.outcome, 'success');
+        assert.ok(succeeded?.admission);
+        assert.deepEqual(succeeded, attempt && (({ chunk_message_ids, chunk_hash, model, ...trace }) => trace)(attempt));
+        assert.equal(succeeded.persisted, true);
+        assert.equal(succeeded.admission.baseProviderInputTokens, 1234);
+        assert.equal(succeeded.admission.boundedInputTokens, 1234 + succeeded.admission.expansionDeltaTokens);
+        assert.equal(succeeded.admittedTokens, succeeded.admission.admittedTokens);
+        assert.equal(fx.target.compressed, true);
+      } finally { fx.manager.close(); }
+    });
+
+    it('the logged delta prices sent forms, not released raw replay copies', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 50_000 }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      fx.target.messages = fx.target.messages.map(m => ({
+        ...m, content: m.content.map(b => ({ ...b, rawXml: '<raw>' + 'replay '.repeat(1000) + '</raw>' }) as ContentBlock),
+      }));
+      try {
+        const logs = await capture(fx);
+        const [base, rewrite] = mock.calls.map(c => c.request);
+        assert.ok(fx.strategy.inputBound(rewrite!) < fx.strategy.inputBound(base!), 'complete bound falls when raw copies are released');
+        const sent = (r: NormalizedRequest): NormalizedRequest => ({ ...r, messages: r.messages.map(m => ({
+          ...m, content: m.content.map(b => {
+            const { rawXml: _raw, ...fields } = b as ContentBlock & { rawXml?: string };
+            return fields as ContentBlock;
+          }),
+        })) });
+        const delta = fx.strategy.inputBound(sent(rewrite!)) - fx.strategy.inputBound(sent(base!));
+        assert.ok(delta > 1);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'tool-prose-hoist')?.metadata;
+        assert.equal(trace?.admission?.expansionDeltaTokens, delta);
+        assert.equal(trace?.admission?.boundedInputTokens, 50_000 + delta);
+      } finally { fx.manager.close(); }
+    });
+
+    it('reports entry serialization separately with the curve rung and chunk', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      const warnings: string[] = [];
+      const path = `${freshPath()}-serialization.jsonl`;
+      paths.push(path);
+      const seam = fx.strategy as unknown as { compressionAdmissionTrace: () => unknown };
+      seam.compressionAdmissionTrace = () => ({ toJSON() { throw new Error('entry serialization failed'); } });
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = path;
+      console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        assert.equal(fx.target.compressed, true);
+        assert.equal(mock.calls.length, 2);
+        assert.ok(warnings.some(w => /compression log serialization failed: event=compression:curve-attempt rung=tool-prose-hoist chunk=[a-f0-9]+/.test(w)));
+        assert.equal(warnings.some(w => w.includes('compression log write failed:')), false);
+        assert.ok(readFileSync(path, 'utf8').trim().split('\n').every(line => JSON.parse(line)),
+          'failed serialization appends no partial entry');
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+
+    it('an unwritable opt-in log remains nonfatal for an admitted hoist', async () => {
+      const mock = flexibleMembrane([{ stop: 'refusal' }, { stop: 'end_turn', text: 'a memory' }]);
+      const fx = await fixture(mock.membrane, options('canonical-hoist', 1_000_000));
+      hoistableChunk(fx);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      const warn = console.warn;
+      let warnings = 0;
+      console.warn = (...args) => { if (args.some(arg => String(arg).includes('compression log write failed'))) { warnings++; throw new Error('warning failed'); } };
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = '.'; // a directory, not a writable JSONL file
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        assert.equal(mock.calls.length, 2);
+        assert.equal(fx.target.compressed, true);
+        assert.ok(warnings > 0, 'the actual write failures were reported');
+      } finally {
+        console.warn = warn;
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+        fx.manager.close();
+      }
+    });
+
+    it('a resumed source-only hoist logs the count retained from source-only-final', async () => {
+      const outage = Object.assign(new Error('temporary outage'), { type: 'server_error' });
+      const mock = flexibleMembrane([
+        { stop: 'max_tokens', inputTokens: 777 }, { stop: 'refusal', inputTokens: 1234 },
+        { error: outage }, { stop: 'end_turn', text: 'memory after the outage' },
+      ]);
+      const fx = await fixture(mock.membrane, options('source-hoist', 1_000_000));
+      hoistableChunk(fx);
+      try {
+        const interrupted = await capture(fx, () => assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage));
+        assert.equal(interrupted.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
+          && log.metadata?.curveLabel === label('source-hoist')), false, 'interrupted rungs have no attempt trace');
+        assert.equal(interrupted.some(log => log.metadata?.admission), false, 'no admission diagnostic for an interrupted rung');
+        assert.equal(mock.calls.length, 3);
+        const progress = fx.manager.getStore().getStateJson('default/autobio:compression-family-progress');
+        assert.ok(!JSON.stringify(progress).includes('baseProviderInputTokens'));
+        const logs = await capture(fx);
+        assert.equal(mock.calls.length, 4, 'only the interrupted hoist is sent again');
+        assert.deepEqual(mock.calls[3]!.request, mock.calls[2]!.request);
+        const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label('source-hoist'))?.metadata;
+        assert.equal(trace?.admission?.baseCurveLabel, 'source-only-final');
+        assert.equal(trace?.admission?.baseProviderInputTokens, 1234);
+        assert.equal(trace?.admission?.accountingSource, 'source_only_provider_usage_plus_expansion');
+        const admission = trace!.admission!;
+        assert.equal(trace!.admittedTokens, admission.admittedTokens);
+        assert.equal(trace!.budgetTokens, admission.budgetTokens);
+        assert.equal(admission.boundedInputTokens, 1234 + admission.expansionDeltaTokens);
+        assert.equal(admission.admittedTokens, admission.boundedInputTokens + admission.outputReserveTokens);
+        const succeeded = logs.find(log => log.event === 'compression:curve-succeeded');
+        // Hoists do not expand a parent, so only recall expansions emit curve-succeeded.
+        assert.equal(succeeded, undefined);
+      } finally { fx.manager.close(); }
+    });
+
+    it('a local failure after a successful stripped retry does not reuse the carrier failure snapshot', async () => {
+      const mock = flexibleMembrane([
+        { error: Object.assign(new Error('thinking blocks cannot be modified'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) },
+        { stop: 'end_turn', text: 'memory' },
+      ]);
+      const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+      const seam = fx.strategy as unknown as {
+        prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        resumeCompressionLane(): void;
+      };
+      const prepare = seam.prepareCompressionCandidate;
+      seam.prepareCompressionCandidate = function (request, curveLabel) {
+        const prepared = prepare.call(this, request, curveLabel);
+        prepared.messages.push({ ...prepared.messages[0]!, content: carrierBlocks('standalone', '').slice(0, 2) });
+        return prepared;
+      };
+      let resumed = false;
+      seam.resumeCompressionLane = () => {
+        resumed = true;
+        throw Object.assign(new Error('local resume failure'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+      };
+      try {
+        const logs = await capture(fx);
+        assert.equal(mock.calls.length, 2);
+        assert.ok(resumed);
+        assert.equal(logs.some(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === 'canonical'), false);
+      } finally { fx.manager.close(); }
+    });
+
+    for (const winner of ['canonical', 'canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`${winner} logs each answered outcome when the stage succeeds`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = winner === 'canonical' ? []
+          : winner === 'canonical-plain-prose' ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : winner === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const mock = flexibleMembrane([...prior, { stop: 'end_turn', text: 'usable memory' }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.equal(attempts.length, prior.length + 1);
+          assert.deepEqual(attempts.map(trace => trace.outcome), [
+            ...prior.map(() => winner === 'canonical-plain-prose' ? 'unusable_empty' : 'incomplete'), 'success',
+          ]);
+          assert.equal(attempts.at(-1)!.curveLabel, winner);
+          assert.equal(attempts.at(-1)!.persisted, true);
+          assert.equal(fx.target.compressed, true);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const next of ['canonical-no-tools', 'canonical-toolless', 'canonical-plain-prose']) {
+      it(`answered outcomes survive an interrupted ${next} retry`, async () => {
+        const toolUse: AttemptHandler = { raw: { ...response('max_tokens', 'preamble'), stopReason: 'tool_use' } };
+        const prior: AttemptHandler[] = next === 'canonical-plain-prose'
+          ? [{ stop: 'end_turn', text: '<thinking>hidden</thinking>' }]
+          : next === 'canonical-no-tools' ? [toolUse] : [toolUse, toolUse];
+        const outage = Object.assign(new Error('temporary outage'), { type: 'server_error' });
+        const mock = flexibleMembrane([...prior, { error: outage }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx, () => assert.rejects(
+            fx.strategy.run(fx.target, managerContext(fx.manager)), error => error === outage,
+          ));
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.equal(mock.calls.length, prior.length + 1);
+          assert.equal(attempts.length, prior.length, 'the interrupted call has no trace');
+          assert.deepEqual(attempts.map(trace => trace.outcome), prior.map(() =>
+            next === 'canonical-plain-prose' ? 'unusable_empty' : 'incomplete'));
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const stop of ['refusal', 'max_tokens', 'end_turn'] as const) {
+      it(`an answered plain-prose ${stop} retry logs its own unsuccessful outcome`, async () => {
+        const mock = flexibleMembrane([
+          { stop: 'end_turn', text: '<thinking>hidden</thinking>' },
+          { stop, text: stop === 'end_turn' ? '<thinking>still hidden</thinking>' : 'not a memory' },
+        ]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const attempts = logs.filter(log => log.event === 'compression:attempt').map(log => log.metadata!);
+          assert.deepEqual(attempts.map(trace => trace.outcome), [
+            'unusable_empty', stop === 'end_turn' ? 'unusable_empty' : stop === 'refusal' ? 'refusal' : 'incomplete',
+          ]);
+          assert.equal(fx.target.compressed, false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const retryLabel of ['canonical-no-tools', 'canonical-toolless']) {
+      for (const stopReason of ['refusal', 'max_tokens'] as const) {
+        it(`${retryLabel} keeps its answered ${stopReason} outcome in attempt logs`, async () => {
+          const toolUse: AttemptHandler = { raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } };
+          const answers = [toolUse, ...(retryLabel === 'canonical-toolless' ? [toolUse] : [])];
+          const mock = flexibleMembrane([...answers, { stop: stopReason }]);
+          const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+          try {
+            const logs = await capture(fx);
+            const trace = logs.find(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === retryLabel)?.metadata;
+            assert.ok(trace, 'the canonical-stage retry answered');
+            assert.equal(trace.stopReason, stopReason);
+            const expected = stopReason === 'refusal' ? 'refusal' : 'incomplete';
+            assert.equal(trace.outcome, expected);
+            assert.equal(exhaustedOutcomes(fx).find(o => o.curveLabel === retryLabel)?.outcome, expected);
+            const incomplete = logs.find(log => log.event === 'compression:canonical-incomplete')?.metadata;
+            assert.equal(incomplete?.curveLabel, 'canonical');
+            assert.equal(incomplete?.outcome, 'incomplete');
+          } finally { fx.manager.close(); }
+        });
+      }
+    }
+
+    for (const rejectedLabel of ['canonical-no-tools', 'canonical-toolless']) {
+      it(`canonical rejection identifies the rejected ${rejectedLabel} retry, not an answered request`, async () => {
+        const answers: AttemptHandler[] = [{ raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } }];
+        if (rejectedLabel === 'canonical-toolless') answers.push({ raw: { ...response('max_tokens', ''), stopReason: 'tool_use' } });
+        const mock = flexibleMembrane([...answers, { error: Object.assign(new Error('bad retry'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) }]);
+        const fx = await fixture(mock.membrane, options('expansion', 1_000_000));
+        try {
+          const logs = await capture(fx);
+          const rejected = logs.find(log => log.event === 'compression:canonical-rejected')?.metadata;
+          assert.equal(rejected?.curveLabel, rejectedLabel);
+          const request = mock.calls.at(-1)!.request;
+          assert.equal(rejected?.requestHash, createHash('sha256').update(JSON.stringify(request)).digest('hex'));
+          assert.equal(rejected?.messageCount, request.messages.length);
+          const estimator = fx.strategy as unknown as { estimateCompressionRequestTokens(request: NormalizedRequest): number };
+          assert.equal(rejected?.estimatedTokens, estimator.estimateCompressionRequestTokens(request));
+          const attempts = logs.filter(log => log.event === 'compression:attempt');
+          for (const label of ['canonical', ...(rejectedLabel === 'canonical-toolless' ? ['canonical-no-tools'] : [])]) {
+            const answered = attempts.find(log => log.metadata?.curveLabel === label)?.metadata;
+            assert.equal(answered?.stopReason, 'tool_use');
+            assert.equal(answered?.outcome, 'incomplete', 'the tool-use answer retains its own outcome');
+          }
+          const final = attempts.find(log => log.metadata?.curveLabel === rejectedLabel)?.metadata;
+          assert.ok(final);
+          const { chunk_message_ids, chunk_hash, model, ...trace } = final;
+          assert.deepEqual(rejected, trace, 'rejection metadata is the failed retry trace, including latency');
+          assert.equal(mock.calls.length, answers.length + 1);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    it('canonical and source-only-final provider rejections emit attempt traces', async () => {
+      const rejected = { error: Object.assign(new Error('bad request'), {
+        type: 'invalid_request', httpStatus: 400, retryable: false,
+      }) };
+      const mock = flexibleMembrane([rejected, rejected]);
+      const fx = await fixture(mock.membrane, { ...options('expansion', 1_000_000), compressionSourceOnlyFallback: true });
+      try {
+        const logs = await capture(fx);
+        for (const curveLabel of ['canonical', 'source-only-final']) {
+          const traces = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === curveLabel);
+          assert.equal(traces.length, 1);
+          assert.equal(traces[0]!.metadata?.outcome, 'provider_error');
+          if (curveLabel === 'source-only-final') {
+            const curve = logs.find(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === curveLabel);
+            assert.equal(curve?.metadata?.outcome, 'provider_error');
+            assert.equal(curve?.metadata?.requestHash, traces[0]!.metadata?.requestHash);
+          }
+        }
+      } finally { fx.manager.close(); }
+    });
+
+    for (const kind of kinds) {
+      it(`${kind}: preparation rejection does not fabricate a provider attempt`, async () => {
+        const mock = flexibleMembrane(kind === 'source-hoist'
+          ? [{ stop: 'max_tokens' }, { stop: 'refusal' }]
+          : [{ stop: 'refusal' }]);
+        const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+        if (kind !== 'expansion') hoistableChunk(fx);
+        const seam = fx.strategy as unknown as {
+          prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+        };
+        const prepare = seam.prepareCompressionCandidate;
+        let reached = false;
+        seam.prepareCompressionCandidate = function (request, curveLabel) {
+          if (curveLabel === label(kind)) {
+            reached = true;
+            throw Object.assign(new Error('preparation rejected'), {
+              type: 'invalid_request', httpStatus: 400, retryable: false,
+            });
+          }
+          return prepare.call(this, request, curveLabel);
+        };
+        try {
+          const logs = await capture(fx);
+          assert.equal(reached, true, 'target preparation hook ran');
+          assert.equal(mock.calls.length, kind === 'source-hoist' ? 2 : 1);
+          assert.equal(logs.some(log => ['compression:curve-attempt', 'compression:attempt'].includes(log.event ?? '')
+            && log.metadata?.curveLabel === label(kind)), false);
+        } finally { fx.manager.close(); }
+      });
+    }
+
+    for (const kind of kinds) for (const stripped of (kind === 'source-hoist' ? [false] : [false, true])) {
+      it(`${kind}: provider rejection logs the actual ${stripped ? 'stripped' : 'planned'} request and elapsed time`, async () => {
+        const rejection = { error: Object.assign(new Error('bad request'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) };
+        const handlers: AttemptHandler[] = kind === 'source-hoist'
+          ? [{ stop: 'max_tokens', inputTokens: 777 }, { stop: 'refusal', inputTokens: 1234 }]
+          : [{ stop: 'refusal' }];
+        if (stripped) handlers.push({ error: Object.assign(new Error('thinking blocks cannot be modified'), {
+          type: 'invalid_request', httpStatus: 400, retryable: false,
+        }) });
+        handlers.push(rejection);
+        const mock = flexibleMembrane(handlers);
+        const membrane = mock.membrane as unknown as { complete: (request: NormalizedRequest) => Promise<unknown> };
+        const complete = membrane.complete;
+        let monotonicTime = 100;
+        membrane.complete = async request => {
+          try {
+            return await complete(request);
+          } finally { monotonicTime += 37.25; }
+        };
+        const fx = await fixture(mock.membrane, options(kind, 1_000_000));
+        if (kind !== 'expansion') hoistableChunk(fx);
+        if (stripped) {
+          for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+          fx.strategy.flushSummaries();
+          const seam = fx.strategy as unknown as {
+            prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest;
+          };
+          const prepare = seam.prepareCompressionCandidate;
+          seam.prepareCompressionCandidate = function (request, curveLabel) {
+            const prepared = prepare.call(this, request, curveLabel);
+            if (curveLabel === label(kind)) prepared.messages.push({
+              ...prepared.messages[0]!,
+              content: carrierBlocks('standalone', '').slice(0, 2),
+            });
+            return prepared;
+          };
+        }
+        try {
+          const now = performance.now;
+          let logs: Awaited<ReturnType<typeof capture>>;
+          performance.now = () => monotonicTime;
+          try { logs = await capture(fx); }
+          finally { performance.now = now; }
+          const curves = logs.filter(log => log.event === 'compression:curve-attempt' && log.metadata?.curveLabel === label(kind));
+          assert.equal(curves.length, 1);
+          const trace = curves[0]?.metadata;
+          assert.equal(trace?.outcome, 'provider_error');
+          assert.ok(trace);
+          assert.deepEqual(Object.keys(trace).sort(), [
+            'curveLabel', 'recallIds', 'recallLevels', 'leafCoverageHash', 'requestHash',
+            'messageCount', 'estimatedTokens', 'latencyMs', 'persisted', 'outcome',
+            'errorType', 'admittedTokens', 'budgetTokens', 'admission',
+            ...(kind === 'expansion' ? ['expandedParentId', 'expandedChildIds'] : []),
+          ].sort());
+          assert.equal(trace.errorType, 'invalid_request');
+          assert.equal(trace.latencyMs, stripped ? 74.5 : 37.25,
+            'exact monotonic elapsed time, including the carrier-rejected call');
+          assert.equal(trace.persisted, false);
+          assert.equal(trace.messageCount, mock.calls.at(-1)!.request.messages.length);
+          assert.equal(trace.requestHash, createHash('sha256').update(JSON.stringify(mock.calls.at(-1)!.request)).digest('hex'));
+          if (stripped) {
+            assert.equal(mock.calls.at(-1)!.request.messages.length,
+              mock.calls.at(-2)!.request.messages.length - 1, 'stripping removes the carrier-only message');
+          }
+          const estimator = fx.strategy as unknown as { estimateCompressionRequestTokens(request: NormalizedRequest): number };
+          assert.equal(trace.estimatedTokens, estimator.estimateCompressionRequestTokens(mock.calls.at(-1)!.request));
+          assert.equal(trace.admittedTokens, trace.admission?.admittedTokens);
+          assert.equal(trace.budgetTokens, trace.admission?.budgetTokens);
+          const attempts = logs.filter(log => log.event === 'compression:attempt' && log.metadata?.curveLabel === label(kind));
+          assert.equal(attempts.length, 1);
+          const { chunk_message_ids, chunk_hash, model, ...attempt } = attempts[0]!.metadata!;
+          assert.deepEqual(attempt, trace);
+          assert.deepEqual(chunk_message_ids, fx.target.messages.map(m => m.id));
+          assert.equal(typeof chunk_hash, 'string');
+          assert.equal(typeof model, 'string');
+          assert.equal(trace?.admission?.disposition, 'provider_attempt');
+          assert.equal(trace?.admission?.baseProviderInputTokens, kind === 'source-hoist' ? 1234 : 100);
+          assert.equal(trace?.admission?.baseCurveLabel, baseLabel(kind));
+          assert.equal(mock.calls.length, handlers.length);
+          assert.ok(!JSON.stringify(quarantineEvents(fx.manager)).includes('baseProviderInputTokens'));
+        } finally { fx.manager.close(); }
+      });
+    }
+  });
 });
 
 describe('prepared tool-prose mode rewrite', () => {

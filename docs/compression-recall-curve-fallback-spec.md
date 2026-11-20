@@ -274,7 +274,62 @@ For canonical and each fallback attempt, record metadata only by default:
 - message count and estimated/rendered tokens;
 - stop reason and provider refusal category when available;
 - latency;
-- whether result was persisted.
+- whether result was persisted;
+- opt-in `admission` decomposition on answered, deterministically provider-rejected or admission-rejected gated rungs (log-only, never persisted).
+
+Set `CONTEXT_MANAGER_COMPRESSION_LOG` before starting compression and keep it
+unchanged until that compression finishes. Snapshot capture, decision tracing
+and final writes check it independently; enabling it mid-flight cannot recover
+earlier attempts, and changing or disabling it can split or omit the trace.
+
+Interrupted calls (for example a transient provider failure below the persistent-failure
+threshold, withdrawal or branch discard) emit no attempt/admission trace. Their
+absence is not evidence that no provider call occurred. A later retry logs only
+its own attempt. Completed split parts can still emit traces when a later part
+interrupts the split-stitch rung. Preparation failures outside `membrane.complete` emit no provider-attempt trace.
+Here “provider-rejected” means a classified rejection from `membrane.complete`,
+not proof of adapter dispatch: host pre-request hooks run inside that boundary
+and can reject locally. Request hashes describe the final request handed to
+Membrane (including carrier-stripped retries), not verified wire bytes.
+Failed-request diagnostics are best-effort and inspect the live request after
+rejection, not an invocation-time snapshot. A host-installed serializer with
+side effects can therefore mutate shared request data during diagnostics;
+logging is not isolated from such hooks. Invocation-time snapshotting is deferred
+because it changes these traces from post-hook request identities to planned
+identities and needs explicit handling for carrier-stripped retries.
+If a final request cannot be
+serialized, diagnostics use scalar plan diagnostics captured before dispatch, explicitly
+marked `requestIdentity: planned-fallback`; its hash, count and estimate describe
+the plan, while latency remains the elapsed attempt time. If both diagnostic
+constructions fail, the durable outcome remains but its attempt trace can be absent.
+Hoist and source-only answers that extract to empty are traced as `unusable_empty`.
+For otherwise valid split-part answers, outcomes instead classify the trimmed
+raw text the fold accepts, not text after summary extraction: empty raw text is `unusable_empty`; nonempty raw
+text is `success`, including `<thinking>hidden</thinking>` alone when wrapper
+recovery is disabled. That thinking-only part is accepted into the raw fold. This is existing fold behavior, not a change to
+acceptance; the stitched summary is still extracted before persistence.
+Stripped-versus-unstripped attribution of counted failures is per attempt,
+independent of logging. The flag starts clear, is set at stripped dispatch,
+stays set through rejection handling, and clears when the stripped call
+answers. A counted failure uses the stripped run key only while the flag is
+set, which can include a local exception while handling the rejection. A
+counted local failure after the answer uses the rung's unstripped key.
+Deterministic provider rejections go straight to `noteOutcome`, ending the
+rung's failure runs, and aborts start none. This replaces the previous
+module-level map keyed by the thrown error for stripped attribution:
+concurrent attempts that share an error object no longer overwrite each other's
+stripped attribution, and primitive errors are attributed too. This can affect
+retry counts and when persistent failures contribute to quarantine. Attribution
+of the dispatched model is separate and still keyed by error object. Split
+parts end only their part keys after resume; the enclosing split-stitch run
+ends on whole-fold completion, not a part's answer.
+Canonical and plain-prose end-turn answers are not success until extraction
+succeeds; extraction errors are logged as `provider_error` / `malformed_content`.
+Answered and provider-rejected attempt latency uses a monotonic clock (fractional milliseconds)
+and includes any carrier fallback. A provider-rejected attempt’s
+request hash, count and estimate describe the final request handed to Membrane; admission
+continues to describe the planned rewrite. Admission-rejected traces instead
+describe the planned request with zero latency; no provider call occurred.
 
 Do not log new plaintext copies of summary bodies beyond existing configured compression logging.
 
