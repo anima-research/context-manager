@@ -4,14 +4,14 @@
 
 ## Changelog
 
-- **rev 5.1 (2026-08-05)**: Doc-truth reconciliation against the shipped solver (audited `fa8f938..ec34f2b`). §13.2 corrected: the shipped solve is a **lexicographic branch cascade**, not the drafted `+ λ·perturbation` minimization (no λ exists in `src/`); `relevance_loss` documented as what it is — a salience-weighted *misallocation comparator*, not a minimand; the enforced rejection wall documented as `W × (1 + overBudgetGraceRatio)` at the strategy layer. §13.4 pseudocode regenerated from `planControlledFrontier` (adds `strictReach`/`blocked`, the `madeProgress` guard, the exact bootstrap predicate). §13.5's "budget-driven depth by construction" claim corrected (phase B is W-gated; the shape prior still bounds depth in the [target, W] band). New **§13.6** documents the robustness machinery the solve grew in production (boundary-cut tolerance `de3d293`, overlap tolerance + fold→project fixpoint `b99fcc3`/`204431b`, deepest-first projection, phase-C overshoot acceptance, the `TokenLedger` invariant, memoization contracts). New **§13.7** documents prepared-window transitions (`goalTotalTokens`/`strictReach`/hot-context API). §12 marked historical; its phantom `best-fit` strategy bullet removed (deleted in `ea198a1`).
+- **rev 5.1 (2026-08-05)**: Doc-truth reconciliation against the shipped solver (audited `fa8f938..ec34f2b`). §13.2 corrected: the shipped solve is a **lexicographic branch cascade**, not the drafted `+ λ·perturbation` minimization (no λ exists in `src/`); `relevance_loss` documented as what it is — a salience-weighted *misallocation comparator*, not a minimand; the strategy-layer rejection budget distinguished from the solver budget (see §13.2 for the formula and request-allowance cap). §13.4 pseudocode regenerated from `planControlledFrontier` (adds `strictReach`/`blocked`, the `madeProgress` guard, the exact bootstrap predicate). §13.5's "budget-driven depth by construction" claim corrected (phase B is W-gated; the shape prior still bounds depth in the [target, W] band). New **§13.6** documents the robustness machinery the solve grew in production (boundary-cut tolerance `de3d293`, overlap tolerance + fold→project fixpoint `b99fcc3`/`204431b`, deepest-first projection, phase-C overshoot acceptance, the `TokenLedger` invariant, memoization contracts). New **§13.7** documents prepared-window transitions (`goalTotalTokens`/`strictReach`/hot-context API). §12 marked historical; its phantom `best-fit` strategy bullet removed (deleted in `ea198a1`).
 
-- **rev 5.0 (2026-07-12)**: The kv-stable controller is redesigned as a **single-path solve** — the emergency path, the reach *eligibility gate*, and the fold/expand pass pair are removed. One algorithm per turn: build the salience-weighted **ideal cut** (relevance only, W the sole hard wall), then reconcile it against the carried frontier under a **perturbation trust region** (P, the re-priced `reachTokens`) via suffix adoption, with a **quality-gap override** allowed to exceed P. Salience becomes a per-chunk *coefficient on information loss* (fold-cheap content: externalized code / tool output / images) rather than an eligibility rule. Motivated by the 2026-07-12 production incident (mythos): the emergency path + a reach-gated from-scratch pick manufactured an **inverted resolution profile** (oldest history at L1, the most recent days at L3) which the reach gate then made permanently unrepairable. See **section 13**, which supersedes 12.2 / 12.4 where they conflict.
+- **rev 5.0 (2026-07-12)**: The kv-stable controller is redesigned as a **single-path solve** — the emergency path, the reach *eligibility gate*, and the fold/expand pass pair are removed. One algorithm per turn: build the salience-weighted **ideal cut** (relevance only, using the pre-grace window bound W), then reconcile it against the carried frontier under a **perturbation trust region** (P, the re-priced `reachTokens`) via suffix adoption, with a **quality-gap override** allowed to exceed P. Salience becomes a per-chunk *coefficient on information loss* (fold-cheap content: externalized code / tool output / images) rather than an eligibility rule. Motivated by the 2026-07-12 production incident (mythos): the emergency path + a reach-gated from-scratch pick manufactured an **inverted resolution profile** (oldest history at L1, the most recent days at L3) which the reach gate then made permanently unrepairable. See **section 13**, which supersedes 12.2 / 12.4 where they conflict.
 
 - **rev 4.0 (2026-06-22)**: Reconciliation against the post-PR #19 solver evolution (shipped on `main`, `context-manager` >= 0.5.3). Three changes reshaped the picker and are documented in the new **section 12**, which is the current source of truth where it conflicts with sections 3.5/3.7/3.9/5: (a) a `best-fit` sequence-DP strategy was added and the earlier **half-life / value-minus-lambda-KVcost solver was removed** (`ea198a1`) -- flat-profile is the baseline, not a lambda solve; (b) a **`kv-stable`** controller (`kv-control.ts`) landed as the production default -- a receding-horizon policy under a constraint hierarchy that **replaces cache-as-a-cost-term with cache-as-a-structural-constraint** (the reach cap); (c) kv-stable is **bidirectional** (it un-folds to use budget headroom), so the "V1 ships only monotonic strategies" claim in section 3.9 no longer holds. A production limitation surfaced (opus4): the `foldDepthCap` saliency geometry is a hard per-chunk ceiling that mis-scales to the token wall -- see section 12.4.
 
 - **rev 3.0 (2026-05-15)**: Reconciliation pass against the implementation that landed in PR #19. The architectural shape from rev 2.3 stood; this revision corrects the spots where the implementation diverged from or extended the doc — per-chunk state lives in dedicated state slots rather than on `MessageEntry` records, `mergedInto` is retained as a read-compat alias for `parentId` rather than removed, `FoldingState` is methods-not-fields, the picker returns `produced` ops for the strategy to route (not the picker itself), and the scope grew ~3× over the rev-2 estimate. Lock API simplified to strategy methods only.
-- **rev 2.3 (2026-05-13)**: Replaced the three-step hard-fail escalation ladder (tail-shrink → head-truncate → throw) with throw-only. The strategy raises `OverBudgetError` when the picker is exhausted and the result still exceeds the hard budget; the host decides how to recover. See §3.10.
+- **rev 2.3 (2026-05-13)**: Replaced the three-step hard-fail escalation ladder (tail-shrink → head-truncate → throw) with throw-only. The strategy raises `OverBudgetError` when a budget check refuses the current context or plan (not necessarily because the picker is exhausted); the host decides how to recover. See §3.10.
 - **rev 2.2 (2026-05-13)**: Revised bodyGroup rendering. Rev 2 proposed one composite message with inline `[Section summary]` markers for folded portions; rev 2.2 switches to standard Q+A recall pairs interleaved with raw runs. Matches the existing agent experience for summaries. See §3.6.
 - **rev 2.1 (2026-05-12)**: Settled outstanding decisions. Slack default = 10%. Speculative production = bottom-up background pre-producer, default-on. `lockedByAgent` programmatic API set-only in V1, no agent tool. Migration deferred to follow-up PR; V1 validates via re-ingest on fresh chronicles.
 - **rev 2 (2026-05-12)**: Major revision after design discussion. Switched from fixed L0–L3 levels to unbounded L_n. Replaced `RenderState` slot with on-chunk state. Replaced stored regions with derived runs over per-chunk state. Added `bodyGroupId` mechanism for sub-message chunking, used for documents *and* oversize chat messages. Added pluggable `FoldingStrategy` interface with `FlatProfileStrategy` as default. Corrected the cache analysis.
@@ -356,7 +356,9 @@ V2's agent-driven `unfold` violates monotonicity intentionally — the agent dec
 
 ### 3.10 Hard-fail behavior
 
-When the picker exhausts itself (no more groups it can raise, no more L_{k+1}s it can request) and the result still exceeds the **hard** budget (not just the soft target), the strategy throws `OverBudgetError`.
+The strategy throws `OverBudgetError` when a budget check refuses the current context or plan against the **hard** budget (not just the soft target). This includes head/tail reservation, an over-budget plan, and emission overrunning the plan. The plan check tests the plan's size, not whether the picker has exhausted possible folds: a refused plan can still request missing summaries that compression may produce.
+
+When the constructor's `stage` parameter is omitted, it defaults to the legacy `Adaptive picker exhausted` wording if `diagnostics.solver` is undefined, otherwise to `Adaptive plan check (<solver>)` (for example, `Adaptive plan check (kv-unified)`). The plan check supplies its own stage with the solver name; exhaustion follows the token figures, and the label-ceiling fallback flag is printed only when true; these flags are diagnostics, not the refusal condition or proof that no further compression is possible. Emission sites supply their own stage too. When `clearedBy` includes `compression`, completing queued compression may clear the refusal.
 
 No silent degradation. No automatic tail-shrink or head-truncate. The host is in a better position than the strategy to decide what to do — raise the budget, switch to a larger-context model, drop the head/tail windows for this call, surface a "context too large" error to the user. The strategy's job is to fit when it can and report cleanly when it can't.
 
@@ -373,9 +375,9 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 `OverBudgetError` carries diagnostic info: `{ budget, actual, diagnostics: { headTokens, tailTokens, middleTokens, middleChunkCount, deepestLevel } }`.
 
 > *(rev 5.1 qualifications)* Two shipped behaviors refine "throw-only":
-> **(a)** the enforced wall is the *grace-inflated* budget —
-> `maxTokens × (1 + overBudgetGraceRatio)`, default ×1.02 — so a marginal
-> overshoot from projection repairs (§13.6) doesn't refuse a turn (§13.2);
+> **(a)** the strategy checks against the floored, grace-expanded input
+> budget, capped by the room left under a request limit (§13.2). A marginal
+> overshoot from projection repairs (§13.6) can still fit;
 > **(b)** the recent-window emitter *can* evict tail messages under extreme
 > pressure, but any such eviction that would silently lose content instead
 > **refuses the turn** (`UncoveredDropError`) — pressure never ships silent
@@ -488,15 +490,44 @@ Given:
    persist the staged changes only once every later stage has succeeded,
    and never in a dry run, so neither a refused compile nor a dry run saves
    a level.
-6. If produced.length > 0: handleProducedOps to route into compression
+6. If not dry and produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
-7. If finalTokens > rejectionBudget — the hard budget × (1 +
-   overBudgetGraceRatio), default ×1.02 — and this is not a dry-run
-   preview: throw OverBudgetError. (Rev 5.1: the throw no longer
+7. If finalTokens > rejectionBudget — the floored, grace-expanded input
+   budget, capped by the remaining request allowance when a limit is set
+   (§13.2) — throw OverBudgetError from this attempt, dry or live. For an
+   eligible refusal, a provisional multiplier above 1 can be dropped and
+   selection retried at 1. previewContext reports the final outcome (including
+   entries and stats on a fitting render: true preview). A final budget
+   refusal reports fits: false without entries or stats; other errors that
+   escape final selection propagate.
+   (Rev 5.1: the throw no longer
    consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
    shards via the rendering algorithm in §3.6.1.
 ```
+
+The adaptive plan-check refusal names the solver in its message and exposes
+`solver`, `pickerExhausted`, and `labelCeilingFallback` diagnostics. The
+picker's normalized exhaustion flag uses `FoldingSolution.exhausted` when
+supplied, preserving solver-specific semantics (for example, kv-unified
+reports a frontier infeasible at the pre-grace `FoldingBudget.totalBudget`,
+not necessarily above the strategy's rejection budget in §13.2); otherwise
+it is derived as no production requests and applied tokens above the soft
+target. It does not generally
+mean nothing remains to fold, nor does it trigger this refusal. The message
+labels it `exhausted`, without claiming a provenance for the normalized value.
+`labelCeilingFallback` reports a live kv-unified ceiling fallback, not a
+shadow solve's ceiling hit, and is absent for other solvers. Refusals before
+the plan omit these fields. With the real solver, an infeasible minimum
+frontier returns before search; a search that hits the ceiling falls back
+to a minimum cut that fits the unfloored solve budget. The compile
+checks the applied plan against the separate rejection bound in §13.2.
+With zero grace and no request limit, a 100.25-token cut fits a
+100.5-token solve budget yet
+exceeds the hard bound of 100 with matching accounting and
+`pickerExhausted=false`, including after a real ceiling fallback.
+Provider `usage.outputTokens` can supply fractional summary costs.
+The fallback flag identifies which plan was used, not why it was refused.
 
 `moves` is the number of chunks whose resolution changed from the level
 they started the solve at. It replaced the op walk's `iterations` in
@@ -634,7 +665,7 @@ Implemented in PR #19 (`feat/adaptive-resolution`, anima-research/context-manage
 2. **Recall pair format consistency** — promoted to a design property in §3.9 (monotonic memory fading by construction).
 3. **Pins interaction** — pins always render raw; picker's `foldableMiddle()` excludes pinned chunks. If a pin pushes total over the hard budget, `OverBudgetError` fires (§3.10).
 4. **Branching semantics** — chunk state lives in branch-scoped Chronicle state slots (`autobio:resolutions`, `autobio:locks`); branching inherits the slots via Chronicle's copy-on-write. Verified by `test/adaptive/branching.test.ts`.
-5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `finalResolutions`, `produced`, `finalTokens`, `budgetMet`, `exhausted`, `moves`, `deadFrontierIds`, `unrealizable` for observability at the call site *(rev 5.1: `iterations`/`applied` died with the op walk — `moves` replaced them; see §5)*. A formal `RenderStats` extension is still pending.
+5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `finalResolutions`, `produced`, `finalTokens`, `budgetMet`, `exhausted`, `moves`, `deadFrontierIds`, `unrealizable` for observability at the call site *(rev 5.1: `iterations`/`applied` died with the op walk — `moves` replaced them; see §5)*. Render-time planner telemetry is exposed through `RenderStats.planVsActual`.
 
 **Note (rev 4.0):** the as-shipped solver has since evolved well past this PR #19 snapshot -- `best-fit` and `kv-stable` strategies, cache-as-reach-cap, bidirectional folding. See **section 12** for the current controller and its open calibration question.
 
@@ -760,7 +791,7 @@ an eligibility rule.
 build       ideal = relevanceCut(tree, target, W, base)   -- pure relevance, no P anywhere;
                                                       -- base = carried frontier (seedFromCarried, default) or raw
 reconcile   hold F_prev | adopt ideal | adopt a suffix of ideal | override
-subject to  render(F) ≤ W·(1+grace)   -- the enforced wall (see below)
+compile checks applied plan cost ≤ rejectionBudget   -- strategy layer, not solver
             perturbation(F, F_prev) ≤ P   -- trust region: soft, default-on,
                                           -- overridable with cause
 ```
@@ -796,18 +827,32 @@ and re-introducing one via the objective notation would repeat it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
   turn may take; it never determines *which* chunks may move.
-- `W` — the physical wall, with two qualifications the original rev 5.0 text
-  lacked:
-  - the ideal-cut construction is **best-effort**: on a damaged (non-nested)
-    tree it can return an over-W frontier with `escalated` set rather than
-    throwing — the fold→project fixpoint is round-capped (§13.6);
-  - the **enforced** rejection wall lives in the strategy layer, one grace
-    band above W: `rejectionBudget = floor(maxTokens · (1 +
-    overBudgetGraceRatio))`, default ratio 0.02 → ×1.02
-    (`autobiographical.ts`). `OverBudgetError` fires on
-    `finalTokens > rejectionBudget` — regardless of the solver's `exhausted`
-    flag, which is now solver-owned telemetry (`446c28c`) — correctly
-    pointing at summary *production*, not allocation.
+- `W` — the controller window bound, distinct from hard rejection:
+  - the ideal-cut construction is **best-effort**, not a minimum-token
+    search. If kv-stable adopts an ideal cut above its pre-grace
+    `FoldingBudget.totalBudget` (W), it sets `escalated` and the picker
+    reports exhaustion. This neither rules out a cheaper frontier nor
+    implies a hard-budget refusal;
+  - the **enforced** rejection wall lives in the strategy layer. Let
+    `inputRoom = budget.maxTokens - budget.reserveForResponse` before
+    applying any request limit. The uncapped bound is
+    `floor(inputRoom × (1 + overBudgetGraceRatio))`, with the ratio clamped
+    to zero or higher (default 0.02). When `requestLimitTokens` is set,
+    the strategy caps the solve budget and rejection budget separately.
+    `rejectionBudget` is the smaller of the uncapped bound and the
+    remaining request allowance, after pricing overhead and message
+    injections, accounting for provisional calibration when applicable,
+    and subtracting any reserved stub cost. The strategy does not apply
+    grace to the already-capped W. The plan check throws `OverBudgetError`
+    on `finalTokens > rejectionBudget`, regardless of `exhausted`.
+
+    For example, at W = 782 with 20% grace, an 860-token plan compiled
+    without a request limit (rejection budget 938). With
+    `requestLimitTokens = 1408`, empty request overhead, no message
+    injections, no response or stub reserve, and a provisional multiplier
+    of 1.00 against the calibration ceiling of 1.80, the allowance was
+    `floor(1408 × (1.00 / 1.80)) = 782`. The plan check refused the same
+    plan at 782.
 
 **Override rule (what replaces the emergency).** The trust region may be
 exceeded, same algorithm, same code path, when either:
@@ -834,19 +879,22 @@ Every override is loud: the plan reports `override: 'infeasible' | 'quality-gap'
 **Demand-side production under escalation (issue #56, 2026-08-06).** The
 solver never *speculatively* pre-produces — deeper folding than has been
 produced stays the pre-producer's job — but when the plan **escalates**
-(even full folding exceeds W) while foldable chunks have no L1 coverage at
-all, `KvStableStrategy.solve` emits level-1 `ProduceRequest`s over the
-contiguous uncovered runs (skipping the flat zone, pins, and locked chunks).
+(its adopted ideal cut exceeds the pre-grace budget W) while foldable
+chunks have no L1 coverage at all, `KvStableStrategy.solve` emits level-1
+`ProduceRequest`s over contiguous uncovered runs (skipping the flat zone,
+pins, and locked chunks).
 This is the only route into the strategy layer's demand path
 (`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`), which is
 what overrides the `l1HoldbackChunks` window. Without it, tight operating
 points — where the budget wall lands while the only uncompressed material is
 the unclosed trailing span plus the held-back newest closed chunk — wedged
-permanently: empty speculative queue, no way to raise demand, every compile
-re-escalating infeasible (the L1-holdback deadlock; external repro at
-budgets 14–26k). A produce op still never authorizes an inference — the
-escalated compile hard-fails as before — but recovery now needs only the
-production drain, not config surgery. A range whose tail ends in the
+permanently: empty speculative queue, no way to raise demand (the L1-holdback
+deadlock; external repro at budgets 14–26k). A produce op does not bypass the
+budget checks. An escalated plan can still compile if its applied cost fits
+the rejection budget (including any request-allowance cap) and the final
+render passes its checks.
+When missing L1 coverage does cause a refusal, draining production can let
+the next compile fit without config changes. A range whose tail ends in the
 unclosed trailing span (not yet a chunk) resolves "through the newest closed
 chunk" at the consumer, so the whole backlog is demanded in one compile.
 
@@ -916,8 +964,8 @@ solve(tree, F_prev, W, P):
       --   projection will put it, and an un-fold that overshoots the target
       --   is accepted when it lands CLOSER to it and stays under W (§13.6);
       -- project to a valid group-consistent cut and iterate fold→project
-      --   to a fixpoint (§13.6). BEST-EFFORT: on a damaged tree this can
-      --   return over-W with `escalated` set — it does not throw.
+      --   to a fixpoint (§13.6). BEST-EFFORT: the ideal can be over W
+      --   (not a minimum cut); adopting it sets `escalated` without throwing.
 
   seeded, carried < expandAt, Δ(ideal) > 0,
     Δ(ideal) ≥ 0.9 · Δ(from-scratch cut) → ideal = from-scratch cut
@@ -960,8 +1008,11 @@ solve(tree, F_prev, W, P):
       -- additionally reports blocked='target-floor'
 
 [strategy layer, after picker.run:]
-  finalTokens > W·(1 + overBudgetGraceRatio) and not a dry-run preview
-      → OverBudgetError (loud)
+  finalTokens > rejectionBudget  -- floored grace bound capped by request room (§13.2)
+      → OverBudgetError from this attempt, dry or live
+      → an eligible provisional-calibration retry runs at 1
+      → previewContext can render a fitting outcome; a final budget
+        refusal reports fits: false without entries or stats
 ```
 
 Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally

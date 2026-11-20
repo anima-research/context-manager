@@ -412,6 +412,37 @@ describe('ContextManager initialization fence', () => {
 
   // A superseded switch or fork names the branch it selected or created.
   for (const operation of ['switch', 'fork'] as const) {
+    it(`a reentrant switch during ${operation} reconciliation reports supersession, not a name mismatch`, async (t) => {
+      await fixture(new PassthroughStrategy(), async (manager, store) => {
+        manager.addMessage('user', text('original'));
+        const created = operation === 'fork';
+        if (!created) store.createBranch('A');
+        store.createBranch('B');
+        const currentBranch = store.currentBranch.bind(store);
+        let newer: Promise<void> | undefined;
+        const mocked = t.mock.method(store, 'currentBranch', () => {
+          const branch = currentBranch();
+          if (branch.name === 'A') {
+            mocked.mock.restore();
+            newer = manager.switchBranch('B');
+          }
+          return branch;
+        });
+
+        const outer = created ? manager.fork('A') : manager.switchBranch('A');
+        const rejected = assert.rejects(outer, (error: unknown) => {
+          assert.ok(error instanceof InitializationSupersededError, `Expected supersession, got ${error}`);
+          assert.equal(error.branch, 'A');
+          assert.equal(error.created, created);
+          return true;
+        });
+        assert.ok(newer, 'reconciliation started the newer switch');
+        await Promise.all([rejected, newer]);
+        assert.equal(manager.currentBranch().name, 'B');
+        assert.ok(manager.listBranches().some(branch => branch.name === 'A'));
+      });
+    });
+
     it(`a superseded ${operation} rejects naming the branch it ${operation === 'fork' ? 'created' : 'selected'}`, async () => {
       const strategy = new GatedStrategy();
       await fixture(strategy, async (manager, store) => {

@@ -71,7 +71,11 @@ import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type {
+  CompressionQuarantineBinding, CompressionQuarantineInspection, CompressionQuarantineRecordView,
+  CompressionQuarantineReleaseSelection, CompressionQuarantineReleaseResult,
+} from '../types/compression-quarantine.js';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { noRoomUnderRequestLimit, requestOverheadContent } from '../request-limit.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
@@ -141,16 +145,29 @@ function isCalibrationReset(v: unknown): v is CalibrationReset {
  * Every entry names the namespace whose compression it describes, since one
  * process's strategies share the log (#239).
  */
-function logCompressionCall(entry: Record<string, unknown>, namespace: string): void {
+function withCompressionLog(work: (logPath: string) => void, namespace: string, failure: string | (() => string) = 'compression log write failed:'): void {
   const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
   if (!logPath) return;
   try {
-    mkdirSync(dirname(logPath), { recursive: true });
-    const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
-    appendFileSync(logPath, line);
+    work(logPath);
   } catch (err) {
-    namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
+    try { namespaceDiagnostics(() => namespace).warn(typeof failure === 'function' ? failure() : failure, err); } catch { /* Diagnostics remain nonfatal. */ }
   }
+}
+
+function logCompressionCall(entry: Record<string, unknown>, namespace: string, chunkHash?: string): void {
+  let line: string | undefined;
+  let context = '';
+  withCompressionLog(() => {
+    const metadata = entry.metadata as Record<string, unknown> | undefined;
+    context = ` event=${entry.event ?? 'compression-call'} rung=${metadata?.curveLabel ?? 'n/a'} chunk=${chunkHash ?? metadata?.chunk_hash ?? 'n/a'}`;
+    line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
+  }, namespace, () => 'compression log serialization failed:' + context);
+  if (line === undefined) return;
+  withCompressionLog((logPath) => {
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, line!);
+  }, namespace, 'compression log write failed:' + context);
 }
 
 /**
@@ -470,6 +487,9 @@ function compressionFailureKind(error: unknown): CompressionFailureKind {
 
 /** Longest failure text a compression log line carries. */
 const COMPRESSION_FAILURE_LOG_MAX_CHARS = 2_000;
+
+/** Bound each floor warning lane to 64 SHA-256 hex digests (4 KiB of ASCII key content). */
+const FLOOR_FAILURE_KEY_LIMIT = 64;
 
 /**
  * `text` when it fits; otherwise its head and tail around a marker stating
@@ -1124,13 +1144,6 @@ const heldUntilText = (until: number): string =>
  * compression model changed while it was in flight.
  */
 const dispatchedCompressionModel = new WeakMap<object, string>();
-/**
- * The hash of the request each failed L1 call actually dispatched, keyed by
- * its error. A rung's outcome keeps the rung's identity, but after a carrier
- * rejection the rung dispatches its stripped request, whose failures are a
- * run of their own (chunkRunKey).
- */
-const dispatchedRequestHash = new WeakMap<object, string>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
   const model = (request.config as { model?: unknown } | undefined)?.model;
   if (error !== null && typeof error === 'object' && typeof model === 'string') dispatchedCompressionModel.set(error, model);
@@ -1312,6 +1325,19 @@ export class StoreTopologyError extends Error {
   }
 }
 
+function isCanonicalQuarantineKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+function metadataDigest(value: unknown): string | null {
+  return isCanonicalQuarantineKey(value) ? value : null;
+}
+function metadataString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+function metadataNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 interface CompressionRefusalOutcomeRecord {
   curveLabel: string;
   requestHash: string;
@@ -1344,6 +1370,42 @@ interface CompressionAdmission {
   admittedTokens: number;
   budgetTokens: number;
   disposition: 'provider_attempt' | 'admission_rejected';
+}
+
+/** Log-only decomposition of an already computed admission; never part of a
+ *  refusal plan, family identity, outcome or persisted progress record. */
+interface CompressionAdmissionTrace extends CompressionAdmission {
+  baseCurveLabel: 'canonical' | 'source-only-final';
+  accountingSource:
+    | 'complete_normalized_request_bound'
+    | 'canonical_provider_usage_plus_expansion'
+    | 'source_only_provider_usage_plus_expansion';
+  /** Null means no usable observation of the planned base, not measured zero.
+   *  A count of its carrier-stripped copy is not an observation of that base. */
+  baseProviderInputTokens: number | null;
+}
+
+
+function compressionAdmissionTrace(
+  admission: CompressionAdmission,
+  baseCurveLabel: CompressionAdmissionTrace['baseCurveLabel'],
+  baseProviderInputTokens: number | undefined,
+): CompressionAdmissionTrace {
+  return {
+    baseCurveLabel,
+    accountingSource: baseProviderInputTokens === undefined
+      ? 'complete_normalized_request_bound'
+      : baseCurveLabel === 'canonical'
+        ? 'canonical_provider_usage_plus_expansion'
+        : 'source_only_provider_usage_plus_expansion',
+    baseProviderInputTokens: baseProviderInputTokens ?? null,
+    expansionDeltaTokens: admission.expansionDeltaTokens,
+    boundedInputTokens: admission.boundedInputTokens,
+    outputReserveTokens: admission.outputReserveTokens,
+    admittedTokens: admission.admittedTokens,
+    budgetTokens: admission.budgetTokens,
+    disposition: admission.disposition,
+  };
 }
 
 interface CompressionRefusalPlanRecord extends CompressionRefusalVariantRecord {
@@ -1379,6 +1441,8 @@ type CompressionQuarantineEvent =
   | (CompressionQuarantineEventBase & {
       kind: 'clear';
       targetClaimId: string;
+      /** Additive metadata: old readers ignore it; projection/clear identity is unchanged. */
+      reason?: 'operator-waiver';
     })
   | (CompressionQuarantineEventBase & {
       kind: 'exhausted';
@@ -1429,6 +1493,53 @@ function isUsableQuarantineRecord(record: unknown): record is CompressionRefusal
     typeof (record as { chunkSourceHash?: unknown }).chunkSourceHash === 'string';
 }
 
+/** Distinguishes damaged stored data from store execution/I/O failures. */
+class UnreadableCompressionQuarantineError extends Error {}
+
+/** Only errors thrown by the store-read boundary, not projection/programmer errors. */
+class CompressionQuarantineStoreReadError extends Error {
+  constructor(cause: unknown) { super('Compression quarantine store read failed', { cause }); }
+}
+
+/** Fixed categories only: store error messages, names and arbitrary codes may contain payloads. */
+function quarantineFailureCategory(error: unknown): string {
+  try {
+    const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+    switch (code) {
+      case 'EACCES': case 'EPERM': case 'EIO': case 'ENOSPC': case 'EROFS': case 'EMFILE': case 'ENOENT':
+        return code;
+    }
+  } catch { /* A foreign error can have throwing accessors. */ }
+  return 'unclassified';
+}
+
+/** Shared by the native shape cap and metadata inspection; never counts old accounting. */
+function compressionQuarantineCountsTowardShapeCap(
+  record: CompressionRefusalQuarantineRecord,
+  chunkSourceHash: string,
+  regime: Pick<CompressionRefusalNormalizedConfig,
+    'sourceOnlyFallbackEnabled' | 'sourceOnlyFallbackRequestHash' | 'toolProseFallback' | 'fallbackModel'>,
+): boolean {
+  return record.chunkSourceHash === chunkSourceHash &&
+    record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION &&
+    record.normalizedConfig?.sourceOnlyFallbackEnabled === regime.sourceOnlyFallbackEnabled &&
+    record.normalizedConfig?.sourceOnlyFallbackRequestHash === regime.sourceOnlyFallbackRequestHash &&
+    canonicalJson(record.normalizedConfig?.toolProseFallback ?? null) === canonicalJson(regime.toolProseFallback ?? null) &&
+    // Naming a fallback model, or another one, is a request-family change.
+    record.normalizedConfig?.fallbackModel === regime.fallbackModel;
+}
+
+/** Native key/source digests and optional recorded membership must be readable. No repair. */
+function requireReadableQuarantineMembership(record: CompressionRefusalQuarantineRecord): void {
+  if (!isCanonicalQuarantineKey(record.key) || !isCanonicalQuarantineKey(record.chunkSourceHash)) {
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine key/source digest');
+  }
+  if (record.sourceIds !== undefined &&
+      (!isIdList(record.sourceIds) || sha256Json(record.sourceIds) !== record.chunkSourceHash)) {
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine source membership');
+  }
+}
+
 /**
  * The active quarantine, replayed from the ledger (and the legacy snapshot
  * before it). An entry is made only from a usable record
@@ -1453,11 +1564,28 @@ function projectCompressionQuarantineEvents(
   legacyRecords: CompressionRefusalQuarantineRecord[] = [],
   dropped?: Set<string>,
   unlisted?: Set<string>,
+  strict = false,
 ): Map<string, ActiveCompressionQuarantine> {
   const active = new Map<string, ActiveCompressionQuarantine>();
   const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
+  // Strict reads validate only the state the latest checkpoint supersedes
+  // history with, even if append-first hygiene stopped before redaction.
+  let firstEvent = 0;
+  if (strict) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]?.kind === 'checkpoint') {
+        firstEvent = i;
+        legacyRecords = [];
+        break;
+      }
+    }
+  }
   for (const record of legacyRecords) {
-    if (!isUsableQuarantineRecord(record)) continue;
+    if (!isUsableQuarantineRecord(record)) {
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable legacy quarantine record');
+      continue;
+    }
+    if (strict) requireReadableQuarantineMembership(record);
     active.set(record.key, {
       generationId: `legacy:${record.key}`,
       record,
@@ -1468,34 +1596,64 @@ function projectCompressionQuarantineEvents(
     });
   }
   for (const [index, event] of events.entries()) {
-    if (!event) continue;
+    if (index < firstEvent) {
+      // Checkpoints supersede active state, not claim identities referenced by
+      // later legacy exhaustions. Retain these without validating superseded
+      // history; a referenced record is validated at the exhaustion below.
+      if (event?.kind === 'claim' && typeof event.key === 'string' && event.eventId) {
+        legacyClaims.set(event.eventId, {
+          generationId: event.eventId,
+          record: event.record,
+          outcomes: [],
+          sentAlertKeys: new Set(),
+        });
+      }
+      continue;
+    }
+    if (!event) {
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine event');
+      continue;
+    }
+    if (strict && !['checkpoint', 'claim', 'clear', 'exhausted', 'alert_pending', 'alert_sent'].includes(event.kind)) {
+      throw new UnreadableCompressionQuarantineError('Unknown quarantine event');
+    }
     // A checkpoint is known by its kind; its key isn't read.
     if (event.kind === 'checkpoint') {
       active.clear();
       if (!Array.isArray(event.active)) {
+        if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine checkpoint');
         unlisted?.add(`the ledger's checkpoint at index ${index}`);
         continue;
       }
       for (const item of event.active) {
         if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
+          if (strict) throw new UnreadableCompressionQuarantineError('Unreadable checkpoint generation/record');
           const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
           if (typeof key === 'string') dropped?.add(key);
           continue;
         }
+        if (strict) requireReadableQuarantineMembership(item.record);
         active.set(item.record.key, {
           generationId: item.generationId,
           record: item.record,
-          outcomes: outcomeList(item.outcomes),
+          outcomes: outcomeList(item.outcomes, strict),
           ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
           sentAlertKeys: new Set(Array.isArray(item.sentAlertKeys) ? item.sentAlertKeys : []),
         });
       }
       continue;
     }
-    if (typeof event.key !== 'string') continue;
+    if (typeof event.key !== 'string') {
+      if (strict) throw new UnreadableCompressionQuarantineError('Unreadable quarantine key');
+      continue;
+    }
     if (event.kind === 'claim') {
       const generationId = event.eventId;
+      if (strict && (!isUsableGenerationId(generationId) || !isUsableQuarantineRecord(event.record))) {
+        throw new UnreadableCompressionQuarantineError('Unreadable quarantine claim');
+      }
       if (!generationId) continue;
+      if (strict) requireReadableQuarantineMembership(event.record);
       legacyClaims.set(generationId, {
         generationId,
         record: event.record,
@@ -1513,17 +1671,20 @@ function projectCompressionQuarantineEvents(
         : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
       const generationId = own ? event.eventId : event.targetClaimId;
       if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
+        if (strict) throw new UnreadableCompressionQuarantineError('Unreadable exhaustion generation/record');
         dropped?.add(event.key);
         continue;
       }
+      if (strict) requireReadableQuarantineMembership(record);
       active.set(event.key, {
         generationId,
         record,
-        outcomes: outcomeList(event.outcomes),
+        outcomes: outcomeList(event.outcomes, strict),
         sentAlertKeys: new Set<string>(),
       });
       continue;
     }
+    if (strict && !isUsableGenerationId(event.targetClaimId)) throw new UnreadableCompressionQuarantineError('Unreadable quarantine target');
     const current = active.get(event.key);
     if (!current || current.generationId !== event.targetClaimId) continue;
     if (event.kind === 'clear') {
@@ -1541,6 +1702,7 @@ function projectCompressionQuarantineEvents(
   return active;
 }
 
+/** Pass a lazy legacy read to avoid accessing a snapshot superseded by a checkpoint. */
 export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
   holds(messageIds: readonly string[]): boolean;
   dropped: string[];
@@ -1548,10 +1710,11 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
 } {
   const dropped = new Set<string>();
   const unlisted = new Set<string>();
+  const hasCheckpoint = Array.isArray(ledger) && ledger.some((event) => event?.kind === 'checkpoint');
   const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
+  legacy = hasCheckpoint || ledgerHoldsNoList ? undefined : typeof legacy === 'function' ? legacy() : legacy;
   if (ledgerHoldsNoList) unlisted.add('the ledger');
   if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
-  if (ledgerHoldsNoList && Array.isArray(legacy)) for (const record of legacy) if (isUsableQuarantineRecord(record)) dropped.add(record.key);
   const active = projectCompressionQuarantineEvents(
     Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
     !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
@@ -1563,7 +1726,11 @@ export function compressionQuarantineHolds(ledger: unknown, legacy: unknown): {
 }
 
 /** A quarantine entry's outcomes as read back from the ledger: the objects in a list that carry a string `outcome`, and nothing else. */
-function outcomeList(value: unknown): CompressionRefusalOutcomeRecord[] {
+function outcomeList(value: unknown, strict = false): CompressionRefusalOutcomeRecord[] {
+  if (strict && (!Array.isArray(value) || value.some((entry) =>
+    typeof entry !== 'object' || entry === null || typeof entry.outcome !== 'string'))) {
+    throw new UnreadableCompressionQuarantineError('Unreadable quarantine outcomes');
+  }
   return Array.isArray(value)
     ? value.filter((entry): entry is CompressionRefusalOutcomeRecord =>
       typeof entry === 'object' && entry !== null && typeof (entry as { outcome?: unknown }).outcome === 'string')
@@ -1592,6 +1759,10 @@ interface CompressionOperationBranch {
   name: string;
   generation: number;
   strategyGeneration: number;
+}
+
+function compressionBranchOf(identity: CompressionOperationBranch): CompressionOperationBranch {
+  return { name: identity.name, generation: identity.generation, strategyGeneration: identity.strategyGeneration };
 }
 
 interface LoadedBranchIdentity extends CompressionOperationBranch {
@@ -1638,6 +1809,10 @@ interface RecallCurveVariant {
 }
 
 interface CompressionAttemptTrace {
+  /** Opt-in, log-only; never copied into durable outcomes or progress. */
+  admission?: CompressionAdmissionTrace;
+  /** Failed final-request diagnostics fell back to the planned request; log-only. */
+  requestIdentity?: 'planned-fallback';
   curveLabel: string;
   recallIds: string[];
   recallLevels: number[];
@@ -1728,7 +1903,6 @@ const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
   'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
-const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
 async function withCompressionStateLock<T>(
   store: JsStore,
@@ -2709,9 +2883,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * drop would otherwise leave them).
    */
   async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
-    this.requireLoadedBranch('clearCompressionRefusalQuarantine');
-    if (!this.store) return;
-    const sourceBranch = this.captureCompressionBranch();
+    const source = this.requireLoadedBranch('clearCompressionRefusalQuarantine');
+    await this.clearObservedCompressionQuarantine(key, undefined, source);
+  }
+
+  // Internal decisions retain both the load and the hold generation they observed.
+  private async clearObservedCompressionQuarantine(
+    key: string | undefined,
+    expectedGeneration: string | undefined,
+    sourceBranch: CompressionOperationBranch,
+  ): Promise<boolean> {
+    const store = this.store;
+    if (!store || this.compressionBranchGeneration !== sourceBranch.strategyGeneration) return false;
     // Capture exhaustion identities at invocation. A delayed clear can
     // tombstone only those exact generations; it cannot erase a newer one.
     const observed = this.readCompressionQuarantineProjection();
@@ -2719,16 +2902,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? [...observed.values()].map((active) => ({
           key: active.record.key, generationId: active.generationId,
         }))
-      : observed.has(key)
+      : observed.has(key) && (expectedGeneration === undefined || observed.get(key)!.generationId === expectedGeneration)
         ? [{ key, generationId: observed.get(key)!.generationId }]
         : [];
-    await withCompressionStateLock(
-      this.store,
+    return withCompressionStateLock(
+      store,
       sourceBranch.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
-      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
       const current = this.readCompressionQuarantineProjection();
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
       const cleared = targets.flatMap((target) => {
         const active = current.get(target.key);
         return active?.generationId === target.generationId ? [{ ...target, familyKey: active.record.familyKey }] : [];
@@ -2738,7 +2922,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // family whose recorded answers would exhaust it again at once.
       if (cleared.length > 0) {
         const families = new Set(cleared.map((target) => target.familyKey));
-        this.forgetCompressionFamilyProgress((entry) => families.has(entry.familyKey));
+        this.forgetCompressionFamilyProgress((entry) => families.has(entry.familyKey), undefined, sourceBranch);
       }
       for (const target of cleared) {
         this.appendCompressionQuarantineEvent({
@@ -2746,10 +2930,173 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           key: target.key,
           targetClaimId: target.generationId,
           created: Date.now(),
-        });
+        }, sourceBranch);
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
+      return cleared.length > 0;
+    });
+  }
+
+  private readonly quarantineLoadIds = new WeakMap<LoadedBranchIdentity, string>();
+
+  private quarantineBinding(): CompressionQuarantineBinding | null {
+    if (!this.isLoadedBranchCurrent() || !this.loadedBranchIdentity) return null;
+    const identity = this.loadedBranchIdentity;
+    let loadId = this.quarantineLoadIds.get(identity);
+    if (!loadId) {
+      loadId = randomUUID();
+      this.quarantineLoadIds.set(identity, loadId);
+    }
+    return { namespace: identity.namespace, branch: identity.name, loadId };
+  }
+
+  /** Metadata only: no sweep, repair, journal write, or provider call. */
+  inspectCompressionRefusalQuarantine(options: { key?: string; limit?: number } = {}): CompressionQuarantineInspection {
+    if (!options || typeof options !== 'object' || Array.isArray(options) || (options.key !== undefined && !isCanonicalQuarantineKey(options.key)) ||
+        (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100))) {
+      return { status: 'invalidSelection' };
+    }
+    let binding: CompressionQuarantineBinding | null;
+    try { binding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
+    try {
+      if (!binding) return { status: 'branchUnavailable' };
+      const identity = this.loadedBranchIdentity;
+      const projection = this.readCompressionQuarantineProjection(true, true);
+      try {
+        if (this.loadedBranchIdentity !== identity || !this.isBranchIdentityCurrent(identity)) return { status: 'branchUnavailable' };
+      } catch { return { status: 'branchUnavailable' }; }
+      const limit = options.limit ?? 50;
+      const chunksByHash = new Map(this.chunks.map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk]));
+      const selected = options.key === undefined ? [...projection.keys()].sort() : projection.has(options.key) ? [options.key] : [];
+      const records = selected.slice(0, limit).map((key): CompressionQuarantineRecordView => {
+        const active = projection.get(key)!;
+        const record = active.record;
+        const chunk = chunksByHash.get(record.chunkSourceHash);
+        const recordedIds = Array.isArray(record.sourceIds) && record.sourceIds.every((id) => typeof id === 'string') ? record.sourceIds : null;
+        const ids = recordedIds ?? chunk?.messages.map((message) => message.id) ?? null;
+        const siblings = [...projection.keys()].filter((other) => other !== key && projection.get(other)!.record.chunkSourceHash === record.chunkSourceHash).sort();
+        const generation = active.generationId.startsWith('legacy:') ? null : active.generationId;
+        // Inspect each recorded source-only request regime under today's config.
+        // No request is rebuilt here: this is cap accounting, not eligibility.
+        const regime = {
+          sourceOnlyFallbackEnabled: this.config.compressionSourceOnlyFallback === true ? true : undefined,
+          sourceOnlyFallbackRequestHash: this.config.compressionSourceOnlyFallback === true
+            ? record.normalizedConfig?.sourceOnlyFallbackRequestHash : undefined,
+          toolProseFallback: this.toolProseHoistOptions(),
+          fallbackModel: this.config.compressionFallbackModel || undefined,
+        };
+        const countsTowardShapeCap = compressionQuarantineCountsTowardShapeCap(record, record.chunkSourceHash, regime);
+        const sameRegimeRecords = countsTowardShapeCap ? [...projection.values()].filter((item) =>
+          compressionQuarantineCountsTowardShapeCap(item.record, record.chunkSourceHash, regime)).length : 0;
+        return {
+          key, generation, selectable: generation !== null && isCanonicalQuarantineKey(key) && isCanonicalQuarantineKey(record.familyKey),
+          chunkSourceHash: record.chunkSourceHash,
+          familyKey: metadataDigest(record.familyKey), canonicalRequestHash: metadataDigest(record.canonicalRequestHash),
+          frontierHash: metadataDigest(record.frontierHash), created: metadataNumber(record.created),
+          recordedModel: metadataString(record.model), recordedProvider: null, recordedCategory: null,
+          sourceIds: ids?.slice(0, 100) ?? null, sourceIdsComplete: ids !== null && ids.length <= 100,
+          membership: recordedIds ? 'recorded' : chunk ? 'loaded-chunk' : 'unknown',
+          loadedChunkMatch: chunk !== undefined,
+          profile: {
+            accountingVersion: metadataNumber(record.normalizedConfig?.accountingVersion),
+            fallbackLimit: metadataNumber(record.fallbackLimit), contextBudgetTokens: metadataNumber(record.contextBudgetTokens),
+            sourceOnlyFallbackEnabled: typeof record.normalizedConfig?.sourceOnlyFallbackEnabled === 'boolean' ? record.normalizedConfig.sourceOnlyFallbackEnabled : null,
+          },
+          outcomes: active.outcomes.slice(0, 32).map((entry) => ({
+            outcome: ['refusal', 'topology_violation', 'unusable_empty', 'provider_error', 'admission_rejected', 'incomplete'].includes(entry.outcome) ? entry.outcome : 'unknown',
+            stopReason: ['end_turn', 'refusal', 'max_tokens', 'tool_use', 'abort', 'stop_sequence'].includes(entry.stopReason ?? '') ? entry.stopReason! : null,
+            requestHash: metadataDigest(entry.requestHash),
+          })),
+          outcomesComplete: active.outcomes.length <= 32,
+          countsTowardShapeCap, sameRegimeRecords,
+          sameSourceRecords: siblings.length + 1, siblingKeys: siblings.slice(0, 100), siblingKeysComplete: siblings.length <= 100,
+        };
+      });
+      return { status: 'ok', binding, records, totalRecords: projection.size, complete: selected.length <= limit,
+        configuredModel: metadataString(this.config.compressionModel), configuredProvider: null, configuredCredentialAlias: null };
+    } catch (error) {
+      // Never return store error text (paths/payloads), or disguise programmer errors.
+      if (error instanceof UnreadableCompressionQuarantineError) return { status: 'unreadable', reason: 'ledger-entry' };
+      if (error instanceof CompressionQuarantineStoreReadError) return { status: 'unreadable', reason: 'store-read' };
+      throw error;
+    }
+  }
+
+  /** One explicit generation, compared and cleared under the native branch/state lock. */
+  async releaseCompressionRefusalQuarantine(selection: CompressionQuarantineReleaseSelection): Promise<CompressionQuarantineReleaseResult> {
+    if (!selection || !isCanonicalQuarantineKey(selection.key) || !isUsableGenerationId(selection.expectedGeneration) ||
+        !selection.expectedBinding || typeof selection.expectedBinding.namespace !== 'string' ||
+        typeof selection.expectedBinding.branch !== 'string' || !isUsableGenerationId(selection.expectedBinding.loadId)) {
+      return { status: 'invalidSelection' };
+    }
+    // Copy caller-owned input before waiting; later edits cannot change what was authorized.
+    const { key, expectedGeneration } = selection;
+    const expected = { ...selection.expectedBinding };
+    let binding: CompressionQuarantineBinding | null;
+    try { binding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
+    if (!binding || !this.store) return { status: 'branchUnavailable' };
+    const store = this.store;
+    return withCompressionStateLock(store, binding.branch, this.compressionRefusalQuarantineLedgerStateId, () => {
+      let currentBinding: CompressionQuarantineBinding | null;
+      try { currentBinding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' } as const; }
+      if (!currentBinding) return { status: 'branchUnavailable' };
+      if (currentBinding.loadId !== expected.loadId || currentBinding.namespace !== expected.namespace || currentBinding.branch !== expected.branch) return { status: 'stale' };
+      const identity = this.loadedBranchIdentity;
+      let current: Map<string, ActiveCompressionQuarantine>;
+      try { current = this.readCompressionQuarantineProjection(true, true); } catch (error) {
+        if (error instanceof UnreadableCompressionQuarantineError) return { status: 'unreadable', reason: 'ledger-entry' };
+        if (error instanceof CompressionQuarantineStoreReadError) return { status: 'unreadable', reason: 'store-read' };
+        throw error;
+      }
+      // Reads can reenter branch lifecycle code. Classify loss of the load
+      // before any selection result or mutation-path uncertainty guard.
+      try { currentBinding = this.quarantineBinding(); } catch { return { status: 'branchUnavailable' }; }
+      if (!currentBinding) return { status: 'branchUnavailable' };
+      if (currentBinding.loadId !== expected.loadId || currentBinding.namespace !== expected.namespace || currentBinding.branch !== expected.branch) return { status: 'stale' };
+      const active = current.get(key);
+      if (!active) return { status: 'not-held' };
+      if (active.generationId.startsWith('legacy:')) return { status: 'unsupported' };
+      if (active.generationId !== expectedGeneration) return { status: 'stale' };
+      // Never waive a native hold without the identity needed to forget ALL
+      // of its family's progress. Do not guess from its source, key or model.
+      if (!isCanonicalQuarantineKey(active.record.familyKey)) return { status: 'unreadable', reason: 'ledger-entry' };
+      const requireReleaseBinding = () => {
+        if (this.loadedBranchIdentity !== identity || !this.isBranchIdentityCurrent(identity)) {
+          throw new Error('Compression quarantine release uncertain: authorized branch binding changed during operation');
+        }
+      };
+      requireReleaseBinding();
+      // The identity just validated, not a fresh observation (see the legacy clear).
+      const sourceBranch = compressionBranchOf(identity!);
+      // An attempted write can land and then throw. Mark an open alarm episode
+      // conservatively BEFORE writing, so a later empty read never calls that
+      // uncertainty proof of coverage. This flag is in-memory, not a receipt.
+      if (this.quarantineAlarmActive && this.quarantineAlarmScope?.ns === currentBinding.namespace && this.quarantineAlarmScope.branch === currentBinding.branch) {
+        this.quarantineAlarmOperatorWaived = true;
+      }
+      // As in the legacy native clear: progress first, then the targeted tombstone.
+      // From here on exceptions propagate; a landed write followed by a failure is uncertain.
+      this.forgetCompressionFamilyProgress((entry) => entry.familyKey === active.record.familyKey, requireReleaseBinding, sourceBranch);
+      requireReleaseBinding();
+      this.appendCompressionQuarantineEvent({ kind: 'clear', key, targetClaimId: expectedGeneration, reason: 'operator-waiver', created: Date.now() }, sourceBranch);
+      requireReleaseBinding();
+      // Hygiene can return normally after losing branch currency. Neither it
+      // nor sync/postread may turn another branch's absence into an acknowledgement.
+      this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
+      requireReleaseBinding();
+      store.sync();
+      requireReleaseBinding();
+      const remaining = this.readCompressionQuarantineProjection(true);
+      requireReleaseBinding();
+      // Acknowledge only what the reread shows: a store adapter that moved the
+      // raw handle under a write and back can leave the selected generation
+      // active here while its tombstone landed elsewhere.
+      if (remaining.get(key)?.generationId === expectedGeneration) {
+        throw new Error('Compression quarantine release uncertain: the selected generation is still active after its clear');
+      }
+      this.compressionRefusalQuarantine = remaining;
+      return { status: 'released', key, generation: expectedGeneration, remainingRecords: this.compressionRefusalQuarantine.size };
     });
   }
 
@@ -2766,10 +3113,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `opts.excludePins` lists read as absent (an id no pin has is ignored),
    * optionally with a scoped config swap for knobs that are otherwise
    * recipe-and-restart only (tail, head window, chunk size, merge
-   * threshold, folding strategy...). Commits nothing: no resolution
-   * persistence, no compression enqueue, no transition bookkeeping, and no
-   * pin is removed or written; the pins it leaves out are left out of what
-   * the select reads, not of the strategy's list.
+   * threshold, folding strategy...). Does not persist resolutions, enqueue
+   * compression, or advance live transition bookkeeping. Dry floor-warning
+   * keys can persist (see `SelectOptions.dryRun`). Excluded pins are left
+   * out of what the select reads, not removed from the strategy's list.
+   *
+   * Budget refusals return `fits: false`, not rendered entries or stats,
+   * even with `opts.render: true`. An over-budget adaptive plan is refused
+   * before rendering; a fitting preview can include both fields on request.
    *
    * Two things this deliberately does NOT do:
    *  - It does not apply anything. Applying is `updateHotContextSettings` (for
@@ -2799,7 +3150,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The config swap below is this method's own to undo. What the dry select
     // leaves for observers (transition status, render stats, calibration),
     // select() puts back for every dry run, whichever of selectAdaptive's
-    // OverBudgetError sites throws; any throw is turned into a report below.
+    // OverBudgetError sites throws; only budget refusals become reports below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
@@ -2837,13 +3188,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (!(err instanceof OverBudgetError)) throw err;
         // Read through a cast: control-flow narrowing still has this pinned to
         // `undefined` from the reset above, but selectAdaptive may have filled
-        // it in before a late render-stage throw.
+        // it in before a plan-check or later render-stage throw.
         const partial = this._lastPreview as PreviewResult | undefined;
-        // A plan already over the budget is refused at its gate by the live
-        // compile, with the numbers its preview recorded and the plan's list
-        // (which the preview gives as this dry run sees it), so a later stage's
-        // refusal of this dry run doesn't change the answer: the preview is the
-        // plan's, as when nothing later throws.
+        // Live and dry compiles refuse an over-budget plan before rendering.
+        // Return its recorded report rather than reconstructing it from
+        // refusal diagnostics: even render:true has no entries or stats.
         if (partial?.fits === false) return partial;
         // Infeasible at this budget. That is an ANSWER, not a failure — it is
         // the whole reason to preview before applying. Report it with the
@@ -2875,7 +3224,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!preview) throw new NoFoldPlanToPreviewError();
       // Segment breakdown for the hypothetical compile, which select() kept
       // apart from the live one. Lets a caller show the previewed
-      // head/middle/tail split without re-deriving it.
+      // head/middle/tail split without re-deriving it. Budget refusals return
+      // above without entries or stats, even when rendering was requested.
       return {
         ...preview,
         ...(opts?.render
@@ -3178,8 +3528,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // itself leaves this load in place until the manager initializes it again
     // (setStrategy(getStrategy())).
     this.namedDroppedQuarantineKeys.clear();
-    this.floorFailure = undefined;
+    this.floorFailures.clear();
+    this.dryFloorFailures.clear();
     this.namedUnlistedQuarantineState.clear();
+    this.quarantineHygieneSkipLogged = false;
     this.compressionDebtFailureLogged = null;
 
     // Bind to the chronicle store + namespace for persistent strategy state.
@@ -3191,6 +3543,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.windowLengthLooked = undefined;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
+    if (this.compressionBranchGeneration !== sourceBranch.strategyGeneration) return;
     this.initializingBranchIdentity = {
       store: ctx.store,
       namespace: ctx.namespace,
@@ -4592,6 +4945,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return canonical;
   }
 
+  private compressionFailedAttemptTrace(
+    failed: { request: NormalizedRequest; latencyMs: number },
+  ): Pick<CompressionAttemptTrace, 'requestHash' | 'messageCount' | 'estimatedTokens' | 'latencyMs'> {
+    return {
+      requestHash: sha256Json(failed.request),
+      messageCount: failed.request.messages.length,
+      estimatedTokens: this.estimateCompressionRequestTokens(failed.request),
+      latencyMs: failed.latencyMs,
+    };
+  }
+
   private estimateCompressionRequestTokens(request: NormalizedRequest): number {
     // Metadata-only observability and a conservative budget check. The ordinary
     // formatter/provider remains authoritative for rendered token accounting.
@@ -4747,7 +5111,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never persisted, however plausible its text looks.
    */
   private assessFallbackCompressionResponse(response: unknown):
-    | { outcome: 'valid'; response: NormalizedResponse; text: string }
+    | { outcome: 'valid'; response: NormalizedResponse; text: string; onlyTextBlocks: boolean }
     | { outcome: 'refusal'; stopReason: 'refusal' }
     | { outcome: 'incomplete'; stopReason?: string }
     | { outcome: 'unusable_empty'; stopReason?: string }
@@ -4764,10 +5128,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return { outcome: 'provider_error', stopReason, errorType: 'malformed_content' };
     }
     const textParts: string[] = [];
+    let onlyTextBlocks = true;
     for (const block of content) {
       const errorType = this.fallbackContentBlockError(block);
       if (errorType) return { outcome: 'provider_error', stopReason, errorType };
       const type = (block as { type: string }).type;
+      if (type !== 'text') onlyTextBlocks = false;
       if (type === 'text') {
         textParts.push((block as { text: string }).text);
       }
@@ -4781,7 +5147,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // unknown finish reasons to 'end_turn', so this cannot reject a
     // healthy provider leg.
     if (stopReason !== 'end_turn') return { outcome: 'incomplete', stopReason };
-    return { outcome: 'valid', response: response as NormalizedResponse, text };
+    return { outcome: 'valid', response: response as NormalizedResponse, text, onlyTextBlocks };
   }
 
   /**
@@ -5014,6 +5380,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Number.isFinite(configured) && configured > 0 ? configured : 200_000;
   }
 
+  private compressionAdmissionTrace(
+    admission: CompressionAdmission,
+    baseCurveLabel: CompressionAdmissionTrace['baseCurveLabel'],
+    baseProviderInputTokens: number | undefined,
+  ): CompressionAdmissionTrace {
+    return compressionAdmissionTrace(admission, baseCurveLabel, baseProviderInputTokens);
+  }
+
   /**
    * Admission for a request the refusal ladder sends after the canonical, one
    * rule for the recall-curve variants and both tool-prose hoists: the
@@ -5145,20 +5519,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * nothing (projectCompressionQuarantineEvents): its cleared records would
    * come back. A stored null reads as no value at all.
    */
-  private readCompressionQuarantineProjection(): Map<string, ActiveCompressionQuarantine> {
+  private readCompressionQuarantineProjection(strict = false, classifyStoreReadErrors = false): Map<string, ActiveCompressionQuarantine> {
     if (!this.store) return new Map();
-    const ledger = this.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
-    const legacy = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
+    // Only keyed prewrite reads classify store exceptions for a public result.
+    // Native/mutation reads keep throwing the original failure as before.
+    const read = (id: string): unknown => {
+      try { return this.store!.getStateJson(id); } catch (error) {
+        if (classifyStoreReadErrors) throw new CompressionQuarantineStoreReadError(error);
+        throw error;
+      }
+    };
+    const ledger = read(this.compressionRefusalQuarantineLedgerStateId);
+    // A checkpoint completely replaces the legacy snapshot, including one
+    // left damaged by an older writer. Validate the checkpoint itself below.
+    const hasCheckpoint = Array.isArray(ledger) && ledger.some((event) => event?.kind === 'checkpoint');
+    const legacy = hasCheckpoint ? undefined : read(this.compressionRefusalQuarantineStateId);
     const dropped = new Set<string>();
     const unlisted = new Set<string>();
     const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
     if (ledgerHoldsNoList) unlisted.add('the ledger');
     if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
+    if (strict && unlisted.size > 0) throw new UnreadableCompressionQuarantineError('Unreadable quarantine lists');
     const active = projectCompressionQuarantineEvents(
       Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
       !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
       dropped,
       unlisted,
+      strict,
     );
     if (dropped.size > 0) this.reportDroppedQuarantineEntries(dropped);
     if (unlisted.size > 0) this.reportUnlistedQuarantineState(unlisted);
@@ -5208,7 +5595,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       `[compression-quarantine] on branch '${this.store?.currentBranch().name ?? ''}', left out ledger ${one ? 'entry' : 'entries'} it can't use ` +
         `(keys=${fresh.map((key) => key.slice(0, 12)).join(',')}): ${one ? 'it no longer holds its chunk' : 'they no longer hold their chunks'} back, ` +
         `no clear reaches ${one ? 'it' : 'them'}, and ${one ? 'it stays' : 'they stay'} in the ledger until a checkpoint ` +
-        `rewrites the ledger, which needs ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events in it`,
+        `rewrites the gate's tolerant projection on the next native hygiene pass with at least ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events; hygiene failures or mid-pass loss of currency are logged once per load (already-stale work is skipped silently)`,
     );
   }
 
@@ -5235,31 +5622,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // record, or of one by its key, which leaves the span's other shapes
     // counting toward the cap. A shape whose ledger entry is found unusable
     // is left out of the projection, and so stops counting too.
-    const sameHash = [...projection.values()].filter(
-      (active) => active.record.chunkSourceHash === record.chunkSourceHash &&
-        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
-    );
-    // The shape cap is per request regime, not merely per source chunk. Enabling
-    // the final source-only rung is a genuine request-family change and must
-    // earn a fresh bounded family even when the old regime already filled its
-    // cap. Within the new regime the cap remains sticky.
-    const sameRegime = sameHash.filter((active) =>
-      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
-        record.normalizedConfig.sourceOnlyFallbackEnabled &&
-      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
-        record.normalizedConfig.sourceOnlyFallbackRequestHash &&
-      // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since the options
-      // of a record chronicle before 0.5.1 stored or reads back can have their
-      // keys in another order than toolProseHoistOptions builds them in
-      // (0.5.1 and later keep the written order, chronicle #67).
-      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        canonicalJson(record.normalizedConfig.toolProseFallback ?? null) &&
-      // And for the fallback-model rung: naming a model, or another one, is a
-      // request-family change.
-      active.record.normalizedConfig?.fallbackModel === record.normalizedConfig.fallbackModel,
-    );
+    // Enabling/repointing a fallback (source-only, tool-prose or fallback-model
+    // rung) is a genuine request-family change.
+    // Canonical tool-prose options also survive Chronicle key-order changes.
+    const sameRegime = [...projection.values()].filter((active) =>
+      compressionQuarantineCountsTowardShapeCap(active.record, record.chunkSourceHash, record.normalizedConfig));
     return projection.get(record.key)
       ?? sameRegime.find((active) => active.record.familyKey === record.familyKey)
       ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
@@ -5267,9 +5634,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private appendCompressionQuarantineEvent(
     event: NewCompressionQuarantineEvent,
+    source: CompressionOperationBranch,
   ): CompressionQuarantineEvent {
     if (!this.store) throw new Error('Compression quarantine store is not initialized');
-    this.requireBranchMutation('appendCompressionQuarantineEvent');
+    // Authorize only the branch/load the caller checked, never a reentrant initializer.
+    if (!this.isCompressionBranchCurrent(source)) {
+      throw new Error('Compression quarantine append refused stale branch-scoped mutation: authorized binding changed during operation');
+    }
     const stored = this.store.appendToStateJsonWithIdentity(
       this.compressionRefusalQuarantineLedgerStateId,
       event,
@@ -5281,11 +5652,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private captureCompressionBranch(): CompressionOperationBranch {
     if (!this.store) throw new Error('Compression store is not initialized');
+    const strategyGeneration = this.compressionBranchGeneration;
     const observed = observeStoreBranch(this.store);
     return {
       name: observed.name,
       generation: observed.generation,
-      strategyGeneration: this.compressionBranchGeneration,
+      strategyGeneration,
     };
   }
 
@@ -5294,10 +5666,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // detached or reinitialized no check reads the store, which its manager
     // may have closed by then.
     if (!identity || !this.store || this.compressionBranchGeneration !== identity.strategyGeneration) return false;
-    const observed = observeStoreBranch(this.store);
-    return this.store === identity.store &&
+    const store = this.store;
+    const observed = observeStoreBranch(store);
+    return this.compressionBranchGeneration === identity.strategyGeneration &&
+      this.store === store && store === identity.store &&
       this.ns === identity.namespace &&
-      this.store.currentBranch().name === identity.name &&
       observed.name === identity.name &&
       observed.generation === identity.generation;
   }
@@ -5308,7 +5681,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Fail closed rather than using mirrors loaded from another generation. */
   private requireLoadedBranch(entrypoint: string): CompressionOperationBranch {
-    if (!this.isLoadedBranchCurrent()) {
+    const identity = this.loadedBranchIdentity;
+    if (!identity || !this.isBranchIdentityCurrent(identity)) {
       // An entrypoint racing a still-current initializer must not clear the
       // initializer's partial mirrors out from under it; it simply cannot use
       // them until the identity is committed.
@@ -5321,7 +5695,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `AutobiographicalStrategy.${entrypoint} requires reinitialization for the current branch generation`,
       );
     }
-    return this.captureCompressionBranch();
+    return identity;
   }
 
   private requireBranchMutation(entrypoint: string): void {
@@ -5346,8 +5720,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private isCompressionBranchCurrent(source: CompressionOperationBranch): boolean {
     // Generation first, as in isBranchIdentityCurrent.
     if (!this.store || this.compressionBranchGeneration !== source.strategyGeneration) return false;
-    const observed = observeStoreBranch(this.store);
-    return this.store.currentBranch().name === source.name &&
+    const store = this.store;
+    const observed = observeStoreBranch(store);
+    return this.compressionBranchGeneration === source.strategyGeneration &&
+      this.store === store &&
       observed.name === source.name &&
       observed.generation === source.generation;
   }
@@ -5379,33 +5755,67 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }, this.ns);
   }
 
+  private quarantineHygieneSkipLogged = false;
+
+  /** No store text/payloads; repeated failures or stale work must not spam a load. */
+  private reportSkippedQuarantineHygiene(): void {
+    if (this.quarantineHygieneSkipLogged) return;
+    this.quarantineHygieneSkipLogged = true;
+    this.diag.warn('[compression-quarantine] checkpoint hygiene skipped or incomplete; ledger replay may grow (further skips suppressed until next load)');
+  }
+
   private checkpointCompressionQuarantineIfNeeded(source: CompressionOperationBranch): void {
-    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
-    const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
-    if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
-    const projection = this.readCompressionQuarantineProjection();
-    const retained = [...projection.values()]
-      .sort((a, b) => b.record.created - a.record.created)
-      .slice(0, COMPRESSION_QUARANTINE_MAX_ACTIVE);
-    const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
-      generationId: item.generationId,
-      record: item.record,
-      outcomes: item.outcomes,
-      ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
-      sentAlertKeys: [...item.sentAlertKeys],
-    }));
-    this.appendCompressionQuarantineEvent({
-      kind: 'checkpoint',
-      key: '__checkpoint__',
-      active: serialized,
-      created: Date.now(),
-    });
-    if (!this.isCompressionBranchCurrent(source)) return;
-    // Append-first makes every crash point safe: before redaction both histories
-    // project identically; afterwards the checkpoint is the complete projection.
-    this.store.redactStateItems(this.compressionRefusalQuarantineLedgerStateId, 0, length);
-    if (!this.isCompressionBranchCurrent(source)) return;
-    this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
+    try {
+      // Obsolete work must not consume the current load's failure warning,
+      // especially when no checkpoint was due for the old invocation.
+      if (!this.store || !this.isCompressionBranchCurrent(source)) return;
+      const length = this.store.getStateLen(this.compressionRefusalQuarantineLedgerStateId) ?? 0;
+      if (length < COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS) return;
+      let projection: Map<string, ActiveCompressionQuarantine>;
+      try { projection = this.readCompressionQuarantineProjection(true); } catch (error) {
+        if (!(error instanceof UnreadableCompressionQuarantineError)) throw error;
+        // This is exactly the set enforced by the gate. Damage already ignored
+        // there must not disable compaction; the tolerant read names dropped keys.
+        projection = this.readCompressionQuarantineProjection();
+      }
+      // Lossless even above 1,024 holds: bound replay events, never held records.
+      const retained = [...projection.values()]
+        .sort((a, b) => b.record.created - a.record.created);
+      const serialized: SerializedCompressionQuarantine[] = retained.map((item) => ({
+        generationId: item.generationId,
+        record: item.record,
+        outcomes: item.outcomes,
+        ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
+        sentAlertKeys: [...item.sentAlertKeys],
+      }));
+      // The projection read can reenter initialization on another branch;
+      // the generic append guard alone would accept that new initializer.
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      this.appendCompressionQuarantineEvent({
+        kind: 'checkpoint',
+        key: '__checkpoint__',
+        active: serialized,
+        created: Date.now(),
+      }, source);
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      // Append first: before redaction the gate projects the same holds;
+      // afterwards the checkpoint contains every hold the gate enforces.
+      this.store.redactStateItems(this.compressionRefusalQuarantineLedgerStateId, 0, length);
+      if (!this.isCompressionBranchCurrent(source)) {
+        this.reportSkippedQuarantineHygiene();
+        return;
+      }
+      this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
+    } catch (error) {
+      this.reportSkippedQuarantineHygiene();
+      throw error; // In particular, never acknowledge uncertain mutation hygiene.
+    }
   }
 
   /** How many quarantine records exist, for a health read that needs only the
@@ -5428,8 +5838,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The status, and the error when the quarantine couldn't be read, which the
-   * alarm logs. Health reads must never throw, so a read that fails comes
+   * The status, and the error when the quarantine couldn't be read. The
+   * alarm logs a payload-free failure notice, not the error. Health reads
+   * must never throw, so a read that fails comes
    * back with `unreadable` set, which tells it from an empty quarantine.
    */
   private readCompressionQuarantineStatus(now: number): { status: CompressionQuarantineStatus; error?: unknown } {
@@ -5496,6 +5907,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private quarantineAlarmLastAt = 0;
   /** True while an alarm episode is open (alarmed and not yet all-cleared). */
   private quarantineAlarmActive = false;
+  private quarantineAlarmOperatorWaived = false;
   /**
    * The quarantine the open episode's alarm last sounded on, by namespace and
    * branch: its all-clear is said only when that quarantine reads empty. Not
@@ -5522,7 +5934,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Called with `count > 0` for each repeating alarm, and ONCE with
    * `count === 0` when an alarm episode ends (the quarantine it spoke of is
-   * empty) — hosts should route the all-clear under a DISTINCT alert kind so a
+   * empty, NOT coverage or debt payment). Its optional `clearReason` reports
+   * only known episode intent; absent/unknown reasons remain neutral. Hosts
+   * should route this empty notification under a DISTINCT alert kind so a
    * same-kind cooldown cannot swallow it. The alarm speaks of the quarantine
    * the strategy is reading: an episode follows the namespace and branch its
    * alarm last sounded on, and only that quarantine reading empty ends it.
@@ -5685,7 +6099,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // emitCompressionQuarantineAlert; the klaxon picks it up within one
     // interval and then sustains it.)
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
-    // Sweep BEFORE reading status: the klaxon must reflect real debt only.
+    // Best-effort stale-hold sweep before reading status; not proof of debt.
     const sweptIdentity = this.loadedBranchIdentity;
     await this.sweepPaidOffQuarantineRecords();
     // A strategy detached, or loaded again on another branch, during the
@@ -5699,8 +6113,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (now - this.quarantineUnreadableSaidAt < interval) return;
       this.quarantineUnreadableSaidAt = now;
       this.diag.error(
-        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds:`,
-        error,
+        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds (status check failed: ${quarantineFailureCategory(error)})`,
       );
       return;
     }
@@ -5730,10 +6143,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.quarantineAlarmActive = false;
         this.quarantineAlarmLastAt = 0;
         this.diag.error(
-          '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
+          this.quarantineAlarmOperatorWaived
+            ? '[compression-quarantine] quarantine empty after operator waiver request; coverage and debt payment not established; alarm stands down'
+            : '[compression-quarantine] quarantine empty; coverage and debt payment not established; alarm stands down',
         );
         try {
-          this.onQuarantineAlarm?.(status);
+          this.onQuarantineAlarm?.({ ...status, clearReason: this.quarantineAlarmOperatorWaived ? 'operator-waiver-requested' : 'quarantine-empty' });
         } catch (error) {
           this.diag.error('[compression-quarantine] all-clear handler failed:', error);
         }
@@ -5741,6 +6156,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
+    if (!this.quarantineAlarmActive || this.quarantineAlarmScope?.ns !== scope.ns || this.quarantineAlarmScope.branch !== scope.branch) {
+      this.quarantineAlarmOperatorWaived = false;
+    }
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
     this.quarantineAlarmScope = scope;
@@ -5764,7 +6182,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     this.diag.error(
       `[compression-quarantine] ⚠️ ${status.spans.length} span(s) in compression quarantine ` +
-        `(${status.count} record(s)) — their spans stay raw and WILL eventually exhaust the context budget. ` +
+        `(${status.count} record(s)) — unresolved raw spans may exhaust the context budget; stale holds may remain after coverage. ` +
         `Operator action required (inspect refusing content; branch, pin, or clear). ` +
         `spans: ${spans.join('; ')}. keys=${status.keys.map(k => k.slice(0, 12)).join(',')}`,
     );
@@ -5776,8 +6194,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Sweep quarantine records whose debt is already paid, so the klaxon only
-   * ever sounds on REAL debt. Two ways a record goes stale (both observed
+   * Best-effort sweep of quarantine records whose debt appears paid. Skipped
+   * or failed sweeps can leave stale holds sounding the alarm; it is not proof
+   * of outstanding debt. Two ways a record goes stale (both observed
    * live, mythos 2026-07-16 — three records klaxoning on spans compressed
    * hours earlier as L1-625):
    *  - chunk-boundary drift: rebuildChunks re-cut the compressible zone, the
@@ -5791,8 +6210,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    retried NOR success-cleared), clear.
    */
   private async sweepPaidOffQuarantineRecords(): Promise<void> {
-    if (!this.store) return;
     const identity = this.loadedBranchIdentity;
+    if (!this.store || !identity) return;
     let projection: Map<string, ActiveCompressionQuarantine>;
     try {
       projection = this.readCompressionQuarantineProjection();
@@ -5816,16 +6235,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const reason = match
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
-        await this.clearCompressionRefusalQuarantine(key);
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId, identity);
         // A strategy detached, loaded again on another branch, or whose
         // branch moved, while a clear waited stops sweeping here: that clear
         // may have written nothing, the chunk records read above are another
         // branch's, and the records stay for the next sweep.
         if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
+        if (!cleared) continue;
         this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
-      this.diag.warn('[compression-quarantine] paid-off sweep failed (records remain, klaxon persists):', error);
+      this.diag.warn(`[compression-quarantine] paid-off sweep incomplete; clear may have landed, inspect status to confirm holds (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
   }
 
@@ -5835,11 +6255,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * state (it can be off, and an active alarm would otherwise sweep on every
    * tick), and a slot with no progress costs one small read.
    */
-  private sweepCompressionProgressIfDue(ctx: StrategyContext): void {
+  private sweepCompressionProgressIfDue(ctx: StrategyContext, source: CompressionOperationBranch): void {
     const now = Date.now();
     if (now - this.compressionProgressSweptAt < AutobiographicalStrategy.COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS) return;
     this.compressionProgressSweptAt = now;
-    this.sweepPaidOffCompressionProgress(ctx);
+    this.sweepPaidOffCompressionProgress(ctx, source);
   }
 
   /**
@@ -5857,7 +6277,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    live progress would pay its answered rungs again. An entry that
    *    doesn't carry its span's ids keeps the old rule: dropped.
    */
-  private sweepPaidOffCompressionProgress(ctx: StrategyContext): void {
+  private sweepPaidOffCompressionProgress(ctx: StrategyContext, source: CompressionOperationBranch): void {
     if (!this.store) return;
     try {
       const progress = this.readCompressionFamilyProgress();
@@ -5870,7 +6290,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunkRecords.length === 0) {
         // Nothing to judge spans by (no records yet, or chunk persistence
         // off): only age decides.
-        this.forgetCompressionFamilyProgress(aged);
+        this.forgetCompressionFamilyProgress(aged, undefined, source);
         return;
       }
       const byHash = new Map<string, ChunkRecord>();
@@ -5899,7 +6319,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const match = byHash.get(entry.chunkSourceHash);
         if (match) return match.compressed === true;
         return Array.isArray(entry.sourceIds) ? paidOff(entry.sourceIds) : true;
-      });
+      }, undefined, source);
     } catch (error) {
       this.diag.warn(`[autobiographical] compression progress sweep failed (progress remains): ${describeCompressionFailure(error)}`);
     }
@@ -5914,33 +6334,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * span are cleared. Failures are logged, never thrown: clearing is
    * hygiene, not a correctness dependency.
    */
-  private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
+  private async clearQuarantineForCompressedChunk(chunk: Chunk, source: CompressionOperationBranch): Promise<void> {
     if (!this.store) return;
-    const identity = this.loadedBranchIdentity;
     // The span is covered: no family of it needs ladder progress any more.
     const chunkHash = sha256Json(chunk.messages.map((message) => message.id));
     try {
-      this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash);
+      this.forgetCompressionFamilyProgress((entry) => entry.chunkSourceHash === chunkHash, undefined, source);
     } catch (error) {
-      this.diag.warn(`[autobiographical] could not drop compression progress for a compressed chunk: ${describeCompressionFailure(error)}`);
+      this.diag.warn(`[autobiographical] could not drop compression progress for a compressed chunk (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
     try {
-      const hash = chunkHash;
+      if (!this.isCompressionBranchCurrent(source)) return;
       const projection = this.readCompressionQuarantineProjection();
+      if (!this.isCompressionBranchCurrent(source)) return;
       for (const [key, active] of projection) {
-        if (active.record.chunkSourceHash !== hash) continue;
-        await this.clearCompressionRefusalQuarantine(key);
+        if (active.record.chunkSourceHash !== chunkHash) continue;
+        const cleared = await this.clearObservedCompressionQuarantine(key, active.generationId, source);
         // As in the paid-off sweep: a strategy detached, loaded again on
         // another branch, or whose branch moved while a clear waited stops
         // here, since that clear may have written nothing.
-        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
+        if (!this.isCompressionBranchCurrent(source)) return;
+        if (!cleared) continue;
         this.diag.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
             `successfully under a newer request shape`,
         );
       }
     } catch (error) {
-      this.diag.warn('[compression-quarantine] success-clear failed (records remain, klaxon persists):', error);
+      this.diag.warn(`[compression-quarantine] success-clear incomplete; clear may have landed, inspect status to confirm holds (maintenance failed: ${quarantineFailureCategory(error)})`);
     }
   }
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
@@ -6003,7 +6424,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           alertKey: pending.alertKey,
           pendingEventId: pending.eventId,
           created: Date.now(),
-        });
+        }, source);
       }
       if (!this.isCompressionBranchCurrent(source)) return;
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
@@ -6063,7 +6484,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const exhausted = this.appendCompressionQuarantineEvent({
         kind: 'exhausted', key: record.key, record, outcomes, created: Date.now(),
-      });
+      }, source);
       exhaustion = 'written';
       if (!this.isCompressionBranchCurrent(source)) return;
       this.appendCompressionQuarantineEvent({
@@ -6072,7 +6493,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         targetClaimId: exhausted.eventId!,
         alertKey: record.key,
         created: Date.now(),
-      });
+      }, source);
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(source);
     });
@@ -6387,13 +6808,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(sourceOnlyTokens !== undefined ? { sourceOnlyProviderInputTokens: sourceOnlyTokens } : {}),
       updated: Date.now(),
     });
-    this.writeCompressionFamilyProgress(progress);
+    this.writeCompressionFamilyProgress(progress, source);
   }
 
-  private writeCompressionFamilyProgress(progress: Map<string, CompressionFamilyProgress>): void {
-    if (!this.store) return;
-    this.store.setStateJson(this.compressionFamilyProgressStateId, [...progress.values()]);
-    this.store.sync();
+  private writeCompressionFamilyProgress(progress: Map<string, CompressionFamilyProgress>, source: CompressionOperationBranch): void {
+    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
+    const store = this.store;
+    store.setStateJson(this.compressionFamilyProgressStateId, [...progress.values()]);
+    store.sync();
   }
 
   /**
@@ -6401,16 +6823,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * clear, an age or paid-off sweep): read afresh, remove only the matching
    * families, keep every other writer's.
    */
-  private forgetCompressionFamilyProgress(matches: (entry: CompressionFamilyProgress) => boolean): void {
-    if (!this.store) return;
+  private forgetCompressionFamilyProgress(
+    matches: (entry: CompressionFamilyProgress) => boolean,
+    requireBinding: (() => void) | undefined,
+    source: CompressionOperationBranch,
+  ): void {
+    if (!this.store || !this.isCompressionBranchCurrent(source)) return;
+    requireBinding?.();
     const progress = this.readCompressionFamilyProgress();
+    // A synchronous store read can reenter and change the loaded branch.
+    // Reuse the caller's binding guard before the first progress write.
+    requireBinding?.();
     let changed = false;
     for (const [key, entry] of progress) {
       if (!matches(entry)) continue;
       progress.delete(key);
       changed = true;
     }
-    if (changed) this.writeCompressionFamilyProgress(progress);
+    if (changed) this.writeCompressionFamilyProgress(progress, source);
   }
 
   /**
@@ -6917,7 +7347,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.noteFloorFailure(`no cut meets the plan's constraints (${floor.certificate.reason}, ${conflicts} conflicting leaves)`);
         return null;
       }
-      this.floorFailure = undefined;
+      // Recovery clears only this lane's warning suppression.
+      (this._dryRunSelect ? this.dryFloorFailures : this.floorFailures).clear();
       return floor.floorTokens;
     } catch (error) {
       this.noteFloorFailure(describeCompressionFailure(error));
@@ -6925,14 +7356,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Says once, for a run of compiles whose floor is missing for the same
-   *  cause, why it is, since the report goes missing from each while it
-   *  lasts. Causes that differ only in their numbers or ids count as one. */
+  /** Deduplicates causes until recovery or FIFO eviction in this lane.
+   *  Dry selects (including leave probes) dedup independently and never
+   *  read or write live suppression. Normalize variable IDs and numbers before
+   *  hashing so the retained key has fixed size without changing the log text. */
   private noteFloorFailure(cause: string): void {
-    const kind = cause.replace(/[0-9a-f]{8,}|\d+/gi, '#');
-    if (kind === this.floorFailure) return;
-    this.floorFailure = kind;
-    this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+    const kind = sha256Json(cause.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,}|\d+/gi, '#'));
+    const failures = this._dryRunSelect ? this.dryFloorFailures : this.floorFailures;
+    if (failures.has(kind)) return;
+    if (failures.size >= FLOOR_FAILURE_KEY_LIMIT) {
+      const oldest = failures.values().next();
+      if (!oldest.done) failures.delete(oldest.value);
+    }
+    failures.add(kind);
+    this.diag.warn(`[autobiographical] floor not computed (${this._dryRunSelect ? 'dry' : 'live'}), so floor= is left off the plan line until it is: ${cause}`);
   }
 
   /** An estimate of what the queued work would take off the floor once it
@@ -9028,7 +9465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     await this.soundQuarantineAlarmIfNeeded();
     // Detached, or the branch moved, during the sweep: nothing more to do.
     if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-    this.sweepCompressionProgressIfDue(ctx);
+    this.sweepCompressionProgressIfDue(ctx, sourceBranch);
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
@@ -9675,8 +10112,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.reportCeilingHits();
       return entries;
     }
-    // A dry run commits nothing, and that includes what a select leaves for
-    // the next one and for observers: the cache-marker baseline the next
+    // A dry run does not commit layout or compression work. Dry floor warning
+    // keys persist in their own lane (noteFloorFailure). What we restore for
+    // subsequent selects and observers includes the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
     // plan-vs-actual), calibration's estimate, arming, store view, load and
@@ -9702,6 +10140,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
     const restore = this.saveDryRunState(store);
+    const dryBefore = this._dryRunSelect;
     this._dryRunSelect = true;
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
     this.selectPricing = pricing;
@@ -9710,7 +10149,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
-      this._dryRunSelect = false;
+      this._dryRunSelect = dryBefore;
       if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
       this.thinkingBound = false;
@@ -9844,7 +10283,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let failed: string | undefined;
     try {
       probe = run('leave', true);
-      if ((this._lastPreview as PreviewResult | undefined)?.fits === false) failed = 'its plan is over the budget';
     } catch (err) {
       failed = describeFailure(err);
     } finally {
@@ -10777,8 +11215,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
   /** This select's floor and the budget its plan check refuses above (#415). */
   private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
-  /** The cause of the last floor computation that failed, while it keeps failing (floorTokens). */
-  private floorFailure: string | undefined;
+  /** Bounded, insertion-ordered keys for live floor warnings. Cleared by recovery. */
+  private floorFailures = new Set<string>();
+  /** Independent keys for dry floor warnings, with the same bound and reset policy. */
+  private dryFloorFailures = new Set<string>();
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
@@ -11219,7 +11659,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The span is covered: its ladder progress and quarantine debt are paid
       // off, as at a mint (the paid-off sweep judges by the persisted mark,
       // which a store without chunk persistence doesn't keep).
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       return;
     }
 
@@ -11250,7 +11690,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `is fully covered by existing L1s under different boundaries — dropped, not re-compressed.`,
       );
       chunk.compressed = true;
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       return;
     }
 
@@ -11318,7 +11758,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._compressionCount++;
       // The span is covered, so its progress and quarantine debt are paid
       // off. A stub made no call, so it is no landing (noteCompressionLanded).
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       logCompressionCall({
         operation: 'compress_l1',
         system: null,
@@ -12161,8 +12601,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logError: string | undefined;
     let logWithdrawn = false;
     let logSummaryId: string | undefined;
+    // Log-only traces: durable outcomes/progress copy named fields, never admission.
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
+    // Log-only metadata for the most recent failed runAttempt. A stripped
+    // retry replaces the final request here, without changing rung identity
+    // in durable progress. Reused decisions never consume this snapshot.
+    let failedAttempt: { request: NormalizedRequest; plannedTrace?: Pick<CompressionAttemptTrace, 'requestHash' | 'messageCount' | 'estimatedTokens'>; latencyMs: number;
+      metadata: Pick<CompressionAttemptTrace, 'curveLabel' | 'recallIds' | 'recallLevels' | 'leafCoverageHash' | 'expandedParentId' | 'expandedChildIds'> } | undefined;
+    // Rungs within this chunk are sequential; never attribute through a shared error.
+    let attemptStripped = false;
     let splitMeta: Record<string, unknown> | undefined;
     let inFlightError: unknown;
     /**
@@ -12194,6 +12642,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedParentId?: string,
         expandedChildIds?: string[],
       ): Promise<unknown> => {
+        failedAttempt = undefined;
+        attemptStripped = false;
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         // Each attempt, a ladder's next rung included, checks before it calls
         // the provider: a strategy let go of between two attempts starts no
@@ -12204,7 +12654,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             name: 'CompressionBranchDiscard',
           });
         }
-        const started = Date.now();
+        const started = performance.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
         // whatever comes back. It is `attemptRequest` unless the carrier
@@ -12214,6 +12664,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        let attemptHash: string;
+        let plannedTrace: Pick<CompressionAttemptTrace, 'requestHash' | 'messageCount' | 'estimatedTokens'> | undefined;
+        {
+          // Reuse the required carrier-identity serialization for the log-only
+          // snapshot, before hooks can mutate the plan. Retain only scalars.
+          const attemptJson = JSON.stringify(attemptRequest);
+          attemptHash = createHash('sha256').update(attemptJson, 'utf8').digest('hex');
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            plannedTrace = {
+              requestHash: attemptHash,
+              messageCount: attemptRequest.messages.length,
+              estimatedTokens: Math.ceil(attemptJson.length / 4),
+            };
+          }, this.ns, `compression planned-attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+        }
+        const noteFailedAttempt = (failedRequest: NormalizedRequest): void => {
+          // Retain the final request reference and the pre-dispatch plan's
+          // scalar snapshot. Never serialize in the provider catch.
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            failedAttempt = { request: failedRequest, plannedTrace, latencyMs: performance.now() - started,
+              metadata: { curveLabel, recallIds, recallLevels, leafCoverageHash, expandedParentId, expandedChildIds } };
+          }, this.ns, `compression attempt diagnostic failed: rung=${curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+        };
         // A call's error, when its work lost its branch or strategy
         // generation while the call was out (a detach, a branch move), is
         // discarded as the call's result would be: no rung counts it, a split
@@ -12232,21 +12705,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // is a deterministic answer like any rung's, kept under its own
         // identity: a resumed ladder goes straight to the stripped request.
         const carrierLabel = `${curveLabel}:carrier-rejected`;
-        const attemptHash = sha256Json(attemptRequest);
         const carrierKnownRejected = knownOutcomes.has(`${carrierLabel}\u0000${attemptHash}`) &&
           requestCarriesReasoning(attemptRequest);
+        let providerAnswered = false;
         try {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
           response = await this.callProvider(ctx.membrane!, attemptRequest);
-          // An answer ends its route's pause, on whatever branch.
+          providerAnswered = true;
+          // Keep main's local resume boundary, including carrier retry and
+          // error-model attribution, without tracing it as a provider failure.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
+            if (!providerAnswered) noteFailedAttempt(attemptRequest);
             noteDispatchedModel(error, attemptRequest);
-            if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
           discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
@@ -12262,6 +12737,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           )) {
             throw error;
           }
+          // The carrier call has been classified. Fallback setup/progress
+          // failures are local, not failures of that dispatched request.
+          failedAttempt = undefined;
           if (!known) {
             noteOutcome({
               curveLabel: carrierLabel,
@@ -12270,9 +12748,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
           }
-          // The rejection answers the request with its carriers, whose
-          // failures ran under the rung's own label: it ends that run, whether
-          // it came now or is reused from progress.
+          // Preserve main's reset boundary: the carrier progress write above
+          // must succeed before this shared local/provider run is ended.
           this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
@@ -12282,23 +12759,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:carrier-transport-fallback',
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
+          failedAttempt = undefined;
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
+          attemptStripped = true;
           try {
             response = await this.callProvider(ctx.membrane!, acceptedRequest);
+            // Later local errors are not failures of this settled provider call.
+            attemptStripped = false;
           } catch (retryError) {
+            noteFailedAttempt(acceptedRequest);
             noteDispatchedModel(retryError, acceptedRequest);
-            if (retryError !== null && typeof retryError === 'object') {
-              dispatchedRequestHash.set(retryError, sha256Json(acceptedRequest));
-            }
             throw retryError;
           }
           if (response && typeof response === 'object') countedStripped.add(response);
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(acceptedRequest));
         }
-        // An answer ends the run of failures of the rung that gave it.
+        failedAttempt = undefined;
+        // As on main, a local resume failure precedes the shared run reset.
+        // Split parts end only their own key, not the enclosing stitch rung.
         this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, acceptedRequest !== attemptRequest));
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
@@ -12322,9 +12803,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           refusalCategory: response && typeof response === 'object'
             ? this.refusalCategory(response as NormalizedResponse)
             : undefined,
-          latencyMs: Date.now() - started,
+          latencyMs: performance.now() - started,
           persisted: false,
         };
+        // Nonterminal answers are classified now; end_turn is not success
+        // until extraction below has actually produced usable text.
+        if (CANONICAL_STAGE_LABELS.has(curveLabel) || curveLabel === 'canonical-plain-prose') {
+          if (stopReason !== 'end_turn') trace.outcome = stopReason === 'refusal' ? 'refusal' : 'incomplete';
+        }
         attemptTraces.push(trace);
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
@@ -12417,7 +12903,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           plan: quarantineRecord.plan,
           outcomes: familyRecord,
         },
-      }, this.ns);
+      }, this.ns, quarantineRecord.chunkSourceHash);
       /**
        * What either exhaustion exit does once the family's exhaustion is
        * decided: a span a row left while the ledger's lock was awaited is
@@ -12440,7 +12926,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.logCompressionFamilyDropped(chunk, quarantineRecord);
           return;
         }
-        this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
+        this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey, undefined, sourceBranch);
         if (exhaustion === 'written') logExhausted();
         onRequestStopped?.();
       };
@@ -12494,7 +12980,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         error: unknown,
         curveLabel: string,
         requestHash: string,
-        streakHash: string = requestHash,
+        stripped: boolean = false,
       ): CompressionRefusalOutcomeRecord => {
         // The fallback-model rung doesn't wait out a long hold of its model
         // (fallbackModelHeldUntil): it ends here with a decided outcome, so
@@ -12508,13 +12994,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         }
         if (!isNoCallDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
-          // Counted against the request actually dispatched (the stripped one
-          // after a carrier rejection is its own run); the outcome at the
-          // bound is the rung's.
+          // Unsettled stripped provider failures have their own run. Once
+          // the provider answers, later local failures use the unstripped
+          // rung key; the outcome at the bound is always the rung's.
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
           const run = nextFailureStreak(
-            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash),
+            this.compressionFailureRuns.get(runSubject)?.run, chunkRunKey(runSubject, curveLabel, stripped),
             compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched),
           );
           // The decision is the rung's outcome, which ends its run (noteOutcome).
@@ -12526,9 +13012,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         persistProgress();
         throw error;
       };
+      const traceFailedAttempt = (
+        errorType: string | undefined,
+        annotation: Pick<CompressionRefusalOutcomeRecord, 'admittedTokens' | 'budgetTokens'> = {},
+      ): CompressionAttemptTrace | undefined => {
+        let trace: CompressionAttemptTrace | undefined;
+        try {
+          if (failedAttempt && process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace = { ...failedAttempt!.metadata, ...this.compressionFailedAttemptTrace(failedAttempt!),
+              persisted: false, outcome: 'provider_error', errorType, ...annotation };
+            attemptTraces.push(trace);
+          }, this.ns, `compression attempt diagnostic failed: rung=${failedAttempt?.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+          // A hook/transport may mutate any final request into an unserializable
+          // object. Keep the decided rung visible using the pre-dispatch
+          // scalar snapshot, never a retained mutable plan.
+          if (!trace && failedAttempt?.plannedTrace &&
+              process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace = { ...failedAttempt!.metadata,
+              ...failedAttempt!.plannedTrace!, latencyMs: failedAttempt!.latencyMs,
+              requestIdentity: 'planned-fallback', persisted: false, outcome: 'provider_error', errorType, ...annotation };
+            attemptTraces.push(trace);
+          }, this.ns, `compression planned-fallback diagnostic failed: rung=${failedAttempt.metadata.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+          return trace;
+        } finally {
+          failedAttempt = undefined;
+        }
+      };
       type LadderStep =
         | { kind: 'answered'; response: unknown }
-        | { kind: 'decided'; outcome: CompressionRefusalOutcomeRecord; reused: boolean };
+        | { kind: 'decided'; outcome: CompressionRefusalOutcomeRecord; reused: boolean; trace?: CompressionAttemptTrace };
       /**
        * One rung's request: reuse its known answer, or call it. A thrown
        * request-attributable rejection becomes the rung's outcome; a transient
@@ -12548,7 +13060,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt-reused',
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel, requestHash, outcome: known.outcome },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           // Another ladder's answer, perhaps another process's, decided the
           // rung: a run this process opened on it before then ends here.
           endRungRuns(curveLabel);
@@ -12570,6 +13082,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const kind = compressionFailureKind(error);
           if (kind === 'abort') throw error;
+          const stripped = attemptStripped;
           const decided: CompressionRefusalOutcomeRecord = kind === 'rejection'
             ? {
                 curveLabel,
@@ -12581,11 +13094,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 error,
                 curveLabel,
                 requestHash,
-                (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
+                stripped,
               );
           const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
-          return { kind: 'decided', outcome, reused: false };
+          const trace = traceFailedAttempt(outcome.errorType, annotation);
+          return { kind: 'decided', outcome, reused: false, trace };
+        } finally {
+          failedAttempt = undefined;
+        }
+      };
+
+      // Classification uses the assessment's existing text snapshot, never
+      // another read of a live response. Disabled logging does no extra work.
+      const classifyFallbackTrace = (
+        assessment: { text: string; onlyTextBlocks: boolean }, trace: CompressionAttemptTrace,
+      ): void => {
+        withCompressionLog(() => {
+          const extracted = extractCompressionSummaryText(assessment.text,
+            this.config.recoverLiteralThinkingWrappedCompression === true && assessment.onlyTextBlocks);
+          trace.outcome = extracted.text.trim() ? 'success' : 'unusable_empty';
+        }, this.ns, `compression outcome diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+      };
+
+      const extractSummaryText = (r: NormalizedResponse, trace?: CompressionAttemptTrace): { text: string; recoveredWholeWrapper: boolean } => {
+        try {
+          const rawText = r.content
+            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .map(b => b.text)
+            .join('\n');
+          // An operator's text (externalWork) is stored as given: only a
+          // model's answer is read for a thinking wrapper, so no text of
+          // theirs strips to an empty answer the ladder would record.
+          if (this.externalWork?.by) return { text: rawText, recoveredWholeWrapper: false };
+          // The opt-in reads an answer of text blocks alone; one with native
+          // reasoning beside its text is read as before.
+          const onlyTextBlocks = r.content.every((block) => block.type === 'text');
+          const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+          return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
+        } catch (error) {
+          if (trace) {
+            trace.outcome = 'provider_error';
+            trace.errorType = 'malformed_content';
+          }
+          throw error;
         }
       };
 
@@ -12600,6 +13152,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * source-only-final, and exhausts if that fails.
        */
       let canonicalRejection: CompressionRefusalOutcomeRecord | undefined;
+      let canonicalRejectionTrace: CompressionAttemptTrace | undefined;
       /**
        * The canonical-stage rung (canonical, no-tools or tools-less) whose
        * end_turn answer the summary is extracted from, or whose answer is known
@@ -12631,6 +13184,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       } else if (canonicalStep.outcome.outcome === 'provider_error') {
         canonicalRejection = canonicalStep.outcome;
+        canonicalRejectionTrace = canonicalStep.trace;
       } else {
         canonicalStopReason = canonicalStep.outcome.stopReason;
         if (canonicalStep.outcome.outcome === 'unusable_empty') {
@@ -12684,6 +13238,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
         } else if (retryStep.outcome.outcome === 'provider_error') {
           canonicalRejection = retryStep.outcome;
+          canonicalRejectionTrace = retryStep.trace;
         } else {
           retryStopReason = retryStep.outcome.stopReason;
           if (retryStep.outcome.outcome === 'unusable_empty') {
@@ -12725,6 +13280,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
           } else if (toolslessStep.outcome.outcome === 'provider_error') {
             canonicalRejection = toolslessStep.outcome;
+            canonicalRejectionTrace = toolslessStep.trace;
           } else if (toolslessStep.outcome.outcome === 'unusable_empty') {
             canonicalStopReason = 'end_turn';
             answeredRung = { curveLabel: 'canonical-toolless', requestHash: toolslessHash };
@@ -12753,7 +13309,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           sourceOnlyFallbackRequestHash,
         );
         const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
-        if (canonicalTrace) canonicalTrace.outcome = canonicalOutcome;
+        // A later canonical-stage retry may be rejected after canonical answered.
+        // Its trace identifies the dispatched bytes (possibly carrier-stripped);
+        // the durable rejection instead identifies the planned rung.
+        const canonicalMetadata = canonicalRejection
+          ? canonicalRejectionTrace ?? canonicalRejection
+          : canonicalTrace ?? familyRecord.find((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel));
         successfulTrace = undefined;
         logCompressionCall({
           event: canonicalRejection
@@ -12762,8 +13323,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? 'compression:canonical-refused'
               : 'compression:canonical-incomplete',
           operation: 'compress_l1',
-          metadata: canonicalTrace ?? familyRecord.find((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel)),
-        }, this.ns);
+          metadata: canonicalMetadata,
+        }, this.ns, quarantineRecord.chunkSourceHash);
         let fallbackResponse: NormalizedResponse | undefined;
 
         // One bounded attempt of a tool-prose-hoisted request. Same receipts
@@ -12776,7 +13337,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // variant's is, and nothing is sent.
         const runToolProseRung = async (
           hoistedRequest: NormalizedRequest,
-          base: { request: NormalizedRequest; providerInputTokens: number | undefined },
+          base: {
+            request: NormalizedRequest;
+            curveLabel: CompressionAdmissionTrace['baseCurveLabel'];
+            providerInputTokens: number | undefined;
+          },
           curveLabel: string,
           recallIds: string[],
           recallLevels: number[],
@@ -12807,6 +13372,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               budgetTokens: admission.budgetTokens,
             };
             attemptTraces.push(trace);
+            if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+              trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12816,22 +13384,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens: admission.admittedTokens,
               budgetTokens: admission.budgetTokens,
             });
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
             return;
           }
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
             hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
           ));
-          if (result.kind === 'decided') return;
+          if (result.kind === 'decided') {
+            if (result.trace) {
+              const trace = result.trace;
+              trace.admittedTokens = admission.admittedTokens;
+              trace.budgetTokens = admission.budgetTokens;
+              if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+                trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
+              logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
+            }
+            return;
+          }
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          trace.admittedTokens = admission.admittedTokens;
+          trace.budgetTokens = admission.budgetTokens;
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace.admission = this.compressionAdmissionTrace(admission, base.curveLabel, base.providerInputTokens);
+          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
-            trace.outcome = 'success';
+            classifyFallbackTrace(assessment, trace);
             fallbackResponse = assessment.response;
             response = assessment.response;
             successfulTrace = trace;
           } else {
             trace.outcome = assessment.outcome;
+            if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
             const outcome: CompressionRefusalOutcomeRecord = {
               curveLabel, requestHash, outcome: assessment.outcome,
               ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
@@ -12839,7 +13424,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             };
             noteOutcome(outcome);
           }
-          logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+          logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
         };
 
         // ---- tool-prose hoist rung (compressionToolProseFallback) ----
@@ -12855,7 +13440,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedCanonical) {
             await runToolProseRung(
               hoistedCanonical,
-              { request, providerInputTokens: canonicalProviderInputTokens },
+              { request, curveLabel: 'canonical', providerInputTokens: canonicalProviderInputTokens },
               'tool-prose-hoist',
               canonicalRecallIds,
               canonicalRecallLevels,
@@ -12902,6 +13487,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               budgetTokens: contextBudget,
             };
             attemptTraces.push(trace);
+            if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+              trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+            }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
             // No call answers it, so progress doesn't keep it; the family's
             // record does, where the ladder made it.
             familyRecord.push({
@@ -12913,7 +13501,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             });
             logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-            }, this.ns);
+            }, this.ns, quarantineRecord.chunkSourceHash);
             continue;
           }
           const result = await ladderStep(curveLabel, variant.requestHash, () => runAttempt(
@@ -12926,41 +13514,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             variant.children.map((child) => child.id),
           ), { admittedTokens, budgetTokens: contextBudget });
           if (result.kind === 'decided') {
-            if (!result.reused) {
-              const trace: CompressionAttemptTrace = {
-                curveLabel,
-                recallIds: variantFrontier.map((summary) => summary.id),
-                recallLevels: variantFrontier.map((summary) => summary.level),
-                expandedParentId: variant.parent.id,
-                expandedChildIds: variant.children.map((child) => child.id),
-                leafCoverageHash: variant.leafCoverageHash,
-                requestHash: variant.requestHash,
-                messageCount: variant.request.messages.length,
-                estimatedTokens: this.estimateCompressionRequestTokens(variant.request),
-                latencyMs: 0,
-                persisted: false,
-                outcome: 'provider_error',
-                ...(result.outcome.errorType !== undefined ? { errorType: result.outcome.errorType } : {}),
-                admittedTokens,
-                budgetTokens: contextBudget,
-              };
-              attemptTraces.push(trace);
+            if (result.trace) {
+              const trace = result.trace;
+              trace.admittedTokens = admittedTokens;
+              trace.budgetTokens = contextBudget;
+              if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+                trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+              }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
               logCompressionCall({
                 event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-              }, this.ns);
+              }, this.ns, quarantineRecord.chunkSourceHash);
             }
             continue;
           }
           const variantResponse = result.response;
           const trace = attemptTraces[attemptTraces.length - 1]!;
+          if (process.env.CONTEXT_MANAGER_COMPRESSION_LOG) withCompressionLog(() => {
+            trace.admission = this.compressionAdmissionTrace(planned, 'canonical', canonicalProviderInputTokens);
+          }, this.ns, `compression admission diagnostic failed: rung=${trace.curveLabel} chunk=${quarantineRecord.chunkSourceHash}`);
           trace.admittedTokens = admittedTokens;
           trace.budgetTokens = contextBudget;
+          const assessment = this.assessFallbackCompressionResponse(variantResponse);
+          if (assessment.outcome === 'valid') classifyFallbackTrace(assessment, trace);
+          else trace.outcome = assessment.outcome;
+          if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
           logCompressionCall({
             event: 'compression:curve-attempt',
             operation: 'compress_l1',
             metadata: trace,
-          }, this.ns);
-          const assessment = this.assessFallbackCompressionResponse(variantResponse);
+          }, this.ns, quarantineRecord.chunkSourceHash);
           if (assessment.outcome === 'refusal') {
             trace.outcome = 'refusal';
             const outcome: CompressionRefusalOutcomeRecord = {
@@ -12991,7 +13573,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteOutcome(outcome);
             continue;
           }
-          trace.outcome = 'success';
           fallbackResponse = assessment.response;
           response = assessment.response;
           successfulTrace = trace;
@@ -13014,18 +13595,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ));
           if (result.kind === 'decided') {
             sourceOnlyOutcome = result.outcome.outcome;
+            if (result.trace) logCompressionCall({
+              event: 'compression:curve-attempt', operation: 'compress_l1', metadata: result.trace,
+            }, this.ns, quarantineRecord.chunkSourceHash);
           } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(result.response);
             progressSourceOnlyInputTokens = baseInputTokens(result.response);
             if (assessment.outcome === 'valid') {
-              trace.outcome = 'success';
+              classifyFallbackTrace(assessment, trace);
               fallbackResponse = assessment.response;
               response = assessment.response;
               successfulTrace = trace;
             } else {
               sourceOnlyOutcome = assessment.outcome;
               trace.outcome = assessment.outcome;
+              if (assessment.outcome === 'provider_error') trace.errorType = assessment.errorType;
               const outcome: CompressionRefusalOutcomeRecord = {
                 curveLabel, requestHash, outcome: assessment.outcome,
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
@@ -13033,7 +13618,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               };
               noteOutcome(outcome);
             }
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns, quarantineRecord.chunkSourceHash);
           }
         }
 
@@ -13047,7 +13632,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedSourceOnly) {
             await runToolProseRung(
               hoistedSourceOnly,
-              { request: sourceOnlyFallbackRequest, providerInputTokens: progressSourceOnlyInputTokens },
+              { request: sourceOnlyFallbackRequest, curveLabel: 'source-only-final', providerInputTokens: progressSourceOnlyInputTokens },
               'source-only-tool-prose-hoist',
               [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
@@ -13153,7 +13738,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt-reused',
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel: 'split-stitch', requestHash: splitLeafHash, outcome: knownSplit.outcome },
-          }, this.ns);
+          }, this.ns, quarantineRecord.chunkSourceHash);
         } else if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
           const leafHash = splitLeafHash;
           const textOf = (m: { content: ContentBlock[] }): string =>
@@ -13265,7 +13850,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // abort) ends this attempt of it and propagates; only a
               // deterministic rejection of a piece abandons the rung.
               if (compressionFailureKind(error) !== 'rejection') throw error;
-              abortReason = `provider-error:${compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error)}`;
+              const errorType = compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error);
+              traceFailedAttempt(errorType);
+              abortReason = `provider-error:${errorType}`;
               return false;
             }
             const assessment = this.assessFallbackCompressionResponse(res);
@@ -13292,7 +13879,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }
             }
             if (assessment.outcome === 'valid') {
-              trace.outcome = 'success';
               lastGood = assessment.response;
               inputTokens += assessment.response.usage?.inputTokens ?? 0;
               {
@@ -13303,14 +13889,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 successfulLeaves++;
                 if (d?.model?.actual) { modelReportedLeaves++; leafModels.add(`${d.model.actual}|${d.model.provider ?? ''}`); }
               }
+              // Classify trimmed raw text, not extracted summary text. With
+              // wrapper recovery disabled, even a thinking-only part is success
+              // and folded; extraction happens only after stitching (unchanged).
               const txt = textOf(assessment.response).trim();
+              trace.outcome = txt ? 'success' : 'unusable_empty';
               if (txt.length > 0) {
                 parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: trace.requestHash, responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
                 return true;
               }
             } else {
               trace.outcome = assessment.outcome;
-              if (assessment.outcome === 'provider_error') { abortReason = `provider-error:${assessment.errorType ?? 'unclassified'}`; return false; }
+              if (assessment.outcome === 'provider_error') { trace.errorType = assessment.errorType; abortReason = `provider-error:${assessment.errorType ?? 'unclassified'}`; return false; }
             }
             }
             // Refused (or empty): split at a lawful boundary, never inside a tool round.
@@ -13355,7 +13945,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // applying again. When the failures decide the request
             // (COMPRESSION_PERSISTENT_FAILURES), the rung ends here instead.
             const decision = interrupt(error, 'split-stitch', leafHash);
+            traceFailedAttempt(decision.errorType);
             abortReason = `provider-error:${decision.errorType ?? 'persistent'}`;
+          } finally {
+            failedAttempt = undefined;
           }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
@@ -13417,7 +14010,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
             };
             this.diag.error(`[autobiographical] split-stitch fold stitched for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
-            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } }, this.ns);
+            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } }, this.ns, quarantineRecord.chunkSourceHash);
           } else {
             const reason = abortReason ?? 'refused';
             // A provider error, a piece's rejection or the rung's decision,
@@ -13433,7 +14026,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             };
             noteOutcome(splitOutcome);
             this.diag.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
-            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns);
+            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns, quarantineRecord.chunkSourceHash);
           }
         }
         if (!fallbackResponse) {
@@ -13458,25 +14051,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // progress: an end_turn whose text stripped to empty (recorded below
       // before the plain-prose rung was interrupted). It has no text.
       let acceptedResponse = response as NormalizedResponse | undefined;
-      const extractSummaryText = (r: NormalizedResponse): { text: string; recoveredWholeWrapper: boolean } => {
-        const rawText = r.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map(b => b.text)
-          .join('\n');
-        // An operator's text (externalWork) is stored as given: only a
-        // model's answer is read for a thinking wrapper, so no text of
-        // theirs strips to an empty answer the ladder would record.
-        if (this.externalWork?.by) return { text: rawText, recoveredWholeWrapper: false };
-        // The opt-in reads an answer of text blocks alone; one with native
-        // reasoning beside its text is read as before.
-        const onlyTextBlocks = r.content.every((block) => block.type === 'text');
-        const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
-        return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
-      };
       let extraction = acceptedResponse
-        ? extractSummaryText(acceptedResponse)
+        ? extractSummaryText(acceptedResponse, successfulTrace)
         : { text: '', recoveredWholeWrapper: false };
       let summaryText = extraction.text;
+      if (successfulTrace) {
+        successfulTrace.outcome = summaryText.trim() ? 'success' : 'unusable_empty';
+      }
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
       let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
       /** The rung whose answer stripped to empty, as recorded before the plain-prose retry. */
@@ -13525,8 +14106,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (proseStep.kind === 'answered') {
           const proseStop = this.compressionResponseStopReason(proseStep.response);
           const proseExtraction = proseStop === 'end_turn'
-            ? extractSummaryText(proseStep.response as NormalizedResponse)
+            ? extractSummaryText(proseStep.response as NormalizedResponse, attemptTraces[attemptTraces.length - 1])
             : { text: '', recoveredWholeWrapper: false };
+          const proseTrace = attemptTraces[attemptTraces.length - 1]!;
+          if (proseStop === 'end_turn') proseTrace.outcome = proseExtraction.text.trim() ? 'success' : 'unusable_empty';
           if (proseExtraction.text.trim()) {
             acceptedResponse = proseStep.response as NormalizedResponse;
             extraction = proseExtraction;
@@ -13648,7 +14231,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         chunk.summaryId = postExisting.id;
         // Adoption covers the span just as a fresh summary does — pay off
         // any quarantine debt (see the success path below).
-        await this.clearQuarantineForCompressedChunk(chunk);
+        await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
         return;
       }
 
@@ -13723,7 +14306,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           event: 'compression:literal-thinking-wrapper-recovered',
           operation: 'compress_l1',
           metadata: { model: successfulTrace?.model ?? model, chunk_size: chunk.messages.length, summary_id: entry.id },
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
       }
       this._compressionCount++;
       logSummaryId = entry.id;
@@ -13735,14 +14318,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
       // stale records alarm forever and bury the real alarms.
-      await this.clearQuarantineForCompressedChunk(chunk);
+      await this.clearQuarantineForCompressedChunk(chunk, sourceBranch);
       if (successfulTrace) successfulTrace.persisted = true;
       if (successfulTrace?.expandedParentId) {
         logCompressionCall({
           event: 'compression:curve-succeeded',
           operation: 'compress_l1',
           metadata: successfulTrace,
-        }, this.ns);
+        }, this.ns, quarantineRecord.chunkSourceHash);
       }
 
       // The summary is written. A strategy let go of, or loaded again, while
@@ -13800,7 +14383,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : {}),
       });
       if (inFlight.get(inFlightKey) === inFlightCompletion) inFlight.delete(inFlightKey);
-      for (const trace of attemptTraces) {
+      for (const trace of attemptTraces) withCompressionLog(() => {
         logCompressionCall({
           event: 'compression:attempt',
           operation: 'compress_l1',
@@ -13810,9 +14393,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             model,
             ...trace,
           },
-        }, this.ns);
-      }
-      logCompressionCall({
+        }, this.ns, quarantineRecord.chunkSourceHash);
+      }, this.ns, `compression attempt receipt diagnostic failed: chunk=${quarantineRecord.chunkSourceHash}`);
+      withCompressionLog(() => logCompressionCall({
         operation: 'compress_l1',
         // The DISPATCHED bytes, read off the request object — deliberately
         // NOT ctx.systemPrompt again. This finally runs after an awaited
@@ -13848,7 +14431,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
-      }, this.ns);
+      }, this.ns, quarantineRecord.chunkSourceHash), this.ns,
+        `compression receipt diagnostic failed: chunk=${quarantineRecord.chunkSourceHash}`);
     }
   }
 
@@ -16020,6 +16604,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
     this.loadCalibration(store, { dryRun });
+    // kv-unified solves against pre-grace totalBudget: exhaustion need not
+    // mean the plan exceeds the grace-expanded rejectionBudget below.
     const overBudgetGraceRatio = Math.max(0, this.config.overBudgetGraceRatio ?? 0);
     const room = budget.maxTokens - budget.reserveForResponse;
     const { maxTokens, rejectionBudget } = this.boundsUnderRequestLimit(
@@ -16457,8 +17043,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // disagree the emitter can overrun a plan that "fit", and the overrun is
     // paid by whatever renders last — the recent window — which is how tail
     // eviction becomes reachable at all. Eviction is therefore a symptom of
-    // plan drift, not of scarce foldable material: the picker either reaches
-    // its target or raises OverBudgetError. Record the plan so rsEnd() can
+    // plan drift, not of scarce foldable material: a plan may miss the soft
+    // target and still pass the hard-budget check. Record the plan so rsEnd() can
     // compare it against what was actually committed (its other figures,
     // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;
@@ -16549,17 +17135,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Standing production target (productionBudgetTokens): run a SHADOW pick
     // against the production budget on the same inputs. Pure CPU — no LLM
     // call, no state commit; only its produce ops are enqueued, speculatively,
-    // so the drain keeps the forest deep enough to lower the live budget to
-    // this level at any time without a fold-storm or an OverBudget dead end.
-    // The guarantee holds only while the target is reachable at all — the
-    // exhausted branch below is the standing check for that.
+    // so the drain can prepare the forest for a lower live budget. The
+    // exhausted branch reports what this solver picked, not a proof that
+    // no other frontier could meet the production budget.
     const prodBudget = this.config.productionBudgetTokens;
     if (!dryRun && prodBudget !== undefined && prodBudget > 0 && prodBudget < totalBudget) {
       const liveKvStable = this._lastKvStable;
       const liveKvUnified = this._lastKvUnified;
       try {
-        // With the line a compile at prodBudget refuses above, as the live
-        // pick has its own, so the solver plans as that compile would.
+        // Give the shadow solver a rejection bound, but do not simulate
+        // the compile's reservation gates or rendering at that target.
         const prodLine = Math.min(Math.floor(prodBudget * (1 + overBudgetGraceRatio)), rejectionBudget);
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
@@ -16570,17 +17155,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
+          // This pick runs before the live plan gate, which can trigger a
+          // retry at multiplier 1. Describe the pricing of this attempt.
+          const calibration = this._calibrationProvisional !== null
+            ? `under provisional calibration (multiplier ${this._calibration}), ` : '';
           const plan =
-            `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
-            `${Math.floor(prodBudget * (1 - slack))}, and it can fold no further with the summaries ` +
-            `the store has now and asks for none`;
+            calibration + `the solver's plan for it is ${shadowResult.finalTokens} tokens, and no production was requested`;
+          const boundStatus = shadowResult.finalTokens > prodLine ? 'exceeds' : 'is within';
           this.diag.warn(
-            shadowResult.finalTokens > prodLine
-              ? `autobio: production target ${prodBudget} unreachable with the summaries the store has ` +
-                  `now: ${plan}; the plan check of a compile at that budget refuses a plan over ` +
-                  `${prodLine} tokens with OverBudgetError`
-              : `autobio: production target ${prodBudget}: ${plan}, but the plan is within the ` +
-                  `${prodLine} tokens the plan check of a compile at that budget refuses above`,
+            `autobio: production target ${prodBudget}: ${plan}; this plan ${boundStatus} the ` +
+              `${prodLine}-token rejection bound`,
           );
         }
       } catch (err) {
@@ -16641,25 +17225,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Hard-fail whenever the picker's current plan exceeds the hard budget.
     // A `produce` op only schedules a missing summary; it does not make the
     // current raw plan feasible and must never authorize an inference.
-    // A dry run reports infeasibility via `_lastPreview.fits` instead: the
-    // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause. Except
-    // under a provisional multiplier above 1, which a committing select
-    // would drop and retry at (selectPath): the dry run throws the same
-    // refusal so it takes the same fallback, and its preview says what the
-    // real compile will do. If the retry at 1 is still over, it reports.
-    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    if (!planFits && (!dryRun || dryFallback)) {
+    // This gate applies to dry and live attempts. selectPath and
+    // withRoomForStubs handle retries.
+    if (!planFits) {
       // The plan's middle is what's over, priced as the plan priced it, so
       // the pins keeping raw tokens there are named. The refusals after the
       // plan count other things (an emitted prefix, a shard's text alone)
       // and don't name pins.
       const rawPins = this.rawPinsDiagnostics(store, middlePrice);
+      // What was tested is the plan's size, not `result.exhausted`: a solver
+      // can return a plan over the budget while it still has folds to ask
+      // for. Report the normalized exhaustion flag,
+      // not a claim that nothing remains to fold (#496). The fallback flag
+      // identifies a live ceiling fallback (#252), not a reason for refusal.
+      // The shadow pick above put the live pick's strategy back.
+      const solver = picker.solverName;
+      const labelCeilingFallback = solver === 'kv-unified'
+        ? this._lastKvUnified?.lastTimings?.ceiling?.live !== undefined : undefined;
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
         clearedBy: planClearedBy(),
+        stage: `Adaptive plan check (${solver})`,
         diagnostics: {
+          solver,
+          pickerExhausted: result.exhausted,
+          ...(labelCeilingFallback === undefined ? {} : { labelCeilingFallback }),
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
           headTokens,
@@ -23579,7 +24170,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * What a dry select puts back on every path out (see the dry branch in
    * `select`), saved now: the returned function puts it back. A dry select
    * and `renderAsNewest` share it, so a render leaves what the next compile
-   * reads as it found it.
+   * reads as it found it. Dry floor-warning dedup persists separately from
+   * this snapshot and never touches the live warning record.
    */
   private saveDryRunState(store: MessageStoreView): () => void {
     const saved = {
@@ -23708,6 +24300,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.requireLoadedBranch('renderAsNewest');
     const restore = this.saveDryRunState(store);
+    const dryBefore = this._dryRunSelect;
     this._dryRunSelect = true;
     try {
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
@@ -23750,7 +24343,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return first === undefined ? null : rendered.get(first) ?? null;
       });
     } finally {
-      this._dryRunSelect = false;
+      this._dryRunSelect = dryBefore;
       restore();
     }
   }

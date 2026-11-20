@@ -57,7 +57,7 @@ export interface OverBudgetDiagnostics {
    * `tokens` is the raw tokens they keep there together, estimated as the
    * plan prices them, and each pin gives its own; a message two pins cover
    * counts once in `tokens` and toward each pin. Set only by the refusal of a
-   * plan whose middle is over the budget ("Adaptive picker exhausted but …");
+   * plan whose middle is over the budget ("Adaptive plan check (…): …");
    * every other refusal leaves it out, as does that one when no pin keeps
    * any.
    */
@@ -92,6 +92,29 @@ export interface OverBudgetDiagnostics {
    */
   requestLimitTokens?: number;
   requestAllowanceTokens?: number;
+  /**
+   * Set only by the refusal of an adaptive plan over the budget ("Adaptive
+   * plan check (…): …"), which tests the plan's size and not whether the solver
+   * could fold further (#496): the folding solver that planned (`kv-unified`,
+   * `kv-stable`, …).
+   */
+  solver?: string;
+  /**
+   * With `solver`: the picker's normalized `exhausted` flag. Uses the solver's
+   * value when supplied (with solver-specific semantics); otherwise true iff
+   * no production was requested and the applied plan exceeds the soft target.
+   * This does not generally mean there is nothing left to fold, and is not
+   * the condition tested by the plan check.
+   */
+  pickerExhausted?: boolean;
+  /**
+   * With `solver`: whether the plan is the minimum-token cut kv-unified takes
+   * when its search passes `labelCeiling` (#252), rather than the cut its
+   * search chose. Absent under every other solver. The minimum cut fits the
+   * unfloored solve budget, but can still exceed the floored rejection bound
+   * with fractional costs and budgets, even if the two counts agree.
+   */
+  labelCeilingFallback?: boolean;
 }
 
 /** A pin that keeps messages raw in an over-budget refusal's middle (`OverBudgetDiagnostics.rawPins`). */
@@ -233,12 +256,14 @@ function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
 }
 
 /**
- * Error raised when the picker has folded everything it can and the
- * resulting context still exceeds the hard token budget.
+ * Error raised when a budget check refuses the current context or plan.
+ * A refusal does not imply that all possible folds have been exhausted:
+ * missing summaries may still be producible, or emission may exceed the plan.
  *
  * Thrown rather than silently dropping entries. The host application decides
  * how to respond — typical responses: raise the budget, switch to a
- * larger-context model, drop the head/tail windows explicitly, or surface a
+ * larger-context model, wait for compression when `clearedBy` names it,
+ * drop the head/tail windows explicitly, or surface a
  * "context too large" error to the user.
  *
  * Cross-package behavioral surface: agent-framework gates its OverBudget
@@ -250,9 +275,9 @@ function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
 export class OverBudgetError extends Error {
   /** The hard budget the strategy was trying to fit under. */
   readonly budget: number;
-  /** The token count the strategy could not reduce below `budget`. */
+  /** The token count refused by this budget check. */
   readonly actual: number;
-  /** Diagnostic snapshot of the picker's final state. */
+  /** Diagnostic snapshot at the refusing stage. */
   readonly diagnostics: OverBudgetDiagnostics;
   /**
    * What clears this refusal at run time besides a larger budget (see
@@ -266,9 +291,10 @@ export class OverBudgetError extends Error {
     diagnostics: OverBudgetError['diagnostics'];
     /** What clears the refusal besides a larger budget; empty when left out. */
     clearedBy?: readonly OverBudgetClearedBy[];
-    /** Which stage refused — defaults to the plan-stage wording. Emission
-     *  sites pass their own so a planner/emitter drift refusal doesn't
-     *  masquerade as picker exhaustion (it cost a debugging session once). */
+    /** Which stage refused — when omitted, defaults to "Adaptive picker exhausted"
+     *  if diagnostics.solver is undefined, otherwise "Adaptive plan check (<solver>)".
+     *  The plan check and emission sites pass their own stage so a
+     *  refusal doesn't imply that no further folds are possible. */
     stage?: string;
   }) {
     const countLabels = {
@@ -289,7 +315,9 @@ export class OverBudgetError extends Error {
       ? 'fold plan=not computed'
       : `${depthLabel}=L${opts.diagnostics.deepestLevel}`;
     super(
-      `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}` +
+      (opts.diagnostics.solver === undefined
+        ? `${opts.stage ?? 'Adaptive picker exhausted'} but ${opts.actual} tokens still exceed hard budget ${opts.budget}`
+        : `${opts.stage ?? `Adaptive plan check (${opts.diagnostics.solver})`}: ${opts.actual} tokens exceed hard budget ${opts.budget}`) +
         ` (head=${opts.diagnostics.headTokens}, tail=${opts.diagnostics.tailTokens},` +
         ` middle=${opts.diagnostics.middleTokens}${middleCount}, ${depth}` +
         (opts.diagnostics.deepestAvailableLevel === undefined ? '' :
@@ -305,6 +333,8 @@ export class OverBudgetError extends Error {
         (opts.diagnostics.queuedReliefTokens === undefined ? '' : `, queued relief=${opts.diagnostics.queuedReliefTokens}`) +
         (opts.diagnostics.requestLimitTokens === undefined ? '' : `, request limit=${opts.diagnostics.requestLimitTokens}`) +
         (opts.diagnostics.requestAllowanceTokens === undefined ? '' : `, request allowance=${opts.diagnostics.requestAllowanceTokens}`) +
+        (opts.diagnostics.pickerExhausted === undefined ? '' : `, exhausted=${opts.diagnostics.pickerExhausted}`) +
+        (opts.diagnostics.labelCeilingFallback === true ? ', label-ceiling fallback=true' : '') +
         ')' + rawPinsText(opts.diagnostics.rawPins)
     );
     // Writable per Error convention so instanceof-by-name works across
@@ -473,8 +503,12 @@ export interface PickerResult {
   /** True if the applied frontier is at or below the soft target. */
   budgetMet: boolean;
   /** Solver-owned exhaustion (see FoldingSolution.exhausted): greedy =
-   *  above soft target with nothing left to fold/produce; kv-stable = even
-   *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
+   *  above soft target with no production requested after search (possibly
+   *  replaying a cheaper raw frontier); kv-stable = the controller's ideal
+   *  exceeds pre-grace totalBudget (a dead-band hold is NOT exhausted).
+   *  kv-unified = realizable frontier infeasible at pre-grace totalBudget,
+   *  even when missing summaries are requested; this can still fit the
+   *  grace-expanded hard rejection budget. Not proof compression cannot help.
    *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
   /** Number of chunks whose resolution changed from the `currentResolution`

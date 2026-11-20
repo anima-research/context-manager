@@ -12,8 +12,8 @@
  *  - guards: no shadow pick when the target is unset, non-positive, or not
  *    below the live budget;
  *  - a throwing shadow pick never breaks the live compile;
- *  - an unreachable target (exhausted shadow with nothing to produce) warns
- *    loudly instead of failing silently at descent time;
+ *  - an exhausted shadow plan with no production requested warns and
+ *    says whether that plan exceeds the rejection bound;
  *  - speculative demand does not punch through the L1 holdback window;
  *  - `[kv-overlap]` reports the compile's own plan, once, and never the
  *    shadow pick's, which no compile renders.
@@ -22,7 +22,7 @@
 import { describe, it, before, after, beforeEach, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { SummaryEntry } from '../src/index.js';
@@ -73,6 +73,12 @@ class SpyStrategy extends AutobiographicalStrategy {
   /** A summary written as is, with no model call. */
   seed(entry: Omit<SummaryEntry, 'created'>): void {
     this.pushSummary({ ...entry, created: 0 });
+  }
+
+  seedProvisionalCalibration(multiplier: number): void {
+    this.store!.setStateJson(this.calibrationStateId, {
+      multiplier, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, provisional: true,
+    });
   }
 
   protected handleProducedOps(
@@ -220,28 +226,59 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     manager.close();
   });
 
-  it('an unreachable target warns on every compile instead of failing silently', async () => {
+  it('reports the shadow bound without predicting which compile gate refuses', async (t) => {
     // Everything fits in the recent window: the middle is empty, so the
     // shadow pick has nothing to fold and nothing to produce, yet head+tail
-    // alone exceed the target — the exact "exhausted" state that would
-    // hard-fail at descent time.
+    // alone exceed the target. A real compile at that target hits the
+    // reservation gate before the picker can run.
     const strategy = makeStrategy({
       recentWindowTokens: 100_000,
       productionBudgetTokens: 100,
     });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    t.after(() => manager.close());
     addConversation(manager, 10);
 
     const compiled = await manager.compile({ maxTokens: 50_000, reserveForResponse: 200 });
     assert.ok(compiled.messages.length > 0, 'live compile must still succeed');
-    assert.ok(
-      warnings.some((w) => w.includes('unreachable')),
-      `expected an unreachable-target warning, got: ${JSON.stringify(warnings)}`,
-    );
-    manager.close();
+    const line = warnings.find((w) => w.includes('production target 100:'));
+    assert.ok(line, `expected a shadow warning, got: ${JSON.stringify(warnings)}`);
+    assert.match(line, /plan for it is \d+ tokens, and no production was requested/);
+    assert.match(line, /this plan exceeds the 102-token rejection bound/);
+    await assert.rejects(manager.compile({ maxTokens: 300, reserveForResponse: 200 }),
+      (err: unknown) => err instanceof OverBudgetError && /^Head\/tail reservation exceeded budget/.test(err.message));
+    assert.deepEqual(strategy.pickerRunBudgets, [49_800, 100], 'the refusal ran no picker');
+    assert.doesNotMatch(line, /plan check|OverBudgetError|unreachable|no folds remain/);
   });
 
-  it('a target whose exhausted plan is within the line its compile refuses above is not called unreachable', async () => {
+  it('labels the shadow warning from a provisional attempt that retries and fits', async (t) => {
+    const strategy = makeStrategy({
+      foldingStrategy: 'kv-stable',
+      recentWindowTokens: 0,
+      productionBudgetTokens: 750,
+      overBudgetGraceRatio: 0,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    t.after(() => manager.close());
+    const ids = Array.from({ length: 10 }, (_, i) =>
+      manager.addMessage('User', textBlock(`Turn ${i}. ` + 'word '.repeat(40))));
+    // Keep the history raw, but in the middle so the first attempt reaches
+    // the picker rather than refusing at the head/tail reservation.
+    manager.pinRange(ids[0]!, ids[ids.length - 1]!);
+    strategy.seedProvisionalCalibration(1.45);
+
+    const compiled = await manager.compile({ maxTokens: 800, reserveForResponse: 0 });
+    assert.ok(compiled.messages.length > 0, 'the retry renders');
+    assert.deepEqual(strategy.pickerRunBudgets, [800, 750, 800, 750], 'both attempts make a live and shadow pick');
+    const discarded = warnings.findIndex((w) => w.includes('DISCARDED provisional multiplier 1.45'));
+    assert.ok(discarded >= 0, 'the first attempt was discarded');
+    const shadow = warnings.filter((w) => w.includes('production target 750:'));
+    assert.equal(shadow.length, 1, 'only one shadow warning');
+    assert.ok(warnings.indexOf(shadow[0]!) < discarded, 'the shadow warning precedes the discard');
+    assert.match(shadow[0]!, /under provisional calibration \(multiplier 1\.45\).*exceeds the 750-token rejection bound/);
+  });
+
+  it('distinguishes a shadow plan at the rejection bound from one above it', async () => {
     const grace = 0.02;
     const planAt = async (target: number): Promise<string[]> => {
       cleanup();
@@ -270,11 +307,12 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.equal(onLine.length, 1, `expected one line, got: ${JSON.stringify(onLine)}`);
     assert.ok(!onLine[0]!.includes('unreachable'), onLine[0]);
     assert.ok(onLine[0]!.includes(`plan for it is ${plan} tokens`), onLine[0]);
-    assert.ok(onLine[0]!.includes(`within the ${plan} tokens`), onLine[0]);
+    assert.ok(onLine[0]!.includes(`within the ${plan}-token rejection bound`), onLine[0]);
 
     const overLine = await planAt(target - 1);
     assert.equal(overLine.length, 1, `expected one line, got: ${JSON.stringify(overLine)}`);
-    assert.ok(overLine[0]!.includes('unreachable'), overLine[0]);
+    assert.match(overLine[0]!, /this plan exceeds the \d+-token rejection bound/);
+    assert.doesNotMatch(overLine[0]!, /unreachable|no folds remain/);
   });
 
   it('speculative demand does not punch through the L1 holdback window', async () => {

@@ -1120,15 +1120,15 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       seed(manager);
       await manager.compile();
       // The producer's clear after its summary waits until the test lets it go.
-      const internals = producer as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void> };
+      const internals = producer as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown, source: unknown) => Promise<void> };
       const clear = internals.clearQuarantineForCompressedChunk.bind(producer);
       let clearing = false;
       let openClear!: () => void;
       const clearGate = new Promise<void>((resolve) => { openClear = resolve; });
-      internals.clearQuarantineForCompressedChunk = async (chunk) => {
+      internals.clearQuarantineForCompressedChunk = async (chunk, source) => {
         clearing = true;
         await clearGate;
-        return clear(chunk);
+        return clear(chunk, source);
       };
       const producing = manager.tick();
       await waitFor(() => calls.length === 1);
@@ -1555,15 +1555,15 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       seed(manager);
       await manager.compile();
       // The clear that follows a written summary waits until the test lets it go.
-      const internals = strategy as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void> };
+      const internals = strategy as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown, source: unknown) => Promise<void> };
       const clear = internals.clearQuarantineForCompressedChunk.bind(strategy);
       let clearing = false;
       let openClear!: () => void;
       const clearGate = new Promise<void>((resolve) => { openClear = resolve; });
-      internals.clearQuarantineForCompressedChunk = async (chunk) => {
+      internals.clearQuarantineForCompressedChunk = async (chunk, source) => {
         clearing = true;
         await clearGate;
-        return clear(chunk);
+        return clear(chunk, source);
       };
       let ended = { outcome: 'pending' };
       const records = await compressionLogDuring(async () => {
@@ -1599,15 +1599,15 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       seed(manager);
       await manager.compile();
       // The clear that follows the written stub waits until the test lets it go.
-      const internals = strategy as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void> };
+      const internals = strategy as unknown as { clearQuarantineForCompressedChunk: (chunk: unknown, source: unknown) => Promise<void> };
       const clear = internals.clearQuarantineForCompressedChunk.bind(strategy);
       let clearing = false;
       let openClear!: () => void;
       const clearGate = new Promise<void>((resolve) => { openClear = resolve; });
-      internals.clearQuarantineForCompressedChunk = async (chunk) => {
+      internals.clearQuarantineForCompressedChunk = async (chunk, source) => {
         clearing = true;
         await clearGate;
-        return clear(chunk);
+        return clear(chunk, source);
       };
       let ended = { outcome: 'pending' };
       const records = await compressionLogDuring(async () => {
@@ -1641,11 +1641,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         await manager.compile();
         // Two quarantine records whose chunk no chunk record matches, so the
         // sweep clears both. Each clear waits until the test lets it go, as one
-        // waiting on the state lock does, and then writes nothing, as one that
-        // finds its strategy detached by then does.
+        // already committed does when its continuation resumes after the move.
         const internals = strategy as unknown as {
           readCompressionQuarantineProjection: () => Map<string, unknown>;
-          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+          clearObservedCompressionQuarantine: (key?: string, generation?: string) => Promise<boolean>;
           quarantineAlarmActive: boolean;
         };
         const orphan = (key: string) => ({ record: { key, chunkSourceHash: key } });
@@ -1653,7 +1652,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         let openClear!: () => void;
         const clearing = new Promise<void>((resolve) => { openClear = resolve; });
         const cleared: string[] = [];
-        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        internals.clearObservedCompressionQuarantine = async (key) => { cleared.push(String(key)); await clearing; return true; };
         internals.quarantineAlarmActive = true;
         let ended = { outcome: 'pending' };
         const logged = await logsDuring(async () => {
@@ -1686,24 +1685,25 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         seed(manager, 2);
         await manager.compile();
         // Two quarantine records of the chunk that just compressed, each
-        // cleared as one waiting on the state lock is: it waits until the
-        // test lets it go, then writes nothing.
+        // already cleared before the move, but with the successful result
+        // deferred until the test lets it resume afterwards.
         const chunk = { messages: [{ id: 'chunk-a' }, { id: 'chunk-b' }] };
         const hash = createHash('sha256').update(JSON.stringify(['chunk-a', 'chunk-b']), 'utf8').digest('hex');
         const internals = strategy as unknown as {
           readCompressionQuarantineProjection: () => Map<string, unknown>;
-          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
-          clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void>;
+          clearObservedCompressionQuarantine: (key?: string, generation?: string) => Promise<boolean>;
+          clearQuarantineForCompressedChunk: (chunk: unknown, source: unknown) => Promise<void>;
+          captureCompressionBranch: () => unknown;
         };
         const debt = (key: string) => ({ record: { key, chunkSourceHash: hash } });
         internals.readCompressionQuarantineProjection = () => new Map([['debt-1', debt('debt-1')], ['debt-2', debt('debt-2')]]);
         let openClear!: () => void;
         const clearing = new Promise<void>((resolve) => { openClear = resolve; });
         const cleared: string[] = [];
-        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        internals.clearObservedCompressionQuarantine = async (key) => { cleared.push(String(key)); await clearing; return true; };
         let ended = { outcome: 'pending' };
         const logged = await logsDuring(async () => {
-          const clearingChunk = internals.clearQuarantineForCompressedChunk(chunk);
+          const clearingChunk = internals.clearQuarantineForCompressedChunk(chunk, internals.captureCompressionBranch());
           ended = outcomeOf(clearingChunk);
           assert.ok(await reaches(() => cleared.length === 1), 'the first clear began');
           if (move === 'swap') await manager.setStrategy(new PassthroughStrategy());

@@ -2,6 +2,8 @@ import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError, UncoveredDropError } from '../src/index.js';
+import { Picker } from '../src/adaptive/picker.js';
+import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { StrategyContext } from '../src/types/strategy.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -372,14 +374,14 @@ describe('a compile whose select with those summaries left out does not fit, as 
     await manager.close();
   });
 
-  it('kv-unified: refused by both selects, the refusal is the one selecting as before gives', async () => {
+  it('kv-unified: refused by both selects, the refusal is the one selecting as before gives', async (t) => {
     const taken = await seeded('kv-unified', 'head');
     const before = await seeded('kv-unified', 'head');
     before.strategy.ruleOff = true;
     const refusal = async (twin: typeof taken, maxTokens: number) => {
       const error = await twin.manager.compile({ maxTokens, reserveForResponse: 0 }).then(() => undefined, (e: unknown) => e);
       if (!(error instanceof OverBudgetError)) return undefined;
-      return { name: error.name, message: error.message, clearedBy: error.clearedBy, budget: error.budget, actual: error.actual };
+      return { name: error.name, message: error.message, clearedBy: error.clearedBy, budget: error.budget, actual: error.actual, diagnostics: error.diagnostics };
     };
     let budget: number | undefined;
     let expected: Awaited<ReturnType<typeof refusal>>;
@@ -388,9 +390,36 @@ describe('a compile whose select with those summaries left out does not fit, as 
       if (expected && !expected.message.startsWith('Head/tail')) budget = maxTokens;
     }
     assert.ok(budget !== undefined, 'premise: selecting as before refuses past the head and tail at some budget');
+    const run = Picker.prototype.run;
+    const lanes: string[] = [];
+    t.mock.method(Picker.prototype, 'run', function (this: Picker, ...args: Parameters<Picker['run']>) {
+      const result = run.apply(this, args);
+      const state = taken.strategy as unknown as { acrossMode: string };
+      const leave = state.acrossMode === 'leave';
+      lanes.push(leave ? 'leave' : 'take');
+      // Both plans still refuse; only their diagnostic flags differ.
+      return { ...result, exhausted: leave };
+    });
+    // Ceiling telemetry lives on the strategy, independently of PickerResult.
+    const build = (taken.strategy as unknown as { buildPicker(inputs: unknown): Picker }).buildPicker;
+    t.mock.method(taken.strategy as unknown as { buildPicker(inputs: unknown): Picker }, 'buildPicker', function (this: Edges, inputs: unknown) {
+      const picker = build.call(this, inputs);
+      const state = this as unknown as { acrossMode: string; _lastKvUnified: { lastTimings: { ceiling?: { live?: unknown } } } };
+      const original = picker.run.bind(picker);
+      picker.run = (...args) => {
+        const result = original(...args);
+        state._lastKvUnified.lastTimings.ceiling = state.acrossMode === 'leave' ? { live: {} } : undefined;
+        return result;
+      };
+      return picker;
+    });
+    expected = await refusal(before, budget!);
     const fallbacks = taken.strategy.getStats().acrossFallbacks;
     taken.strategy.leftOut = 0;
     assert.deepStrictEqual(await refusal(taken, budget!), expected!);
+    assert.deepStrictEqual(lanes, ['take', 'leave', 'take'], 'reference take, discarded leave probe, final take');
+    assert.strictEqual(expected!.diagnostics.pickerExhausted, false);
+    assert.strictEqual(expected!.diagnostics.labelCeilingFallback, false);
     assert.ok(taken.strategy.leftOut > 0, 'premise: the select with those summaries left out ran');
     assert.strictEqual(taken.strategy.getStats().acrossFallbacks, fallbacks, 'a refused compile counts no fallback');
     assert.deepStrictEqual(taken.strategy.getLastSelectStats(), before.strategy.getLastSelectStats(), "the refused compile's stats are the ones selecting as before leaves, not its dry run's");
@@ -422,6 +451,41 @@ describe('a live select with those summaries left out that fails after its dry r
     }
     assert.fail('premise: a compile sends the select with summaries left out');
   }
+
+  it('flat-profile: a fitting leave probe never suppresses its live run floor warning', async (t) => {
+    const lines = capture(t);
+    const { manager, strategy, budget } = await leaving('flat-profile');
+    const modes: string[] = [];
+    t.mock.method(CanonicalSummaryForest.prototype, 'minimumTokens', () => {
+      const state = strategy as unknown as { acrossMode: string; _dryRunSelect: boolean };
+      modes.push(`${state.acrossMode}:${state._dryRunSelect ? 'dry' : 'live'}`);
+      throw new Error('leave probe floor failure');
+    });
+    lines.length = 0;
+    const warningModes: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => {
+      const line = args.map(String).join(' ');
+      lines.push(line);
+      if (line.includes('floor not computed')) {
+        const lane = /floor not computed \((dry|live)\)/.exec(line)?.[1];
+        assert.ok(lane, 'the warning identifies its lane');
+        warningModes.push(lane!);
+      }
+    });
+    try {
+      await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.deepStrictEqual(warningModes, ['dry', 'live'], 'the probe does not silence the first live warning');
+      assert.ok(modes.includes('leave:dry') && modes.includes('leave:live'), 'both lanes ran on the first compile');
+      modes.length = 0;
+      await manager.compile({ maxTokens: budget, reserveForResponse: 0 });
+      assert.ok(modes.includes('leave:dry'), 'premise: the second leave probe attempted the floor');
+      assert.ok(modes.includes('leave:live'), 'premise: the second live leave run attempted the floor too');
+      assert.deepStrictEqual(warningModes, ['dry', 'live'], 'subsequent probes and live runs each dedup');
+      assert.strictEqual(lines.filter((l) => l.includes('floor not computed')).length, 2, 'one dry warning and one live warning');
+    } finally {
+      await manager.close();
+    }
+  });
 
   const refusals = [
     [OverBudgetError, refusal],

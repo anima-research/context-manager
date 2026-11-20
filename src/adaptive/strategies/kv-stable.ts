@@ -22,9 +22,9 @@
  * It does not SPECULATIVELY emit produce requests — deeper folding than has
  * been produced is the speculative pre-producer's job; the controller only
  * targets levels whose summaries already exist. The one exception is DEMAND
- * under escalation (issue #56): when even full folding exceeds the hard wall
- * W while foldable chunks have no L1 coverage at all, production is the only
- * remaining lever, and the caller's demand path (`handleProducedOps` →
+ * under escalation (issue #56): when the controller's ideal exceeds the
+ * pre-grace total budget and foldable chunks lack L1 coverage, production
+ * may help, and the caller's demand path (`handleProducedOps` →
  * `enqueueL1ForRange` → the L1-holdback exemption) is reachable only through
  * produce ops — so the solve emits L1 requests for the uncovered ranges.
  * Deterministic.
@@ -186,14 +186,14 @@ export class KvStableStrategy implements FoldingSolver {
     this._lastTarget = plan.resolutions;
 
     // DEMAND-SIDE PRODUCTION (issue #56). Speculative pre-production stays the
-    // pre-producer's job — but when even full folding exceeds the hard wall W
-    // (plan.escalated) while foldable chunks have no L1 at all, producing
-    // those L1s is the only lever left, and the caller's demand path
+    // pre-producer's job — but when the ideal cut exceeds the pre-grace total
+    // budget (plan.escalated), producing L1s for uncovered chunks can reduce
+    // it, and the caller's demand path
     // (`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`) fires
     // only on produce ops. Emitting none wedged tight operating points
     // PERMANENTLY: the L1 holdback filter kept the newest closed chunk(s) out
     // of the speculative queue, demand could never be raised to override the
-    // holdback, and every compile re-escalated infeasible (the L1-holdback
+    // holdback, and every compile escalated again (the L1-holdback
     // deadlock — external repro at budgets 14–26k). Contiguous uncovered runs
     // coalesce into one request each; the consumer maps message ranges back
     // onto closed chunks and dedupes against its queue, so re-emission on
@@ -223,8 +223,8 @@ export class KvStableStrategy implements FoldingSolver {
     return {
       frontier: plan.resolutions,
       produced,
-      // Kv-stable exhaustion is the ESCALATED state only: even full folding
-      // exceeds the hard wall W. A dead-band hold above the soft target is
+      // Kv-stable exhaustion is the ESCALATED state only: the ideal exceeds
+      // the pre-grace total budget. A dead-band hold above the soft target is
       // the designed steady state, not exhaustion — see
       // FoldingSolution.exhausted for why the semantics are solver-owned.
       exhausted: plan.escalated,

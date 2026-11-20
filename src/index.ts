@@ -170,3 +170,13 @@ export {
 // JSON-compatible compression instruction selection and recipe validation.
 export { validateCompressionInstructions } from './compression-instructions.js';
 export type { CompressionInstructions, CompressionInstructionTemplates, CompressionInstructionValues } from './compression-instructions.js';
+
+export type {
+  CompressionQuarantineBinding,
+  CompressionQuarantineRecordView,
+  CompressionQuarantineInspection,
+  CompressionQuarantineReleaseSelection,
+  CompressionQuarantineReleaseResult,
+  KeyedCompressionQuarantineStrategy,
+} from './types/compression-quarantine.js';
+export { isKeyedCompressionQuarantineStrategy } from './types/compression-quarantine.js';
