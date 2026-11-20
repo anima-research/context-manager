@@ -24,6 +24,6 @@
     returning other text), L1 requests read a recall pair only when its
     header and answer both lie before the opening, for the resume separator,
     the cache seams and the refusal-curve retry. The zero-recall surgery
-    script refuses a `strategyConfig` that sets `templates.opening`. The autobiographical drain script forwards
+    script refuses a `strategyConfig` that sets `templates.opening`. The autobiographical drain and external-memory scripts forward
     `compressionInstructions` from its recipe; hosts must forward and validate
     the option themselves.
