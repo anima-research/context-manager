@@ -10,6 +10,7 @@ import type {
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 import type { WindowMode } from '../window-index.js';
+import type { OldSummaryCost, SweptRows } from '../sweep.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -595,6 +596,26 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * The old summaries over `rows`, and the cost of dropping them
+   * (dropOldSummaries). An L1 is old where it covers a row of
+   * `rows.rewritten` and was written at or before that row's time there;
+   * every summary above an old L1 is old too. What covers a row of
+   * `rows.removed` is no old summary: the removal drops it. Writes nothing.
+   * A strategy without it keeps no old summaries.
+   */
+  oldSummaryCost?(rows: SweptRows, ctx: StrategyContext): OldSummaryCost;
+
+  /**
+   * The second act of a sweep: drop the old summaries over `rows`
+   * (oldSummaryCost), done when it returns, and give what was dropped. The
+   * chunk records under them keep their rows and are folded again.
+   */
+  dropOldSummaries?(rows: SweptRows, ctx: StrategyContext): OldSummaryCost;
+
+  /** Read the branch's applied list of sweeps (sweep.ts): the manager asks it as its pass ends. */
+  afterSweepPass?(ctx: StrategyContext): void;
 
   /**
    * Declares that select() reports its rendered layout completely, and which
@@ -3074,6 +3095,13 @@ export interface SummaryEntry {
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
+  /**
+   * The store's sequence on its branch (`JsStore.currentSequence`) just
+   * before the summary was written. A sweep's count of old summaries
+   * compares it with the sequence of the pass that listed a row under the
+   * summary. Absent on a summary written before it was added.
+   */
+  writtenAtSequence?: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
   /**

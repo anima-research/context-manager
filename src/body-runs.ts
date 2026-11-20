@@ -64,6 +64,21 @@ export function bodyBounds(length: number, at: At, index: number): { from: numbe
   return { from: bodyStart(at, index), to: bodyEnd(length, at, index) };
 }
 
+/**
+ * Whether a body's stored members are the whole body. A group whose head
+ * declared its size holds exactly that many shards, indices 0..n-1: an
+ * interrupted write leaves members that are not the whole body. A group with
+ * no declaration (written before it was recorded) is judged by its members
+ * alone, so it reads as whole.
+ */
+export function isWholeGroup(head: { shardCount?: number | undefined }, members: readonly BodyShard[]): boolean {
+  const declared = head.shardCount;
+  if (declared === undefined) return true;
+  const indices = new Set(members.map((m) => m.shardIndex));
+  return members.length === declared && indices.size === declared
+    && [...indices].every((i) => i !== undefined && i >= 0 && i < declared);
+}
+
 /** The body holding `messages[index]`, as positions in `messages`. */
 export function bodyBoundsIn(messages: readonly (BodyShard | null | undefined)[], index: number): { from: number; to: number } {
   return bodyBounds(messages.length, (i) => messages[i], index);
