@@ -1024,6 +1024,23 @@ describe('old summaries and the second act', () => {
     store.close();
   });
 
+  it('S76: an old summary whose text an operator replaced after the pass is no longer counted, and the second act keeps it', async () => {
+    const strategy = folding();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const id = note(cm, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(cm);
+    cm.takeSweep('rewords-test');
+    cm.applySweeps([rewords()]);
+    const [l1] = summariesOver(strategy, id);
+    assert.ok(l1 && total(cm.sweepReceipt('rewords-test').oldSummaries) === 1, 'premise: one old summary over the note');
+    cm.editSummaryText(l1.id, `a summary with ${NEW}`, { by: 'test' }, { apply: true });
+    assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, [], 'the receipt no longer counts it');
+    assert.deepEqual(cm.dropOldSummaries('rewords-test').summaries, [], 'the second act drops nothing');
+    assert.ok(summariesOf(strategy).some((s) => s.id === l1.id), 'the edited summary stays');
+    cm.close();
+  });
+
   it('S70: an audit-only strategy refuses the second act, and the store stays as it was', async () => {
     const path = freshPath();
     const cm = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() });

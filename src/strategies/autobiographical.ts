@@ -15545,7 +15545,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * it carried, its `provenance` and its split-stitch record (`stitched`);
    * and `external` says who supplied the text. The store's history keeps
    * the entry as it was. Summaries merged over the old text are reported
-   * and left alone. Without `apply` nothing is written.
+   * and left alone. The summary takes the store's sequence of the edit
+   * (`writtenAtSequence`), so a sweep's earlier pass no longer counts it
+   * old. Without `apply` nothing is written.
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -15572,6 +15574,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     delete entry.provenance;
     delete entry.stitched;
     entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    const sequence = this.store?.currentSequence();
+    if (sequence !== undefined) entry.writtenAtSequence = sequence;
     this.writeStoredSummary(entry, 'editSummaryText', 'new text');
     return edit;
   }

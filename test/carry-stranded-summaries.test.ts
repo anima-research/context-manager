@@ -73,7 +73,7 @@ class Probe extends AutobiographicalStrategy {
     (this as unknown as { requireBranchMutation: () => void }).requireBranchMutation = () => {};
     (this as unknown as { requireLoadedBranch: () => void }).requireLoadedBranch = () => {};
     (this as unknown as { store: unknown }).store = {
-      getStateJson: () => null, setStateJson: () => {}, appendToStateJson: () => {}, editStateItem: () => {}, currentBranch: () => ({ name: 'main' }),
+      getStateJson: () => null, setStateJson: () => {}, appendToStateJson: () => {}, editStateItem: () => {}, currentBranch: () => ({ name: 'main' }), currentSequence: () => 0,
     };
   }
   /** One compressed chunk over every message, or the chunks given. */
