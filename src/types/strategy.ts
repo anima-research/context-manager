@@ -3014,6 +3014,13 @@ export interface SummaryEntry {
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
+  /**
+   * The store's sequence on its branch (`JsStore.currentSequence`) just
+   * before the summary was written. A sweep's count of old summaries
+   * compares it with the sequence of the pass that listed a row under the
+   * summary. Absent on a summary written before it was added.
+   */
+  writtenAtSequence?: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
   /**

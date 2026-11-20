@@ -3190,6 +3190,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
       if (abortIfStale()) return;
+      if (this.storeWrittenElsewhere()) this.loadPersistedState();
+      if (abortIfStale()) return;
 
       // Restore headWindowStartId from last topic transition message
       const messages = ctx.messageStore.getAll();
@@ -4314,6 +4316,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       entry.sourceRange = { first: ids[0]!, last: ids[ids.length - 1]! };
     }
+    const sequence = this.store?.currentSequence();
+    if (sequence !== undefined) entry.writtenAtSequence = sequence;
     this.summaries.push(entry);
     this.writeHeldState(this.summariesStateId, () => this.store?.appendToStateJson(this.summariesStateId, entry));
   }
@@ -8530,12 +8534,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             `if any, keeps the summaries over it; this reader moves past them, and doesn't read them again, before ${operation}`,
         );
       }
-      if (items.some((item) => item.kind === 'dropped' && item.namespace === this.ns) && this.storeWrittenElsewhere()) {
+      if (items.some((item) => item.kind === 'dropped' && item.namespace === this.ns)) {
         this.takeUpStoreState();
+        this.rebuildChunks(ctx.messageStore);
       }
       const listed = listedRows(items);
       if (listed.size > 0) {
-        const leaving = listedLaterShards(items);
+        const leaving = new Set([...listedLaterShards(items)].filter((id) => ctx.messageStore.get(id) === null));
         if (leaving.size > 0 && this.storeWrittenElsewhere()) {
           for (const id of this.takeUpStoreBeforeLetGo(leaving, ctx)) listed.add(id);
         }
@@ -8649,18 +8654,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The second act of a sweep. It takes up the store where another
-   * instance wrote it, then drops the old summaries over `rows` as a row's
-   * let-go drops what covers it (unfold): each chunk record under a dropped
-   * L1 keeps its rows and is compressed again, a summary left without its
-   * parent renders again, and a queued merge of a dropped summary goes. An
-   * audit-only instance writes nothing, so it refuses.
+   * The second act of a sweep. It reads the applied list first, so a
+   * removal that it hasn't heard drops what covers the removed shard, and
+   * takes up the store where another instance wrote it. Then it drops the
+   * old summaries over `rows` as a row's let-go drops what covers it
+   * (unfold): each chunk record under a dropped L1 keeps its rows and is
+   * compressed again, a summary left without its parent renders again, and
+   * a queued merge of a dropped summary goes. An audit-only instance writes
+   * nothing, so it refuses.
    */
   dropOldSummaries(rows: SweptRows, ctx: StrategyContext): OldSummaryCost {
     this.requireLoadedBranch('dropOldSummaries');
     if (this.config.auditOnly) {
       throw new Error('AutobiographicalStrategy.dropOldSummaries refused: an audit-only instance writes nothing.');
     }
+    this.letGoOfSweptRows(ctx, 'the second act');
     if (this.storeWrittenElsewhere()) this.takeUpStoreState();
     const old = this.oldSummaries(rows);
     const cost = this.costOf(old, ctx);
@@ -8677,10 +8685,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const seeds = new Set<string>();
     const consider = (summary: SummaryEntry | undefined, sources: readonly MessageId[]): void => {
       if (summary?.level !== 1) return;
-      const created: unknown = summary.created;
+      const written: unknown = summary.writtenAtSequence;
       for (const id of sources) {
-        const at = rows.rewritten.get(id);
-        if (at !== undefined && !(typeof created === 'number' && created > at)) {
+        const listedAt = rows.rewritten.get(id);
+        if (listedAt !== undefined && !(typeof written === 'number' && written >= listedAt)) {
           seeds.add(summary.id);
           return;
         }

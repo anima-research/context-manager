@@ -57,11 +57,14 @@
     open branch: the store's newest take, whether the branch finished it,
     each pass with the bodies that it listed, and `oldSummaries`, the
     strategy's old summaries at each level over the rows those passes
-    rewrote. An old summary is an L1 written before a pass listed a row
-    that it covers, by its `created` against the list item's `at` (a tie
-    counts as old), or a summary above such an L1. A summary over a removed
-    later shard is none: the removal drops it. The show, the receipt and the
-    two calls below need an initialized manager.
+    listed. An old summary is an L1 written before a pass listed a row that
+    it covers, or a summary above such an L1. An L1 written before this
+    release counts as old; a later one carries the store's sequence when it
+    was written (`SummaryEntry.writtenAtSequence`), which is compared with
+    the list item's `sequence`. A summary over a removed later shard is
+    none: the removal drops it. The show, the receipt and the two calls
+    below need an initialized manager, and read its strategy as it last
+    read the store.
   - `ContextManager.oldSummaryCost(name)` gives what the second act would
     drop and writes nothing: the old summaries at each level, the chunk
     records under them, which the strategy's compression folds again, and
@@ -70,16 +73,18 @@
   - `ContextManager.dropOldSummaries(name)` is the second act: the manager's
     strategy drops its old summaries of the sweep, with every summary above
     them, and gives what it dropped. It is done when the call returns, and
-    no compile after it, dry or live, holds one of them. Each chunk record
-    under them keeps its rows and is compressed again. A second call drops
-    nothing, and other namespaces keep theirs. Where it dropped any, it
-    then appends to the applied list that the namespace dropped them (an
-    item of kind `dropped`), so another instance of the namespace takes up
-    the store at its next read of the list. An audit-only strategy refuses
-    it, and writes nothing. A
-    strategy declares it, with `oldSummaryCost` and `afterSweepPass`, as
-    optional members of `ContextStrategy`; one without them keeps no old
-    summaries.
+    no compile of that manager after it, dry or live, holds one of them.
+    Each chunk record under them keeps its rows and is compressed again. A
+    second call drops nothing, and other namespaces keep theirs. It then
+    appends to the applied list that the namespace made the act (an item of
+    kind `dropped`), so another instance of the namespace takes up the
+    store at its next initialize, live select, tick or L1; until then, a
+    dry compile of that instance can still hold a dropped summary. A call
+    that throws lists nothing, and a call made again lists the act. An
+    audit-only strategy refuses it, and writes nothing. A strategy declares
+    it, with `oldSummaryCost` and `afterSweepPass`, as optional members of
+    `ContextStrategy`; for a strategy without them, the manager reports no
+    old summaries and drops none.
   - `derive` carries the applied list with the other states the manager
     owns.
   - `AutobiographicalStrategy`, and so `KnowledgeStrategy`, reads the
@@ -87,12 +92,15 @@
     before it writes an L1 and, in the manager that made the pass, as the
     pass ends (`afterSweepPass`). Each instance keeps in memory how far it
     has read, and reads the list from its start at each initialize. A
-    summary over a rewritten row stays: nothing drops it but the second act,
-    so a rewrite doesn't make the resident's context larger, and a dry
-    compile and a live one show the same summaries. A summary over a removed
-    later shard goes at once, with every summary above it, in either window
-    mode, and the chunk record that held the shard keeps its other rows and
-    is compressed again. An L1 in flight over a listed row is not written,
+    summary over a rewritten row stays: no read of the list drops it, so a
+    rewrite doesn't make the resident's context larger, and a dry compile
+    and a live one show the same summaries. It goes at the second act, or
+    as any summary goes when its row leaves the window. A summary over a
+    removed later shard goes at once, with every summary above it, in
+    either window mode, and the chunk record that held the shard keeps its
+    other rows and is compressed again; a listed later shard that still
+    stands, after a pass that stopped before its removal, keeps what covers
+    it until a pass removes it. An L1 in flight over a listed row is not written,
     and its chunk is folded again from the new text. Nothing is read while
     any pass runs. Another manager's strategy lets go of a removed shard's
     summaries at its next live select, tick or L1, and until then a dry

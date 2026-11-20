@@ -102,9 +102,9 @@ export interface OldSummaryCost {
 }
 
 /**
- * The rows that a sweep's passes rewrote on a branch, each with the time in
- * ms of the newest list item that lists it, and the later shards that its
- * passes removed.
+ * The rows that a sweep's passes listed to rewrite on a branch, each with
+ * the store's sequence of the newest list item that lists it, and the later
+ * shards that they listed to remove.
  */
 export interface SweptRows {
   rewritten: ReadonlyMap<MessageId, number>;
@@ -197,7 +197,7 @@ export interface SweepReceipt {
   take: SweepTake | null;
   finished: boolean;
   passes: SweepPass[];
-  /** The old summaries over the rows that its passes rewrote. */
+  /** The old summaries over the rows that its passes listed. */
   oldSummaries: OldSummaryLevel[];
 }
 
@@ -237,20 +237,13 @@ export function listedRows(items: readonly SweepApplied[]): Set<MessageId> {
   return ids;
 }
 
-/**
- * The rows that the `listed` items of `items` rewrote, each with its newest
- * listing's time, and the later shards they removed. A time that doesn't
- * parse is read as later than any summary.
- */
 export function sweptRows(items: readonly SweepApplied[]): SweptRows {
   const rewritten = new Map<MessageId, number>();
   const removed = new Set<MessageId>();
   for (const item of items) {
     if (item.kind !== 'listed') continue;
-    const parsed = Date.parse(item.at);
-    const at = Number.isNaN(parsed) ? Infinity : parsed;
     for (const body of item.bodies) {
-      rewritten.set(body.id, Math.max(rewritten.get(body.id) ?? -Infinity, at));
+      rewritten.set(body.id, Math.max(rewritten.get(body.id) ?? -Infinity, item.sequence));
       for (const shard of body.laterShards) removed.add(shard);
     }
   }

@@ -128,16 +128,9 @@ function byLevel(summaries: readonly SummaryEntry[]): Array<{ level: number; cou
   return [...counts].sort(([a], [b]) => a - b).map(([level, count]) => ({ level, count }));
 }
 
-/** The summaries whose leaves hold `id`: an L1 over it, and every summary above that L1. */
 function summariesOver(strategy: AutobiographicalStrategy, id: MessageId): SummaryEntry[] {
   const all = summariesOf(strategy);
   return all.filter((summary) => leavesOf(all, summary).has(id));
-}
-
-/** Waits until the clock reads past `iso`, so that what is written next is written after it. */
-async function clockPast(iso: string): Promise<void> {
-  const at = Date.parse(iso);
-  while (Date.now() <= at) await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
 function bodyRows(cm: ContextManager, id: MessageId): MessageId[] {
@@ -473,7 +466,7 @@ describe('a take and its pass', () => {
 });
 
 describe('a pass that stops partway', () => {
-  it('S5: after its first rewrite, then a restart: both bodies are mended, and a namespace that loads later keeps its summary over the first and counts it old', async () => {
+  it('S5: a pass whose second rewrite fails after its first, then a restart: both bodies are mended, and a namespace that loads later keeps its summary over the first and counts it old', async () => {
     const path = freshPath();
     let store = JsStore.openOrCreate({ path });
     const a = await ContextManager.open({ store, namespace: 'a', strategy: new PassthroughStrategy() });
@@ -760,7 +753,6 @@ describe('old summaries and the second act', () => {
     cm.takeSweep('rewords-test');
     cm.applySweeps([rewords()]);
     assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, shown.oldSummaries, 'the receipt after the take counts the same');
-    await clockPast(sweepsApplied(cm.getStore()).items[0]!.at);
     await drain(cm);
     assert.ok(covered(strategy).has(unfolded), 'premise: an L1 over the later note is written after the pass');
     const level1 = (levels: readonly { level: number; count: number }[]) => levels.find((each) => each.level === 1)?.count;
@@ -782,7 +774,9 @@ describe('old summaries and the second act', () => {
     assert.equal(sequenceOf(cm), sequence, 'the cost report writes nothing');
     assert.deepEqual(cost.summaries, [{ level: 1, count: 1 }]);
     assert.equal(cost.records, 1, 'one chunk record is folded again');
-    assert.ok(cost.rawTokens > 0, 'its rows have tokens');
+    const view = (cm as unknown as { messageStore: { estimateTokens(message: unknown): number } }).messageStore;
+    const rows = summariesOver(strategy, id)[0]!.sourceIds;
+    assert.equal(cost.rawTokens, rows.reduce((sum, row) => sum + view.estimateTokens(cm.getMessage(row)), 0), 'its tokens are those of the rows under it');
     assert.deepEqual(cm.dropOldSummaries('rewords-test'), cost, 'the second act drops what the report named');
     cm.close();
   });
@@ -800,7 +794,6 @@ describe('old summaries and the second act', () => {
     assert.equal(total(cm.dropOldSummaries('rewords-test').summaries), counted.length);
     assert.ok(!(await dryCompiledText(cm)).includes(OLD), 'a dry compile made before any live one holds none of them');
     for (const sid of counted) assert.ok(!summariesOf(strategy).some((s) => s.id === sid), `${sid} is dropped`);
-    await clockPast(sweepsApplied(cm.getStore()).items[0]!.at);
     await drain(cm);
     const made = summariesOver(strategy, id);
     assert.ok(made.length > 0 && made.every((s) => s.content.includes(NEW) && !s.content.includes(OLD)), 'the record is folded again from the new text');
@@ -883,6 +876,154 @@ describe('old summaries and the second act', () => {
     cm.close();
   });
 
+  it('S71: an instance that opens while another makes the second act loads the store again after its await, so its repairs write no dropped summary back', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const one = folding();
+    const first = await ContextManager.open({ store, namespace: 'a', strategy: one, membrane: mockMembrane() });
+    first.presentRows([]);
+    const id = note(first, `a note ${OLD} ${'words '.repeat(60)}`);
+    const ids = [id];
+    for (let i = 0; i < 10; i++) ids.push(first.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]));
+    first.presentRows(ids);
+    await drain(first);
+    first.takeSweep('rewords-test');
+    first.applySweeps([rewords()]);
+    const counted = summariesOver(one, id).map((s) => s.id);
+    assert.ok(counted.length > 0, 'premise: the note has an old summary');
+    const unheard = ids.slice(1).find((row) => covered(one).has(row) && counted.every((sid) => !leavesOf(summariesOf(one), summariesOf(one).find((s) => s.id === sid)!).has(row)));
+    assert.ok(unheard, 'premise: a summary that is not old folds a row, which leaves unheard');
+    const outside = await ContextManager.open({ store, namespace: 'a', strategy: new PassthroughStrategy() });
+    outside.removeMessage(unheard);
+    outside.close();
+    const target = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = target.getStateJson!;
+    let dropping: Promise<unknown> | undefined;
+    target.getStateJson = function (this: unknown, ...args: unknown[]) {
+      const value = real.apply(this, args);
+      if (args[0] === 'a/autobio:summaries' && !dropping) dropping = Promise.resolve().then(() => first.dropOldSummaries('rewords-test'));
+      return value;
+    };
+    const two = folding();
+    const second = await ContextManager.open({ store, namespace: 'a', strategy: two, membrane: mockMembrane() });
+    target.getStateJson = real;
+    assert.ok(dropping, 'premise: the first made the second act while the second opened');
+    await dropping;
+    assert.ok(!covered(two).has(unheard), 'premise: the second let go of the row that left unheard as it opened');
+    const stored = (store.getStateJson('a/autobio:summaries') as SummaryEntry[]).map((s) => s.id);
+    for (const sid of counted) assert.ok(!stored.includes(sid), `the store holds no ${sid}`);
+    assert.ok(!(await compiledText(second)).includes(OLD), 'the second compiles none of the old text');
+    second.close();
+    first.close();
+    store.close();
+  });
+
+  it('S72: the second act in a namespace that has not read the pass first lets go of what covers a removed shard, then drops what its report named', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const writer = await ContextManager.open({ store, namespace: 'w', strategy: adaptive() });
+    note(writer, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) writer.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const long = longNote(writer, 'LONG');
+    for (let i = 0; i < 4; i++) writer.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
+    const later = bodyRows(writer, long).slice(1);
+    const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true, hierarchical: true, mergeThreshold: 2 });
+    const reader = await ContextManager.open({ store, namespace: 'r', strategy, membrane: mockMembrane() });
+    await drain(reader);
+    const overLater = (summary: SummaryEntry) => later.some((id) => leavesOf(summariesOf(strategy), summary).has(id));
+    assert.ok(summariesOf(strategy).some(overLater), 'premise: the reader folds a later shard');
+    writer.takeSweep('rewords-test');
+    writer.applySweeps([rewords()]);
+    const before = summariesOf(strategy).length;
+    const going = summariesOf(strategy).filter(overLater).length;
+    const cost = reader.oldSummaryCost('rewords-test');
+    assert.ok(total(cost.summaries) > 0, 'premise: the reader has old summaries');
+    assert.deepEqual(reader.dropOldSummaries('rewords-test'), cost, 'it drops what its report named');
+    for (const id of later) assert.ok(!covered(strategy).has(id), `no summary covers ${id}`);
+    assert.equal(before - summariesOf(strategy).length, going + total(cost.summaries), 'what went is what covered a removed shard and what the report named');
+    reader.close();
+    writer.close();
+    store.close();
+  });
+
+  it('S73: a later shard that a pass listed and left standing keeps the summaries over it, also after a reopen, until a pass removes it', async () => {
+    const path = freshPath();
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path, strategy, membrane: mockMembrane() });
+    const long = longNote(cm, 'LONG');
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const later = bodyRows(cm, long).slice(1);
+    cm.takeSweep('rewords-test');
+    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
+    cm.applySweeps([rewords()]);
+    stop.restore();
+    assert.ok(cm.getMessage(later[0]!), 'premise: the later shards stand');
+    await drain(cm);
+    const over = summariesOf(strategy).filter((s) => s.level === 1 && s.sourceIds.some((id) => later.includes(id))).map((s) => s.id);
+    assert.ok(over.length > 0, 'premise: a summary covers a standing later shard');
+    cm.close();
+    const reopenedStrategy = adaptive();
+    const reopened = await ContextManager.open({ path, strategy: reopenedStrategy, membrane: mockMembrane() });
+    await reopened.compile(BIG);
+    assert.deepEqual(summariesOf(reopenedStrategy).filter((s) => over.includes(s.id)).map((s) => s.id), over, 'a reopen keeps them');
+    assert.equal(reopened.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    for (const id of later) assert.ok(!covered(reopenedStrategy).has(id), `the pass that removes ${id} drops what covers it`);
+    reopened.close();
+  });
+
+  it('S74: a pass that a failed finish stops after its removals still has its strategy let go of what covers the removed shards', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const long = longNote(cm, 'LONG');
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const later = bodyRows(cm, long).slice(1);
+    await drain(cm);
+    const going = summariesOf(strategy).filter((s) => later.some((id) => leavesOf(summariesOf(strategy), s).has(id)));
+    assert.ok(going.length > 0, 'premise: a later shard is folded');
+    cm.takeSweep('rewords-test');
+    const target = cm.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = target.appendToStateJson!;
+    let calls = 0;
+    target.appendToStateJson = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === SWEEPS_APPLIED_STATE_ID && ++calls === 2) throw new Error('test: the finish write failed');
+      return real.apply(this, args);
+    };
+    const report = cm.applySweeps([rewords()]);
+    target.appendToStateJson = real;
+    assert.match(report.stopped ?? '', /applied list/, 'premise: the failed finish stops the pass');
+    assert.equal(cm.getMessage(later[0]!), null, 'premise: the later shards are removed');
+    for (const summary of going) assert.ok(!summariesOf(strategy).some((s) => s.id === summary.id), `${summary.id} is dropped`);
+    cm.close();
+  });
+
+  it('S75: a second act whose listing throws lists the act when it is called again, and another instance then takes it up', async () => {
+    const path = freshPath();
+    const store = JsStore.openOrCreate({ path });
+    const one = folding();
+    const first = await ContextManager.open({ store, namespace: 'a', strategy: one, membrane: mockMembrane() });
+    const id = note(first, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 4; i++) first.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(first);
+    const second = await ContextManager.open({ store, namespace: 'a', strategy: folding(), membrane: mockMembrane() });
+    first.takeSweep('rewords-test');
+    first.applySweeps([rewords()]);
+    assert.ok(summariesOver(one, id).length > 0, 'premise: the note has an old summary');
+    const target = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = target.appendToStateJson!;
+    target.appendToStateJson = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === SWEEPS_APPLIED_STATE_ID) throw new Error('test: the listing failed');
+      return real.apply(this, args);
+    };
+    assert.throws(() => first.dropOldSummaries('rewords-test'), /listing failed/);
+    target.appendToStateJson = real;
+    assert.deepEqual(summariesOver(one, id), [], 'premise: the drop landed before the listing threw');
+    assert.deepEqual(first.dropOldSummaries('rewords-test').summaries, [], 'the call made again drops nothing');
+    assert.ok(!(await compiledText(second)).includes(OLD), 'the other instance takes up the act');
+    second.close();
+    first.close();
+    store.close();
+  });
+
   it('S70: an audit-only strategy refuses the second act, and the store stays as it was', async () => {
     const path = freshPath();
     const cm = await ContextManager.open({ path, strategy: folding(), membrane: mockMembrane() });
@@ -923,7 +1064,6 @@ describe('branches', () => {
     for (let i = 0; i < 3; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
     cm.takeSweep('rewords-test');
     cm.applySweeps([rewords()]);
-    await clockPast(sweepsApplied(cm.getStore()).items[0]!.at);
     const second = note(cm, `second ${OLD} ${'words '.repeat(60)}`);
     for (let i = 0; i < 3; i++) cm.addMessage('User', [text(`later ${i} ${'words '.repeat(60)}`)]);
     await drain(cm);
@@ -1426,7 +1566,7 @@ describe('readers that keep summaries', () => {
     store.close();
   });
 
-  it('S66: another instance of the namespace takes up the second act: it compiles none of the dropped summaries, and writes none back', async () => {
+  it('S66: another instance of the namespace takes up the second act at its next tick: it folds the row again, compiles none of the dropped summaries, and writes none back', async () => {
     const path = freshPath();
     const store = JsStore.openOrCreate({ path });
     const one = folding();
@@ -1441,7 +1581,10 @@ describe('readers that keep summaries', () => {
     first.applySweeps([rewords()]);
     const counted = summariesOver(one, id).map((s) => s.id);
     assert.ok(counted.length > 0, 'premise: the note has an old summary');
+    assert.ok((await compiledText(second)).includes(OLD), 'premise: the second read the pass and keeps its old summary');
     first.dropOldSummaries('rewords-test');
+    await second.tick();
+    assert.ok(summariesOver(two, id).length > 0 && summariesOver(two, id).every((s) => s.content.includes(NEW)), 'the second\'s first tick takes up the drop and folds the note again');
     assert.ok(!(await compiledText(second)).includes(OLD), 'the second compiles none of the dropped summaries');
     await drain(second);
     const stored = (store.getStateJson('a/autobio:summaries') as SummaryEntry[]).map((s) => s.id);

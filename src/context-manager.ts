@@ -2043,7 +2043,10 @@ export class ContextManager {
    * each level, the chunk records that its compression would fold again,
    * and the estimated tokens of the rows under them, which render raw until
    * it has. An old summary is an L1 written before a pass listed a row it
-   * covers, or a summary above one. It writes nothing.
+   * covers, or a summary above one. It writes nothing. It reads the
+   * strategy as it last read the store, so where another instance of the
+   * namespace wrote since, the act, which takes up the store first, can
+   * drop otherwise.
    */
   oldSummaryCost(name: string): OldSummaryCost {
     this.requireInitialized('oldSummaryCost');
@@ -2052,24 +2055,25 @@ export class ContextManager {
 
   /**
    * The second act of the sweep `name`: this manager's strategy drops its
-   * old summaries over the rows that the sweep's passes rewrote on the open
+   * old summaries over the rows that the sweep's passes listed on the open
    * branch (oldSummaryCost), with every summary above them, and gives what
-   * it dropped. It is done when this returns: no compile after it, dry or
-   * live, holds one of them. Each chunk record under them keeps its rows,
+   * it dropped. It is done when this returns: no compile of this manager
+   * after it, dry or live, holds one of them. Each chunk record under them keeps its rows,
    * and the strategy's compression folds it again, at the cost of its
    * summarizer calls; until then its rows render raw, and a compile whose
    * budget can't hold them refuses. A second call drops nothing. Other
-   * namespaces keep theirs. Where it dropped any, it then appends to the
-   * branch's applied list that this namespace dropped them, so another
-   * instance of the namespace takes up the store.
+   * namespaces keep theirs. Then it appends to the branch's applied list
+   * that this namespace made the act, so another instance of the namespace
+   * takes up the store at its next initialize, live select, tick or L1.
+   * Until then, that instance's dry compile can still hold a dropped
+   * summary. A call that throws lists nothing: call it again, and it lists
+   * the act, whatever its drop had written.
    */
   dropOldSummaries(name: string): OldSummaryCost {
     this.requireInitialized('dropOldSummaries');
     if (!this.strategy.dropOldSummaries) return { summaries: [], records: 0, rawTokens: 0 };
     const dropped = this.strategy.dropOldSummaries(this.sweptRowsOf(name), this.createStrategyContext());
-    if (dropped.summaries.length > 0) {
-      appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
-    }
+    appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
     return dropped;
   }
 
@@ -2129,8 +2133,9 @@ export class ContextManager {
           'Ask for the pass once that call has returned.',
       );
     }
+    const branch = this.store.currentBranch().id;
     const report = runSweepPass(() => this.sweepPass(entries));
-    if (report.stopped === null) this.strategy.afterSweepPass?.(this.createStrategyContext());
+    if (!this.isClosed() && this.store.currentBranch().id === branch) this.strategy.afterSweepPass?.(this.createStrategyContext());
     return report;
   }
 
@@ -2358,7 +2363,7 @@ export class ContextManager {
    * open branch: the store's newest take of it, whether this branch
    * finished that take, each pass the branch's applied list holds, with the
    * bodies it listed, and the strategy's old summaries over the rows those
-   * passes rewrote (oldSummaryCost). It never gives the old text.
+   * passes listed (oldSummaryCost). It never gives the old text.
    */
   sweepReceipt(name: string): SweepReceipt {
     this.requireInitialized('sweepReceipt');
