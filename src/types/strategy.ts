@@ -1,3 +1,4 @@
+import type { CompressionInstructions } from '../compression-instructions.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
@@ -1930,6 +1931,9 @@ export interface AutobiographicalConfig {
    *  background promise so compression runs automatically without the
    *  framework calling tick() explicitly. The name is the hook's older one. */
   autoTickOnNewMessage: boolean;
+  /** Base instruction-hook customization; see docs/compression-instructions.md. */
+  compressionInstructions?: CompressionInstructions;
+
   /** System prompt for summarization */
   summarySystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
@@ -1948,7 +1952,8 @@ export interface AutobiographicalConfig {
    * present in them. Reading mode (a portion of a much larger message, or a
    * merge of portions of one) keeps its own instructions, which have no
    * witnessed variant, except that the split rung's pieces and a merge
-   * retried after a refusal take the witnessed one.
+   * retried after a refusal take the witnessed one (or the configured
+   * `witnessedChunk`/`witnessedMerge` template for that separate hook).
    */
   witnessedBeforeSequence?: number;
   /**
@@ -2016,7 +2021,7 @@ export interface AutobiographicalConfig {
    * reading instruction, which has no witnessed variant: it asks the agent
    * to speak in its own voice as the reader. The split rung's pieces and a
    * merge retried after a refusal take the witnessed instruction instead of
-   * the reading one.
+   * the reading one, including with custom templates.
    *
    * The reminder follows the target whatever instruction it gets. An
    * override of `getCompressionInstruction` or `getMergeInstruction` that
@@ -2025,8 +2030,9 @@ export interface AutobiographicalConfig {
    * with this reminder. It doesn't reach a reading-mode chunk or merge,
    * which takes `getReadingChunkInstruction` or `getReadingMergeInstruction`
    * (though the split rung's pieces take `getCompressionInstruction`), or a
-   * merge retried after a refusal, which takes the base merge instruction,
-   * the witnessed one when every source is witnessed.
+   * merge retried after a refusal, which takes `getSourceMergeInstruction`:
+   * its base implementation uses `merge`/`witnessedMerge` templates or the
+   * corresponding built-in formatter, ignoring reading mode.
    *
    * Unset: every target uses `identityReminder` (unchanged behavior).
    */

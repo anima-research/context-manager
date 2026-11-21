@@ -34,6 +34,13 @@ const config = JSON.parse(readFileSync(args[ci + 1], 'utf8')) as Config;
 if (config.acknowledgeStoppedCopiedOrBackedUpStore !== true) throw new Error('Explicit stopped/copy acknowledgement required');
 if (!/^(treatment|surgery)\//.test(config.branchName)) throw new Error('branchName must begin treatment/ or surgery/');
 if (!Number.isInteger(config.targetChunkIndex)) throw new Error('targetChunkIndex must be an integer');
+// The transform finds recall pairs by text, and a custom opening is text it
+// cannot tell from a recall header. Refuse rather than edit the opening away.
+const instructionTemplates = (config.strategyConfig as { compressionInstructions?: { templates?: unknown } } | undefined)
+  ?.compressionInstructions?.templates;
+if (instructionTemplates !== null && typeof instructionTemplates === 'object' && Object.hasOwn(instructionTemplates, 'opening')) {
+  throw new Error('Zero-recall surgery is not supported with a custom compressionInstructions.templates.opening; remove it from strategyConfig');
+}
 
 async function hashFile(path: string): Promise<string> { const h=createHash('sha256'); for await (const c of createReadStream(path)) h.update(c); return h.digest('hex'); }
 const recordsSha256=await hashFile(`${config.storePath}/records.log`); if(recordsSha256!==config.expectedRecordsSha256)throw new Error(`records hash mismatch ${recordsSha256}`);

@@ -32,6 +32,7 @@ const passthroughKeys = [
   'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
+  'compressionInstructions',
 ] as const;
 
 /**
