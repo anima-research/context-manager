@@ -93,20 +93,33 @@ slot-presence rule; remove the slot for the surgery run.
 ## Changing templates and refused chunks
 
 The L1 wording (`opening`, `chunk`, `witnessedChunk`, `readingChunk`) is part
-of the request, and so of the refusal-quarantine key. An edit therefore makes
-a new request shape for each quarantined chunk whose request uses that
-wording, and each such chunk is attempted again, until it holds
-`CHUNK_QUARANTINE_SHAPE_CAP` (3) quarantined shapes. A chunk at the cap is
-not retried after further edits until its quarantine is cleared: by a later
-successful compression of the chunk, or by an operator (see
-[`keyed-compression-quarantine.md`](keyed-compression-quarantine.md)).
+of the request, and so of the refusal-quarantine key. A wording a quarantined
+chunk has not been tried with makes a new request shape, and the chunk is
+attempted again with it, until the chunk holds `CHUNK_QUARANTINE_SHAPE_CAP`
+(3) quarantined shapes under the same fallback settings. Going back to an
+earlier wording, with the rest of the request unchanged, rebuilds that
+wording's request, so its existing record stops the chunk again, below the
+cap as well as at it.
+
+At the cap the chunk makes no provider call under those settings, so it
+cannot compress its way out. Its records clear when an operator clears them
+(see [`keyed-compression-quarantine.md`](keyed-compression-quarantine.md));
+when the paid-off sweep finds the chunk compressed by other means or no
+longer cut the same way; or when changed fallback settings
+(`compressionSourceOnlyFallback`, the tool-prose rung, or
+`compressionFallbackModel`) put its requests in a new regime, where the
+earlier shapes don't count and a successful compression clears them all.
 Releasing one record by its key leaves the chunk's other shapes counting
 toward the cap.
 
-`compressionSourceOnlyFallback` changes this. With it on, the source-only
-request, which carries the opening, the chunk and its instruction, is part of
-what decides which shapes count together, so after an edit the earlier shapes
-no longer count and the chunk is retried on every edit.
+With `compressionSourceOnlyFallback` on and `compressionSourceOnly` off, a
+separate source-only fallback request is built. It carries the opening, the
+chunk and its instruction, and its hash is part of the regime, so a new
+wording also starts a new regime: the earlier shapes stop counting and the
+chunk is tried with each new wording (an earlier wording still meets its own
+record). With `compressionSourceOnly` also on, the canonical request is
+already source-only, no separate fallback request is built, and the cap
+applies as above.
 
 ## Validation and precedence
 
