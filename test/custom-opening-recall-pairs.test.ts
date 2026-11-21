@@ -1,11 +1,13 @@
 // A custom opening begins the chunk's own messages. The recall-curve variants
 // and the cache seams find recall pairs by their text, so with a custom
 // opening they read pairs only before it: neither a header-shaped opening nor
-// a source turn quoting a recall answer is read as a pair. Witnesses from the
-// CM486 R3 review (curve.mjs, curve-prefix.mjs, probe.mjs) and the
-// templates-b review (boundary-control.mjs, probe), through the
-// public ContextManager.open -> tick -> membrane.complete path on a reopened
-// store.
+// a source turn quoting a recall answer is read as a pair. Covered: a
+// header-shaped opening, from the slot or from a getCompressionOpening hook,
+// followed by a source turn quoting the recalled answer (refusal-curve retry
+// and frontier cache seam); the same when the genuine pair can't be matched;
+// a raw header-shaped turn right before the opening; and an opening slot equal
+// to the built-in marker. All run through the public ContextManager.open ->
+// tick -> membrane.complete path on a reopened store.
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';

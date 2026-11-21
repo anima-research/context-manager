@@ -30,12 +30,17 @@ built-in text. No migration of existing summaries is performed.
 | --- | --- | --- |
 | `opening` | L1 record marker, including split pieces; coordinate with `chunk` (the built-in chunk refers back to this notification) | `participant` |
 | `chunk` | Ordinary/mixed L1 and split pieces | `participant`, `targetTokens` |
-| `witnessedChunk` | Wholly inherited L1 and split pieces | `participant`, `targetTokens` |
+| `witnessedChunk` | Wholly inherited L1, not in reading mode, and split pieces | `participant`, `targetTokens` |
 | `readingChunk` | L1 portion of a larger sharded body | `participant`, `targetTokens`, `totalTokens` |
 | `merge` | Ordinary/mixed consolidation | `participant`, `targetTokens`, `sourceLevelShown`, `targetLevel` |
-| `witnessedMerge` | Consolidation with every source witnessed | same as `merge` |
+| `witnessedMerge` | Consolidation with every source witnessed, not in reading mode | same as `merge` |
 | `readingMerge` | Consolidation of portions of one larger body | same as `merge`, plus `totalTokens` |
 | `transition` | `generateTransitionSummary` | `participant`, `targetTokens`, `context` |
+
+Reading mode takes precedence over the witnessed choice: a reading-mode L1
+uses `readingChunk` and a reading-mode consolidation uses `readingMerge`, even
+when the material is wholly inherited or every source is witnessed. Split
+pieces and source-level merge retries are the exceptions, described below.
 
 Use single braces, for example `{targetTokens}`. Braces are reserved for
 placeholders; there is no escaping, expression syntax, evaluation, callback,
@@ -84,6 +89,24 @@ unchanged. The zero-recall surgery script
 (`scripts/one-shot-zero-recall-surgery.ts`) matches recall pairs by text, so it
 refuses a `strategyConfig` that sets `templates.opening`, by the same
 slot-presence rule; remove the slot for the surgery run.
+
+## Changing templates and refused chunks
+
+The L1 wording (`opening`, `chunk`, `witnessedChunk`, `readingChunk`) is part
+of the request, and so of the refusal-quarantine key. An edit therefore makes
+a new request shape for each quarantined chunk whose request uses that
+wording, and each such chunk is attempted again, until it holds
+`CHUNK_QUARANTINE_SHAPE_CAP` (3) quarantined shapes. A chunk at the cap is
+not retried after further edits until its quarantine is cleared: by a later
+successful compression of the chunk, or by an operator (see
+[`keyed-compression-quarantine.md`](keyed-compression-quarantine.md)).
+Releasing one record by its key leaves the chunk's other shapes counting
+toward the cap.
+
+`compressionSourceOnlyFallback` changes this. With it on, the source-only
+request, which carries the opening, the chunk and its instruction, is part of
+what decides which shapes count together, so after an edit the earlier shapes
+no longer count and the chunk is retried on every edit.
 
 ## Validation and precedence
 

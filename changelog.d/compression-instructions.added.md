@@ -13,17 +13,13 @@
     empty `witnessedInstruction` is ignored.
   - New protected hooks for subclass authors: `getCompressionOpening`, and
     `getSourceMergeInstruction` for the source-level merge retry (its base
-    implementation uses `merge`/`witnessedMerge`, ignoring reading mode). The
-    hooks `getMergeInstruction` and `getReadingMergeInstruction` take an
-    optional shown-level argument, `separateRecallAnswers` an optional
-    `recallHeadersEnd`, and `applyMintCacheSeams` an optional
-    `recallPairsEnd`. A subclass that already defines a member with one of
-    the new names should rename it before upgrading.
+    implementation uses `merge`/`witnessedMerge`, ignoring reading mode).
   - With a custom `opening` (any configured `templates.opening`, even one
     equal to the built-in text, or a `getCompressionOpening` override
     returning other text), L1 requests read a recall pair only when its
     header and answer both lie before the opening, for the resume separator,
     the cache seams and the refusal-curve retry. The zero-recall surgery
-    script refuses a `strategyConfig` that sets `templates.opening`. The autobiographical drain and external-memory scripts forward
-    `compressionInstructions` from its recipe; hosts must forward and validate
-    the option themselves.
+    script refuses a `strategyConfig` that sets `templates.opening`. The
+    autobiographical drain and external-memory scripts forward
+    `compressionInstructions` from their recipes; hosts must forward and
+    validate the option themselves.
