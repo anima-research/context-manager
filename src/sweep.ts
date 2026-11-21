@@ -81,8 +81,8 @@ export type SweepApplied =
   | { v: 1; kind: 'dropped'; name: string; slot: string; namespace: string; at: string };
 
 /**
- * The old summaries at one level. An old summary is an L1 written before a
- * pass rewrote a row that it covers, or a summary above such an L1.
+ * The old summaries at one level. An old summary is a summary written
+ * before a pass listed a row under it, or a summary above one.
  */
 export interface OldSummaryLevel {
   level: number;

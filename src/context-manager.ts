@@ -2043,8 +2043,8 @@ export class ContextManager {
    * from this manager's strategy, on the open branch: its old summaries at
    * each level, the chunk records that its compression would fold again,
    * and the estimated tokens of the rows under them, which render raw until
-   * it has. An old summary is an L1 written before a pass listed a row it
-   * covers, or a summary above one. It writes nothing. It reads the
+   * it has. An old summary is a summary written before a pass listed a row
+   * under it, or a summary above one. It writes nothing. It reads the
    * strategy as it last read the store, so where another instance of the
    * namespace wrote since, the act, which takes up the store first, can
    * drop otherwise.
@@ -2120,9 +2120,12 @@ export class ContextManager {
    * every listed body is rewritten and no body failed, it appends that the
    * branch finished the take.
    *
-   * Synchronous, so no turn can start between its reads and its writes, and
-   * one pass at a time runs: a listener of its writes that asks for another,
-   * on any store, is refused. A listener that moves the store to another
+   * Synchronous, so no turn that awaits can start between its reads and its
+   * writes, and one pass at a time runs: a listener of its writes that asks
+   * for another, on any store, is refused. A listener of its writes that
+   * compiles sees the slot as that write left it: after a long note's
+   * first shard is rewritten and before its later shards are removed, the
+   * state a stop there leaves. A listener that moves the store to another
    * branch or closes the manager stops it after that write, and so does a
    * write to the applied list that throws (`stopped`).
    */
@@ -2186,7 +2189,7 @@ export class ContextManager {
           continue;
         }
         if (leftover.length === 0) continue;
-        if (!list({ ...item, at: new Date().toISOString(), sequence: this.store.currentSequence(), bodies: [{ ...body, laterShards: leftover }] })) return done();
+        if (!list({ ...item, at: new Date().toISOString(), bodies: [{ ...body, laterShards: leftover }] })) return done();
         try {
           this.removeMessages(leftover[0]!, leftover[leftover.length - 1]!);
           outcomeOf(item.name, item.take).removed.push(...leftover);

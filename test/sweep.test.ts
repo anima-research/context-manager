@@ -717,6 +717,34 @@ describe('summaries made from a mended row', () => {
     cm.close();
   });
 
+  it('S78: a pass that only removes leftover shards keeps the body\'s listing: each pass in the receipt reads the old text at its sequence, and an L1 written from the mended text before it is not old', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const long = longNote(cm, 'LONG');
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    const shards = bodyRows(cm, long);
+    assert.ok(shards.length > 1, 'premise: the note is stored as shards');
+    const firstBefore = textOfBlocks(cm.getMessage(long)!.content);
+    cm.takeSweep('rewords-test');
+    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
+    cm.applySweeps([rewords()]);
+    stop.restore();
+    assert.ok(cm.getMessage(shards[1]!), 'premise: the later shards stayed');
+    await drain(cm);
+    assert.ok(summariesOver(strategy, long).some((s) => s.level === 1), 'premise: an L1 over the mended first row, written after its listing');
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    const passes = cm.sweepReceipt('rewords-test').passes;
+    assert.ok(passes.length > 1, 'premise: the cleanup listed the body again');
+    for (const pass of passes) {
+      for (const body of pass.bodies.filter((each) => each.id === long)) {
+        const then = cm.getMessageAt(body.id, pass.sequence);
+        assert.equal(then && textOfBlocks(then.content), firstBefore, 'the first row reads as it was before the take, at the sequence of each pass that listed it');
+      }
+    }
+    assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, [], 'the L1 written from the mended text is not counted old');
+    cm.close();
+  });
+
   it('S57: after a long note\'s pass, no chunk record names a shard the pass removed', async () => {
     const strategy = adaptive();
     const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
@@ -1038,6 +1066,28 @@ describe('old summaries and the second act', () => {
     assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, [], 'the receipt no longer counts it');
     assert.deepEqual(cm.dropOldSummaries('rewords-test').summaries, [], 'the second act drops nothing');
     assert.ok(summariesOf(strategy).some((s) => s.id === l1.id), 'the edited summary stays');
+    cm.close();
+  });
+
+  it('S77: an old L1 replaced after the pass still leaves the summaries above it old, merged as they were from its old text; the second act drops them and keeps it', async () => {
+    const strategy = new AutobiographicalStrategy({ ...FOLD, hierarchical: true, mergeThreshold: 2 });
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    const id = note(cm, `a note ${OLD} ${'words '.repeat(60)}`);
+    for (let i = 0; i < 7; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    await drain(cm);
+    const over = summariesOver(strategy, id);
+    const l1 = over.find((s) => s.level === 1);
+    const above = over.filter((s) => s.level > 1);
+    assert.ok(l1 && above.length > 0, 'premise: an L1 over the note and a summary above it');
+    cm.takeSweep('rewords-test');
+    cm.applySweeps([rewords()]);
+    cm.editSummaryText(l1.id, `a summary with ${NEW}`, { by: 'test' }, { apply: true });
+    assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, byLevel(above), 'the summaries above the replaced L1 are still old');
+    const dropped = cm.dropOldSummaries('rewords-test');
+    assert.deepEqual(dropped.summaries, byLevel(above), 'the second act drops them');
+    const left = new Set(summariesOf(strategy).map((s) => s.id));
+    assert.ok(left.has(l1.id), 'and keeps the replaced L1');
+    assert.ok(above.every((s) => !left.has(s.id)));
     cm.close();
   });
 

@@ -57,14 +57,14 @@
     open branch: the store's newest take, whether the branch finished it,
     each pass with the bodies that it listed, and `oldSummaries`, the
     strategy's old summaries at each level over the rows those passes
-    listed. An old summary is an L1 written before a pass listed a row that
-    it covers, or a summary above such an L1. An L1 written before this
-    release counts as old; a later one carries the store's sequence when it
-    was written (`SummaryEntry.writtenAtSequence`), which is compared with
-    the list item's `sequence`. A summary over a removed later shard is
-    none: the removal drops it. The show, the receipt and the two calls
-    below need an initialized manager, and read its strategy as it last
-    read the store.
+    listed. An old summary is a summary written before a pass listed a row
+    under it, at any level, or a summary above one. A summary written
+    before this release counts as old; a later one carries the store's
+    sequence when it was written (`SummaryEntry.writtenAtSequence`), which
+    is compared with the list item's `sequence`. A summary over a removed
+    later shard is none: the removal drops it. The show, the receipt and
+    the two calls below need an initialized manager, and read its strategy
+    as it last read the store.
   - `ContextManager.oldSummaryCost(name)` gives what the second act would
     drop and writes nothing: the old summaries at each level, the chunk
     records under them, which the strategy's compression folds again, and

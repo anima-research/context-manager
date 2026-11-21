@@ -8792,21 +8792,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private oldSummaries(rows: SweptRows): Set<string> {
     const going = this.summariesAbove(this.summariesFolding(rows.removed));
-    const seeds = new Set<string>();
-    const consider = (summary: SummaryEntry | undefined, sources: readonly MessageId[]): void => {
-      if (summary?.level !== 1) return;
-      const written: unknown = summary.writtenAtSequence;
-      for (const id of sources) {
-        const listedAt = rows.rewritten.get(id);
-        if (listedAt !== undefined && !(typeof written === 'number' && written >= listedAt)) {
-          seeds.add(summary.id);
-          return;
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
+    const rowsUnder = new Map<string, MessageId[]>();
+    for (const summary of this.summaries) if (summary.level === 1) rowsUnder.set(summary.id, [...summary.sourceIds]);
+    for (const record of this.chunkRecords) {
+      if (record.summaryId && byId.get(record.summaryId)?.level === 1) rowsUnder.get(record.summaryId)?.push(...record.sourceIds);
+    }
+    const newestListing = new Map<string, number>();
+    const listedUnder = (summary: SummaryEntry): number => {
+      const known = newestListing.get(summary.id);
+      if (known !== undefined) return known;
+      newestListing.set(summary.id, -Infinity);
+      let newest = -Infinity;
+      for (const id of rowsUnder.get(summary.id) ?? []) newest = Math.max(newest, rows.rewritten.get(id) ?? -Infinity);
+      if (summary.level > 1) {
+        for (const id of summary.sourceIds) {
+          const child = byId.get(id);
+          if (child) newest = Math.max(newest, listedUnder(child));
         }
       }
+      newestListing.set(summary.id, newest);
+      return newest;
     };
-    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
-    for (const summary of this.summaries) consider(summary, summary.sourceIds);
-    for (const record of this.chunkRecords) if (record.summaryId) consider(byId.get(record.summaryId), record.sourceIds);
+    const seeds = new Set<string>();
+    for (const summary of this.summaries) {
+      const listedAt = listedUnder(summary);
+      const written: unknown = summary.writtenAtSequence;
+      if (listedAt !== -Infinity && !(typeof written === 'number' && written >= listedAt)) seeds.add(summary.id);
+    }
     const old = this.summariesAbove(seeds);
     for (const id of going) old.delete(id);
     return old;
