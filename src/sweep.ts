@@ -100,7 +100,6 @@ export interface SummaryDropCost {
   rawTokens: number;
 }
 
-/** A drop of no summary. */
 export function noDrop(): SummaryDropCost {
   return { summaries: [], records: 0, rawTokens: 0 };
 }
@@ -197,20 +196,23 @@ export interface SweepPassReport {
    */
   unreadable: { items: number[]; takes: string[] };
   /**
-   * What the manager's strategy dropped during the pass: the summaries over
-   * a piece of each note that it joined, its first row included, with every
-   * summary above one; the chunk records that keep a row and are folded
-   * again; and the tokens of the rows under them that stand. Null where a
-   * listener of one of its writes moved the store to another branch or
-   * closed the manager: the strategy then no longer holds the branch.
+   * What the manager's strategy dropped during the pass: the summaries it
+   * held as the pass began and no longer holds as it ends, which are those
+   * over a piece of each note that the pass joined, its first row included,
+   * with every summary above one; the chunk records that no longer name a
+   * dropped summary and are folded again; and the tokens of the rows under
+   * them that stand. Where another instance of the namespace writes the
+   * store from a listener during the pass, its drops are counted too. Null
+   * where a listener of one of its writes moved the store to another branch
+   * or closed the manager, so the strategy no longer holds the branch, and
+   * where the strategy threw in telling it.
    */
   dropped: SummaryDropCost | null;
 }
 
 /**
  * A body that a pass listed, as a receipt gives it. `joined`: the pass
- * listed it with later shards, and none of them is stored now, so its first
- * row holds the whole note.
+ * listed it with later shards, and none of them is stored now.
  */
 export interface ReceiptBody extends ListedBody {
   joined: boolean;

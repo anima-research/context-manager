@@ -8662,7 +8662,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if ((leaving.size > 0 || joined.size > 0) && this.storeWrittenElsewhere()) {
           for (const id of this.takeUpStoreBeforeLetGo(leaving, ctx)) listed.add(id);
         }
-        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldRowsThatLeft(leaving, ctx, this.writtenBeforeJoin(joined)));
+        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldRowsThatLeft(leaving, ctx, this.writtenBefore(joined)));
       }
       this.sweepCursor = length;
     } catch (err) {
@@ -8711,10 +8711,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * over the rows it keeps, and one left with none goes. A row that left
    * and is in the window again, presented again before this strategy heard
    * it go, stays in a record that holds it beside a row of its own that
-   * didn't leave: that record was made over it where it stands. The L1s
-   * `alsoDrop` names go too, with every summary above them, and the record
-   * of each is compressed again over its own rows: those over a joined
-   * note's first row (letGoOfSweptRows). The chunks aren't rebuilt here.
+   * didn't leave: that record was made over it where it stands. The
+   * summaries `alsoDrop` names go too. The chunks aren't rebuilt here.
    */
   private unfoldRowsThatLeft(
     leaving: ReadonlySet<MessageId>,
@@ -8780,9 +8778,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return (ctx) => {
       this.letGoOfSweptRows(ctx, 'the end of a pass');
       const kept = new Set(this.summaries.map((summary) => summary.id));
-      const records = new Set(this.chunkRecords.map((record) => record.id));
+      const records = new Map(this.chunkRecords.map((record) => [record.id, record]));
       const dropped = new Set(from.summaries.filter((summary) => !kept.has(summary.id)).map((summary) => summary.id));
-      return this.costOf(dropped, ctx, { from, keeps: (record) => records.has(record.id) });
+      const keeps = (record: ChunkRecord): boolean => {
+        const now = records.get(record.id);
+        return now !== undefined && !(now.summaryId && dropped.has(now.summaryId));
+      };
+      return this.costOf(dropped, ctx, { from, keeps });
     };
   }
 
@@ -8823,58 +8825,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return cost;
   }
 
-  /**
-   * What a pass's join of long notes drops (rows.removed, rows.joined):
-   * each L1 over a removed later shard, each L1 over a joined first row
-   * written before that row's join was listed, and every summary above one.
-   */
   private joinDrops(rows: SweptRows): Set<string> {
     const seeds = this.summariesFolding(rows.removed);
-    for (const id of this.writtenBeforeJoin(rows.joined)) seeds.add(id);
+    for (const id of this.writtenBefore(rows.joined)) seeds.add(id);
     return this.summariesAbove(seeds);
   }
 
-  /**
-   * The L1s over a joined note's first row (`joined`, with the sequence of
-   * the newest listing of its join) written before that listing, or with no
-   * sequence: made from one piece of the note. An L1 written after it was
-   * made from the joined row.
-   */
-  private writtenBeforeJoin(joined: ReadonlyMap<MessageId, number>): Set<string> {
-    const found = new Set<string>();
-    if (joined.size === 0) return found;
-    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
-    for (const [id, rows] of this.rowsUnderL1s()) {
-      let listedAt = -Infinity;
-      for (const row of rows) listedAt = Math.max(listedAt, joined.get(row) ?? -Infinity);
-      const written: unknown = byId.get(id)?.writtenAtSequence;
-      if (listedAt !== -Infinity && !(typeof written === 'number' && written >= listedAt)) found.add(id);
-    }
-    return found;
+  private oldSummaries(rows: SweptRows): Set<string> {
+    const old = this.summariesAbove(this.writtenBefore(rows.rewritten));
+    for (const id of this.joinDrops(rows)) old.delete(id);
+    return old;
   }
 
-  /** Each L1, with the rows under it: its sources and those of the chunk record that names it. */
-  private rowsUnderL1s(): Map<string, MessageId[]> {
+  private writtenBefore(listings: ReadonlyMap<MessageId, number>): Set<string> {
+    const found = new Set<string>();
+    if (listings.size === 0) return found;
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
     const rowsUnder = new Map<string, MessageId[]>();
     for (const summary of this.summaries) if (summary.level === 1) rowsUnder.set(summary.id, [...summary.sourceIds]);
     for (const record of this.chunkRecords) {
       if (record.summaryId && byId.get(record.summaryId)?.level === 1) rowsUnder.get(record.summaryId)?.push(...record.sourceIds);
     }
-    return rowsUnder;
-  }
-
-  private oldSummaries(rows: SweptRows): Set<string> {
-    const going = this.joinDrops(rows);
-    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
-    const rowsUnder = this.rowsUnderL1s();
     const newestListing = new Map<string, number>();
     const listedUnder = (summary: SummaryEntry): number => {
       const known = newestListing.get(summary.id);
       if (known !== undefined) return known;
       newestListing.set(summary.id, -Infinity);
       let newest = -Infinity;
-      for (const id of rowsUnder.get(summary.id) ?? []) newest = Math.max(newest, rows.rewritten.get(id) ?? -Infinity);
+      for (const id of rowsUnder.get(summary.id) ?? []) newest = Math.max(newest, listings.get(id) ?? -Infinity);
       if (summary.level > 1) {
         for (const id of summary.sourceIds) {
           const child = byId.get(id);
@@ -8884,25 +8862,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       newestListing.set(summary.id, newest);
       return newest;
     };
-    const seeds = new Set<string>();
     for (const summary of this.summaries) {
       const listedAt = listedUnder(summary);
       const written: unknown = summary.writtenAtSequence;
-      if (listedAt !== -Infinity && !(typeof written === 'number' && written >= listedAt)) seeds.add(summary.id);
+      if (listedAt !== -Infinity && !(typeof written === 'number' && written >= listedAt)) found.add(summary.id);
     }
-    const old = this.summariesAbove(seeds);
-    for (const id of going) old.delete(id);
-    return old;
+    return found;
   }
 
-  /**
-   * What dropping the summaries `drop` costs (SummaryDropCost), read from
-   * `from` (this instance's summaries and records when not given): the
-   * summaries at each level; each record of a dropped L1 that `keeps`, by
-   * default one with a row not `gone`; and the estimated tokens of the rows
-   * under them that the view holds and that aren't `gone`, a row of
-   * `contents` at its new content.
-   */
   private costOf(
     drop: ReadonlySet<string>,
     ctx: StrategyContext,

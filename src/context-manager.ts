@@ -2009,9 +2009,11 @@ export class ContextManager {
    * the strategy's summaries that a pass of the changes would leave old
    * (oldSummaryCost), and gives what the pass would drop itself where it
    * joins a long note (writeDropCost): each summary over a piece of the
-   * note, its first row included, and each summary above one. A summary is
-   * in one of the two, never both. Refused while a sharded addMessage of
-   * this manager stores its shards.
+   * note, its first row included, and each summary above one, also for a
+   * note whose later shards an earlier pass listed and left standing, which
+   * the next pass removes first. A summary is in one of the two, never
+   * both. Refused while a sharded addMessage of this manager stores its
+   * shards.
    */
   showSweep(entry: SweepEntry): SweepShow {
     this.requireInitialized('showSweep');
@@ -2022,13 +2024,20 @@ export class ContextManager {
       );
     }
     const slot = this.messageSlot();
-    const listed = listedLaterShards(sweepsApplied(this.store).items.filter((item) => item.slot === slot));
-    const { mended, failed } = this.sweepCandidates(entry, listed);
-    const rows: SweptRows = {
-      rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])),
-      removed: new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id))),
-      joined: new Map(mended.filter(({ rows }) => rows.length > 1).map(({ body }) => [body.id, Infinity])),
-    };
+    const items = sweepsApplied(this.store).items.filter((item) => item.slot === slot);
+    const { mended, failed } = this.sweepCandidates(entry, listedLaterShards(items));
+    const removed = new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id)));
+    const joined = new Map(mended.filter(({ rows }) => rows.length > 1).map(({ body }) => [body.id, Infinity]));
+    for (const item of items) {
+      if (item.kind !== 'listed') continue;
+      for (const body of item.bodies) {
+        const leftover = this.leftoverShards(body);
+        if (leftover.length === 0) continue;
+        for (const id of leftover) removed.add(id);
+        joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
+      }
+    }
+    const rows: SweptRows = { rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])), removed, joined };
     const contents = new Map(mended.map(({ body, written }) => [body.id, written]));
     return {
       changes: mended.map(({ body, content }) => ({
@@ -2147,10 +2156,18 @@ export class ContextManager {
       );
     }
     const branch = this.store.currentBranch().id;
-    const ended = this.strategy.beforeSweepPass?.(this.createStrategyContext());
-    const report = runSweepPass(() => this.sweepPass(entries));
+    const { report, ended } = runSweepPass(() => {
+      const ended = this.strategy.beforeSweepPass?.(this.createStrategyContext());
+      return { report: this.sweepPass(entries), ended };
+    });
     if (this.isClosed() || this.store.currentBranch().id !== branch) return report;
-    return { ...report, dropped: ended ? ended(this.createStrategyContext()) : noDrop() };
+    if (!ended) return { ...report, dropped: noDrop() };
+    try {
+      return { ...report, dropped: ended(this.createStrategyContext()) };
+    } catch (error) {
+      logThrown('Strategy: what a sweep pass dropped could not be told:', error, this.diag);
+      return report;
+    }
   }
 
   private sweepPass(entries: readonly SweepEntry[]): SweepPassReport {

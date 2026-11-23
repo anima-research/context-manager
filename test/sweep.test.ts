@@ -141,7 +141,6 @@ function summariesOverAny(strategy: AutobiographicalStrategy, ids: readonly Mess
 const recordsOf = (strategy: AutobiographicalStrategy) =>
   (strategy as unknown as { chunkRecords: Array<{ id: string; sourceIds: MessageId[]; summaryId?: string }> }).chunkRecords;
 
-/** Three short rows, then a long note whose first shard their chunk record holds with them, then four chats. */
 function joinFixture(cm: ContextManager): { before: MessageId[]; long: MessageId; rows: MessageId[] } {
   const before = [0, 1, 2].map((i) => cm.addMessage('User', [text(`before ${i}`)]));
   const long = longNote(cm, 'LONG');
@@ -735,22 +734,25 @@ describe('summaries made from a mended row', () => {
     cm.close();
   });
 
-  it('S78: a pass that only removes leftover shards keeps the body\'s listing: each pass in the receipt reads the old text at its sequence, and an L1 written from the mended text before it is not old', async () => {
+  it('S78: a pass that only removes leftover shards keeps the body\'s listing: each pass in the receipt reads the old text at its sequence, and an L1 over the first row written after the listing stays and is not old', async () => {
     const strategy = adaptive();
     const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    const long = longNote(cm, 'LONG');
-    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    const shards = bodyRows(cm, long);
-    assert.ok(shards.length > 1, 'premise: the note is stored as shards');
+    const { long, rows: shards } = joinFixture(cm);
+    await drain(cm);
     const firstBefore = textOfBlocks(cm.getMessage(long)!.content);
+    const l1 = summariesOf(strategy).find((s) => s.level === 1 && s.sourceIds.includes(long))!;
+    assert.ok(l1 && !l1.sourceIds.some((id) => shards.slice(1).includes(id)), 'premise: an L1 folds the first row and no later shard');
     cm.takeSweep('rewords-test');
     const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
     cm.applySweeps([rewords()]);
     stop.restore();
     assert.ok(cm.getMessage(shards[1]!), 'premise: the later shards stayed');
-    await drain(cm);
-    assert.ok(summariesOver(strategy, long).some((s) => s.level === 1), 'premise: an L1 over the mended first row, written after its listing');
+    cm.editSummaryText(l1.id, `a summary with ${NEW}`, { by: 'test' }, { apply: true });
+    const listing = sweepsApplied(cm.getStore()).items.find((item) => item.kind === 'listed');
+    const edited = summariesOf(strategy).find((s) => s.id === l1.id);
+    assert.ok(listing?.kind === 'listed' && typeof edited?.writtenAtSequence === 'number' && edited.writtenAtSequence >= listing.sequence, 'premise: the L1 is written after the listing');
     assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.ok(summariesOf(strategy).some((s) => s.id === l1.id), 'the L1 written after the listing stays through the cleanup');
     const passes = cm.sweepReceipt('rewords-test').passes;
     assert.ok(passes.length > 1, 'premise: the cleanup listed the body again');
     for (const pass of passes) {
@@ -759,7 +761,7 @@ describe('summaries made from a mended row', () => {
         assert.equal(then && textOfBlocks(then.content), firstBefore, 'the first row reads as it was before the take, at the sequence of each pass that listed it');
       }
     }
-    assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, [], 'the L1 written from the mended text is not counted old');
+    assert.deepEqual(cm.sweepReceipt('rewords-test').oldSummaries, [], 'the L1 written after the listing is not counted old');
     cm.close();
   });
 
@@ -787,6 +789,7 @@ describe('summaries made from a mended row', () => {
     const record = recordsOf(strategy).find((r) => r.sourceIds.includes(long))!;
     assert.deepEqual(record.sourceIds, [...before, long], 'premise: one record holds the rows before the note and its first row');
     const old = record.summaryId!;
+    assert.ok(old && summariesOf(strategy).some((s) => s.id === old), 'premise: an L1 folds that record');
     cm.takeSweep('rewords-test');
     cm.applySweeps([rewords()]);
     const after = recordsOf(strategy).find((r) => r.id === record.id);
@@ -827,6 +830,7 @@ describe('summaries made from a mended row', () => {
     assert.ok(!cm.getMessage(long)!.bodyGroupId && cm.getMessage(rows[1]!), 'premise: the first row is rewritten, and its later shards stand');
     assert.ok(summariesOf(strategy).some((s) => s.id === first.id), 'the first row\'s L1 stays while the later shards stand');
     assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    for (const id of rows.slice(1)) assert.equal(cm.getMessage(id), null, `premise: the pass removed ${id}`);
     assert.deepEqual(summariesOverAny(strategy, rows), [], 'once they are gone, no summary covers a piece of the note');
     assert.ok((await compiledText(cm)).includes(MENDED_LONG), 'the compile holds the note\'s whole new text');
     cm.close();
@@ -840,11 +844,14 @@ describe('summaries made from a mended row', () => {
     const a = await ContextManager.open({ store, namespace: 'a', strategy: mine, membrane: mockMembrane() });
     const b = await ContextManager.open({ store, namespace: 'b', strategy: other, membrane: mockMembrane() });
     const { long, rows } = joinFixture(a);
+    for (let i = 0; i < 8; i++) a.addMessage('User', [text(`later ${i} ${'words '.repeat(60)}`)]);
     await drain(a);
     await drain(b);
     const third = adaptive();
     const c = await ContextManager.open({ store, namespace: 'c', strategy: third, membrane: mockMembrane() });
     await drain(c);
+    const unrelated = summariesOf(third).filter((s) => !summariesOverAny(third, rows).includes(s)).map((s) => s.id);
+    assert.ok(unrelated.length > 0, 'premise: c folds rows outside the note too');
     c.close();
     for (const s of [mine, other, third]) assert.ok(covered(s).has(long), 'premise: each namespace folds the first row');
     a.takeSweep('rewords-test');
@@ -856,6 +863,7 @@ describe('summaries made from a mended row', () => {
     const later = adaptive();
     const reopened = await ContextManager.open({ store, namespace: 'c', strategy: later, membrane: mockMembrane() });
     assert.deepEqual(summariesOverAny(later, rows), [], 'c: at its open');
+    assert.deepEqual(summariesOf(later).map((s) => s.id), unrelated, 'c: and it keeps every other summary');
     reopened.close();
     await drain(a);
     const made = summariesOver(mine, long).map((s) => s.id);
@@ -873,14 +881,16 @@ describe('summaries made from a mended row', () => {
     const strategy = adaptive();
     const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
     const short = note(cm, `a note ${OLD}`);
-    const { long } = joinFixture(cm);
+    const { long, rows } = joinFixture(cm);
     cm.takeSweep('rewords-test');
     const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
     cm.applySweeps([rewords()]);
     stop.restore();
     const marks = () => cm.sweepReceipt('rewords-test').passes.flatMap((pass) => pass.bodies.map((body) => `${body.id === long ? 'long' : body.id === short ? 'short' : body.id}:${body.joined}`));
+    assert.ok(rows.slice(1).every((id) => cm.getMessage(id) !== null), 'premise: the later shards stand');
     assert.deepEqual(marks(), ['short:false', 'long:false'], 'not while its later shards stand');
     cm.applySweeps([rewords()]);
+    assert.ok(rows.slice(1).every((id) => cm.getMessage(id) === null), 'premise: the later shards are gone');
     assert.deepEqual(marks(), ['short:false', 'long:true', 'long:true'], 'once they are gone, in each pass that listed it');
     cm.close();
   });
@@ -907,6 +917,82 @@ describe('summaries made from a mended row', () => {
     second.close();
     first.close();
     store.close();
+  });
+
+  it('S85: an L1 over a joined note\'s first row edited after the listing stays, and a summary above it merged before the listing goes', async () => {
+    const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true, hierarchical: true, mergeThreshold: 2 });
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    for (let i = 0; i < 4; i++) cm.addMessage('User', [text(`early ${i} ${'words '.repeat(60)}`)]);
+    const { long, rows } = joinFixture(cm);
+    await drain(cm);
+    const all = () => summariesOf(strategy);
+    const l1 = all().find((s) => s.level === 1 && s.sourceIds.includes(long))!;
+    const above = all().find((s) => s.level === 2 && s.sourceIds.includes(l1.id));
+    assert.ok(above && !rows.slice(1).some((id) => leavesOf(all(), above).has(id)), 'premise: an L2 over the first row\'s L1 covers no later shard');
+    cm.takeSweep('rewords-test');
+    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
+    cm.applySweeps([rewords()]);
+    stop.restore();
+    cm.editSummaryText(l1.id, `a summary with ${NEW}`, { by: 'test' }, { apply: true });
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.ok(all().some((s) => s.id === l1.id), 'the L1 edited after the listing stays');
+    assert.ok(!all().some((s) => s.id === above.id), 'the L2 merged from its old text goes');
+    cm.close();
+  });
+
+  it('S86: after a pass that stopped before a long note\'s shards were removed, the show counts what the next pass drops in removing them', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    joinFixture(cm);
+    await drain(cm);
+    cm.takeSweep('rewords-test');
+    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
+    cm.applySweeps([rewords()]);
+    stop.restore();
+    const shown = cm.showSweep(rewords());
+    assert.deepEqual(shown.changes, [], 'premise: no body is left to mend');
+    const report = cm.applySweeps([rewords()]);
+    assert.ok(report.dropped && total(report.dropped.summaries) > 0, 'premise: the cleanup drops summaries');
+    assert.deepEqual(shown.writeDrops, report.dropped, 'the show counted them');
+    cm.close();
+  });
+
+  it('S87: a strategy that throws in telling what a pass dropped leaves the report whole, with no drop', async () => {
+    const strategy = new PassthroughStrategy();
+    Object.assign(strategy, { beforeSweepPass: () => () => { throw new Error('test: no count'); } });
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
+    const id = note(cm, `a note ${OLD}`);
+    cm.takeSweep('rewords-test');
+    const report = cm.applySweeps([rewords()]);
+    assert.equal(report.sweeps[0]!.outcome, 'finished');
+    assert.deepEqual(report.sweeps[0]!.rewritten, [id]);
+    assert.equal(report.dropped, null);
+    cm.close();
+  });
+
+  it('S88: a pass report counts no chunk record whose write failed after its summary was dropped', async () => {
+    const strategy = adaptive();
+    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
+    joinFixture(cm);
+    await drain(cm);
+    cm.takeSweep('rewords-test');
+    const store = cm.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = store.setStateJson!;
+    let failed = 0;
+    store.setStateJson = function (this: unknown, ...args: unknown[]) {
+      if (String(args[0]).endsWith('autobio:chunks') && failed === 0) {
+        failed++;
+        throw new Error('test: the chunk records\' write stopped');
+      }
+      return real.apply(this, args);
+    };
+    const report = cm.applySweeps([rewords()]);
+    store.setStateJson = real;
+    assert.equal(failed, 1, 'premise: the chunk records\' write failed');
+    assert.ok(report.dropped && total(report.dropped.summaries) > 0, 'premise: the summaries were dropped');
+    assert.ok(recordsOf(strategy).some((r) => r.summaryId && !summariesOf(strategy).some((s) => s.id === r.summaryId)), 'premise: a record still names a dropped summary');
+    assert.equal(report.dropped!.records, 0, 'no record is counted as folded again');
+    cm.close();
   });
 });
 
@@ -1590,8 +1676,11 @@ describe('what runs beside a pass', () => {
     cm.close();
   });
 
-  it('S33: a pass asked during a pass is refused, and the first pass finishes', async () => {
-    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+  it('S33: a pass asked during a pass is refused, asking its strategy nothing, and the first pass finishes', async () => {
+    const strategy = new PassthroughStrategy();
+    let begun = 0;
+    Object.assign(strategy, { beforeSweepPass: () => { begun++; return () => ({ summaries: [], records: 0, rawTokens: 0 }); } });
+    const cm = await ContextManager.open({ path: freshPath(), strategy });
     note(cm, `first ${OLD}`);
     note(cm, `second ${OLD}`);
     cm.takeSweep('rewords-test');
@@ -1609,6 +1698,7 @@ describe('what runs beside a pass', () => {
     const report = cm.applySweeps([rewords()]);
     assert.ok(asked, 'premise: the listener asked for a pass');
     assert.match(String(refused), /applySweeps refused: a pass is running/);
+    assert.equal(begun, 1, 'the refused pass asked its strategy nothing');
     assert.equal(report.sweeps[0]!.outcome, 'finished');
     assert.deepEqual(sweepsApplied(cm.getStore()).items.map((item) => item.kind), ['listed', 'finished']);
     cm.close();

@@ -27,8 +27,9 @@
     long note (below): the summaries at each level, the chunk records that
     keep a row and are folded again, and the estimated tokens of the rows
     under them that stand, the first row at its new size
-    (`SummaryDropCost`). A summary is counted in one of the two, never in
-    both.
+    (`SummaryDropCost`). It counts a note whose later shards an earlier
+    pass left standing too, since the next pass removes them first. A
+    summary is counted in one of the two, never in both.
   - `ContextManager.takeSweep(name)` records once, for the whole store, that
     it took the sweep: a `context-manager/sweep-take` typed record, which
     every branch sees. It rewrites nothing. No call takes a take back, so
@@ -141,17 +142,18 @@
     other branch when a pass there joins the note, with no show before it.
     `showSweep` gives the size on the open branch before the write
     (`writeDrops`), and each pass reports what it dropped (`dropped`).
-  - Four limits. A long note whose mended text is still long is not
-    mended: it is refused, and stays owed. A summary of other rows, made
-    before the pass, keeps any words that it took from a mended body that
-    its request carried as context: a summary records no recall set, so
-    the second act doesn't find it. Every namespace keeps its old summaries
-    until its own second act; an older context-manager makes none, and
-    reads no applied list, so beside a host that runs one a namespace keeps
-    its summaries over a joined note until an instance of this release
-    opens it. A context copied from a compile between a pass and the
-    second act, as rows of its own, keeps the old summaries' words for
-    good: no second act reaches a copy.
+  - Four limits. A long note whose mended text is still long is not mended:
+    it is refused, and stays owed. A summary of other rows, made before the
+    pass, keeps any words that it took from a mended body that its request
+    carried as context: a summary records no recall set, so the second act
+    doesn't find it. Every namespace keeps its old summaries until its own
+    second act; an older context-manager makes none, and reads no applied
+    list, so beside a host that runs one a namespace keeps its summaries
+    over a joined note until an instance of this release opens it. A summary
+    that an older release writes carries no sequence, so this release reads
+    it as written before every pass. A context copied from a compile between
+    a pass and the second act, as rows of its own, keeps the old summaries'
+    words for good: no second act reaches a copy.
   - As after any edit, a rewrite changes what a branch sends before its
     later replies, so those replies' thinking is no longer sent to a
     provider that binds thinking to its request (`thinking-binding.ts`).
