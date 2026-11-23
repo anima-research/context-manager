@@ -73,8 +73,8 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
-import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, runSweepPass, sweepBodyOf, sweepsApplied, sweptRows, textLength } from './sweep.js';
-import type { ListedBody, OldSummaryCost, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake, SweptRows } from './sweep.js';
+import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, noDrop, runSweepPass, sweepBodyOf, sweepsApplied, sweptRows, textLength } from './sweep.js';
+import type { ListedBody, SummaryDropCost, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake, SweptRows } from './sweep.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   recordedThrough,
@@ -2007,9 +2007,11 @@ export class ContextManager {
    * pass removes them. A show's changes never give the old text, and a show
    * writes nothing, also while a taken sweep waits to be applied. It counts
    * the strategy's summaries that a pass of the changes would leave old
-   * (oldSummaryCost): each summary over a changed body, but for one over a
-   * later shard, which the pass's removal drops. Refused while a sharded
-   * addMessage of this manager stores its shards.
+   * (oldSummaryCost), and gives what the pass would drop itself where it
+   * joins a long note (writeDropCost): each summary over a piece of the
+   * note, its first row included, and each summary above one. A summary is
+   * in one of the two, never both. Refused while a sharded addMessage of
+   * this manager stores its shards.
    */
   showSweep(entry: SweepEntry): SweepShow {
     this.requireInitialized('showSweep');
@@ -2022,6 +2024,12 @@ export class ContextManager {
     const slot = this.messageSlot();
     const listed = listedLaterShards(sweepsApplied(this.store).items.filter((item) => item.slot === slot));
     const { mended, failed } = this.sweepCandidates(entry, listed);
+    const rows: SweptRows = {
+      rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])),
+      removed: new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id))),
+      joined: new Map(mended.filter(({ rows }) => rows.length > 1).map(({ body }) => [body.id, Infinity])),
+    };
+    const contents = new Map(mended.map(({ body, written }) => [body.id, written]));
     return {
       changes: mended.map(({ body, content }) => ({
         id: body.id,
@@ -2031,10 +2039,8 @@ export class ContextManager {
         newLength: textLength(content),
       })),
       failures: failed,
-      oldSummaries: this.oldSummariesOver({
-        rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])),
-        removed: new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id))),
-      }).summaries,
+      oldSummaries: this.oldSummariesOver(rows).summaries,
+      writeDrops: this.strategy.writeDropCost?.(rows, this.createStrategyContext(), contents) ?? noDrop(),
     };
   }
 
@@ -2044,12 +2050,13 @@ export class ContextManager {
    * each level, the chunk records that its compression would fold again,
    * and the estimated tokens of the rows under them, which render raw until
    * it has. An old summary is a summary written before a pass listed a row
-   * under it, or a summary above one. It writes nothing. It reads the
+   * under it, or a summary above one, but for one that a pass's join of a
+   * long note drops (showSweep's `writeDrops`). It writes nothing. It reads the
    * strategy as it last read the store, so where another instance of the
    * namespace wrote since, the act, which takes up the store first, can
    * drop otherwise.
    */
-  oldSummaryCost(name: string): OldSummaryCost {
+  oldSummaryCost(name: string): SummaryDropCost {
     this.requireInitialized('oldSummaryCost');
     return this.oldSummariesOver(this.sweptRowsOf(name));
   }
@@ -2070,9 +2077,9 @@ export class ContextManager {
    * summary. A call that throws lists nothing: call it again, and it lists
    * the act, whatever its drop had written.
    */
-  dropOldSummaries(name: string): OldSummaryCost {
+  dropOldSummaries(name: string): SummaryDropCost {
     this.requireInitialized('dropOldSummaries');
-    if (!this.strategy.dropOldSummaries) return { summaries: [], records: 0, rawTokens: 0 };
+    if (!this.strategy.dropOldSummaries) return noDrop();
     const dropped = this.strategy.dropOldSummaries(this.sweptRowsOf(name), this.createStrategyContext());
     appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
     return dropped;
@@ -2083,8 +2090,8 @@ export class ContextManager {
     return sweptRows(sweepsApplied(this.store).items.filter((item) => item.slot === slot && item.name === name));
   }
 
-  private oldSummariesOver(rows: SweptRows): OldSummaryCost {
-    return this.strategy.oldSummaryCost?.(rows, this.createStrategyContext()) ?? { summaries: [], records: 0, rawTokens: 0 };
+  private oldSummariesOver(rows: SweptRows): SummaryDropCost {
+    return this.strategy.oldSummaryCost?.(rows, this.createStrategyContext()) ?? noDrop();
   }
 
   /**
@@ -2118,7 +2125,9 @@ export class ContextManager {
    * never makes one row of content that the strategy would store as shards
    * (chunkIngressMessage), unless the body was such a row already. Once
    * every listed body is rewritten and no body failed, it appends that the
-   * branch finished the take.
+   * branch finished the take. Its report gives what the strategy dropped
+   * during the pass (`dropped`): a joined note loses each summary over a
+   * piece of it, its first row included, and each summary above one.
    *
    * Synchronous, so no turn that awaits can start between its reads and its
    * writes, and one pass at a time runs: a listener of its writes that asks
@@ -2138,15 +2147,16 @@ export class ContextManager {
       );
     }
     const branch = this.store.currentBranch().id;
+    const ended = this.strategy.beforeSweepPass?.(this.createStrategyContext());
     const report = runSweepPass(() => this.sweepPass(entries));
-    if (!this.isClosed() && this.store.currentBranch().id === branch) this.strategy.afterSweepPass?.(this.createStrategyContext());
-    return report;
+    if (this.isClosed() || this.store.currentBranch().id !== branch) return report;
+    return { ...report, dropped: ended ? ended(this.createStrategyContext()) : noDrop() };
   }
 
   private sweepPass(entries: readonly SweepEntry[]): SweepPassReport {
     const slot = this.messageSlot();
     const branch = this.store.currentBranch();
-    const report: SweepPassReport = { slot, branch: branch.name, sweeps: [], stopped: null, unreadable: { items: [], takes: [] } };
+    const report: SweepPassReport = { slot, branch: branch.name, sweeps: [], stopped: null, unreadable: { items: [], takes: [] }, dropped: null };
     const outcomes = new Map<string, SweepPassOutcome>();
     const outcomeOf = (name: string, take: string): SweepPassOutcome => {
       let outcome = outcomes.get(name);
@@ -2366,8 +2376,9 @@ export class ContextManager {
    * Where the sweep `name` stands for the slot this manager writes, on the
    * open branch: the store's newest take of it, whether this branch
    * finished that take, each pass the branch's applied list holds, with the
-   * bodies it listed, and the strategy's old summaries over the rows those
-   * passes listed (oldSummaryCost). It never gives the old text.
+   * bodies it listed, each marked where a pass joined it, and the
+   * strategy's old summaries over the rows those passes listed
+   * (oldSummaryCost). It never gives the old text.
    */
   sweepReceipt(name: string): SweepReceipt {
     this.requireInitialized('sweepReceipt');
@@ -2378,13 +2389,21 @@ export class ContextManager {
       name,
       take,
       finished: take !== null && items.some((item) => item.kind === 'finished' && item.take === take.take),
-      passes: items.flatMap((item) => (item.kind === 'listed' ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies }] : [])),
+      passes: items.flatMap((item) =>
+        item.kind === 'listed'
+          ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies.map((body) => ({ ...body, joined: this.joined(body) })) }]
+          : [],
+      ),
       oldSummaries: this.oldSummariesOver(sweptRows(items)).summaries,
     };
   }
 
   private messageSlot(): string {
     return MessageStore.registrationFor(this.slots.messageNamespace).id;
+  }
+
+  private joined(body: ListedBody): boolean {
+    return body.laterShards.length > 0 && body.laterShards.every((id) => this.messageStore.sequenceOf(id) === undefined);
   }
 
   private leftoverShards(body: ListedBody): MessageId[] {

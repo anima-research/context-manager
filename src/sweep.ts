@@ -80,35 +80,42 @@ export type SweepApplied =
   | { v: 1; kind: 'finished'; name: string; take: string; slot: string; at: string }
   | { v: 1; kind: 'dropped'; name: string; slot: string; namespace: string; at: string };
 
-/**
- * The old summaries at one level. An old summary is a summary written
- * before a pass listed a row under it, or a summary above one.
- */
-export interface OldSummaryLevel {
+/** How many summaries of one level a count holds. */
+export interface SummaryLevelCount {
   level: number;
   count: number;
 }
 
 /**
- * What the second act (ContextManager.dropOldSummaries) drops: the old
- * summaries at each level, with each level that has none left out; the
- * chunk records that the strategy's compression then folds again; and the
- * estimated tokens of the rows that render raw until it does.
+ * What a drop of summaries costs: the summaries it drops at each level,
+ * with each level that has none left out; the chunk records that keep a
+ * row and that the strategy's compression then folds again; and the
+ * estimated tokens of the rows under them that stand, which render raw
+ * until it does. The second act gives it (ContextManager.dropOldSummaries),
+ * and so does a pass's join of a long note.
  */
-export interface OldSummaryCost {
-  summaries: OldSummaryLevel[];
+export interface SummaryDropCost {
+  summaries: SummaryLevelCount[];
   records: number;
   rawTokens: number;
 }
 
+/** A drop of no summary. */
+export function noDrop(): SummaryDropCost {
+  return { summaries: [], records: 0, rawTokens: 0 };
+}
+
 /**
  * The rows that a sweep's passes listed to rewrite on a branch, each with
- * the store's sequence of the newest list item that lists it, and the later
- * shards that they listed to remove.
+ * the store's sequence of the newest list item that lists it; the later
+ * shards that they listed to remove; and each body that a pass listed with
+ * later shards, a joined note, by its first row, with the store's sequence
+ * of the newest such list item.
  */
 export interface SweptRows {
   rewritten: ReadonlyMap<MessageId, number>;
   removed: ReadonlySet<MessageId>;
+  joined: ReadonlyMap<MessageId, number>;
 }
 
 export const SWEEP_TAKE_RECORD = 'context-manager/sweep-take';
@@ -139,8 +146,20 @@ export interface SweepShow {
    * content that the entry gave.
    */
   failures: SweepFailure[];
-  /** The summaries that would be old once a pass rewrote the changes. */
-  oldSummaries: OldSummaryLevel[];
+  /**
+   * The summaries that would be old once a pass rewrote the changes. A
+   * summary that the pass's join of a long note would drop is not counted
+   * here: it is in `writeDrops`.
+   */
+  oldSummaries: SummaryLevelCount[];
+  /**
+   * What a pass of the changes would drop itself, where it joins a long
+   * note: each summary over a piece of the note, its first row included,
+   * and each summary above one; the chunk records that keep a row; and the
+   * tokens of the rows under them that stand, a joined note's first row at
+   * its new size.
+   */
+  writeDrops: SummaryDropCost;
 }
 
 /**
@@ -177,6 +196,24 @@ export interface SweepPassReport {
    * bodies are not let go of, and a damaged take is not applied.
    */
   unreadable: { items: number[]; takes: string[] };
+  /**
+   * What the manager's strategy dropped during the pass: the summaries over
+   * a piece of each note that it joined, its first row included, with every
+   * summary above one; the chunk records that keep a row and are folded
+   * again; and the tokens of the rows under them that stand. Null where a
+   * listener of one of its writes moved the store to another branch or
+   * closed the manager: the strategy then no longer holds the branch.
+   */
+  dropped: SummaryDropCost | null;
+}
+
+/**
+ * A body that a pass listed, as a receipt gives it. `joined`: the pass
+ * listed it with later shards, and none of them is stored now, so its first
+ * row holds the whole note.
+ */
+export interface ReceiptBody extends ListedBody {
+  joined: boolean;
 }
 
 /** A pass on the open branch, as its list item names it. */
@@ -184,7 +221,7 @@ export interface SweepPass {
   take: string;
   at: string;
   sequence: number;
-  bodies: ListedBody[];
+  bodies: ReceiptBody[];
 }
 
 /**
@@ -198,7 +235,7 @@ export interface SweepReceipt {
   finished: boolean;
   passes: SweepPass[];
   /** The old summaries over the rows that its passes listed. */
-  oldSummaries: OldSummaryLevel[];
+  oldSummaries: SummaryLevelCount[];
 }
 
 /**
@@ -240,14 +277,16 @@ export function listedRows(items: readonly SweepApplied[]): Set<MessageId> {
 export function sweptRows(items: readonly SweepApplied[]): SweptRows {
   const rewritten = new Map<MessageId, number>();
   const removed = new Set<MessageId>();
+  const joined = new Map<MessageId, number>();
   for (const item of items) {
     if (item.kind !== 'listed') continue;
     for (const body of item.bodies) {
       rewritten.set(body.id, Math.max(rewritten.get(body.id) ?? -Infinity, item.sequence));
       for (const shard of body.laterShards) removed.add(shard);
+      if (body.laterShards.length > 0) joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
     }
   }
-  return { rewritten, removed };
+  return { rewritten, removed, joined };
 }
 
 export function listedLaterShards(items: readonly SweepApplied[]): Set<MessageId> {

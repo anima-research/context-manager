@@ -119,7 +119,7 @@ import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
 import { SWEEPS_APPLIED_STATE_ID, listedLaterShards, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
-import type { OldSummaryCost, SweptRows } from '../sweep.js';
+import type { SummaryDropCost, SweptRows } from '../sweep.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -8650,11 +8650,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const listed = listedRows(items);
       if (listed.size > 0) {
-        const leaving = new Set([...listedLaterShards(items)].filter((id) => ctx.messageStore.get(id) === null));
-        if (leaving.size > 0 && this.storeWrittenElsewhere()) {
+        const gone = (id: MessageId): boolean => ctx.messageStore.get(id) === null;
+        const leaving = new Set([...listedLaterShards(items)].filter(gone));
+        const joined = new Map<MessageId, number>();
+        for (const item of items) {
+          if (item.kind !== 'listed') continue;
+          for (const body of item.bodies) {
+            if (body.laterShards.length > 0 && body.laterShards.every(gone)) joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
+          }
+        }
+        if ((leaving.size > 0 || joined.size > 0) && this.storeWrittenElsewhere()) {
           for (const id of this.takeUpStoreBeforeLetGo(leaving, ctx)) listed.add(id);
         }
-        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldRowsThatLeft(leaving, ctx));
+        this.letGoOf(listed, ctx, "were listed by a sweep's pass", () => this.unfoldRowsThatLeft(leaving, ctx, this.writtenBeforeJoin(joined)));
       }
       this.sweepCursor = length;
     } catch (err) {
@@ -8703,15 +8711,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * over the rows it keeps, and one left with none goes. A row that left
    * and is in the window again, presented again before this strategy heard
    * it go, stays in a record that holds it beside a row of its own that
-   * didn't leave: that record was made over it where it stands. The
-   * chunks aren't rebuilt here.
+   * didn't leave: that record was made over it where it stands. The L1s
+   * `alsoDrop` names go too, with every summary above them, and the record
+   * of each is compressed again over its own rows: those over a joined
+   * note's first row (letGoOfSweptRows). The chunks aren't rebuilt here.
    */
   private unfoldRowsThatLeft(
     leaving: ReadonlySet<MessageId>,
     ctx: StrategyContext,
+    alsoDrop: ReadonlySet<string> = new Set(),
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
     const view = ctx.messageStore;
     const seeds = this.summariesFolding(leaving);
+    for (const id of alsoDrop) seeds.add(id);
 
     // A row that left and is in the window again, presented again before
     // this was heard, stays in a record that holds it beside a row of its
@@ -8753,12 +8765,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
-  /** Read the branch's applied list of sweeps: the manager asks it as its pass ends. */
-  afterSweepPass(ctx: StrategyContext): void {
-    this.letGoOfSweptRows(ctx, 'the end of a pass');
+  /**
+   * A pass begins: where another instance of the namespace wrote the store
+   * since this one read it, take the store up first, so the drop that the
+   * pass ends with counts only what this pass dropped. The function given
+   * reads the branch's applied list, as the pass ends, and gives what this
+   * instance dropped since it was made, by any path: the removal of a later
+   * shard heard through onRetracted, and the list's let-go.
+   */
+  beforeSweepPass(_ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost {
+    this.requireLoadedBranch('beforeSweepPass');
+    if (this.storeWrittenElsewhere()) this.takeUpStoreState();
+    const from = { summaries: this.summaries, chunkRecords: this.chunkRecords };
+    return (ctx) => {
+      this.letGoOfSweptRows(ctx, 'the end of a pass');
+      const kept = new Set(this.summaries.map((summary) => summary.id));
+      const records = new Set(this.chunkRecords.map((record) => record.id));
+      const dropped = new Set(from.summaries.filter((summary) => !kept.has(summary.id)).map((summary) => summary.id));
+      return this.costOf(dropped, ctx, { from, keeps: (record) => records.has(record.id) });
+    };
   }
 
-  oldSummaryCost(rows: SweptRows, ctx: StrategyContext): OldSummaryCost {
+  writeDropCost(rows: SweptRows, ctx: StrategyContext, contents: ReadonlyMap<MessageId, ContentBlock[]>): SummaryDropCost {
+    this.requireLoadedBranch('writeDropCost');
+    return this.costOf(this.joinDrops(rows), ctx, { gone: rows.removed, contents });
+  }
+
+  oldSummaryCost(rows: SweptRows, ctx: StrategyContext): SummaryDropCost {
     this.requireLoadedBranch('oldSummaryCost');
     return this.costOf(this.oldSummaries(rows), ctx);
   }
@@ -8773,7 +8806,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * a queued merge of a dropped summary goes. An audit-only instance writes
    * nothing, so it refuses.
    */
-  dropOldSummaries(rows: SweptRows, ctx: StrategyContext): OldSummaryCost {
+  dropOldSummaries(rows: SweptRows, ctx: StrategyContext): SummaryDropCost {
     this.requireLoadedBranch('dropOldSummaries');
     if (this.config.auditOnly) {
       throw new Error('AutobiographicalStrategy.dropOldSummaries refused: an audit-only instance writes nothing.');
@@ -8790,14 +8823,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return cost;
   }
 
-  private oldSummaries(rows: SweptRows): Set<string> {
-    const going = this.summariesAbove(this.summariesFolding(rows.removed));
+  /**
+   * What a pass's join of long notes drops (rows.removed, rows.joined):
+   * each L1 over a removed later shard, each L1 over a joined first row
+   * written before that row's join was listed, and every summary above one.
+   */
+  private joinDrops(rows: SweptRows): Set<string> {
+    const seeds = this.summariesFolding(rows.removed);
+    for (const id of this.writtenBeforeJoin(rows.joined)) seeds.add(id);
+    return this.summariesAbove(seeds);
+  }
+
+  /**
+   * The L1s over a joined note's first row (`joined`, with the sequence of
+   * the newest listing of its join) written before that listing, or with no
+   * sequence: made from one piece of the note. An L1 written after it was
+   * made from the joined row.
+   */
+  private writtenBeforeJoin(joined: ReadonlyMap<MessageId, number>): Set<string> {
+    const found = new Set<string>();
+    if (joined.size === 0) return found;
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
+    for (const [id, rows] of this.rowsUnderL1s()) {
+      let listedAt = -Infinity;
+      for (const row of rows) listedAt = Math.max(listedAt, joined.get(row) ?? -Infinity);
+      const written: unknown = byId.get(id)?.writtenAtSequence;
+      if (listedAt !== -Infinity && !(typeof written === 'number' && written >= listedAt)) found.add(id);
+    }
+    return found;
+  }
+
+  /** Each L1, with the rows under it: its sources and those of the chunk record that names it. */
+  private rowsUnderL1s(): Map<string, MessageId[]> {
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
     const rowsUnder = new Map<string, MessageId[]>();
     for (const summary of this.summaries) if (summary.level === 1) rowsUnder.set(summary.id, [...summary.sourceIds]);
     for (const record of this.chunkRecords) {
       if (record.summaryId && byId.get(record.summaryId)?.level === 1) rowsUnder.get(record.summaryId)?.push(...record.sourceIds);
     }
+    return rowsUnder;
+  }
+
+  private oldSummaries(rows: SweptRows): Set<string> {
+    const going = this.joinDrops(rows);
+    const byId = new Map(this.summaries.map((summary) => [summary.id, summary]));
+    const rowsUnder = this.rowsUnderL1s();
     const newestListing = new Map<string, number>();
     const listedUnder = (summary: SummaryEntry): number => {
       const known = newestListing.get(summary.id);
@@ -8825,25 +8895,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return old;
   }
 
-  private costOf(old: ReadonlySet<string>, ctx: StrategyContext): OldSummaryCost {
+  /**
+   * What dropping the summaries `drop` costs (SummaryDropCost), read from
+   * `from` (this instance's summaries and records when not given): the
+   * summaries at each level; each record of a dropped L1 that `keeps`, by
+   * default one with a row not `gone`; and the estimated tokens of the rows
+   * under them that the view holds and that aren't `gone`, a row of
+   * `contents` at its new content.
+   */
+  private costOf(
+    drop: ReadonlySet<string>,
+    ctx: StrategyContext,
+    options: {
+      from?: { summaries: readonly SummaryEntry[]; chunkRecords: readonly ChunkRecord[] };
+      gone?: ReadonlySet<MessageId>;
+      contents?: ReadonlyMap<MessageId, ContentBlock[]>;
+      keeps?: (record: ChunkRecord) => boolean;
+    } = {},
+  ): SummaryDropCost {
+    const { summaries, chunkRecords } = options.from ?? { summaries: this.summaries, chunkRecords: this.chunkRecords };
+    const gone = options.gone ?? new Set<MessageId>();
+    const keeps = options.keeps ?? ((record: ChunkRecord) => record.sourceIds.some((id) => !gone.has(id)));
     const levels = new Map<number, number>();
     const under = new Set<MessageId>();
-    for (const summary of this.summaries) {
-      if (!old.has(summary.id)) continue;
+    for (const summary of summaries) {
+      if (!drop.has(summary.id)) continue;
       levels.set(summary.level, (levels.get(summary.level) ?? 0) + 1);
       if (summary.level === 1) for (const id of summary.sourceIds) under.add(id);
     }
     let records = 0;
-    for (const record of this.chunkRecords) {
-      if (!record.summaryId || !old.has(record.summaryId)) continue;
-      records++;
+    for (const record of chunkRecords) {
+      if (!record.summaryId || !drop.has(record.summaryId)) continue;
+      if (keeps(record)) records++;
       for (const id of record.sourceIds) under.add(id);
     }
     const view = ctx.messageStore;
     let rawTokens = 0;
     for (const id of under) {
-      const message = view.get(id);
-      if (message) rawTokens += view.estimateTokens(this.prunedForSend(view, message));
+      const message = gone.has(id) ? null : view.get(id);
+      if (!message) continue;
+      const content = options.contents?.get(id);
+      rawTokens += view.estimateTokens(this.prunedForSend(view, content ? { ...message, content } : message));
     }
     return { summaries: [...levels].sort(([a], [b]) => a - b).map(([level, count]) => ({ level, count })), records, rawTokens };
   }

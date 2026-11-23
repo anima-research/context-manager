@@ -22,7 +22,13 @@
     give the old text: what an entry throws is reported by its class alone.
     A refusal is given as it reads, and can quote the content that the entry
     gave. Its `oldSummaries` counts, at each level, the summaries of the
-    manager's strategy that a pass of the changes would leave old.
+    manager's strategy that a pass of the changes would leave old. Its
+    `writeDrops` gives what the pass would drop itself, where it joins a
+    long note (below): the summaries at each level, the chunk records that
+    keep a row and are folded again, and the estimated tokens of the rows
+    under them that stand, the first row at its new size
+    (`SummaryDropCost`). A summary is counted in one of the two, never in
+    both.
   - `ContextManager.takeSweep(name)` records once, for the whole store, that
     it took the sweep: a `context-manager/sweep-take` typed record, which
     every branch sees. It rewrites nothing. No call takes a take back, so
@@ -51,25 +57,29 @@
     store; a listener of its writes that moves the store to another branch
     or closes the manager stops it, and so does a write to the applied list
     that throws (`stopped`), and list items or take records that don't
-    parse are named (`unreadable`).
+    parse are named (`unreadable`). Its report gives what the manager's
+    strategy dropped during the pass (`dropped`, a `SummaryDropCost`), or
+    null where a listener moved the store to another branch or closed the
+    manager.
     No load of a manager makes a pass: its host asks for one.
   - `ContextManager.sweepReceipt(name)` says where the sweep stands on the
     open branch: the store's newest take, whether the branch finished it,
-    each pass with the bodies that it listed, and `oldSummaries`, the
-    strategy's old summaries at each level over the rows those passes
-    listed. An old summary is a summary written before a pass listed a row
-    under it, at any level, or a summary above one. A summary written
-    before this release counts as old; a later one carries the store's
-    sequence when it was written (`SummaryEntry.writtenAtSequence`), which
-    is compared with the list item's `sequence`. A summary over a removed
-    later shard is none: the removal drops it. The show, the receipt and
-    the two calls below need an initialized manager, and read its strategy
-    as it last read the store.
+    each pass with the bodies that it listed, each marked `joined` once a
+    pass joined it and none of its later shards is stored, and
+    `oldSummaries`, the strategy's old summaries at each level over the rows
+    those passes listed. An old summary is a summary written before a pass
+    listed a row under it, at any level, or a summary above one. A summary
+    written before this release counts as old; a later one carries the
+    store's sequence when it was written (`SummaryEntry.writtenAtSequence`),
+    which is compared with the list item's `sequence`. A summary that a
+    pass's join of a long note drops is none. The show, the receipt and the
+    two calls below need an initialized manager, and read its strategy as it
+    last read the store.
   - `ContextManager.oldSummaryCost(name)` gives what the second act would
     drop and writes nothing: the old summaries at each level, the chunk
     records under them, which the strategy's compression folds again, and
     the estimated tokens of the rows under them, which render raw until it
-    has (`OldSummaryCost`).
+    has (`SummaryDropCost`).
   - `ContextManager.dropOldSummaries(name)` is the second act: the manager's
     strategy drops its old summaries of the sweep, with every summary above
     them, and gives what it dropped. It is done when the call returns, and
@@ -82,30 +92,35 @@
     dry compile of that instance can still hold a dropped summary. A call
     that throws lists nothing, and a call made again lists the act. An
     audit-only strategy refuses it, and writes nothing. A strategy declares
-    it, with `oldSummaryCost` and `afterSweepPass`, as optional members of
-    `ContextStrategy`; for a strategy without them, the manager reports no
-    old summaries and drops none.
+    it, with `oldSummaryCost`, `writeDropCost` and `beforeSweepPass`, as
+    optional members of `ContextStrategy`; for a strategy without them, the
+    manager reports no old summaries and drops none.
   - `derive` carries the applied list with the other states the manager
     owns.
   - `AutobiographicalStrategy`, and so `KnowledgeStrategy`, reads the
     branch's applied list at initialize, before a live select, at each tick,
     before it writes an L1 and, in the manager that made the pass, as the
-    pass ends (`afterSweepPass`). Each instance keeps in memory how far it
-    has read, and reads the list from its start at each initialize. A
-    summary over a rewritten row stays: no read of the list drops it, so a
-    rewrite doesn't make the resident's context larger, and a dry compile
-    and a live one show the same summaries. It goes at the second act, or
-    as any summary goes when its row leaves the window. A summary over a
-    removed later shard goes at once, with every summary above it, in
-    either window mode, and the chunk record that held the shard keeps its
-    other rows and is compressed again; a listed later shard that still
-    stands, after a pass that stopped before its removal, keeps what covers
-    it until a pass removes it. An L1 in flight over a listed row is not written,
-    and its chunk is folded again from the new text. Nothing is read while
-    any pass runs. Another manager's strategy lets go of a removed shard's
-    summaries at its next live select, tick or L1, and until then a dry
-    compile of it can still show them. An audit-only instance lets go of
-    nothing, as it leaves rows that left the window under what covers them.
+    pass ends (the function that `beforeSweepPass` gives). Each instance
+    keeps in memory how far it has read, and reads the list from its start
+    at each initialize. A summary over a row that a pass edited in place
+    stays: no read of the list drops it, so such an edit doesn't make the
+    resident's context larger, and a dry compile and a live one show the
+    same summaries. It goes at the second act, or as any summary goes when
+    its row leaves the window. A joined note loses its summaries at once,
+    in either window mode: each summary over a removed later shard, each L1
+    over its first row written before its join was listed, and every
+    summary above one. The chunk record that held a shard keeps its other
+    rows, the record over the first row keeps its rows, and each is
+    compressed again, the first row from its new text. A listed later shard
+    that still stands, after a pass that stopped before its removal, keeps
+    what covers it, and so does the first row, until a pass removes the
+    shard. An L1 written over the joined row after its join stays. An L1 in
+    flight over a listed row is not written, and its chunk is folded again
+    from the new text. Nothing is read while any pass runs. Another
+    manager's strategy lets go of a joined note's summaries at its next
+    live select, tick or L1, and until then a dry compile of it can still
+    show them. An audit-only instance lets go of nothing, as it leaves rows
+    that left the window under what covers them.
   - `MessageStore.rewriteBody(id, content)` writes a body's whole content at
     its first row, without the body group's fields;
     `MessageStore.checkRewrite(id, content)` throws what it would refuse,
@@ -118,15 +133,25 @@
     again, and a compile whose budget can't hold them refuses until then.
     Where a fault runs through much of an old history, the act makes most
     of it raw. `oldSummaryCost` gives that size before the act.
-  - Three limits. A long note whose mended text is still long is not
+  - A write that joins a long note can cost the resident its turns for a
+    time too. A summary left without its parent renders again at its own
+    level until compression merges it again, and the rows under a dropped
+    L1 render raw until compression folds them again; a compile whose
+    budget can't hold them refuses until then. The same happens on each
+    other branch when a pass there joins the note, with no show before it.
+    `showSweep` gives the size on the open branch before the write
+    (`writeDrops`), and each pass reports what it dropped (`dropped`).
+  - Four limits. A long note whose mended text is still long is not
     mended: it is refused, and stays owed. A summary of other rows, made
     before the pass, keeps any words that it took from a mended body that
     its request carried as context: a summary records no recall set, so
     the second act doesn't find it. Every namespace keeps its old summaries
     until its own second act; an older context-manager makes none, and
     reads no applied list, so beside a host that runs one a namespace keeps
-    its summaries over a removed shard until an instance of this release
-    opens it.
+    its summaries over a joined note until an instance of this release
+    opens it. A context copied from a compile between a pass and the
+    second act, as rows of its own, keeps the old summaries' words for
+    good: no second act reaches a copy.
   - As after any edit, a rewrite changes what a branch sends before its
     later replies, so those replies' thinking is no longer sent to a
     provider that binds thinking to its request (`thinking-binding.ts`).

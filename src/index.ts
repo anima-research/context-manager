@@ -150,8 +150,9 @@ export type {
   SweepPassReport,
   SweepPass,
   SweepReceipt,
-  OldSummaryLevel,
-  OldSummaryCost,
+  SummaryLevelCount,
+  SummaryDropCost,
+  ReceiptBody,
   SweptRows,
 } from './sweep.js';
 
