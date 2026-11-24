@@ -125,6 +125,14 @@ export interface StoredMessage {
 }
 
 /**
+ * A stored message as a read without blob resolution gives it
+ * (`resolveBlobs: false`): media that the store keeps as a blob is a
+ * `blob_ref`, at the top of the content and inside a tool result. A write
+ * refuses a `blob_ref`, so this content can't be written back as it is.
+ */
+export type UnresolvedMessage = Omit<StoredMessage, 'content'> & { content: StoredContentBlock[] };
+
+/**
  * Reference to a blob stored in Chronicle.
  * Used internally to avoid duplicating media content.
  */

@@ -60,6 +60,7 @@ export type {
   BranchId,
   MessageMetadata,
   StoredMessage,
+  UnresolvedMessage,
   BlobReference,
   BlobReferenceBlock,
   StoredContentBlock,

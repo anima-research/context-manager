@@ -13,7 +13,12 @@
 - **TypeScript consumers:** `StoredContentBlock` has a new `tool_result`
   variant, `StoredToolResult`. Its content array can hold a
   `BlobReferenceBlock`, and the package exports both types. The compiler
-  doesn't accept a `StoredToolResult` as membrane's `ContentBlock`.
+  doesn't accept a `StoredToolResult` as membrane's `ContentBlock`. A window
+  read with `resolveBlobs: false` (`ContextManager.getMessageWindow`,
+  `MessageStore.getWindow`) now gives `UnresolvedMessage`s, whose content is
+  `StoredContentBlock[]`, so the compiler refuses to write such content back.
+  With a `boolean`, a message has either type. `MessageWindow` takes its
+  message type as a parameter, `StoredMessage` by default.
 - Keep an image in a tool result as a blob, as the store keeps an image at the
   top of a message. This applies to each image in the content array of a
   top-level `tool_result`. An image whose source is a URL stays as it is. The
@@ -26,8 +31,9 @@
     store already gives back an image at the top of a message this way. The
     store writes the base64 again from the bytes. For a png, jpeg, gif or
     webp, it takes the media type from the bytes' signature, and for other
-    bytes it takes the declared type. It keeps no other field, so it drops a
-    `tokenEstimate` stamp and prices the image at 1,600 tokens.
+    bytes it takes the declared type. It keeps no other field, so a read
+    gives no `tokenEstimate` stamp, and the store prices the image at 1,600
+    tokens.
   - A write now refuses an image in a tool result if the store can't keep it.
     Before this release, a write checked only the image's form. The refusal
     names the image's place, such as `content[0].content[1].source.mediaType`.

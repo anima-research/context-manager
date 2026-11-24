@@ -9,6 +9,7 @@ import type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   StoredMessage,
+  UnresolvedMessage,
   ContextEntry,
   TokenBudget,
   PendingWork,
@@ -1858,7 +1859,10 @@ export class ContextManager {
    * See MessageStore.getWindow for options (blob resolution, bodyGroup
    * alignment). Intended for viewers/paginated UIs.
    */
-  getMessageWindow(offset: number, limit: number, opts?: MessageWindowOptions): MessageWindow {
+  getMessageWindow(offset: number, limit: number, opts: MessageWindowOptions & { resolveBlobs: false }): MessageWindow<UnresolvedMessage>;
+  getMessageWindow(offset: number, limit: number, opts?: MessageWindowOptions & { resolveBlobs?: true }): MessageWindow;
+  getMessageWindow(offset: number, limit: number, opts?: MessageWindowOptions): MessageWindow | MessageWindow<UnresolvedMessage>;
+  getMessageWindow(offset: number, limit: number, opts?: MessageWindowOptions): MessageWindow | MessageWindow<UnresolvedMessage> {
     return this.messageStore.getWindow(offset, limit, opts);
   }
 

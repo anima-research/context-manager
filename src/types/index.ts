@@ -8,6 +8,7 @@ export type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   StoredMessage,
+  UnresolvedMessage,
   BlobReference,
   StoredContentBlock,
   StoredToolResult,
