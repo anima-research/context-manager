@@ -25,10 +25,9 @@
     manager's strategy that a pass of the changes would leave old. Its
     `writeDrops` gives what the pass would drop itself, where it joins a
     long note (below): the summaries at each level, the chunk records that
-    keep a row and are folded again, the estimated tokens of the rows under
-    them that stand, the first row at its new size, and the change in the
-    strategy's floor that the write makes (`SummaryDropCost`, below). It
-    counts a note whose later shards an earlier
+    keep a row and are folded again, and the estimated tokens of the rows
+    under them that stand, the first row at its new size
+    (`SummaryDropCost`). It counts a note whose later shards an earlier
     pass left standing too, since the next pass removes them first. A
     summary is counted in one of the two, never in both.
   - `ContextManager.takeSweep(name)` records once, for the whole store, that
@@ -79,10 +78,9 @@
     last read the store.
   - `ContextManager.oldSummaryCost(name)` gives what the second act would
     drop and writes nothing: the old summaries at each level, the chunk
-    records under them, which the strategy's compression folds again, the
-    estimated tokens of the rows under them, which render raw until it has,
-    and the change in the strategy's floor that the act makes
-    (`SummaryDropCost`).
+    records under them, which the strategy's compression folds again, and
+    the estimated tokens of the rows under them, which render raw until it
+    has (`SummaryDropCost`).
   - `ContextManager.dropOldSummaries(name)` is the second act: the manager's
     strategy drops its old summaries of the sweep, with every summary above
     them, and gives what it dropped. It is done when the call returns, and
@@ -136,38 +134,25 @@
     under the dropped summaries render raw until compression folds them
     again, and a compile whose budget can't hold them refuses until then.
     Where a fault runs through much of an old history, the act makes most
-    of it raw. `oldSummaryCost` gives the change in the floor before the
-    act (`floorChange`, below).
+    of it raw. `oldSummaryCost` counts what the act drops before it: the
+    summaries, the chunk records and the tokens of the rows that render
+    raw.
   - A write that joins a long note can cost the resident its turns for a
     time too. A summary left without its parent renders again at its own
     level until compression merges it again, and the rows under a dropped
     L1 render raw until compression folds them again; a compile whose
     budget can't hold them refuses until then. The same happens on each
     other branch when a pass there joins the note, with no show before it.
-    `showSweep` gives the change in the floor on the open branch before the
-    write (`writeDrops.floorChange`), and each pass reports what it dropped
-    and the change it made (`dropped`).
-  - `SummaryDropCost.floorChange` (`FloorChange`) says how much more room,
-    or less, a compile needs after the write: the change in the strategy's
-    floor, the fewest tokens that the compile's plan can reach for the open
-    branch. With the over-budget grace, the floor says the least `maxTokens`
-    at which a compile fits, so a compile whose budget held the old floor
-    can refuse once it grows. It counts the write as it lands, before
-    compression folds anything again, and is below zero where the floor
-    shrinks, as on a flat store, where the dropped summaries' own tokens
-    leave the compile. `rawTokens` is the text that compression folds
-    again, not that change. The change is not known, with the reason, where
-    it could be wrong: the strategy selects without adaptive resolution; a
-    row that the write rewrites or removes lies in or next to the head or
-    the recent window, which then moves, or holds a tool call or result; a
-    summary lies across a raw window, where a compile can take it and fit
-    below the floor; a row that it prices is pinned or, under kv-unified,
-    locked, or holds an image; a chunk record names a summary that the
-    strategy doesn't hold; the instance hasn't read what another instance
-    of its namespace or a pass on the branch changed; a row was added, or a
-    summary written or changed, during the pass; under a folding strategy other than
-    kv-unified, a summary that it prices costs more than the rows under it;
-    or the strategy doesn't price its floor.
+    `showSweep` counts what the write drops on the open branch before it
+    (`writeDrops`), and each pass reports what it dropped (`dropped`).
+  - `rawTokens` in these counts is the text that compression folds again,
+    not the change in the size of a compile. A summary left without its
+    parent renders again at its own level, and the dropped summaries leave
+    the compile, so the smallest compile can grow by more or less than
+    `rawTokens`, or shrink: on a flat store, where every summary is an L1,
+    a join can shrink it. No count gives that change. Where it grows, a
+    compile whose budget held the old size can refuse until compression
+    folds again.
   - Four limits. A long note whose mended text is still long is not mended:
     it is refused, and stays owed. A summary of other rows, made before the
     pass, keeps any words that it took from a mended body that its request

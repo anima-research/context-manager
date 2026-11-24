@@ -602,9 +602,8 @@ export interface ContextStrategy {
    * (dropOldSummaries). A summary of any level is old where it was written
    * before the newest listing of a row of `rows.rewritten` under it, by the
    * store's sequence; every summary above an old one is old too. What a
-   * pass's join drops (writeDropCost) is no old summary. The cost's
-   * floorChange is the change in the floor that dropping them makes.
-   * Writes nothing. A strategy without it keeps no old summaries.
+   * pass's join drops (writeDropCost) is no old summary. Writes nothing. A
+   * strategy without it keeps no old summaries.
    */
   oldSummaryCost?(rows: SweptRows, ctx: StrategyContext): SummaryDropCost;
 
@@ -613,10 +612,8 @@ export interface ContextStrategy {
    * note: each summary over a later shard of `rows.removed`, each summary
    * over a first row of `rows.joined` written before that row's join was
    * listed, and each summary above one. `contents` gives the new content of
-   * a rewritten row, which the raw tokens count. The cost's floorChange is
-   * the change in the floor that the whole write makes: its drop, its
-   * removals and its new contents. Writes nothing. A strategy without it
-   * drops nothing at a pass.
+   * a rewritten row, which the raw tokens count. Writes nothing. A strategy
+   * without it drops nothing at a pass.
    */
   writeDropCost?(rows: SweptRows, ctx: StrategyContext, contents: ReadonlyMap<MessageId, ContentBlock[]>): SummaryDropCost;
 
@@ -633,7 +630,7 @@ export interface ContextStrategy {
    * is asked as the pass ends, where the store is still on the branch and
    * the manager open: it reads the branch's applied list of sweeps
    * (sweep.ts) and gives what the strategy dropped during the pass, by any
-   * path, and the change in the floor from the branch as the pass began.
+   * path.
    */
   beforeSweepPass?(ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost;
 

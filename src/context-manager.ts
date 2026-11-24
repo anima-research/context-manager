@@ -2012,9 +2012,7 @@ export class ContextManager {
    * note, its first row included, and each summary above one, also for a
    * note whose later shards an earlier pass listed and left standing, which
    * the next pass removes first. A summary is in one of the two, never
-   * both. Its floorChange is the change in the strategy's floor that the
-   * write makes (FloorChange), which says whether a compile then needs more
-   * room. Refused while a sharded addMessage of this manager stores its
+   * both. Refused while a sharded addMessage of this manager stores its
    * shards.
    */
   showSweep(entry: SweepEntry): SweepShow {
@@ -2059,15 +2057,13 @@ export class ContextManager {
    * What the second act of the sweep `name` (dropOldSummaries) would drop
    * from this manager's strategy, on the open branch: its old summaries at
    * each level, the chunk records that its compression would fold again,
-   * the estimated tokens of the rows under them, which render raw until it
-   * has, and the change in the strategy's floor that the act makes
-   * (FloorChange). An old summary is a summary written before a pass
-   * listed a row under it, or a summary above one, but for one that a
-   * pass's join of a long note drops (showSweep's `writeDrops`). It writes
-   * nothing. It reads the strategy as it last read the store, so where
-   * another instance of the namespace wrote since, the act, which takes up
-   * the store first, can drop otherwise, and the change in the floor is not
-   * known.
+   * and the estimated tokens of the rows under them, which render raw until
+   * it has. An old summary is a summary written before a pass listed a row
+   * under it, or a summary above one, but for one that a pass's join of a
+   * long note drops (showSweep's `writeDrops`). It writes nothing. It reads the
+   * strategy as it last read the store, so where another instance of the
+   * namespace wrote since, the act, which takes up the store first, can
+   * drop otherwise.
    */
   oldSummaryCost(name: string): SummaryDropCost {
     this.requireInitialized('oldSummaryCost');

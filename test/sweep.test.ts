@@ -1059,7 +1059,7 @@ describe('old summaries and the second act', () => {
     await drain(cm);
     const made = summariesOver(strategy, id);
     assert.ok(made.length > 0 && made.every((s) => s.content.includes(NEW) && !s.content.includes(OLD)), 'the record is folded again from the new text');
-    assert.deepEqual(cm.dropOldSummaries('rewords-test'), { summaries: [], records: 0, rawTokens: 0, floorChange: { known: false, reason: 'the strategy selects without adaptive resolution, which plans no floor' } }, 'a second act drops nothing');
+    assert.deepEqual(cm.dropOldSummaries('rewords-test'), { summaries: [], records: 0, rawTokens: 0 }, 'a second act drops nothing');
     assert.deepEqual(summariesOver(strategy, id).map((s) => s.id), made.map((s) => s.id));
     cm.close();
   });
@@ -1210,12 +1210,9 @@ describe('old summaries and the second act', () => {
     writer.applySweeps([rewords()]);
     const before = summariesOf(strategy).length;
     const going = summariesOf(strategy).filter(overLater).length;
-    const { floorChange, ...cost } = reader.oldSummaryCost('rewords-test');
+    const cost = reader.oldSummaryCost('rewords-test');
     assert.ok(total(cost.summaries) > 0, 'premise: the reader has old summaries');
-    assert.deepEqual(floorChange, { known: false, reason: "this instance hasn't read what another instance of its namespace or a pass on the branch changed since" }, 'its report gives the change in the floor as not known');
-    const { floorChange: actChange, ...dropped } = reader.dropOldSummaries('rewords-test');
-    assert.deepEqual(dropped, cost, 'it drops what its report named');
-    assert.equal(actChange.known, true, 'the act, made after it let go, gives the change it made');
+    assert.deepEqual(reader.dropOldSummaries('rewords-test'), cost, 'it drops what its report named');
     for (const id of later) assert.ok(!covered(strategy).has(id), `no summary covers ${id}`);
     assert.equal(before - summariesOf(strategy).length, going + total(cost.summaries), 'what went is what covered a removed shard and what the report named');
     reader.close();
@@ -1658,7 +1655,7 @@ describe('what runs beside a pass', () => {
     assert.equal(cm.sweepReceipt('rewords-test').finished, false, 'the first branch owes the sweep');
     const finished = cm.applySweeps([rewords()]);
     assert.equal(finished.sweeps[0]!.outcome, 'finished');
-    assert.deepEqual(finished.dropped, { summaries: [], records: 0, rawTokens: 0, floorChange: { known: false, reason: "the strategy doesn't price its floor" } }, 'a strategy that keeps no summaries drops none, and says nothing of its floor');
+    assert.deepEqual(finished.dropped, { summaries: [], records: 0, rawTokens: 0 }, 'a strategy that keeps no summaries drops none');
     assert.ok(textOfBlocks(cm.getMessage(second)!.content).includes(NEW));
     cm.close();
   });
@@ -2128,30 +2125,9 @@ describe('readers that keep summaries', () => {
   });
 });
 
-describe('the floor that a write leaves', () => {
-  const KV_UNIFIED = {
-    policy: {
-      alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
-      cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25, continuityLambda: 1,
-      continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
-      continuityStableHalfLife: 10, continuityStableFloor: 0.25,
-    },
-    tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
-    treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
-  };
-  const HIERARCHICAL = { hierarchical: true, mergeThreshold: 2 } as const;
-  const EXACT = { overBudgetGraceRatio: 0 } as const;
-  const WINDOWS = { headWindowTokens: 150, recentWindowTokens: 400 } as const;
-
-  function notesAmongChats(cm: ContextManager, notes: number, chats: number): void {
-    for (let n = 0; n < notes; n++) {
-      for (let i = 0; i < chats; i++) cm.addMessage('User', [text(`chat ${n}.${i} ${'words '.repeat(60)}`)]);
-      longNote(cm, `LONG${n}`);
-    }
-    for (let i = 0; i < chats; i++) cm.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-  }
-
+describe('the size of a compile after a join', () => {
   async function smallestBudget(cm: ContextManager): Promise<number> {
+    await cm.compile(BIG);
     const fits = async (maxTokens: number): Promise<boolean> => {
       try {
         await cm.compile({ maxTokens, reserveForResponse: 0 }, undefined, { dryRun: true });
@@ -2172,310 +2148,21 @@ describe('the floor that a write leaves', () => {
     return low;
   }
 
-  async function smallestCompile(cm: ContextManager): Promise<number> {
-    await cm.compile(BIG);
-    return smallestBudget(cm);
-  }
-
-  const shapes = [
-    { name: 'hierarchical, three notes among chats', config: HIERARCHICAL, grows: true },
-    { name: 'flat, three notes among chats', config: {}, grows: undefined },
-    { name: 'kv-unified, hierarchical, with a head and a recent window', config: { ...HIERARCHICAL, ...WINDOWS, foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } } }, grows: true },
-  ] as const;
-  for (const shape of shapes) {
-    it(`S90 (${shape.name}): a join's change in the floor is known before the write, and the pass reports the change it made`, async () => {
-      const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...shape.config });
-      const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-      for (let i = 0; i < 6; i++) cm.addMessage('User', [text(`first ${i} ${'words '.repeat(60)}`)]);
-      const short = note(cm, `a note ${OLD} ${'words '.repeat(40)}`);
-      notesAmongChats(cm, 3, 20);
-      await drain(cm);
-      assert.ok(summariesOver(strategy, short).length > 0, 'premise: a summary folds the short note, which the write rewrites');
-      const before = await smallestCompile(cm);
-      const shown = cm.showSweep(rewords());
-      assert.ok(total(shown.writeDrops.summaries) > 0, 'premise: the write drops summaries');
-      assert.ok(total(shown.oldSummaries) > 0, 'premise: the write leaves a summary over the short note old');
-      cm.takeSweep('rewords-test');
-      const report = cm.applySweeps([rewords()]);
-      const change = (await smallestCompile(cm)) - before;
-      if (shape.grows !== undefined) assert.equal(change > 0, shape.grows, 'premise: the floor grows on a hierarchical store');
-      assert.deepEqual(shown.writeDrops.floorChange, { known: true, tokens: change }, 'the show gives the change in the floor');
-      assert.deepEqual(report.dropped?.floorChange, shown.writeDrops.floorChange, 'and the pass reports the change it made');
-      cm.close();
-    });
-  }
-
-  it('S91: a write that rewrites or removes a row in the recent or the head window gives the change as not known, with the reason', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL, ...WINDOWS });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    for (let i = 0; i < 10; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    longNote(cm, 'LONG');
-    cm.addMessage('User', [text('after')]);
-    await drain(cm);
-    const shown = cm.showSweep(rewords());
-    assert.deepEqual(shown.writeDrops.floorChange, { known: false, reason: 'a row that the write rewrites lies in or next to the recent window, which then moves' }, 'not known where a note has rows in the recent window');
-    cm.takeSweep('rewords-test');
-    assert.deepEqual(cm.applySweeps([rewords()]).dropped?.floorChange, shown.writeDrops.floorChange, 'the pass reports it as not known too');
-    cm.close();
-
-    const headStrategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...WINDOWS });
-    const head = await ContextManager.open({ path: freshPath(), strategy: headStrategy, membrane: mockMembrane() });
-    note(head, `a note ${OLD}`);
-    for (let i = 0; i < 12; i++) head.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    await drain(head);
-    const headShown = head.showSweep(rewords());
-    assert.equal(headShown.changes.length, 1, 'premise: the write rewrites the note');
-    assert.deepEqual(headShown.writeDrops.floorChange, { known: false, reason: 'a row that the write rewrites lies in or next to the head window, which then moves' });
-    head.close();
-
-    const chatText = `after ${'words '.repeat(60)}`;
-    const noteText = `a note ${OLD} ${'words '.repeat(40)}`;
-    const sizer = await ContextManager.open({ path: freshPath(), strategy: adaptive(), membrane: mockMembrane() });
-    const sizes = (sizer as unknown as { messageStore: { estimateTokens(message: unknown): number } }).messageStore;
-    const chatTokens = sizes.estimateTokens(sizer.getMessage(sizer.addMessage('User', [text(chatText)])));
-    const noteTokens = sizes.estimateTokens(sizer.getMessage(note(sizer, noteText)));
-    sizer.close();
-    const nextStrategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, recentWindowTokens: 3 * chatTokens + Math.floor(noteTokens / 2) });
-    const next = await ContextManager.open({ path: freshPath(), strategy: nextStrategy, membrane: mockMembrane() });
-    for (let i = 0; i < 12; i++) next.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    const edge = note(next, noteText);
-    for (let i = 0; i < 3; i++) next.addMessage('User', [text(chatText)]);
-    await drain(next);
-    const all = next.getAllMessages();
-    const recentStart = (nextStrategy as unknown as { getRecentWindowStart(view: unknown): number }).getRecentWindowStart((next as unknown as { messageStore: unknown }).messageStore);
-    assert.equal(all[recentStart - 1]?.id, edge, 'premise: the note is the row just before the recent window');
-    assert.deepEqual(next.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that the write rewrites lies in or next to the recent window, which then moves' }, 'a rewrite of the row just before the window can move it');
-    next.close();
-  });
-
-  for (const cap of [0, 5]) {
-  it(`S92 (cap ${cap}): rows that no summary folds are priced as they render raw, before and after: a short note rewritten and a long one joined`, async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL, maxMessageTokens: cap });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    for (let i = 0; i < 12; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    await drain(cm);
-    const short = note(cm, `a note ${OLD} ${'words '.repeat(10)}${FILLER.repeat(4)}`);
-    const long = longNote(cm, 'LONG');
-    for (let i = 0; i < 3; i++) cm.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    assert.equal(summariesOverAny(strategy, [short, ...bodyRows(cm, long)]).length, 0, 'premise: no summary folds either note');
-    const before = await smallestCompile(cm);
-    const shown = cm.showSweep(rewords());
-    assert.equal(shown.changes.length, 2, 'premise: the write rewrites both notes');
-    cm.takeSweep('rewords-test');
-    const report = cm.applySweeps([rewords()]);
-    const change = (await smallestCompile(cm)) - before;
-    assert.ok(change < 0, 'premise: the floor shrinks');
-    assert.deepEqual(shown.writeDrops.floorChange, { known: true, tokens: change });
-    assert.deepEqual(report.dropped?.floorChange, shown.writeDrops.floorChange);
-    cm.close();
-  });
-  }
-
-  it('S98: the pass reports the change that its listeners made too: an edit of another raw row is priced, and a row added or a summary changed during the pass makes the change not known', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    for (let i = 0; i < 12; i++) cm.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    await drain(cm);
-    note(cm, `a note ${OLD} ${'words '.repeat(10)}`);
-    const other = cm.addMessage('User', [text(`another ${'words '.repeat(50)}`)]);
-    for (let i = 0; i < 3; i++) cm.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    const before = await smallestCompile(cm);
-    cm.takeSweep('rewords-test');
-    let edited = false;
-    const stop = cm.onMessage((event) => {
-      if (event.type !== 'edit' || edited) return;
-      edited = true;
-      cm.editMessage(other, [text('another, shorter')]);
-    });
-    const report = cm.applySweeps([rewords()]);
-    stop();
-    assert.ok(edited, 'premise: the listener edited the other row');
-    const change = (await smallestCompile(cm)) - before;
-    assert.deepEqual(report.dropped?.floorChange, { known: true, tokens: change }, 'the report prices the listener\'s edit too');
-
-    const added = await ContextManager.open({ path: freshPath(), strategy: new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true }), membrane: mockMembrane() });
-    for (let i = 0; i < 6; i++) added.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    note(added, `a note ${OLD}`);
-    for (let i = 0; i < 3; i++) added.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    added.takeSweep('rewords-test');
-    let appended = false;
-    added.onMessage((event) => { if (event.type === 'edit' && !appended) { appended = true; added.addMessage('User', [text('a new row')]); } });
-    const addedReport = added.applySweeps([rewords()]);
-    assert.ok(appended, 'premise: the listener added a row');
-    assert.deepEqual(addedReport.dropped?.floorChange, { known: false, reason: 'a row was added during the pass' });
-    added.close();
-
-    const editedStrategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true });
-    const summaryEdit = await ContextManager.open({ path: freshPath(), strategy: editedStrategy, membrane: mockMembrane() });
-    for (let i = 0; i < 6; i++) summaryEdit.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    note(summaryEdit, `a note ${OLD}`);
-    for (let i = 0; i < 3; i++) summaryEdit.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    await drain(summaryEdit);
-    const someSummary = summariesOf(editedStrategy)[0]!;
-    summaryEdit.takeSweep('rewords-test');
-    let rewrote = false;
-    summaryEdit.onMessage((event) => { if (event.type === 'edit' && !rewrote) { rewrote = true; summaryEdit.editSummaryText(someSummary.id, 'a summary written anew', { by: 'test' }, { apply: true }); } });
-    const editedReport = summaryEdit.applySweeps([rewords()]);
-    assert.ok(rewrote, 'premise: the listener changed a summary');
-    assert.deepEqual(editedReport.dropped?.floorChange, { known: false, reason: 'a summary was written or changed during the pass' });
-    summaryEdit.close();
-    cm.close();
-  });
-
-  it('S99: after a pass that left a joined note\'s later shards standing, the second act\'s change in the floor is not known where a summary above an old one also covers a standing shard', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    const short = note(cm, `a note ${OLD} ${'words '.repeat(40)}`);
-    const { rows } = joinFixture(cm);
-    await drain(cm);
-    const shared = summariesOf(strategy).filter((summary) => {
-      const leaves = leavesOf(summariesOf(strategy), summary);
-      return leaves.has(short) && rows.slice(1).some((id) => leaves.has(id));
-    });
-    assert.ok(shared.length > 0, 'premise: a summary covers both the short note and a later shard of the long one');
-    cm.takeSweep('rewords-test');
-    const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
-    cm.applySweeps([rewords()]);
-    stop.restore();
-    assert.ok(cm.getMessage(rows[1]!), 'premise: the later shards stand');
-    assert.deepEqual(cm.oldSummaryCost('rewords-test').floorChange, { known: false, reason: "a pass left a joined note's later shards standing, and a summary above them goes with the old ones" });
-    cm.close();
-  });
-
-  const solvers = [
-    { name: 'flat-profile', config: {}, cheaper: false },
-    { name: 'kv-stable', config: { foldingStrategy: 'kv-stable' }, cheaper: false },
-    { name: 'kv-unified', config: { foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } } }, cheaper: true },
-  ] as const;
-  for (const solver of solvers) {
-  it(`S97 (${solver.name}): where a summary costs more than the rows under it, the change is priced at the cheaper under kv-unified, which takes it, and is not known under another solver`, async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL, ...solver.config });
-    const wordy = {
-      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'a long memory '.repeat(60) }], usage: { input_tokens: 10, output_tokens: 10 } }),
-    } as never;
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: wordy });
-    for (let n = 0; n < 2; n++) {
-      for (let i = 0; i < 60; i++) cm.addMessage('User', [text(`hi ${n}.${i}`)]);
-      longNote(cm, `LONG${n}`);
-    }
-    for (let i = 0; i < 60; i++) cm.addMessage('User', [text(`ok ${i}`)]);
-    await drain(cm);
-    const view = (cm as unknown as { messageStore: { estimateTokens(message: unknown): number } }).messageStore;
-    const dearer = summariesOf(strategy).filter((summary) => summary.level === 1 && view.estimateTokens({ content: [text(summary.content)] }) > summary.sourceIds.reduce((total, id) => total + view.estimateTokens(cm.getMessage(id)), 0));
-    assert.ok(dearer.length > 0, 'premise: an L1 costs more than the rows under it');
-    const before = await smallestCompile(cm);
-    const shown = cm.showSweep(rewords());
-    cm.takeSweep('rewords-test');
-    const report = cm.applySweeps([rewords()]);
-    const change = (await smallestCompile(cm)) - before;
-    assert.deepEqual(shown.writeDrops.floorChange, solver.cheaper ? { known: true, tokens: change } : { known: false, reason: 'a summary costs more than the rows under it, and this solver may not take the cheaper' });
-    assert.deepEqual(report.dropped?.floorChange, shown.writeDrops.floorChange);
-    cm.close();
-  });
-  }
-
-  it('S93: the second act\'s cost gives the change in the floor that the act makes, and the act gives the same', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL });
+  it('S90: rawTokens is the text that renders raw, not the change in the smallest compile: on a flat store a join makes the compile smaller', async () => {
+    const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true, overBudgetGraceRatio: 0 });
     const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
     for (let n = 0; n < 3; n++) {
-      for (let i = 0; i < 8; i++) cm.addMessage('User', [text(`chat ${n}.${i} ${'words '.repeat(60)}`)]);
-      note(cm, `a note ${n} ${OLD} ${'words '.repeat(40)}`);
+      for (let i = 0; i < 20; i++) cm.addMessage('User', [text(`chat ${n}.${i} ${'words '.repeat(60)}`)]);
+      longNote(cm, `LONG${n}`);
     }
-    for (let i = 0; i < 8; i++) cm.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
+    for (let i = 0; i < 20; i++) cm.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
     await drain(cm);
-    cm.takeSweep('rewords-test');
-    assert.equal(cm.applySweeps([rewords()]).sweeps[0]?.removed.length, 0, 'premise: the pass joins no note');
-    const cost = cm.oldSummaryCost('rewords-test');
-    assert.ok(total(cost.summaries) > 0, 'premise: the act drops old summaries');
-    const before = await smallestCompile(cm);
-    const dropped = cm.dropOldSummaries('rewords-test');
-    const change = (await smallestCompile(cm)) - before;
-    assert.notEqual(change, 0, 'premise: the floor changes');
-    assert.deepEqual(cost.floorChange, { known: true, tokens: change }, 'the cost gives the change in the floor');
-    assert.deepEqual(dropped.floorChange, cost.floorChange, 'and the act gives the same');
-    cm.close();
-  });
-
-  it('S95: the change is not known where a summary lies across a raw window: a compression hold starts the recent window over folded rows', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    notesAmongChats(cm, 2, 10);
-    await drain(cm);
-    const all = cm.getAllMessages();
-    const heldAt = all.length - 6;
-    cm.holdCompression([all[heldAt]!.id]);
-    const notes = all.filter((m) => m.metadata?.writer === 'faulty').flatMap((m) => bodyRows(cm, m.id));
-    assert.ok(notes.every((id) => all.findIndex((m) => m.id === id) < heldAt), 'premise: each note lies before the hold');
-    const late = new Set(all.slice(heldAt).map((m) => m.id));
-    const across = summariesOverAny(strategy, notes).filter((summary) => [...leavesOf(summariesOf(strategy), summary)].some((id) => late.has(id)));
-    assert.ok(across.length > 0, 'premise: a summary over a piece of a note has a row in the window');
-    await cm.compile(BIG, undefined, { dryRun: true });
-    const floor = (strategy as unknown as { _plannedFloor: { floorTokens: number } | null })._plannedFloor?.floorTokens;
-    assert.ok(floor !== undefined && (await smallestBudget(cm)) < floor, 'premise: a compile at a small budget takes the summary, and fits below the floor');
+    const before = await smallestBudget(cm);
     const shown = cm.showSweep(rewords());
-    const notKnown = { known: false, reason: 'a summary lies across a raw window, and a compile that cannot leave it out takes it, at another size' };
-    assert.deepEqual(shown.writeDrops.floorChange, notKnown);
+    assert.ok(shown.writeDrops.rawTokens > 0, 'premise: the write makes rows raw');
     cm.takeSweep('rewords-test');
-    assert.deepEqual(cm.applySweeps([rewords()]).dropped?.floorChange, notKnown);
+    cm.applySweeps([rewords()]);
+    assert.ok((await smallestBudget(cm)) < before, 'the smallest compile shrinks, though rawTokens is above zero');
     cm.close();
-  });
-
-  it('S96: the change is not known where a row under a summary that it prices is pinned: a summary that the drop leaves without its parent', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, ...HIERARCHICAL });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    notesAmongChats(cm, 1, 6);
-    await drain(cm);
-    const shown = cm.showSweep(rewords());
-    assert.equal(shown.writeDrops.floorChange.known, true, 'premise: unpinned, the change is known');
-    const notes = cm.getAllMessages().filter((m) => m.metadata?.writer === 'faulty').flatMap((m) => bodyRows(cm, m.id));
-    const going = new Set(summariesOverAny(strategy, notes).map((summary) => summary.id));
-    const all = summariesOf(strategy);
-    const orphan = all.find((summary) => !going.has(summary.id) && summary.level === 1 && going.has(String(summary.parentId ?? summary.mergedInto)));
-    assert.ok(orphan, 'premise: the drop leaves an L1 without its parent');
-    const row = orphan.sourceIds.find((id) => !notes.includes(id))!;
-    cm.pinRange(row, row);
-    assert.deepEqual(cm.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that it prices is pinned or locked, and so kept as it is' });
-    cm.close();
-  });
-
-  it('S94: the change is not known where a row that it prices is pinned, locked under kv-unified, or holds an image', async () => {
-    const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true });
-    const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
-    const { before } = joinFixture(cm);
-    await drain(cm);
-    assert.ok(summariesOverAny(strategy, before).length > 0, 'premise: a summary over the note folds the rows before it');
-    cm.pinRange(before[0]!, before[0]!);
-    assert.deepEqual(cm.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that it prices is pinned or locked, and so kept as it is' });
-    cm.close();
-
-    const kvStrategy = new AutobiographicalStrategy({ ...FOLD, ...EXACT, adaptiveResolution: true, foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } } });
-    const kv = await ContextManager.open({ path: freshPath(), strategy: kvStrategy, membrane: mockMembrane() });
-    const kvFixture = joinFixture(kv);
-    await drain(kv);
-    assert.equal(kv.showSweep(rewords()).writeDrops.floorChange.known, true, 'premise: unlocked, the change is known');
-    kvStrategy.lockChunk(kvFixture.before[0]!);
-    assert.deepEqual(kv.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that it prices is pinned or locked, and so kept as it is' }, 'under kv-unified a lock keeps a row as it is');
-    kv.close();
-
-    const images = await ContextManager.open({ path: freshPath(), strategy: adaptive(), membrane: mockMembrane() });
-    for (let i = 0; i < 6; i++) images.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    images.addMessage('system', [text(`a note ${OLD}`), { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG } }], { writer: 'faulty' });
-    for (let i = 0; i < 6; i++) images.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    assert.deepEqual(images.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that it prices holds an image' });
-    images.close();
-
-    const tools = await ContextManager.open({ path: freshPath(), strategy: adaptive(), membrane: mockMembrane() });
-    for (let i = 0; i < 6; i++) tools.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    tools.addMessage('Assistant', [text(`a call ${OLD}`), { type: 'tool_use', id: 'call-1', name: 'look', input: {} }], { writer: 'faulty' });
-    tools.addMessage('User', [{ type: 'tool_result', toolUseId: 'call-1', content: 'seen' }]);
-    for (let i = 0; i < 6; i++) tools.addMessage('User', [text(`after ${i} ${'words '.repeat(60)}`)]);
-    assert.deepEqual(tools.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'a row that the write rewrites or removes holds a tool call or result, which changes what tool pruning keeps' });
-    tools.close();
-
-    const plain = await ContextManager.open({ path: freshPath(), strategy: folding(), membrane: mockMembrane() });
-    note(plain, `a note ${OLD}`);
-    for (let i = 0; i < 4; i++) plain.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
-    assert.deepEqual(plain.showSweep(rewords()).writeDrops.floorChange, { known: false, reason: 'the strategy selects without adaptive resolution, which plans no floor' });
-    plain.close();
   });
 });

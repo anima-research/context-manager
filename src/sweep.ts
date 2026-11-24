@@ -88,44 +88,26 @@ export interface SummaryLevelCount {
 }
 
 /**
- * How a write changes the strategy's floor, the fewest tokens that the
- * compile's plan can reach for the open branch (its `floor`), counting the
- * write as it lands, before compression folds anything again: above zero
- * where the floor grows, below zero where it shrinks. With the strategy's
- * over-budget grace, the floor says the least `maxTokens` at which a compile
- * fits. Not known, with the reason, where the figure could be wrong: the
- * strategy selects without adaptive resolution; a row that the write
- * rewrites or removes lies in or next to a raw window, which then moves, or
- * holds a tool call or result; a summary lies across a raw window, where a
- * compile can take it and fit below the floor; a row that it prices is
- * pinned or, under kv-unified, locked, or holds an image; a chunk record
- * names a summary that the strategy doesn't hold; the instance hasn't read
- * what another instance of its namespace or a pass on the branch changed;
- * a row was added, or a summary written or changed, during the pass; under a solver
- * other than kv-unified, a summary that it prices costs more than the rows
- * under it; or the strategy doesn't price its floor.
- */
-export type FloorChange = { known: true; tokens: number } | { known: false; reason: string };
-
-/**
  * What a drop of summaries costs: the summaries it drops at each level,
  * with each level that has none left out; the chunk records that keep a
- * row and that the strategy's compression then folds again; the estimated
- * tokens of the rows under them that stand, which is the text that
- * compression folds again; and the change in the floor of the write that
- * drops them (FloorChange), which says whether a compile then needs more
- * room. The second act gives it (ContextManager.dropOldSummaries), and so
- * does a pass's join of a long note.
+ * row and that the strategy's compression then folds again; and the
+ * estimated tokens of the rows under them that stand, which render raw
+ * until it does. `rawTokens` is the text that compression folds again, not
+ * the change in the size of a compile: a summary that the drop leaves
+ * without its parent renders again at its own level, and the dropped
+ * summaries leave the compile, so the smallest compile can grow by more or
+ * less than `rawTokens`, or shrink. The second act gives it
+ * (ContextManager.dropOldSummaries), and so does a pass's join of a long
+ * note.
  */
 export interface SummaryDropCost {
   summaries: SummaryLevelCount[];
   records: number;
   rawTokens: number;
-  floorChange: FloorChange;
 }
 
 export function noDrop(): SummaryDropCost {
-  return { summaries: [], records: 0, rawTokens: 0, floorChange: { known: false, reason: "the strategy doesn't price its floor" } };
+  return { summaries: [], records: 0, rawTokens: 0 };
 }
 
 /**
@@ -178,10 +160,9 @@ export interface SweepShow {
   /**
    * What a pass of the changes would drop itself, where it joins a long
    * note: each summary over a piece of the note, its first row included,
-   * and each summary above one; the chunk records that keep a row; the
+   * and each summary above one; the chunk records that keep a row; and the
    * tokens of the rows under them that stand, a joined note's first row at
-   * its new size; and the change in the floor that the whole write makes,
-   * its rewrites of rows that render raw included.
+   * its new size.
    */
   writeDrops: SummaryDropCost;
 }
@@ -225,9 +206,8 @@ export interface SweepPassReport {
    * held as the pass began and no longer holds as it ends, which are those
    * over a piece of each note that the pass joined, its first row included,
    * with every summary above one; the chunk records that no longer name a
-   * dropped summary and are folded again; the tokens of the rows under
-   * them that stand; and the change in the floor that the pass made. Where
-   * another instance of the namespace writes the
+   * dropped summary and are folded again; and the tokens of the rows under
+   * them that stand. Where another instance of the namespace writes the
    * store from a listener during the pass, its drops are counted too. Null
    * where a listener of one of its writes moved the store to another branch
    * or closed the manager, so the strategy no longer holds the branch, and
