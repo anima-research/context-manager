@@ -1,11 +1,12 @@
 - Sweeps: a named repair of bodies that a store already holds (`src/sweep.ts`).
   A `SweepEntry` has a `name`, a `line` that says what it mends, and a pure
   `mend(body)` that gives a body's new content, or `null` for a body that it
-  leaves. Each block that it is given is a shallow copy. A body is one stored message with its writer, time and metadata,
-  read without blobs; a message stored as shards is given whole, its other
-  blocks first and then its joined text, as `AutobiographicalStrategy`
-  renders a sharded body in its head and recent windows. A block that `mend` gives back as
-  the same object keeps its raw replay forms (`rawItem`, `rawXml`); a block
+  leaves. Each block that it is given is a shallow copy. A body is one
+  stored message with its writer, time and metadata, read without blobs; a
+  message stored as shards is given whole, its other blocks first and then
+  its joined text, as `AutobiographicalStrategy` renders a sharded body in
+  its head and recent windows. A block that `mend` gives back as the same
+  object keeps its raw replay forms (`rawItem`, `rawXml`); a block
   that it changes, and every block that shares a raw form with one, gives
   that form up, so a spread block never replays its old text. An opaque
   carrier keeps its raw item, which is its whole content: an entry mends one
@@ -20,6 +21,8 @@
     it and not through the manager's view, and names each body that a pass
     would not rewrite, and why. It writes nothing, and its changes never
     give the old text: what an entry throws is reported by its class alone.
+    Each change gives the body's new content and the length of its text
+    before and after, counting text blocks and the text of tool results.
     A refusal is given as it reads, and can quote the content that the entry
     gave. Its `oldSummaries` counts, at each level, the summaries of the
     manager's strategy that a pass of the changes would leave old. Its
@@ -59,10 +62,10 @@
     while one runs; a listener of its writes that moves the store to
     another branch or closes the manager stops it, and so does a write to
     the applied list that throws (`stopped`), and list items or take
-    records that don't parse are named (`unreadable`). Its report gives what the manager's
-    strategy dropped during the pass (`dropped`, a `SummaryDropCost`), or
-    null where a listener moved the store to another branch or closed the
-    manager.
+    records that don't parse are named (`unreadable`). Its report gives
+    what the manager's strategy dropped during the pass (`dropped`, a
+    `SummaryDropCost`), or null where a listener moved the store to another
+    branch or closed the manager.
     No load of a manager makes a pass: its host asks for one.
   - `ContextManager.sweepReceipt(name)` says where the sweep stands on the
     open branch: the store's newest take, whether the branch finished it,

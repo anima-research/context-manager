@@ -128,7 +128,11 @@ export interface SweptRows {
 export const SWEEP_TAKE_RECORD = 'context-manager/sweep-take';
 export const SWEEPS_APPLIED_STATE_ID = 'context-manager/sweeps-applied';
 
-/** A change that a show gives: never the old text. Lengths count the characters of text blocks. */
+/**
+ * A change that a show gives: never the old text. Lengths count the
+ * characters of text: each text block's, and each tool result's, as a string
+ * or in its text blocks.
+ */
 export interface SweepChange {
   id: MessageId;
   timestamp: Date;
@@ -183,6 +187,11 @@ export interface SweepPassOutcome {
   rewritten: MessageId[];
   /** Later shards removed: this pass's, and those an earlier pass left. */
   removed: MessageId[];
+  /**
+   * Each body that this pass reported a problem with, and why: one that it
+   * did not rewrite, and one that changed during the pass after its rewrite,
+   * which is in `rewritten` too.
+   */
   failed: SweepFailure[];
 }
 
@@ -395,7 +404,13 @@ function errorClass(error: unknown): string {
 
 export function textLength(content: readonly StoredContentBlock[]): number {
   let length = 0;
-  for (const block of content) if (block.type === 'text') length += block.text.length;
+  for (const block of content) {
+    if (block.type === 'text') length += block.text.length;
+    else if (block.type === 'tool_result') {
+      if (typeof block.content === 'string') length += block.content.length;
+      else for (const inner of block.content) if (inner.type === 'text') length += inner.text.length;
+    }
+  }
   return length;
 }
 

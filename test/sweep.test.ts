@@ -395,6 +395,36 @@ describe('a take and its pass', () => {
     cm.close();
   });
 
+  it('S103: the lengths count the text of a tool result, as a string and in its text blocks', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-1', name: 'calendar', input: {} }]);
+    const asString = cm.addMessage('User', [{ type: 'tool_result', toolUseId: 'tu-1', content: `Calendar ${OLD}` }], { writer: 'faulty' });
+    cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-2', name: 'calendar', input: {} }]);
+    const asBlocks = cm.addMessage(
+      'User',
+      [{ type: 'tool_result', toolUseId: 'tu-2', content: [text(`Calendar ${OLD}`), { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG } }] }],
+      { writer: 'faulty' },
+    );
+    const mendResult = (block: StoredContentBlock): StoredContentBlock => {
+      if (block.type !== 'tool_result') return block;
+      const content = typeof block.content === 'string'
+        ? block.content.replace(OLD, `${NEW}, edition 2`)
+        : block.content.map((inner) => (inner.type === 'text' ? { ...inner, text: inner.text.replace(OLD, `${NEW}, edition 2`) } : inner));
+      return { ...block, content };
+    };
+    const captions: SweepEntry = {
+      name: 'rewords-test',
+      line: 'rewords tool results',
+      mend: (body) => (body.metadata?.writer === 'faulty' && JSON.stringify(body.content).includes(OLD) ? body.content.map(mendResult) : null),
+    };
+    const shown = cm.showSweep(captions);
+    assert.deepEqual(
+      shown.changes.map((change) => [change.id, change.oldLength, change.newLength]),
+      [asString, asBlocks].map((id) => [id, `Calendar ${OLD}`.length, `Calendar ${NEW}, edition 2`.length]),
+    );
+    cm.close();
+  });
+
   it('S18: a rewrite that the store refuses is a failure, and the sweep stays owed', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     cm.addMessage('Claude', [{ type: 'tool_use', id: 'tu-1', name: 'search', input: {} }]);
