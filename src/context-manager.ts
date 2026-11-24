@@ -2169,8 +2169,7 @@ export class ContextManager {
     if (this.isClosed() || this.store.currentBranch().id !== branch) return report;
     if (!ended) return { ...report, dropped: noDrop() };
     try {
-      const changed = new Set(report.sweeps.flatMap((sweep) => [...sweep.rewritten, ...sweep.removed]));
-      return { ...report, dropped: ended(this.createStrategyContext(), changed) };
+      return { ...report, dropped: ended(this.createStrategyContext()) };
     } catch (error) {
       logThrown('Strategy: what a sweep pass dropped could not be told:', error, this.diag);
       return report;

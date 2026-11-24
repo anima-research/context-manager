@@ -147,22 +147,27 @@
     `showSweep` gives the change in the floor on the open branch before the
     write (`writeDrops.floorChange`), and each pass reports what it dropped
     and the change it made (`dropped`).
-  - `SummaryDropCost.floorChange` (`FloorChange`) is what decides whether a
-    compile refuses after the write: the change in the strategy's floor,
-    the fewest tokens that a compile of the open branch needs, which a
-    compile refuses above `maxTokens` × (1 + `overBudgetGraceRatio`). It
-    counts the write as it lands, before compression folds anything again,
-    and is above zero where the floor grows and below zero where it
+  - `SummaryDropCost.floorChange` (`FloorChange`) says how much more room,
+    or less, a compile needs after the write: the change in the strategy's
+    floor, the fewest tokens that the compile's plan can reach for the open
+    branch. With the over-budget grace, the floor says the least `maxTokens`
+    at which a compile fits, so a compile whose budget held the old floor
+    can refuse once it grows. It counts the write as it lands, before
+    compression folds anything again, and is below zero where the floor
     shrinks, as on a flat store, where the dropped summaries' own tokens
     leave the compile. `rawTokens` is the text that compression folds
     again, not that change. The change is not known, with the reason, where
-    it could be wrong: a row that the write rewrites or removes lies in the
-    head or the recent window, which then moves; a summary lies across a
-    raw window, which a compile that can't leave it out takes at another
-    size; a row that it prices is pinned, locked under kv-unified, or holds
-    an image; the instance hasn't read what another instance of its
-    namespace or a pass on the branch changed since; or the strategy
-    doesn't price its floor.
+    it could be wrong: the strategy selects without adaptive resolution; a
+    row that the write rewrites or removes lies in or next to the head or
+    the recent window, which then moves, or holds a tool call or result; a
+    summary lies across a raw window, where a compile can take it and fit
+    below the floor; a row that it prices is pinned or, under kv-unified,
+    locked, or holds an image; a chunk record names a summary that the
+    strategy doesn't hold; the instance hasn't read what another instance
+    of its namespace or a pass on the branch changed; a row was added, or a
+    summary written or changed, during the pass; under a folding strategy other than
+    kv-unified, a summary that it prices costs more than the rows under it;
+    or the strategy doesn't price its floor.
   - Four limits. A long note whose mended text is still long is not mended:
     it is refused, and stays owed. A summary of other rows, made before the
     pass, keeps any words that it took from a mended body that its request

@@ -88,18 +88,22 @@ export interface SummaryLevelCount {
 }
 
 /**
- * How a write changes the strategy's floor: the fewest tokens that a
- * compile of the open branch needs, which a compile refuses above its
- * budget's maxTokens and the strategy's over-budget grace. `tokens` is above
- * zero where the floor grows and below zero where it shrinks. It counts
- * the write as it lands, before compression folds anything again. Not
- * known, with the reason, where the figure could be wrong: a row that the
- * write rewrites or removes lies in a raw window of the compile, which then
- * moves; a summary lies across a raw window, which a compile that can't
- * leave it out takes, at another size; a row that it prices is pinned or
- * locked, and so kept as it is, or holds an image; the instance hasn't
- * read what another instance of its namespace or a pass on the branch
- * changed since; or the strategy doesn't price its floor.
+ * How a write changes the strategy's floor, the fewest tokens that the
+ * compile's plan can reach for the open branch (its `floor`), counting the
+ * write as it lands, before compression folds anything again: above zero
+ * where the floor grows, below zero where it shrinks. With the strategy's
+ * over-budget grace, the floor says the least `maxTokens` at which a compile
+ * fits. Not known, with the reason, where the figure could be wrong: the
+ * strategy selects without adaptive resolution; a row that the write
+ * rewrites or removes lies in or next to a raw window, which then moves, or
+ * holds a tool call or result; a summary lies across a raw window, where a
+ * compile can take it and fit below the floor; a row that it prices is
+ * pinned or, under kv-unified, locked, or holds an image; a chunk record
+ * names a summary that the strategy doesn't hold; the instance hasn't read
+ * what another instance of its namespace or a pass on the branch changed;
+ * a row was added, or a summary written or changed, during the pass; under a solver
+ * other than kv-unified, a summary that it prices costs more than the rows
+ * under it; or the strategy doesn't price its floor.
  */
 export type FloorChange = { known: true; tokens: number } | { known: false; reason: string };
 
@@ -120,7 +124,6 @@ export interface SummaryDropCost {
   floorChange: FloorChange;
 }
 
-/** No drop, by a strategy that doesn't price its floor. */
 export function noDrop(): SummaryDropCost {
   return { summaries: [], records: 0, rawTokens: 0, floorChange: { known: false, reason: "the strategy doesn't price its floor" } };
 }

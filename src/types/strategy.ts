@@ -631,12 +631,11 @@ export interface ContextStrategy {
    * Asked as the manager's pass begins, before the pass writes anything: a
    * throw refuses the pass, and nothing is written. The function it gives
    * is asked as the pass ends, where the store is still on the branch and
-   * the manager open, with each row that the pass rewrote or removed: it
-   * reads the branch's applied list of sweeps (sweep.ts) and gives what the
-   * strategy dropped during the pass, by any path, and the pass's change in
-   * the floor.
+   * the manager open: it reads the branch's applied list of sweeps
+   * (sweep.ts) and gives what the strategy dropped during the pass, by any
+   * path, and the change in the floor from the branch as the pass began.
    */
-  beforeSweepPass?(ctx: StrategyContext): (ctx: StrategyContext, changed: ReadonlySet<MessageId>) => SummaryDropCost;
+  beforeSweepPass?(ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost;
 
   /**
    * Declares that select() reports its rendered layout completely, and which
