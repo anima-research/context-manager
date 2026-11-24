@@ -10,6 +10,8 @@ export type {
   StoredMessage,
   BlobReference,
   StoredContentBlock,
+  StoredToolResult,
+  BlobReferenceBlock,
   StoredMessageInternal,
   MessageQuery,
   MessageQueryResult,
