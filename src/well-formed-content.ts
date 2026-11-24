@@ -407,6 +407,7 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
           places.push(`${at}.content[${i}] is a system_change inside a tool_result; a system change goes in a message of its own`);
         } else {
           placesIn(inner[i], `${at}.content[${i}]`, places, side);
+          if (side === 'write' && isRecord(inner[i]) && inner[i].type === 'image') storePlacesIn(inner[i], `${at}.content[${i}]`, places);
         }
       }
       return;
@@ -438,9 +439,8 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
   }
 }
 
-/** The places of inline media in `block`, a block of the content, that the store can't keep, as phrases from `at`. */
+/** The places of `block`, a media block, that the store can't keep, as phrases from `at`. */
 function storePlacesIn(block: unknown, at: string, places: string[]): void {
-  for (const [image, i] of nestedImages(block)) storePlacesIn(image, `${at}.content[${i}]`, places);
   if (!mediaRefused(block)) return;
   const { type, source } = block as { type: string; source: Record<string, unknown> };
   const unstorable = unstorableSource(block as unknown as ContentBlock)!;

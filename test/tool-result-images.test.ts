@@ -13,6 +13,7 @@ import {
   MessageStore,
   PassthroughStrategy,
   blockAsStored,
+  malformedContentPlaces,
 } from '../src/index.js';
 
 const STORE = './test-tool-result-images';
@@ -210,6 +211,17 @@ describe('an image inside a tool result', () => {
     } finally {
       manager.close();
     }
+  });
+
+  it('names the places of a refused tool result in content order', () => {
+    const result = toolResult('call_1', [
+      { type: 'image', source: { type: 'base64', data: b64(AVIF) } },
+      { type: 'text', text: 42 },
+    ]);
+    assert.deepStrictEqual(malformedContentPlaces([result]), [
+      "content[0].content[0].source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature",
+      'content[0].content[1].text is a number, not a string',
+    ]);
   });
 
   it('leaves other media inside a tool result as given', async () => {
