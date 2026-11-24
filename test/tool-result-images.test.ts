@@ -9,6 +9,7 @@ import {
   BlobManager,
   ContextLog,
   ContextManager,
+  MalformedContentError,
   MessageStore,
   PassthroughStrategy,
   blockAsStored,
@@ -249,6 +250,25 @@ describe('an image inside a tool result', () => {
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
       assert.deepStrictEqual(manager.getAllMessages()[0]!.content, [toolResult('call_1', [reference])]);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('has the type the store holds in a window read without resolution, which a write refuses, and its image in a default read', async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('user', [RESULT]);
+      const raw = manager.getMessageWindow(0, 1, { resolveBlobs: false }).messages[0]!;
+      // @ts-expect-error A row read without resolution holds a blob_ref, which a write refuses.
+      assert.throws(() => manager.editMessage(raw.id, raw.content), MalformedContentError);
+      const resolveBlobs = [false, true][0]!;
+      const either = manager.getMessageWindow(0, 1, { resolveBlobs }).messages[0]!;
+      // @ts-expect-error A read that may be without resolution has either type.
+      assert.throws(() => manager.editMessage(either.id, either.content), MalformedContentError);
+      const read = manager.getMessageWindow(0, 1).messages[0]!;
+      manager.editMessage(read.id, read.content);
+      assert.deepStrictEqual(manager.getMessage(read.id)?.content, read.content);
     } finally {
       manager.close();
     }
