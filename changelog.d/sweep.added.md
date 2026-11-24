@@ -56,10 +56,10 @@
     sweep stays owed; so is a body that changed during the pass, after it
     was listed, which is left as it stands. One pass at a time runs, on any
     store, and a show, `oldSummaryCost` and `dropOldSummaries` are refused
-    while one runs; a listener of its writes that moves the store to another branch
-    or closes the manager stops it, and so does a write to the applied list
-    that throws (`stopped`), and list items or take records that don't
-    parse are named (`unreadable`). Its report gives what the manager's
+    while one runs; a listener of its writes that moves the store to
+    another branch or closes the manager stops it, and so does a write to
+    the applied list that throws (`stopped`), and list items or take
+    records that don't parse are named (`unreadable`). Its report gives what the manager's
     strategy dropped during the pass (`dropped`, a `SummaryDropCost`), or
     null where a listener moved the store to another branch or closed the
     manager.
