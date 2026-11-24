@@ -159,10 +159,11 @@
     it is refused, and stays owed. A summary of other rows, made before the
     pass, keeps any words that it took from a mended body that its request
     carried as context: a summary records no recall set, so the second act
-    doesn't find it. Every namespace keeps its old summaries until its own
-    second act; an older context-manager makes none, and reads no applied
-    list, so beside a host that runs one a namespace keeps its summaries
-    over a joined note until an instance of this release opens it. A summary
+    doesn't find it. Each namespace on the mended slot keeps its old
+    summaries until its own second act; an older context-manager makes
+    none, and reads no applied list, so beside a host that runs one a
+    namespace keeps its summaries over a joined note until an instance of
+    this release opens it. A summary
     that an older release writes carries no sequence, so this release reads
     it as written before every pass. A context copied from a compile between
     a pass and the second act, as rows of its own, keeps the old summaries'
