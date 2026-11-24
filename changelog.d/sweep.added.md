@@ -1,7 +1,7 @@
 - Sweeps: a named repair of bodies that a store already holds (`src/sweep.ts`).
   A `SweepEntry` has a `name`, a `line` that says what it mends, and a pure
   `mend(body)` that gives a body's new content, or `null` for a body that it
-  leaves. A body is one stored message with its writer, time and metadata,
+  leaves. Each block that it is given is a shallow copy. A body is one stored message with its writer, time and metadata,
   read without blobs; a message stored as shards is given whole, its other
   blocks first and then its joined text, as `AutobiographicalStrategy`
   renders a sharded body in its head and recent windows. A block that `mend` gives back as
@@ -55,7 +55,8 @@
     entry throws or gives no content is reported and not listed, and the
     sweep stays owed; so is a body that changed during the pass, after it
     was listed, which is left as it stands. One pass at a time runs, on any
-    store; a listener of its writes that moves the store to another branch
+    store, and a show, `oldSummaryCost` and `dropOldSummaries` are refused
+    while one runs; a listener of its writes that moves the store to another branch
     or closes the manager stops it, and so does a write to the applied list
     that throws (`stopped`), and list items or take records that don't
     parse are named (`unreadable`). Its report gives what the manager's
@@ -65,8 +66,9 @@
     No load of a manager makes a pass: its host asks for one.
   - `ContextManager.sweepReceipt(name)` says where the sweep stands on the
     open branch: the store's newest take, whether the branch finished it,
-    each pass with the bodies that it listed, each marked `joined` once a
-    pass joined it and none of its later shards is stored, and
+    each pass with the bodies that it listed, each marked
+    `laterShardsGone` once none of the later shards listed for it is
+    stored, whatever removed them, and
     `oldSummaries`, the strategy's old summaries at each level over the rows
     those passes listed. An old summary is a summary written before a pass
     listed a row under it, at any level, or a summary above one. A summary

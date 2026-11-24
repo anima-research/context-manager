@@ -455,6 +455,70 @@ describe('a take and its pass', () => {
     cm.close();
   });
 
+  it('S100: an entry that gives a new inline image, with a token estimate: the pass finishes, and the store holds the image', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const id = note(cm, `a note ${OLD}`);
+    const image: StoredContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG }, tokenEstimate: 73 };
+    const withImage: SweepEntry = {
+      name: 'rewords-test',
+      line: 'adds an image',
+      mend: (body) => (body.metadata?.writer === 'faulty' && body.content.some((b) => b.type === 'text' && b.text.includes(OLD)) ? [{ type: 'text', text: `a note ${NEW}` }, image] : null),
+    };
+    cm.takeSweep('rewords-test');
+    const report = cm.applySweeps([withImage]);
+    assert.equal(report.sweeps[0]!.outcome, 'finished', JSON.stringify(report.sweeps[0]!.failed));
+    const stored = cm.getMessage(id)!.content;
+    assert.equal(stored[1]!.type, 'image', 'the image is stored');
+    assert.equal((stored[1] as { source: { data: string } }).source.data, PNG);
+    cm.close();
+  });
+
+  it('S101: an entry that changes the body it is given in place changes nothing stored, at a show or at a pass', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
+    const id = note(cm, `a note ${OLD}`);
+    const meddling: SweepEntry = {
+      name: 'rewords-test',
+      line: 'changes its input',
+      mend: (body) => {
+        for (const block of body.content) if (block.type === 'text') (block as { text: string }).text = 'MEDDLED';
+        return null;
+      },
+    };
+    const stored = () => textOfBlocks(cm.getAllMessages().find((m) => m.id === id)!.content as never);
+    cm.showSweep(meddling);
+    assert.equal(stored(), `a note ${OLD}`, 'a show changes nothing that the store gives');
+    assert.equal(cm.showSweep(rewords()).changes.length, 1, 'and a later show still finds the old text');
+    cm.takeSweep('rewords-test');
+    cm.applySweeps([meddling]);
+    assert.equal(stored(), `a note ${OLD}`, 'a pass that rewrites nothing changes nothing that the store gives');
+    assert.ok((await compiledText(cm)).includes(OLD), 'and a compile still holds the old text');
+    cm.close();
+  });
+
+  it('S102: a show, the cost of the second act and the second act are refused while a pass runs, from a listener of its write', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), strategy: adaptive(), membrane: mockMembrane() });
+    note(cm, `a note ${OLD}`);
+    cm.addMessage('User', [text('after')]);
+    cm.takeSweep('rewords-test');
+    const refused: string[] = [];
+    let asked = false;
+    cm.onMessage((event) => {
+      if (event.type !== 'edit' || asked) return;
+      asked = true;
+      for (const [what, call] of [['show', () => cm.showSweep(rewords())], ['cost', () => cm.oldSummaryCost('rewords-test')], ['act', () => cm.dropOldSummaries('rewords-test')]] as const) {
+        try {
+          call();
+        } catch (error) {
+          if (error instanceof Error && /refused: a sweep pass is running/.test(error.message)) refused.push(what);
+        }
+      }
+    });
+    assert.equal(cm.applySweeps([rewords()]).sweeps[0]!.outcome, 'finished');
+    assert.ok(asked, 'premise: the listener asked during the pass');
+    assert.deepEqual(refused, ['show', 'cost', 'act']);
+    cm.close();
+  });
+
   it('S9: a branch that finished, then a new body the entry changes: the show lists it, and a new take mends it', async () => {
     const cm = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy() });
     note(cm, `first ${OLD}`);
@@ -878,7 +942,7 @@ describe('summaries made from a mended row', () => {
     store.close();
   });
 
-  it('S83: the receipt marks a body that a pass joined, once its later shards are gone, and no body stored as one row', async () => {
+  it('S83: the receipt marks a body whose listed later shards are all gone, and no body stored as one row', async () => {
     const strategy = adaptive();
     const cm = await ContextManager.open({ path: freshPath(), strategy, membrane: mockMembrane() });
     const short = note(cm, `a note ${OLD}`);
@@ -887,7 +951,7 @@ describe('summaries made from a mended row', () => {
     const stop = failOnce(cm.getStore(), 'redactStateItems', 1);
     cm.applySweeps([rewords()]);
     stop.restore();
-    const marks = () => cm.sweepReceipt('rewords-test').passes.flatMap((pass) => pass.bodies.map((body) => `${body.id === long ? 'long' : body.id === short ? 'short' : body.id}:${body.joined}`));
+    const marks = () => cm.sweepReceipt('rewords-test').passes.flatMap((pass) => pass.bodies.map((body) => `${body.id === long ? 'long' : body.id === short ? 'short' : body.id}:${body.laterShardsGone}`));
     assert.ok(rows.slice(1).every((id) => cm.getMessage(id) !== null), 'premise: the later shards stand');
     assert.deepEqual(marks(), ['short:false', 'long:false'], 'not while its later shards stand');
     cm.applySweeps([rewords()]);

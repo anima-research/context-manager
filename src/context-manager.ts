@@ -60,6 +60,7 @@ import type { RenderStats } from './types/index.js';
 import { overRequestLimit, refuseUnreadableRequestLimit, requestOverheadContent } from './request-limit.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { blockAsStored } from './blob-manager.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { WindowIndex, WindowWriteOutcomeUnknownError, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
@@ -73,7 +74,7 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
-import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, noDrop, runSweepPass, sweepBodyOf, sweepsApplied, sweptRows, textLength } from './sweep.js';
+import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, noDrop, runSweepPass, sweepBodyOf, sweepPassRunning, sweepsApplied, sweptRows, textLength } from './sweep.js';
 import type { ListedBody, SummaryDropCost, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake, SweptRows } from './sweep.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
@@ -2013,10 +2014,11 @@ export class ContextManager {
    * note whose later shards an earlier pass listed and left standing, which
    * the next pass removes first. A summary is in one of the two, never
    * both. Refused while a sharded addMessage of this manager stores its
-   * shards.
+   * shards, and while a sweep pass runs, as from a listener of its write.
    */
   showSweep(entry: SweepEntry): SweepShow {
     this.requireInitialized('showSweep');
+    this.refuseDuringPass('showSweep');
     if (this.writingShards) {
       throw new Error(
         'ContextManager.showSweep refused: a sharded addMessage is storing its shards, and a show now would read part of its body. ' +
@@ -2063,10 +2065,12 @@ export class ContextManager {
    * long note drops (showSweep's `writeDrops`). It writes nothing. It reads the
    * strategy as it last read the store, so where another instance of the
    * namespace wrote since, the act, which takes up the store first, can
-   * drop otherwise.
+   * drop otherwise. Refused while a sweep pass runs, as from a listener of
+   * its write.
    */
   oldSummaryCost(name: string): SummaryDropCost {
     this.requireInitialized('oldSummaryCost');
+    this.refuseDuringPass('oldSummaryCost');
     return this.oldSummariesOver(this.sweptRowsOf(name));
   }
 
@@ -2084,14 +2088,31 @@ export class ContextManager {
    * takes up the store at its next initialize, live select, tick or L1.
    * Until then, that instance's dry compile can still hold a dropped
    * summary. A call that throws lists nothing: call it again, and it lists
-   * the act, whatever its drop had written.
+   * the act, whatever its drop had written. Refused while a sweep pass runs,
+   * as from a listener of its write, and while a sharded addMessage of this
+   * manager stores its shards.
    */
   dropOldSummaries(name: string): SummaryDropCost {
     this.requireInitialized('dropOldSummaries');
+    this.refuseDuringPass('dropOldSummaries');
+    if (this.writingShards) {
+      throw new Error(
+        'ContextManager.dropOldSummaries refused: a sharded addMessage is storing its shards, and the act now would read part of its body. ' +
+          'Make the act once that call has returned.',
+      );
+    }
     if (!this.strategy.dropOldSummaries) return noDrop();
     const dropped = this.strategy.dropOldSummaries(this.sweptRowsOf(name), this.createStrategyContext());
     appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
     return dropped;
+  }
+
+  private refuseDuringPass(call: string): void {
+    if (!sweepPassRunning()) return;
+    throw new Error(
+      `ContextManager.${call} refused: a sweep pass is running, and it reads the slot and the strategy as that pass leaves them partway. ` +
+        'Ask once the pass has returned.',
+    );
   }
 
   private sweptRowsOf(name: string): SweptRows {
@@ -2317,7 +2338,7 @@ export class ContextManager {
       if (!stillHere()) return;
     }
     for (const { body, written } of mended) {
-      if (!outcome.rewritten.includes(body.id) || JSON.stringify(this.messageStore.get(body.id)?.content) === JSON.stringify(written)) continue;
+      if (!outcome.rewritten.includes(body.id) || JSON.stringify(this.messageStore.get(body.id)?.content) === JSON.stringify(written.map(blockAsStored))) continue;
       outcome.failed.push({
         id: body.id,
         error: `${body.id} changed during this pass, after its rewrite: it stays as it is now, and the next pass reads it again.`,
@@ -2395,7 +2416,8 @@ export class ContextManager {
    * Where the sweep `name` stands for the slot this manager writes, on the
    * open branch: the store's newest take of it, whether this branch
    * finished that take, each pass the branch's applied list holds, with the
-   * bodies it listed, each marked where a pass joined it, and the
+   * bodies it listed, each marked where none of the later shards listed
+   * for it is stored now (`laterShardsGone`), and the
    * strategy's old summaries over the rows those passes listed
    * (oldSummaryCost). It never gives the old text.
    */
@@ -2410,7 +2432,7 @@ export class ContextManager {
       finished: take !== null && items.some((item) => item.kind === 'finished' && item.take === take.take),
       passes: items.flatMap((item) =>
         item.kind === 'listed'
-          ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies.map((body) => ({ ...body, joined: this.joined(body) })) }]
+          ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies.map((body) => ({ ...body, laterShardsGone: this.laterShardsGone(body) })) }]
           : [],
       ),
       oldSummaries: this.oldSummariesOver(sweptRows(items)).summaries,
@@ -2421,7 +2443,7 @@ export class ContextManager {
     return MessageStore.registrationFor(this.slots.messageNamespace).id;
   }
 
-  private joined(body: ListedBody): boolean {
+  private laterShardsGone(body: ListedBody): boolean {
     return body.laterShards.length > 0 && body.laterShards.every((id) => this.messageStore.sequenceOf(id) === undefined);
   }
 

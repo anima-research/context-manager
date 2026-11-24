@@ -21,7 +21,9 @@ export interface SweepBody {
 }
 
 /**
- * A sweep's code. `mend` is pure. It gives a body's new content, or null for
+ * A sweep's code. `mend` is pure. Each block of the body it is given is a
+ * shallow copy, so an entry that changes one changes nothing stored. It
+ * gives a body's new content, or null for
  * a body that it leaves, a mended body included. It matches only what the
  * faulty writer wrote, and gives null where a body can't show that. After a
  * release its result for a body doesn't change: another transformation is
@@ -217,11 +219,12 @@ export interface SweepPassReport {
 }
 
 /**
- * A body that a pass listed, as a receipt gives it. `joined`: the pass
- * listed it with later shards, and none of them is stored now.
+ * A body that a pass listed, as a receipt gives it. `laterShardsGone`: the
+ * pass listed it with later shards, and none of them is stored now. It
+ * doesn't say what removed them: a pass's join, or another write.
  */
 export interface ReceiptBody extends ListedBody {
-  joined: boolean;
+  laterShardsGone: boolean;
 }
 
 /** A pass on the open branch, as its list item names it. */
@@ -402,9 +405,9 @@ export function sweepBodyOf(
   const first = rows[0]!;
   const content: StoredContentBlock[] =
     rows.length === 1
-      ? first.content
+      ? first.content.map((block) => ({ ...block }))
       : [
-          ...rows.flatMap((row) => row.content.filter((block) => block.type !== 'text')),
+          ...rows.flatMap((row) => row.content.filter((block) => block.type !== 'text').map((block) => ({ ...block }))),
           { type: 'text', text: rows.map((row) => row.content.map((block) => (block.type === 'text' ? block.text : '')).join('')).join('') },
         ];
   return {
