@@ -119,7 +119,7 @@ import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
 import { SWEEPS_APPLIED_STATE_ID, listedLaterShards, listedRows, sweepPassRunning, sweepsApplied } from '../sweep.js';
-import type { SummaryDropCost, SweptRows } from '../sweep.js';
+import type { FloorChange, SummaryDropCost, SweepApplied, SweptRows } from '../sweep.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -701,6 +701,20 @@ type StripReplay = {
  *  the place of the result that first answered it, and every result that
  *  answers it, by message and place in its content. */
 type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
+
+/**
+ * The branch as a write found it, as the floor reads it (floorChangeOf):
+ * each row, the rows that the compile sends raw in its head and recent
+ * windows, the rows kept as they are (a pin, and under kv-unified a lock),
+ * and the summaries and chunk records then held.
+ */
+interface FloorView {
+  messages: readonly StoredMessage[];
+  windows: ReadonlyMap<MessageId, 'head' | 'recent'>;
+  kept: ReadonlySet<MessageId>;
+  summaries: SummaryEntry[];
+  chunkRecords: readonly ChunkRecord[];
+}
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
@@ -8650,15 +8664,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const listed = listedRows(items);
       if (listed.size > 0) {
-        const gone = (id: MessageId): boolean => ctx.messageStore.get(id) === null;
-        const leaving = new Set([...listedLaterShards(items)].filter(gone));
-        const joined = new Map<MessageId, number>();
-        for (const item of items) {
-          if (item.kind !== 'listed') continue;
-          for (const body of item.bodies) {
-            if (body.laterShards.length > 0 && body.laterShards.every(gone)) joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
-          }
-        }
+        const { leaving, joined } = this.sweptBy(items, ctx);
         if ((leaving.size > 0 || joined.size > 0) && this.storeWrittenElsewhere()) {
           for (const id of this.takeUpStoreBeforeLetGo(leaving, ctx)) listed.add(id);
         }
@@ -8668,6 +8674,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (err) {
       this.diag.warn(`[autobiographical] letting go of rows a sweep's pass listed, before ${operation}, failed: ${describeThrown(err)}`);
     }
+  }
+
+  /** What `items` of the branch's applied list leave: the later shards that they listed and that are gone, and each body that they listed with later shards, all gone, by its first row, with the sequence of the newest such item. */
+  private sweptBy(items: readonly SweepApplied[], ctx: StrategyContext): { leaving: Set<MessageId>; joined: Map<MessageId, number> } {
+    const gone = (id: MessageId): boolean => ctx.messageStore.get(id) === null;
+    const leaving = new Set([...listedLaterShards(items)].filter(gone));
+    const joined = new Map<MessageId, number>();
+    for (const item of items) {
+      if (item.kind !== 'listed') continue;
+      for (const body of item.bodies) {
+        if (body.laterShards.length > 0 && body.laterShards.every(gone)) joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
+      }
+    }
+    return { leaving, joined };
+  }
+
+  /**
+   * Why this instance's floor can't be priced now, if it can't: another
+   * instance of the namespace wrote the store since this one read it, or
+   * reading the items of the branch's applied list that it hasn't read
+   * would drop a summary that it holds (letGoOfSweptRows) or take up a
+   * second act of its namespace.
+   */
+  private floorBehind(ctx: StrategyContext): string | undefined {
+    const behind = "this instance hasn't read what another instance of its namespace or a pass on the branch changed since, which its next live compile reads first";
+    if (this.storeWrittenElsewhere()) return behind;
+    const store = this.store;
+    if (!store || (store.getStateLen(SWEEPS_APPLIED_STATE_ID) ?? 0) <= this.sweepCursor) return undefined;
+    const { items } = sweepsApplied(store, this.sweepCursor);
+    const { leaving, joined } = this.sweptBy(items, ctx);
+    const reads = items.some((item) => item.kind === 'dropped' && item.namespace === this.ns) ||
+      this.summariesFolding(leaving).size > 0 || this.writtenBefore(joined).size > 0;
+    return reads ? behind : undefined;
   }
 
   /**
@@ -8772,14 +8811,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * instance dropped since it was made, by any path: the removal of a later
    * shard heard through onRetracted, and the list's let-go.
    */
-  beforeSweepPass(_ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost {
+  beforeSweepPass(ctx: StrategyContext): (ctx: StrategyContext, changed: ReadonlySet<MessageId>) => SummaryDropCost {
     this.requireLoadedBranch('beforeSweepPass');
     if (this.config.auditOnly) {
       throw new Error('AutobiographicalStrategy.beforeSweepPass refused: an audit-only instance writes nothing, so no pass runs through it.');
     }
     if (this.storeWrittenElsewhere()) this.takeUpStoreState();
     const from = { summaries: this.summaries, chunkRecords: this.chunkRecords };
-    return (ctx) => {
+    const behind = this.floorBehind(ctx);
+    const before = this.floorView(ctx.messageStore);
+    return (ctx, changed) => {
       this.letGoOfSweptRows(ctx, 'the end of a pass');
       const kept = new Set(this.summaries.map((summary) => summary.id));
       const records = new Map(this.chunkRecords.map((record) => [record.id, record]));
@@ -8788,18 +8829,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const now = records.get(record.id);
         return now !== undefined && !(now.summaryId && dropped.has(now.summaryId));
       };
-      return this.costOf(dropped, ctx, { from, keeps });
+      const view = ctx.messageStore;
+      const floorChange: FloorChange = behind ? { known: false, reason: behind } : this.floorChangeOf(before, dropped, changed, (id) => view.get(id), view);
+      return { ...this.costOf(dropped, ctx, { from, keeps }), floorChange };
     };
   }
 
   writeDropCost(rows: SweptRows, ctx: StrategyContext, contents: ReadonlyMap<MessageId, ContentBlock[]>): SummaryDropCost {
     this.requireLoadedBranch('writeDropCost');
-    return this.costOf(this.joinDrops(rows), ctx, { gone: rows.removed, contents });
+    const drop = this.joinDrops(rows);
+    const view = ctx.messageStore;
+    const changed = new Set([...contents.keys(), ...rows.removed]);
+    const after = (id: MessageId): StoredMessage | null => {
+      const message = rows.removed.has(id) ? null : view.get(id);
+      const content = contents.get(id);
+      return message && content ? { ...message, content } : message;
+    };
+    const behind = this.floorBehind(ctx);
+    const floorChange: FloorChange = behind ? { known: false, reason: behind } : this.floorChangeOf(this.floorView(view), drop, changed, after, view);
+    return { ...this.costOf(drop, ctx, { gone: rows.removed, contents }), floorChange };
   }
 
   oldSummaryCost(rows: SweptRows, ctx: StrategyContext): SummaryDropCost {
     this.requireLoadedBranch('oldSummaryCost');
-    return this.costOf(this.oldSummaries(rows), ctx);
+    return this.secondActCost(this.oldSummaries(rows), ctx);
+  }
+
+  private secondActCost(old: ReadonlySet<string>, ctx: StrategyContext): SummaryDropCost {
+    const view = ctx.messageStore;
+    const behind = this.floorBehind(ctx);
+    const floorChange: FloorChange = behind ? { known: false, reason: behind } : this.floorChangeOf(this.floorView(view), old, new Set(), (id) => view.get(id), view);
+    return { ...this.costOf(old, ctx), floorChange };
   }
 
   /**
@@ -8820,7 +8880,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.letGoOfSweptRows(ctx, 'the second act');
     if (this.storeWrittenElsewhere()) this.takeUpStoreState();
     const old = this.oldSummaries(rows);
-    const cost = this.costOf(old, ctx);
+    const cost = this.secondActCost(old, ctx);
     if (old.size === 0) return cost;
     const under = new Set<MessageId>();
     for (const summary of this.summaries) if (summary.level === 1 && old.has(summary.id)) for (const id of summary.sourceIds) under.add(id);
@@ -8883,7 +8943,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       contents?: ReadonlyMap<MessageId, ContentBlock[]>;
       keeps?: (record: ChunkRecord) => boolean;
     } = {},
-  ): SummaryDropCost {
+  ): Omit<SummaryDropCost, 'floorChange'> {
     const { summaries, chunkRecords } = options.from ?? { summaries: this.summaries, chunkRecords: this.chunkRecords };
     const gone = options.gone ?? new Set<MessageId>();
     const keeps = options.keeps ?? ((record: ChunkRecord) => record.sourceIds.some((id) => !gone.has(id)));
@@ -8909,6 +8969,93 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       rawTokens += view.estimateTokens(this.prunedForSend(view, content ? { ...message, content } : message));
     }
     return { summaries: [...levels].sort(([a], [b]) => a - b).map(([level, count]) => ({ level, count })), records, rawTokens };
+  }
+
+  /** The branch as the floor reads it now (FloorView). */
+  private floorView(view: MessageStoreView): FloorView {
+    const messages = view.getAll();
+    const headEnd = this.getHeadWindowEnd(view);
+    const recentStart = Math.max(this.getRecentWindowStart(view), headEnd);
+    const windows = new Map<MessageId, 'head' | 'recent'>();
+    for (const at of this.headPositions(messages, this.getHeadWindowStartIndex(view), headEnd)) windows.set(messages[at]!.id, 'head');
+    for (let at = recentStart; at < messages.length; at++) windows.set(messages[at]!.id, 'recent');
+    const kept = new Set<MessageId>();
+    for (const at of this.resolvedPinBounds(messages).keys()) kept.add(messages[at]!.id);
+    if (this.config.foldingStrategy === 'kv-unified') for (const id of this.locked) kept.add(id);
+    return { messages, windows, kept, summaries: this.summaries, chunkRecords: this.chunkRecords };
+  }
+
+  /**
+   * How a write changes the floor (FloorChange), from the branch as it
+   * found it (`before`): `drop` names the summaries that it drops, `changed`
+   * each row that it rewrites or removes, and `after` gives a row as it
+   * leaves it, null where it removes it. The floor folds each row between
+   * the windows under the topmost summary over it. So a row under
+   * a kept summary costs nothing more; a row under a dropped L1 renders
+   * raw; a row under none renders raw before and after, at each one's
+   * price; each kept summary left without its parent renders at its own
+   * level; and each dropped summary that had no parent renders no more.
+   */
+  private floorChangeOf(
+    before: FloorView,
+    drop: ReadonlySet<string>,
+    changed: ReadonlySet<MessageId>,
+    after: (id: MessageId) => StoredMessage | null,
+    view: MessageStoreView,
+  ): FloorChange {
+    for (const id of changed) {
+      const window = before.windows.get(id);
+      if (window) return { known: false, reason: `a row that the write ${after(id) ? 'rewrites' : 'removes'} lies in the ${window} window, which then moves` };
+    }
+    if (drop.size === 0 && changed.size === 0) return { known: true, tokens: 0 };
+    const byId = new Map(before.summaries.map((summary) => [summary.id, summary]));
+    const leaves = new Set<MessageId>();
+    for (const summary of before.summaries) {
+      leaves.clear();
+      this.expandSummaryToLeafMessageIds(summary, byId, leaves);
+      for (const id of leaves) {
+        if (before.windows.has(id)) return { known: false, reason: 'a summary lies across a raw window, and a compile that cannot leave it out takes it, at another size' };
+      }
+    }
+    const floor = new Map(this.pastCarries(before.summaries).map((summary) => [summary.id, summary]));
+    const ownL1 = new Map<MessageId, string>();
+    for (const record of before.chunkRecords) {
+      if (record.summaryId) for (const id of record.sourceIds) if (!ownL1.has(id)) ownL1.set(id, record.summaryId);
+    }
+    for (const summary of before.summaries) {
+      if (summary.level === 1) for (const id of summary.sourceIds) if (!ownL1.has(id)) ownL1.set(id, summary.id);
+    }
+    const cap = this.config.maxMessageTokens;
+    const price = (message: StoredMessage): number =>
+      view.estimateTokens(this.prunedForSend(view, message)) + (message.bodyGroupId ? 0 : this.cappedForSend(view, message, cap).extra);
+    const holdsImage = (message: StoredMessage | null): boolean => message !== null && message.content.some((block) => block.type === 'image');
+    let tokens = 0;
+    for (const message of before.messages) {
+      const id = message.id;
+      if (before.windows.has(id)) continue;
+      const l1 = ownL1.get(id);
+      const folded = l1 !== undefined && floor.has(l1) ? l1 : undefined;
+      const madeRaw = folded !== undefined && drop.has(folded);
+      if (!madeRaw && !changed.has(id)) continue;
+      if (folded !== undefined && !madeRaw) continue;
+      const now = changed.has(id) ? after(id) : message;
+      if (before.kept.has(id)) return { known: false, reason: 'a row that it prices is pinned or locked, and so kept as it is' };
+      if (holdsImage(message) || holdsImage(now)) return { known: false, reason: 'a row that it prices holds an image' };
+      tokens += (now ? price(now) : 0) - (madeRaw ? 0 : price(message));
+    }
+    const priced: SummaryEntry[] = [];
+    for (const summary of floor.values()) {
+      const parentId = getSummaryParentId(summary);
+      const parent = parentId === undefined ? undefined : floor.get(parentId);
+      if (drop.has(summary.id) ? parent === undefined : parent !== undefined && drop.has(parent.id)) priced.push(summary);
+    }
+    if (before.kept.size > 0) {
+      leaves.clear();
+      for (const summary of priced) this.expandSummaryToLeafMessageIds(summary, byId, leaves);
+      for (const id of leaves) if (before.kept.has(id)) return { known: false, reason: 'a row under a summary that it prices is pinned or locked, and so kept as it is' };
+    }
+    for (const summary of priced) tokens += drop.has(summary.id) ? -this.recallPairCost(summary) : this.recallPairCost(summary);
+    return { known: true, tokens };
   }
 
   private summariesAbove(seeds: ReadonlySet<string>): Set<string> {

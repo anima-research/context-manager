@@ -152,6 +152,7 @@ export type {
   SweepReceipt,
   SummaryLevelCount,
   SummaryDropCost,
+  FloorChange,
   ReceiptBody,
   SweptRows,
 } from './sweep.js';

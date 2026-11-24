@@ -88,21 +88,41 @@ export interface SummaryLevelCount {
 }
 
 /**
+ * How a write changes the strategy's floor: the fewest tokens that a
+ * compile of the open branch needs, which a compile refuses above its
+ * budget's maxTokens and the strategy's over-budget grace. `tokens` is above
+ * zero where the floor grows and below zero where it shrinks. It counts
+ * the write as it lands, before compression folds anything again. Not
+ * known, with the reason, where the figure could be wrong: a row that the
+ * write rewrites or removes lies in a raw window of the compile, which then
+ * moves; a summary lies across a raw window, which a compile that can't
+ * leave it out takes, at another size; a row that it prices is pinned or
+ * locked, and so kept as it is, or holds an image; the instance hasn't
+ * read what another instance of its namespace or a pass on the branch
+ * changed since; or the strategy doesn't price its floor.
+ */
+export type FloorChange = { known: true; tokens: number } | { known: false; reason: string };
+
+/**
  * What a drop of summaries costs: the summaries it drops at each level,
  * with each level that has none left out; the chunk records that keep a
- * row and that the strategy's compression then folds again; and the
- * estimated tokens of the rows under them that stand, which render raw
- * until it does. The second act gives it (ContextManager.dropOldSummaries),
- * and so does a pass's join of a long note.
+ * row and that the strategy's compression then folds again; the estimated
+ * tokens of the rows under them that stand, which is the text that
+ * compression folds again; and the change in the floor of the write that
+ * drops them (FloorChange), which says whether a compile then needs more
+ * room. The second act gives it (ContextManager.dropOldSummaries), and so
+ * does a pass's join of a long note.
  */
 export interface SummaryDropCost {
   summaries: SummaryLevelCount[];
   records: number;
   rawTokens: number;
+  floorChange: FloorChange;
 }
 
+/** No drop, by a strategy that doesn't price its floor. */
 export function noDrop(): SummaryDropCost {
-  return { summaries: [], records: 0, rawTokens: 0 };
+  return { summaries: [], records: 0, rawTokens: 0, floorChange: { known: false, reason: "the strategy doesn't price its floor" } };
 }
 
 /**
@@ -155,9 +175,10 @@ export interface SweepShow {
   /**
    * What a pass of the changes would drop itself, where it joins a long
    * note: each summary over a piece of the note, its first row included,
-   * and each summary above one; the chunk records that keep a row; and the
+   * and each summary above one; the chunk records that keep a row; the
    * tokens of the rows under them that stand, a joined note's first row at
-   * its new size.
+   * its new size; and the change in the floor that the whole write makes,
+   * its rewrites of rows that render raw included.
    */
   writeDrops: SummaryDropCost;
 }
@@ -201,8 +222,9 @@ export interface SweepPassReport {
    * held as the pass began and no longer holds as it ends, which are those
    * over a piece of each note that the pass joined, its first row included,
    * with every summary above one; the chunk records that no longer name a
-   * dropped summary and are folded again; and the tokens of the rows under
-   * them that stand. Where another instance of the namespace writes the
+   * dropped summary and are folded again; the tokens of the rows under
+   * them that stand; and the change in the floor that the pass made. Where
+   * another instance of the namespace writes the
    * store from a listener during the pass, its drops are counted too. Null
    * where a listener of one of its writes moved the store to another branch
    * or closed the manager, so the strategy no longer holds the branch, and

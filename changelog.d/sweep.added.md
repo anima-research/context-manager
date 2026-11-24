@@ -25,9 +25,10 @@
     manager's strategy that a pass of the changes would leave old. Its
     `writeDrops` gives what the pass would drop itself, where it joins a
     long note (below): the summaries at each level, the chunk records that
-    keep a row and are folded again, and the estimated tokens of the rows
-    under them that stand, the first row at its new size
-    (`SummaryDropCost`). It counts a note whose later shards an earlier
+    keep a row and are folded again, the estimated tokens of the rows under
+    them that stand, the first row at its new size, and the change in the
+    strategy's floor that the write makes (`SummaryDropCost`, below). It
+    counts a note whose later shards an earlier
     pass left standing too, since the next pass removes them first. A
     summary is counted in one of the two, never in both.
   - `ContextManager.takeSweep(name)` records once, for the whole store, that
@@ -78,9 +79,10 @@
     last read the store.
   - `ContextManager.oldSummaryCost(name)` gives what the second act would
     drop and writes nothing: the old summaries at each level, the chunk
-    records under them, which the strategy's compression folds again, and
-    the estimated tokens of the rows under them, which render raw until it
-    has (`SummaryDropCost`).
+    records under them, which the strategy's compression folds again, the
+    estimated tokens of the rows under them, which render raw until it has,
+    and the change in the strategy's floor that the act makes
+    (`SummaryDropCost`).
   - `ContextManager.dropOldSummaries(name)` is the second act: the manager's
     strategy drops its old summaries of the sweep, with every summary above
     them, and gives what it dropped. It is done when the call returns, and
@@ -134,15 +136,33 @@
     under the dropped summaries render raw until compression folds them
     again, and a compile whose budget can't hold them refuses until then.
     Where a fault runs through much of an old history, the act makes most
-    of it raw. `oldSummaryCost` gives that size before the act.
+    of it raw. `oldSummaryCost` gives the change in the floor before the
+    act (`floorChange`, below).
   - A write that joins a long note can cost the resident its turns for a
     time too. A summary left without its parent renders again at its own
     level until compression merges it again, and the rows under a dropped
     L1 render raw until compression folds them again; a compile whose
     budget can't hold them refuses until then. The same happens on each
     other branch when a pass there joins the note, with no show before it.
-    `showSweep` gives the size on the open branch before the write
-    (`writeDrops`), and each pass reports what it dropped (`dropped`).
+    `showSweep` gives the change in the floor on the open branch before the
+    write (`writeDrops.floorChange`), and each pass reports what it dropped
+    and the change it made (`dropped`).
+  - `SummaryDropCost.floorChange` (`FloorChange`) is what decides whether a
+    compile refuses after the write: the change in the strategy's floor,
+    the fewest tokens that a compile of the open branch needs, which a
+    compile refuses above `maxTokens` × (1 + `overBudgetGraceRatio`). It
+    counts the write as it lands, before compression folds anything again,
+    and is above zero where the floor grows and below zero where it
+    shrinks, as on a flat store, where the dropped summaries' own tokens
+    leave the compile. `rawTokens` is the text that compression folds
+    again, not that change. The change is not known, with the reason, where
+    it could be wrong: a row that the write rewrites or removes lies in the
+    head or the recent window, which then moves; a summary lies across a
+    raw window, which a compile that can't leave it out takes at another
+    size; a row that it prices is pinned, locked under kv-unified, or holds
+    an image; the instance hasn't read what another instance of its
+    namespace or a pass on the branch changed since; or the strategy
+    doesn't price its floor.
   - Four limits. A long note whose mended text is still long is not mended:
     it is refused, and stays owed. A summary of other rows, made before the
     pass, keeps any words that it took from a mended body that its request
