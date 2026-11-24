@@ -630,7 +630,7 @@ describe("content that doesn't match ContentBlock", () => {
         manager.addMessage('User', [toolResult('t1', 'a string') as ContentBlock]);
         manager.addMessage('Claude', [toolUse('u1', {}) as ContentBlock, { type: 'thinking', thinking: '' } as ContentBlock]);
         manager.addMessage('User', [{ type: 'a_later_block', data: 1 } as unknown as ContentBlock]);
-        // The store keeps media inside a tool_result as given, so a write doesn't read its source.
+        // The store keeps media other than an image inside a tool_result as given, so a write doesn't read its source.
         const nested = toolResult('t2', [{ type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } }]);
         manager.addMessage('User', [nested as ContentBlock]);
         assert.equal(manager.getAllMessages().length, 4, 'a string tool_result content, an object input, an empty thinking, a block of a type the check names nowhere and media inside a tool_result are stored');

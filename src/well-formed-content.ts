@@ -42,16 +42,17 @@
  * string `mediaType`: a read gives an image the type its bytes' signature
  * names, where they carry one, and nothing else names a document's, audio's
  * or video's. The rule holds at any depth, as the read's other checks do.
- * Three shapes a read gives still meet a write's refusal, each in a record
+ * Four shapes a read gives still meet a write's refusal, each in a record
  * the store's writes don't make: inline media where the store keeps a blob,
  * whose source it can't keep as one (unstorableSource: data it can't read, or
  * no media type it can give it); a `blob_ref` the read takes deeper than a
- * `tool_result`'s own content array, which resolution leaves as it is, since
- * it resolves the content's blocks and the images in a top-level
- * `tool_result`'s array; and an image's
- * `blob_ref` without a string `mediaType` whose bytes carry no signature
- * (refHasMediaType). Leaving out the first two would take a read that knows
- * where a block sits, which these walks don't.
+ * `tool_result`'s own content array, and a document's, audio's or video's
+ * `blob_ref` in that array, both of which resolution leaves as they are,
+ * since it resolves the content's blocks and the images in a top-level
+ * `tool_result`'s array; and an image's `blob_ref` without a string
+ * `mediaType` whose bytes carry no signature (refHasMediaType). Leaving out
+ * the first three would take a read that knows where a block sits, which
+ * these walks don't.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
