@@ -2136,7 +2136,9 @@ export class ContextManager {
    * every listed body is rewritten and no body failed, it appends that the
    * branch finished the take. Its report gives what the strategy dropped
    * during the pass (`dropped`): a joined note loses each summary over a
-   * piece of it, its first row included, and each summary above one.
+   * piece of it, its first row included, and each summary above one. A
+   * strategy can refuse the pass as it begins (beforeSweepPass), as an
+   * audit-only one does, and then the call throws and writes nothing.
    *
    * Synchronous, so no turn that awaits can start between its reads and its
    * writes, and one pass at a time runs: a listener of its writes that asks

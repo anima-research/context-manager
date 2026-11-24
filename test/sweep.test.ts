@@ -1352,6 +1352,29 @@ describe('old summaries and the second act', () => {
     assert.equal(sequenceOf(audit), sequence, 'the store stays as it was');
     audit.close();
   });
+
+  for (const mode of ['legacy', 'presented'] as const) {
+    it(`S89 (${mode}): a pass through an audit-only strategy is refused before any write, and the store stays as it was`, async () => {
+      const path = freshPath();
+      const cm = await ContextManager.open({ path, strategy: adaptive(), membrane: mockMembrane() });
+      if (mode === 'presented') cm.presentRows([]);
+      const { long } = joinFixture(cm);
+      if (mode === 'presented') cm.presentRows(cm.getAllMessages().map((m) => m.id));
+      await drain(cm);
+      cm.takeSweep('rewords-test');
+      cm.close();
+      const strategy = new AutobiographicalStrategy({ ...FOLD, adaptiveResolution: true, auditOnly: true });
+      const audit = await ContextManager.open({ path, strategy, membrane: mockMembrane() });
+      const summaries = summariesOf(strategy).map((s) => s.id);
+      assert.ok(summaries.length > 0, 'premise: it holds summaries');
+      const sequence = sequenceOf(audit);
+      assert.throws(() => audit.applySweeps([rewords()]), /audit-only/);
+      assert.equal(sequenceOf(audit), sequence, 'the store stays as it was');
+      assert.ok(bodyRows(audit, long).length > 1, 'the note is not joined');
+      assert.deepEqual(summariesOf(strategy).map((s) => s.id), summaries, 'the strategy keeps its summaries');
+      audit.close();
+    });
+  }
 });
 
 describe('branches', () => {

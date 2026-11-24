@@ -625,10 +625,12 @@ export interface ContextStrategy {
   dropOldSummaries?(rows: SweptRows, ctx: StrategyContext): SummaryDropCost;
 
   /**
-   * Asked as the manager's pass begins. The function it gives is asked as
-   * the pass ends, where the store is still on the branch and the manager
-   * open: it reads the branch's applied list of sweeps (sweep.ts) and gives
-   * what the strategy dropped during the pass, by any path.
+   * Asked as the manager's pass begins, before the pass writes anything: a
+   * throw refuses the pass, and nothing is written. The function it gives
+   * is asked as the pass ends, where the store is still on the branch and
+   * the manager open: it reads the branch's applied list of sweeps
+   * (sweep.ts) and gives what the strategy dropped during the pass, by any
+   * path.
    */
   beforeSweepPass?(ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost;
 

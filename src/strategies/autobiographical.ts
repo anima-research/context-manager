@@ -8764,8 +8764,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * A pass begins: where another instance of the namespace wrote the store
-   * since this one read it, take the store up first, so the drop that the
+   * A pass begins. An audit-only instance refuses it, before any write.
+   * Where another instance of the namespace wrote the store since this one
+   * read it, take the store up first, so the drop that the
    * pass ends with counts only what this pass dropped. The function given
    * reads the branch's applied list, as the pass ends, and gives what this
    * instance dropped since it was made, by any path: the removal of a later
@@ -8773,6 +8774,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   beforeSweepPass(_ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost {
     this.requireLoadedBranch('beforeSweepPass');
+    if (this.config.auditOnly) {
+      throw new Error('AutobiographicalStrategy.beforeSweepPass refused: an audit-only instance writes nothing, so no pass runs through it.');
+    }
     if (this.storeWrittenElsewhere()) this.takeUpStoreState();
     const from = { summaries: this.summaries, chunkRecords: this.chunkRecords };
     return (ctx) => {

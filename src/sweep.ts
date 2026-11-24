@@ -36,9 +36,10 @@ export interface SweepBody {
  * is. What an entry throws is reported by its class alone, since its message
  * and its name can quote the body. A sweep repairs what the store gives and
  * erases nothing: the old text stays readable at each listed item's
- * `sequence` (getMessageAt), and on every branch cut before the pass. No
- * call takes a take back, so an entry ships while any store that took it
- * may still owe it; where it no longer ships, a pass reports `unknown`.
+ * `sequence` (getMessageAt), and on a branch cut before the pass until a
+ * pass runs there. No call takes a take back, so an entry ships while any
+ * store that took it may still owe it; where it no longer ships, a pass
+ * reports `unknown`.
  */
 export interface SweepEntry {
   name: string;

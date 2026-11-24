@@ -12,9 +12,9 @@
   by its `rawItem`. An entry can't empty a body: a result with no block, or
   with only text blocks that hold nothing, is reported. A sweep repairs what
   the store gives and erases nothing: the old text stays readable at each
-  listed item's `sequence` (`getMessageAt`), on every branch cut before the
-  pass, in each old summary until its namespace's second act, and in the
-  summaries that the second limit below names.
+  listed item's `sequence` (`getMessageAt`), on a branch cut before the pass
+  until a pass runs there, in each old summary until its namespace's second
+  act, and in the summaries that the second limit below names.
   - `ContextManager.showSweep(entry)` lists what the entry would change in
     the slot the manager writes, on the open branch, read as the store holds
     it and not through the manager's view, and names each body that a pass
@@ -121,7 +121,8 @@
     manager's strategy lets go of a joined note's summaries at its next
     live select, tick or L1, and until then a dry compile of it can still
     show them. An audit-only instance lets go of nothing, as it leaves rows
-    that left the window under what covers them.
+    that left the window under what covers them, and it refuses a pass
+    before any write.
   - `MessageStore.rewriteBody(id, content)` writes a body's whole content at
     its first row, without the body group's fields;
     `MessageStore.checkRewrite(id, content)` throws what it would refuse,
