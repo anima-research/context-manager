@@ -7,7 +7,8 @@
     plan writes nothing. It returns each target before and after, the
     summaries that the mutation drops, the first row whose rendering
     changes, whether a changed row lies inside the thinking-binding record,
-    and a `planSha256`.
+    and a `planSha256` of all that it reports, with each summary that it
+    drops as the strategy holds it.
   - The plan refuses each of these, and says what to change:
     - a target that changed since its caller read it, a target named twice,
       or a target that isn't there;
@@ -44,14 +45,19 @@
     source's, without the plan's drops. Otherwise the apply refuses
     (`READBACK_MISMATCH`). New rows after the source's rows are allowed,
     such as a notice that `beforeSwitch` writes. The apply also refuses an
-    anomaly that the source didn't have (`INVARIANT_BROKEN`). It refuses a
-    source that moved while the branch was built (`SOURCE_MOVED`): a record
-    written to the source, the store on another branch, or the target branch
-    replaced. Only then does it switch the store to the branch.
+    anomaly that the source didn't have (`INVARIANT_BROKEN`). Where the
+    build and the readback pass, it refuses a source that moved while the
+    branch was built (`SOURCE_MOVED`): a record written to the source, the
+    store on another branch, or the target branch replaced. Only then does
+    it switch the store to the branch.
+  - The preview and the apply refuse, before they write anything, a `by`
+    whose `by` is blank or isn't a string, and a call made while the
+    manager stores the shards of a sharded `addMessage`. The apply refuses
+    the same for each reader. Ask again once the add returns.
   - A failure before that switch, or a process that stops, leaves the store
     where it was, and every manager on it with it. That is the source
-    branch, unless something else moved the store meanwhile, which refuses
-    the apply (`SOURCE_MOVED`). A failure in the process also deletes the
+    branch, unless something else moved the store meanwhile. A failure in
+    the process also deletes the
     branch built. Where that deletion fails, the error (`BRANCH_LEFT`) names
     the branch. It says whether the branch is still there, or deleted with
     the deletion not saved yet. A process that stops leaves the branch, as a
@@ -70,16 +76,25 @@
     own window mode. So its summaries over an edited or removed row can
     refuse the plan, and so can a tool pair split in its record or its
     window. The plan says what the mutation does to each reader
-    (`readers`), and `planSha256` covers it. Before `beforeSwitch`, the
-    apply reconciles each reader on the target branch with a fresh instance
-    of the reader's strategy: the removed rows leave its window, and the
-    summaries that the plan drops for it go. A fresh open reads each reader
-    back too. So a failure before the switch leaves every reader as it was.
+    (`readers`): the rows that its window holds or its summaries fold, the
+    summaries that it drops, and where its window and its thinking record
+    change. `planSha256` covers each reader's part. Before `beforeSwitch`,
+    the apply reconciles every reader on the target branch: the removed rows
+    leave its window, and the summaries that the plan drops for it go. It
+    uses a fresh instance of the reader's strategy (`cloneForScratch`), or a
+    `PassthroughStrategy` where that strategy keeps no summaries and has no
+    `onRetracted`. A fresh open reads each reader back too. So a failure
+    before the switch leaves every reader as it was. A reader is refused,
+    thrown before anything is written, where it is the manager itself, is
+    named twice, shares a strategy namespace with the manager or another
+    reader, reads another store, or keeps summaries or has `onRetracted`
+    with no usable `cloneForScratch`.
   - `compileMutationPreview(manifest, { by, budget?, injections?,
-    selectOptions?, strategy?, readers? })` builds the mutation the same way
-    on a scratch branch, compiles there with `dryRun`, and deletes the
-    branch. So a preview writes to the store, though the manager's branch
-    doesn't move. The scratch strategy gets the live strategy's rendering
+    selectOptions?, strategy?, readers? })` builds the manager's part of the
+    mutation the same way on a scratch branch, compiles there with `dryRun`,
+    and deletes the branch. It plans the readers as the apply does, and
+    reconciles none of them: the compile is the manager's. So a preview
+    writes to the store, though the manager's branch doesn't move. The scratch strategy gets the live strategy's rendering
     frontier, as `derive` does, so that the live strategy's hot settings
     apply there too.
   - `checkHistoryInvariants()` lists the anomalies of a history as it

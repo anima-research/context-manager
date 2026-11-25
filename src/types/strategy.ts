@@ -3198,9 +3198,10 @@ export interface SummaryEntry {
    * Set when the text came from outside the strategy's own compression
    * calls: an operator installed it as the result of the work, or replaced
    * the text of an existing summary (`importExternalMemory`,
-   * `editSummaryText`). Absent on every other entry. No selection reads it.
-   * Under `recallEnvelope: 'xml'`, the recall envelope of the entry, and of
-   * each entry that carries it, names `by` as `editedBy`. An entry that has it has no `provenance`: that
+   * `editSummaryText`). Absent on every other entry. Under
+   * `recallEnvelope: 'xml'`, the recall envelope of the entry, and of each
+   * entry that carries it, names `by` as `editedBy`, and selection prices
+   * that envelope; nothing else of selection reads it. An entry that has it has no `provenance`: that
    * records a model's accepted answer, and here there is none. An installed
    * entry names the request it answers in `external.requestHash`; an edit
    * drops the `provenance` of the call that wrote the text it replaced,

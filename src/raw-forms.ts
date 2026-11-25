@@ -158,33 +158,44 @@ export function releaseEditedRawForms(
   return changed ? result : after;
 }
 
-/**
- * releaseEditedRawForms for content that replaces `before` whole, as a
- * history mutation's caller gives it: a block of `after` equal to a block of
- * `before` (canonical JSON) is that block kept, and any other block gives up
- * every raw form it carries, an opaque carrier's item included, so a replay
- * never stands in for changed fields. Where the kept blocks don't stand in
- * `before`'s order, each of them is a moved block
- * (releaseSharedRawFormsOnMove), since a raw form they share replays the old
- * order.
- */
 export function releaseReplacedRawForms(before: readonly ContentBlock[], after: readonly ContentBlock[]): ContentBlock[] {
-  const unused = new Map<string, ContentBlock[]>();
-  for (const block of before) {
+  const unused = new Map<string, number[]>();
+  before.forEach((block, at) => {
     const key = canonicalJson(block);
-    unused.set(key, [...(unused.get(key) ?? []), block]);
+    unused.set(key, [...(unused.get(key) ?? []), at]);
+  });
+  const placeOf = after.map((block) => unused.get(canonicalJson(block))?.shift());
+  const groups: Array<{ keys: string[]; at: number[] }> = [];
+  const byKey = new Map<string, number[]>();
+  before.forEach((block, at) => {
+    for (const key of rawFormKeys(block)) byKey.set(key, [...(byKey.get(key) ?? []), at]);
+  });
+  for (const [key, at] of byKey) groups.push({ keys: [key], at });
+  for (const pairing of pairingsOf(before)) {
+    groups.push({ keys: pairing, at: before.flatMap((block, at) => (pairing.includes(itemKey(block) ?? '') ? [at] : [])) });
   }
-  const matched = after.map((block) => unused.get(canonicalJson(block))?.shift() ?? withoutAnyRawForm(block));
-  const places = matched.map((block) => before.indexOf(block)).filter((at) => at >= 0);
-  const inOrder = places.every((at, i) => i === 0 || (places[i - 1] ?? -1) < at);
-  return releaseEditedRawForms(before, inOrder ? matched : matched.map((block) => (before.includes(block) ? releaseSharedRawFormsOnMove(block, before) : block)));
+  const moved = new Set<string>();
+  for (const { keys, at } of groups) {
+    const first = at[0]!;
+    const last = at[at.length - 1]!;
+    const kept = placeOf.flatMap((place, j) => (place !== undefined && at.includes(place) ? [j] : []));
+    if (kept.length === 0) continue;
+    const span = placeOf.slice(kept[0], kept[kept.length - 1]! + 1);
+    if (span.length !== last - first + 1 || span.some((place, k) => place !== first + k)) for (const key of keys) moved.add(key);
+  }
+  const matched = after.map((block, j) => {
+    const place = placeOf[j];
+    return place === undefined ? withoutAnyRawForm(block) : withoutRawForms(before[place]!, moved);
+  });
+  return releaseEditedRawForms(before, matched);
 }
 
 function withoutAnyRawForm(block: ContentBlock): ContentBlock {
   const carrier = block as ContentBlock & RawFormCarrier;
-  if (carrier.rawXml === undefined && carrier.rawItem === undefined) return block;
+  const replayed = xmlKey(block) !== undefined;
+  if (!replayed && carrier.rawItem === undefined) return block;
   const copy = { ...carrier };
-  delete copy.rawXml;
+  if (replayed) delete copy.rawXml;
   delete copy.rawItem;
   return copy;
 }

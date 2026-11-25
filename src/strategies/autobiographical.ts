@@ -16018,11 +16018,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * carries it up a level reads the new text and is written as its copy
    * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
    * reported and left alone. The store's history keeps each entry as it was.
-   * The carriers are written first and the summary last, so a write that
-   * fails leaves the summary that a compile reads as it was, and the same
-   * edit can be asked for again. Without `apply` nothing is written. Refused
-   * as SummaryTextEditOptions says, and, before anything is written, where
-   * the stored summaries no longer hold the summary or one of its carriers.
+   * The summary and its carriers are written in one write of the summaries,
+   * so a write that fails leaves them all as they were, and the same edit
+   * can be asked for again. Without `apply` nothing is written. Refused as
+   * SummaryTextEditOptions says, and, before anything is written, where the
+   * stored summaries aren't as this strategy holds them.
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -16041,31 +16041,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       parents: plan.parents,
     };
     if (!options.apply) return edit;
-    const carriers = plan.carriedBy.map((carrier) => this.summaryById(carrier.id)!);
-    if (this.store) {
-      const stored = this.store.getStateJson(this.summariesStateId);
-      const held = new Set(Array.isArray(stored) ? stored.map((item: unknown) => (typeof item === 'object' && item !== null && 'id' in item ? item.id : undefined)) : []);
-      const missing = [entry, ...carriers].filter((s) => !held.has(s.id)).map((s) => s.id);
-      if (missing.length > 0) {
-        throw new Error(`summary ${missing.join(', ')} isn't in the stored summaries: another handle changed them since this strategy read them; open the store again`);
-      }
+    if (this.store && this.storeWrittenElsewhere()) {
+      throw new Error('the stored summaries aren\'t as this strategy holds them: another handle changed them since this strategy read them; open the store again');
     }
     const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
-    const rewrite = (summary: SummaryEntry) => {
-      summary.content = body;
-      summary.tokens = edit.tokens;
-      delete summary.responseContent;
-      delete summary.provenance;
-      delete summary.stitched;
-      summary.external = external;
-    };
+    const rewritten = new Set([id, ...plan.carriedBy.map((carrier) => carrier.id)]);
+    const summaries = this.summaries.map((summary) => {
+      if (!rewritten.has(summary.id)) return summary;
+      const { responseContent: _responseContent, provenance: _provenance, stitched: _stitched, ...kept } = summary;
+      return { ...kept, content: body, tokens: edit.tokens, external };
+    });
+    const store = this.store;
     try {
-      for (const written of [...carriers, entry]) {
-        const next = { ...written };
-        rewrite(next);
-        this.writeStoredSummary(next, 'editSummaryText', 'new text');
-        rewrite(written);
+      if (store) {
+        try {
+          this.writeHeldState(this.summariesStateId, () => store.setStateJson(this.summariesStateId, summaries));
+        } catch (error) {
+          let landed = false;
+          try {
+            landed = canonicalJson(store.getStateJson(this.summariesStateId) ?? null) === storedCanonicalJson(summaries);
+          } catch {
+            landed = false;
+          }
+          if (landed) this.summaries = summaries;
+          throw error;
+        }
       }
+      this.summaries = summaries;
     } finally {
       this._answerCostCache.clear();
     }
