@@ -1,7 +1,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -408,7 +408,7 @@ describe('history mutation', () => {
         ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text', mergedInto: 'L3-elsewhere' } : s))],
       ] as const) {
         store.setStateJson(summariesId, stored);
-        assert.throws(ask, /the stored summaries aren't as this strategy holds them/, what);
+        assert.throws(ask, /the stored summaries can't be shown to be as this strategy holds them/, what);
         assert.deepEqual(store.getStateJson(summariesId), stored, `${what}: nothing written`);
         assert.equal(manager.getSummary(under.id)?.content, under.content, `${what}: nothing changed in memory`);
       }
@@ -1392,5 +1392,262 @@ describe('history mutation', () => {
       assert.deepEqual(sourceState(manager), before);
       assert.deepEqual(manager.checkHistoryInvariants(), []);
     });
+  });
+  /** Run `body` with the store's branch file unwritable, as a full or failing disk leaves it: chronicle's switch selects the branch, then its checkpoint fails. */
+  function withBranchFileBlocked<T>(path: string, body: () => T): T {
+    const file = join(path, 'branches.bin');
+    renameSync(file, `${file}.held`);
+    mkdirSync(file);
+    try {
+      return body();
+    } finally {
+      rmdirSync(file);
+      renameSync(`${file}.held`, file);
+    }
+  }
+
+  it('says a switch that landed and failed its checkpoint is applied, with its receipt and how to save it', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => (name === 'surgery/unsaved' ? withBranchFileBlocked(path, () => native(name)) : native(name));
+      let caught: unknown;
+      try {
+        await manager.applyHistoryMutation(manifest, { targetBranch: 'surgery/unsaved', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } });
+      } catch (error) {
+        caught = error;
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.ok(caught instanceof HistoryMutationError && caught.violations.map((v) => v.code).join() === 'APPLIED_INIT_FAILED', String(caught));
+      assert.equal(caught.receipt?.targetBranch, 'surgery/unsaved');
+      assert.match(caught.message, /getStore\(\)\.sync\(\) saves a switch whose checkpoint failed/);
+      assert.equal(store.currentBranch().name, 'surgery/unsaved', 'the store is on the branch it built');
+      assert.ok(manager.listBranches().some((b) => b.name === 'surgery/unsaved'), 'and the branch is kept');
+      assert.throws(() => manager.describeMutationTarget({ messageId: id }), /requires successful strategy initialization/, 'the manager refuses work until it is initialized there');
+      store.sync();
+      await manager.setStrategy(manager.getStrategy());
+      assert.equal(rendered([manager.getMessage(id)!]), '[edited by operator]\nas edited');
+    } finally {
+      manager.close();
+    }
+    const reopened = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      assert.equal(reopened.currentBranch().name, 'surgery/unsaved', 'sync() saved the switch');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => withBranchFileBlocked(path, () => native(name));
+      try {
+        await assert.rejects(manager.switchBranch('elsewhere'), /Branch selection elsewhere took effect, and saving it failed/);
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'elsewhere');
+      assert.throws(() => manager.describeMutationTarget({ summaryId: 'none' }), /requires successful strategy initialization/);
+      store.sync();
+      await manager.setStrategy(manager.getStrategy());
+      assert.equal(manager.currentBranch().name, 'elsewhere');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses a plan whose dropped summary another handle changed since, the manager\'s or a reader\'s', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row rewritten' }],
+        label: '[edited by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const editElsewhere = async (namespace: string, ids: readonly string[], text: string) => {
+        const other = await ContextManager.open({ store: a.getStore(), namespace, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+        try {
+          const summaryId = ids.find((s) => other.getSummary(s)?.level === 1 && !other.getSummary(s)?.carriedFrom)!;
+          const described = other.describeMutationTarget({ summaryId });
+          assert.ok(described?.kind === 'summary', `setup: ${namespace} has summary ${summaryId}`);
+          other.editSummaryText(summaryId, text, { by: 'someone' }, { apply: true, dropResponseContent: true, expectedPriorSha256: described.sha256 });
+        } finally {
+          other.close();
+        }
+      };
+      for (const [whose, namespace, dropped] of [
+        ['a reader\'s', NS_B, (plan: HistoryMutationPlan) => plan.readers[0]!.droppedSummaries],
+        ['the manager\'s', NS, (plan: HistoryMutationPlan) => plan.droppedSummaries],
+      ] as const) {
+        const plan = a.planHistoryMutation(manifest, { readers: [b] });
+        await editElsewhere(namespace, dropped(plan), `Edited through another handle (${whose}).`);
+        await assert.rejects(a.applyHistoryMutation(manifest, {
+          targetBranch: `surgery/elsewhere-${namespace}`, expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+        }), refusedWith('PLAN_DRIFT'), whose);
+        assert.equal(a.currentBranch().name, 'main', `${whose}: the store stays on the source`);
+      }
+    });
+  });
+
+  it('refuses a summary edit where reading the stored summaries to compare them fails, and writes nothing', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { op, target } = l1Edit(manager);
+      const store = manager.getStore();
+      const summariesId = `${NS}/autobio:summaries`;
+      const held = store.getStateJson(summariesId) as SummaryEntry[];
+      const other = held.find((s) => s.id !== target.id)!;
+      const newer = held.map((s) => (s.id === other.id ? { ...s, content: 'a newer text of another summary' } : s));
+      store.setStateJson(summariesId, newer);
+      const get = store.getStateJson.bind(store);
+      let failures = 0;
+      store.getStateJson = (id: string) => {
+        if (id === summariesId && failures++ === 0) throw new Error('the read failed');
+        return get(id);
+      };
+      try {
+        assert.throws(
+          () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: op.expectedSha256 }),
+          /the stored summaries can't be shown to be as this strategy holds them/,
+        );
+      } finally {
+        store.getStateJson = get;
+      }
+      assert.equal(failures, 1, 'setup: the compare read failed');
+      assert.deepEqual(store.getStateJson(summariesId), newer, 'nothing written');
+      assert.equal(manager.getSummary(target.id)?.content, target.content, 'nothing changed in memory');
+    });
+  });
+
+  it('holds an edit a summary write made before it threw, so asking again finds the new text', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { op, target } = l1Edit(manager);
+      const store = manager.getStore();
+      const summariesId = `${NS}/autobio:summaries`;
+      const set = store.setStateJson.bind(store);
+      store.setStateJson = (id: string, value: unknown) => {
+        const written = set(id, value);
+        if (id === summariesId) throw new Error('the write landed, and then failed');
+        return written;
+      };
+      const ask = () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: op.expectedSha256 });
+      try {
+        assert.throws(ask, /the write landed, and then failed/);
+      } finally {
+        store.setStateJson = set;
+      }
+      assert.equal(manager.getSummary(target.id)?.content, 'Edited by hand.', 'memory holds what the store holds');
+      assert.equal((store.getStateJson(summariesId) as SummaryEntry[]).find((s) => s.id === target.id)?.content, 'Edited by hand.');
+      assert.throws(ask, /not the [0-9a-f]{64} given: read it again/, 'asking again finds the new text');
+    });
+  });
+
+  it('reports a plan that has become invalid since as PLAN_DRIFT, though its targets are the same', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const a = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, isolate: true, auxiliaryMessageViews: [{}], strategy: new PassthroughStrategy() });
+    try {
+      a.addMessage('User', [{ type: 'text', text: 'look it up' }]);
+      const id = a.addMessage('Ada', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [id], expectedSha256ById: { [id]: messageSha(a, id) } }] };
+      const agreed = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.equal(agreed.valid, true, 'setup: the call has no result yet');
+      b.addMessage('User', [{ type: 'tool_result', toolUseId: 't1', content: 'found it' }]);
+      const now = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.equal(now.valid, false, 'setup: the removal now splits the pair in the reader\'s record');
+      assert.notEqual(now.planSha256, agreed.planSha256);
+      await assert.rejects(a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/now-invalid', expectedSourceBranch: 'main', expectedPlanSha256: agreed.planSha256, by: { by: 'operator' }, readers: [b],
+      }), (error: unknown) => error instanceof HistoryMutationError && error.violations.map((v) => v.code).join() === 'PLAN_DRIFT' && error.plan?.valid === false);
+    } finally {
+      b.close();
+      a.close();
+    }
+  });
+
+  it('places the KV boundary at an edited row that the edit brings into a view', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const hides = (row: { content: ContentBlock[] }) => !row.content.some((block) => block.type === 'text' && block.text === 'hidden');
+    const a = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy(), viewFilter: hides });
+    const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: new PassthroughStrategy(), viewFilter: hides });
+    try {
+      a.addMessage('User', [{ type: 'text', text: 'first' }]);
+      const id = a.addMessage('User', [{ type: 'text', text: 'hidden' }]);
+      a.addMessage('Ada', [{ type: 'text', text: 'later' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), label: '[edited by operator]', content: [{ type: 'text', text: 'now shown' }] }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.equal(plan.invalidatesKvPrefixFrom?.messageId, id, 'the manager\'s own view');
+      assert.equal(plan.readers[0]!.invalidatesKvPrefixFrom?.messageId, id, 'the reader\'s view');
+      const later = a.getAllMessages().at(-1)!.id;
+      const both = a.planHistoryMutation({ ops: [
+        manifest.ops[0]!,
+        { kind: 'edit_message', messageId: later, expectedSha256: messageSha(a, later), label: '[edited by operator]', content: [{ type: 'text', text: 'later, edited' }] },
+      ] }, { readers: [b] });
+      assert.deepEqual([both.invalidatesKvPrefixFrom?.messageId, both.readers[0]!.invalidatesKvPrefixFrom?.messageId], [id, id], 'it comes into the view before a later edited row');
+      const stillHidden = a.planHistoryMutation({ ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), label: '[edited by operator]', content: [{ type: 'text', text: 'hidden' }] }] }, { readers: [b] });
+      assert.deepEqual([stillHidden.invalidatesKvPrefixFrom, stillHidden.readers[0]!.invalidatesKvPrefixFrom], [undefined, undefined], 'an edit that the view still leaves out changes nothing it sends');
+      const before = rendered((await b.compile(undefined, undefined, { dryRun: true })).messages);
+      await a.applyHistoryMutation(manifest, { targetBranch: 'surgery/shown', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b] });
+      await b.setStrategy(b.getStrategy());
+      const after = rendered((await b.compile(undefined, undefined, { dryRun: true })).messages);
+      assert.ok(!before.includes('now shown') && after.includes('now shown'), 'setup: the edit brings the row into the reader\'s compile');
+    } finally {
+      b.close();
+      a.close();
+    }
+  });
+
+  it('refuses to switch to a branch where a window differs from its source\'s other than the plan says, the manager\'s or a reader\'s', async () => {
+    const changes: Array<[string, (staged: ContextManager, rows: { kept: string; later: string }) => void, (rows: { kept: string; later: string }) => RegExp]> = [
+      ['a kept row leaves it', (staged, { kept }) => staged.retractRows([kept]), ({ kept }) => new RegExp(`message ${kept} left its window`)],
+      ['a kept row moves in it', (staged, { kept }) => { staged.retractRows([kept]); staged.presentRows([kept]); }, ({ kept }) => new RegExp(`message ${kept} moved in its window`)],
+      ['a row it didn\'t hold comes into it', (staged, { later }) => staged.presentRows([later]), ({ later }) => new RegExp(`message ${later} is in its window, and the source's window didn't hold it`)],
+    ];
+    for (const whose of [NS, NS_B]) {
+      for (const [what, change, says] of changes) {
+        const path = join(dir, `store-${stores++}`);
+        const a = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+        const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: new PassthroughStrategy() });
+        try {
+          const edited = a.addMessage('User', [{ type: 'text', text: 'edit me' }]);
+          const kept = a.addMessage('Ada', [{ type: 'text', text: 'keep me' }]);
+          a.presentRows([edited, kept]);
+          b.presentRows([edited, kept]);
+          const later = a.addMessage('User', [{ type: 'text', text: 'not presented yet' }]);
+          const ordinals = [a, b].map((m) => [m.ordinalOf(kept), m.ordinalOf(later)]);
+          const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: edited, expectedSha256: messageSha(a, edited), label: '[edited by operator]', content: [{ type: 'text', text: 'edited' }] }] };
+          const plan = a.planHistoryMutation(manifest, { readers: [b] });
+          await assert.rejects(a.applyHistoryMutation(manifest, {
+            targetBranch: 'surgery/window', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+            beforeSwitch: async ({ view }) => {
+              const staged = await ContextManager.open({ store: view, namespace: whose, strategy: new PassthroughStrategy() });
+              try {
+                change(staged, { kept, later });
+              } finally {
+                staged.close();
+              }
+            },
+          }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && says({ kept, later }).test(String(error)), `${whose}: ${what}`);
+          assert.equal(a.currentBranch().name, 'main', `${whose}: ${what}`);
+          assert.deepEqual([a, b].map((m) => [m.ordinalOf(kept), m.ordinalOf(later)]), ordinals, `${whose}: ${what}: each window stays as it was`);
+        } finally {
+          b.close();
+          a.close();
+        }
+      }
+    }
   });
 });
