@@ -241,7 +241,7 @@ describe('external-memory', () => {
     assert.ok(said(request).includes(first.content), 'setup: its request recalls the first merge');
 
     // The recalled memory's text changes: the work is the same, and its request isn't.
-    const edited = await run(['edit', path, '--namespace', NS, '--id', first.id, '--body-file', bodyFile('The first stretch, rewritten.'), '--by', 'operator', '--apply']);
+    const edited = await run(['edit', path, '--namespace', NS, '--id', first.id, '--body-file', bodyFile('The first stretch, rewritten.'), '--by', 'operator', '--drop-response-content', '--apply']);
     assert.equal(edited.code, 0, edited.stderr);
     const before = memory(path);
     const importArgs = ['import', path, '--namespace', NS, '--descriptor', file, '--body-file', bodyFile(BODY), '--by', 'operator'];
@@ -359,7 +359,7 @@ describe('external-memory', () => {
     assert.equal(l1.level, 1);
   });
 
-  it('edits one summary\'s text: lineage kept, carrier dropped, parents reported and left alone', async () => {
+  it('edits one summary\'s text: lineage kept, carrier dropped on request, parents reported and left alone', async () => {
     const path = await residentStore();
     await asResident(path, answers, (manager) => manager.tick());
     const all = summariesOf(path);
@@ -369,7 +369,7 @@ describe('external-memory', () => {
     assert.equal(target.provenance?.model, MODEL, 'setup: and the provenance of the call that wrote it');
 
     const text = bodyFile('The second stretch, rewritten by hand.');
-    const args = ['edit', path, '--namespace', NS, '--id', target.id, '--body-file', text, '--by', 'operator'];
+    const args = ['edit', path, '--namespace', NS, '--id', target.id, '--body-file', text, '--by', 'operator', '--drop-response-content'];
     const before = memory(path);
     const dry = await run(args);
     assert.equal(dry.code, 0, dry.stderr);
@@ -402,6 +402,69 @@ describe('external-memory', () => {
     const missing = await run(['edit', path, '--namespace', NS, '--id', 'L1-9999', '--body-file', text, '--by', 'operator', '--apply']);
     assert.equal(missing.code, 1);
     assert.match(missing.stderr, /no summary L1-9999/);
+  });
+
+  it('refuses to edit a summary whose verbatim response blocks would render in place of the new text, unless they are dropped', async () => {
+    const path = await residentStore();
+    const target = summariesOf(path).find((s) => (s.responseContent?.length ?? 0) > 0)!;
+    assert.ok(target, 'setup: a summary that renders its response blocks');
+    const before = memory(path);
+    for (const apply of [[], ['--apply']]) {
+      const refused = await run(['edit', path, '--namespace', NS, '--id', target.id, '--body-file', bodyFile('By hand.'), '--by', 'operator', ...apply]);
+      assert.equal(refused.code, 1);
+      assert.match(refused.stderr, new RegExp(`summary ${target.id} renders 2 verbatim response block\\(s\\)`));
+    }
+    assert.equal(memory(path), before, 'nothing is written');
+  });
+
+  it('refuses an edit whose expected text is not the summary\'s, and makes the one whose text is', async () => {
+    const path = await residentStore();
+    const target = summariesOf(path)[0]!;
+    await asResident(path, answers, async (manager) => {
+      const options = { apply: true, dropResponseContent: true };
+      assert.throws(
+        () => manager.editSummaryText(target.id, 'By hand.', { by: 'operator' }, { ...options, expectedPriorSha256: sha256('another text') }),
+        new RegExp(`summary ${target.id}'s text has sha256 ${sha256(target.content)}, not the ${sha256('another text')} given`),
+      );
+      assert.equal(manager.getSummary(target.id)?.content, target.content, 'the refused edit wrote nothing');
+      const edit = manager.editSummaryText(target.id, 'By hand.', { by: 'operator' }, { ...options, expectedPriorSha256: sha256(target.content) });
+      assert.equal(edit.applied, true);
+    });
+    assert.equal(summariesOf(path).find((s) => s.id === target.id)?.content, 'By hand.');
+  });
+
+  it('refuses to edit an entry that carries a summary up a level, naming that summary, and reports the carrier when the summary is edited', async () => {
+    const path = await residentStore();
+    const under = summariesOf(path)[1]!;
+    const carrier: SummaryEntry = {
+      id: 'L2-carry', level: 2, sourceLevel: 1, sourceIds: [under.id], carriedFrom: under.id, sourceRange: under.sourceRange,
+      content: under.content, tokens: under.tokens, created: under.created,
+      ...(under.responseContent ? { responseContent: under.responseContent } : {}),
+    };
+    read(path, (store) => {
+      const all = store.getStateJson(`${NS}/autobio:summaries`) as SummaryEntry[];
+      store.setStateJson(`${NS}/autobio:summaries`, [...all.map((s) => (s.id === under.id ? { ...s, mergedInto: carrier.id } : s)), carrier]);
+      store.sync();
+    });
+    await asResident(path, answers, async (manager) => {
+      assert.equal(manager.getSummary(carrier.id)?.carriedFrom, under.id, 'setup: the resident keeps the carried entry');
+      assert.throws(
+        () => manager.editSummaryText(carrier.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true }),
+        new RegExp(`summary ${carrier.id} carries ${under.id} up a level, .*: edit ${under.id}`),
+      );
+      const edit = manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true, apply: true });
+      assert.deepEqual(edit.carriedBy, [{ id: carrier.id, level: 2 }]);
+      assert.deepEqual(edit.parents, [], 'a carrier is not merged over the text: it reads it as it stands');
+    });
+    const after = summariesOf(path);
+    const edited = after.find((s) => s.id === under.id)!;
+    const carried = after.find((s) => s.id === carrier.id)!;
+    assert.deepEqual(
+      [carried.content, carried.tokens, carried.external, carried.responseContent, carried.provenance],
+      [edited.content, edited.tokens, edited.external, undefined, undefined],
+      'the carrier is written as the edited summary\'s copy again',
+    );
+    assert.equal(carried.carriedFrom, under.id);
   });
 
   it('checks the invocation whole before anything is opened', async () => {
