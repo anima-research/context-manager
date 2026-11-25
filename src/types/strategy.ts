@@ -3250,12 +3250,36 @@ export interface SummaryTextEdit {
   applied: boolean;
   /** The text replaced: its sha256 (hex, of the UTF-8 text), its `String.length` (UTF-16 code units) and its token stamp. */
   prior: { sha256: string; length: number; tokens: number };
-  /** The new text's token stamp: an estimate from its length, as for any summary that comes with no usage. */
+  /** The new text's token stamp: an estimate from its length (`Math.ceil(length / 3)`), as for any summary text no provider measured. */
   tokens: number;
   /** Verbatim response blocks the entry carried, which go with the text they matched (so do its `provenance` and `stitched`). */
   droppedResponseBlocks: number;
-  /** Summaries merged over the old text, nearest first. They are left as they are. */
+  /**
+   * Entries that carry the summary up a level (`carriedFrom`), nearest first.
+   * A compile reads the new text in their place, and an applied edit writes
+   * each as a copy of the edited summary again: its text, tokens and
+   * `external`, with no response blocks, `provenance` or `stitched`, as the
+   * summary keeps none.
+   */
+  carriedBy: Array<{ id: string; level: SummaryLevel }>;
+  /** Summaries merged over the old text, nearest first, with every summary above them. They are left as they are. */
   parents: Array<{ id: string; level: SummaryLevel }>;
+}
+
+/**
+ * `editSummaryText`'s options. Without `apply` nothing is written. The edit is
+ * refused, dry or not, where the entry carries up a level another summary
+ * that the strategy holds (a compile reads that summary's text), where
+ * `expectedPriorSha256` isn't its text's, where it renders verbatim response
+ * blocks and `dropResponseContent` isn't set, and where the new text is
+ * empty.
+ */
+export interface SummaryTextEditOptions {
+  apply?: boolean;
+  /** sha256 (hex) of the UTF-8 text the caller read. */
+  expectedPriorSha256?: string;
+  /** Drop the verbatim response blocks the entry renders in place of its text. */
+  dropResponseContent?: boolean;
 }
 
 /**
@@ -3273,7 +3297,7 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
     ctx: StrategyContext,
     options?: { apply?: boolean },
   ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }>;
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: { apply?: boolean }): SummaryTextEdit;
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: SummaryTextEditOptions): SummaryTextEdit;
 }
 
 export function isExternalMemoryStrategy(s: ContextStrategy): s is ExternalMemoryStrategy {

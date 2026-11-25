@@ -44,6 +44,7 @@ import type {
   MemoryWorkItem,
   MemoryWorkTarget,
   SummaryTextEdit,
+  SummaryTextEditOptions,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -103,6 +104,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
+import { describeSummaryEditRefusal, planSummaryEdit } from '../summary-edit.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
@@ -16022,39 +16024,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Replace the text of one summary. Its lineage stays as it is; its tokens
-   * are stamped from the new text; what described the call that wrote the
-   * old text goes, since it no longer matches: the verbatim response blocks
-   * it carried, its `provenance` and its split-stitch record (`stitched`);
-   * and `external` says who supplied the text. The store's history keeps
-   * the entry as it was. Summaries merged over the old text are reported
-   * and left alone. Without `apply` nothing is written.
+   * are stamped from the new text's length, as for any text no provider
+   * measured; what described the call that wrote the old text goes, since it
+   * no longer matches: the verbatim response blocks it carried (only with
+   * `dropResponseContent`), its `provenance` and its split-stitch record
+   * (`stitched`); and `external` says who supplied the text. Each entry that
+   * carries it up a level reads the new text and is written as its copy
+   * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
+   * reported and left alone. The store's history keeps each entry as it was.
+   * Without `apply` nothing is written. Refused as SummaryTextEditOptions
+   * says.
    */
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
-    const entry = this.summaries.find((s) => s.id === id);
-    if (!entry) throw new Error(`no summary ${id}`);
-    if (body.trim().length === 0) throw new Error('the memory text is empty');
-    const parents: SummaryTextEdit['parents'] = [];
-    for (let parent = this.summaryById(getSummaryParentId(entry) ?? ''); parent; parent = this.summaryById(getSummaryParentId(parent) ?? '')) {
-      parents.push({ id: parent.id, level: parent.level });
-    }
+    const plan = planSummaryEdit(this.summaries, id, body, options);
+    if (!plan) throw new Error(`no summary ${id}`);
+    if (plan.refusals.length > 0) throw new Error(plan.refusals.map((refusal) => describeSummaryEditRefusal(id, refusal)).join('; '));
+    const { entry } = plan;
     const edit: SummaryTextEdit = {
       id,
       level: entry.level,
       applied: options.apply === true,
-      prior: { sha256: createHash('sha256').update(entry.content, 'utf8').digest('hex'), length: entry.content.length, tokens: entry.tokens },
-      tokens: Math.ceil(body.length / 3),
-      droppedResponseBlocks: entry.responseContent?.length ?? 0,
-      parents,
+      prior: plan.prior,
+      tokens: plan.tokens,
+      droppedResponseBlocks: plan.droppedResponseBlocks,
+      carriedBy: plan.carriedBy,
+      parents: plan.parents,
     };
     if (!options.apply) return edit;
-    entry.content = body;
-    entry.tokens = edit.tokens;
-    delete entry.responseContent;
-    delete entry.provenance;
-    delete entry.stitched;
-    entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
-    this.writeStoredSummary(entry, 'editSummaryText', 'new text');
+    const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    for (const written of [entry, ...plan.carriedBy.map((carrier) => this.summaryById(carrier.id)!)]) {
+      written.content = body;
+      written.tokens = edit.tokens;
+      delete written.responseContent;
+      delete written.provenance;
+      delete written.stitched;
+      written.external = external;
+      this.writeStoredSummary(written, 'editSummaryText', 'new text');
+    }
+    this._answerCostCache.clear();
     return edit;
   }
 
