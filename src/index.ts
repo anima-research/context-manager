@@ -42,7 +42,7 @@ export {
   HistoryMutationError, messageContentSha256,
   type FoldedEditPolicy, type FoldedRemovePolicy, type HistoryAnomaly, type HistoryInvariantCode, type HistoryMutationManifest,
   type HistoryMutationOp, type HistoryMutationPlan, type HistoryMutationReceipt, type MessageEditStamp, type MutationTargetDescription,
-  type MutationViolation, type MutationViolationCode, type ParentPolicy, type PlannedTarget,
+  type MutationViolation, type MutationViolationCode, type ParentPolicy, type PlannedReader, type PlannedTarget,
 } from './history-mutation.js';
 export { textSha256 } from './summary-edit.js';
 export { resolveEffectiveConfig } from './config-provenance.js';

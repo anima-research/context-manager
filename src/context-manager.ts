@@ -55,9 +55,9 @@ import {
 } from './types/index.js';
 import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
 import {
-  describeTarget, historyAnomalies, HistoryMutationError, introducedAnomalies, planMutation, readBackMismatches, snapshotOf,
+  describeTarget, historyAnomalies, HistoryMutationError, introducedAnomalies, planMutation, readBackMismatches, readerReadBackMismatches, snapshotOf,
   type HistoryAnomaly, type HistoryMutationManifest, type HistoryMutationPlan, type HistoryMutationReceipt, type HistoryState,
-  type MessageEditStamp, type MutationTargetDescription, type MutationViolationCode,
+  type MessageEditStamp, type MutationTargetDescription, type MutationViolationCode, type PlannedReader,
 } from './history-mutation.js';
 import { isStateExistsFor } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
@@ -4670,10 +4670,41 @@ export class ContextManager {
     return describeTarget(this.historyState(), target);
   }
 
-  /** What `manifest` would do to this manager's history as it stands, and what refuses it. Writes nothing. */
-  planHistoryMutation(manifest: HistoryMutationManifest): HistoryMutationPlan {
+  /**
+   * What `manifest` would do to this manager's history as it stands, and what refuses it. Writes nothing.
+   *
+   * `readers` are the other managers on this store that read the rows the
+   * manifest changes: another agent on this manager's slot, or one that
+   * merges it. Each gets the rules of this manager's own window: its
+   * summaries over an edited row, or over a removed row, refuse as
+   * FOLDED_ROW_REQUIRES_POLICY unless the op's policy says what becomes of
+   * them, and a tool pair split in its record or its window refuses. The
+   * plan says what the mutation does to each (`readers`), and its sha256
+   * covers it. A reader is refused (thrown) where it is this manager, is
+   * named twice, has this manager's strategy namespace or another reader's,
+   * or is on another store.
+   */
+  planHistoryMutation(manifest: HistoryMutationManifest, options: { readers?: readonly ContextManager[] } = {}): HistoryMutationPlan {
     this.requireInitialized('planHistoryMutation');
-    return planMutation(this.historyState(), manifest);
+    return planMutation(this.historyState(), manifest, this.readersOf(options.readers, 'planHistoryMutation'));
+  }
+
+  private readersOf(
+    readers: readonly ContextManager[] | undefined,
+    operation: 'planHistoryMutation' | 'applyHistoryMutation',
+  ): Array<{ manager: ContextManager; namespace: string; state: HistoryState }> {
+    const out: Array<{ manager: ContextManager; namespace: string; state: HistoryState }> = [];
+    const namespaces = new Set([this.strategyNamespace]);
+    for (const reader of readers ?? []) {
+      if (reader === this) throw new Error(`ContextManager.${operation}: a reader is the manager itself`);
+      if (out.some((r) => r.manager === reader)) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} is named twice`);
+      if (reader.store !== this.store) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} reads another store`);
+      if (namespaces.has(reader.strategyNamespace)) throw new Error(`ContextManager.${operation}: two managers have strategy namespace ${reader.strategyNamespace}`);
+      reader.requireInitialized(operation);
+      namespaces.add(reader.strategyNamespace);
+      out.push({ manager: reader, namespace: reader.strategyNamespace, state: reader.historyState() });
+    }
+    return out;
   }
 
   /**
@@ -4702,7 +4733,9 @@ export class ContextManager {
    * `by` is who the apply will name, which the compile shows (a recall
    * envelope's `editedBy`). `strategy` gives the scratch manager its
    * strategy where this one's has no cloneForScratch; it must not compress
-   * on its own.
+   * on its own. `readers` are planned as planHistoryMutation plans them, so
+   * the plan returned is the one an apply with them agrees to; the compile
+   * is this manager's.
    */
   async compileMutationPreview(
     manifest: HistoryMutationManifest,
@@ -4712,10 +4745,11 @@ export class ContextManager {
       injections?: ContextInjection[];
       selectOptions?: SelectOptions;
       strategy?: () => ContextStrategy;
+      readers?: readonly ContextManager[];
     },
   ): Promise<{ plan: HistoryMutationPlan; compiled: CompileResult }> {
     this.requireInitialized('compileMutationPreview');
-    const plan = this.planHistoryMutation(manifest);
+    const plan = this.planHistoryMutation(manifest, options);
     if (!plan.valid) throw new HistoryMutationError(`the plan has ${plan.violations.length} violation(s)`, plan.violations, plan);
     const scratch = `preview-mutation/${randomUUID()}`;
     let created: { id: string };
@@ -4771,6 +4805,16 @@ export class ContextManager {
    * it), the mutation is applied: the error is APPLIED_INIT_FAILED, it
    * carries the receipt, and the message says how to recover.
    *
+   * `readers` are planned as planHistoryMutation plans them, and each is
+   * reconciled on the branch before `beforeSwitch`, by a manager bound to it
+   * that runs the reader's own strategy (its cloneForScratch): the rows the
+   * plan removes leave its window, with what its strategy folded of them,
+   * and its summaries the plan drops go. Each is read back too, by a fresh
+   * open: no removed row in its window, the edited rows as planned in its
+   * record, its summaries its source's without its planned drops, and no
+   * rule broken that its source keeps. The host re-initializes each reader
+   * once this returns, as it does every other manager.
+   *
    * Refused before anything is written where the plan made now has
    * violations, its branch isn't `expectedSourceBranch` (BRANCH_MISMATCH),
    * its sha256 isn't `expectedPlanSha256` (PLAN_DRIFT: the error carries the
@@ -4786,14 +4830,16 @@ export class ContextManager {
       by: Omit<ExternalMemoryProvenance, 'at'>;
       strategy?: () => ContextStrategy;
       beforeSwitch?: (ctx: { view: JsStore; sourceBranch: string; targetBranch: string }) => Promise<void>;
+      readers?: readonly ContextManager[];
     },
   ): Promise<HistoryMutationReceipt> {
     this.requireInitialized('applyHistoryMutation');
     if ((this.store as { pinnedBranch?: () => string | null }).pinnedBranch?.() != null) {
       throw new Error('ContextManager.applyHistoryMutation: this manager is bound to a branch and can\'t move the store; apply through a manager on the store itself');
     }
+    const readers = this.readersOf(options.readers, 'applyHistoryMutation');
     const state = this.historyState();
-    const plan = planMutation(state, manifest);
+    const plan = planMutation(state, manifest, readers);
     const refuse = (code: MutationViolationCode, message: string): never => {
       throw new HistoryMutationError(message, [{ opIndex: -1, code, message }], plan);
     };
@@ -4809,6 +4855,11 @@ export class ContextManager {
     }
     const source = snapshotOf(state);
     const baseline = historyAnomalies(state);
+    const touched = readers.flatMap((reader, i) => {
+      const share = plan.readers[i]!;
+      if (share.heldIds.length === 0 && share.droppedSummaries.length === 0) return [];
+      return [{ ...reader, share, summaryIds: (reader.state.memory?.summaries ?? []).map((s) => s.id), baseline: historyAnomalies(reader.state) }];
+    });
     const stamp = editStamp(options.by, this.now(), plan.sourceBranch);
     const sourceId = this.store.currentBranch().id;
     let created: { id: string };
@@ -4827,15 +4878,32 @@ export class ContextManager {
       const view = staging.store;
       staging.close();
       staging = undefined;
+      for (const { manager, share, state: readerState } of touched) {
+        staging = await manager.managerOnBranch(options.targetBranch, undefined, false);
+        await staging.applyReaderShare(plan, share, readerState.record);
+        staging.close();
+        staging = undefined;
+      }
       await options.beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch: options.targetBranch });
       reader = await this.managerOnBranch(options.targetBranch, options.strategy, false);
       const written = reader.historyState();
       reader.close();
       reader = undefined;
       const mismatches = readBackMismatches(plan, source, written, stamp);
+      const broken = introducedAnomalies(baseline, historyAnomalies(written)).map((a) => a.message);
+      const removed = plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : []));
+      for (const { manager, namespace, share, summaryIds, baseline: readerBaseline } of touched) {
+        const cold = await manager.managerOnBranch(options.targetBranch, undefined, false);
+        reader = cold;
+        const readerWritten = cold.historyState();
+        const stillInWindow = removed.filter((id) => cold.ordinalOf(id) !== undefined);
+        reader.close();
+        reader = undefined;
+        mismatches.push(...readerReadBackMismatches(plan, share, summaryIds, readerWritten, stillInWindow));
+        broken.push(...introducedAnomalies(readerBaseline, historyAnomalies(readerWritten)).map((a) => `reader ${namespace}: ${a.message}`));
+      }
       if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${options.targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
-      const broken = introducedAnomalies(baseline, historyAnomalies(written));
-      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${options.targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.map((a) => a.message).join('; ')}`);
+      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${options.targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.join('; ')}`);
       const built = this.store.listBranches().find((branch) => branch.name === options.targetBranch);
       if (this.store.currentBranch().id !== sourceId || this.store.currentSequence() !== fromSequence || built?.id !== created.id) {
         refuse('SOURCE_MOVED', `the store moved while the apply built ${options.targetBranch}: ` + (
@@ -4933,6 +5001,34 @@ export class ContextManager {
       throw error;
     }
     return manager;
+  }
+
+  /**
+   * Reconcile this manager, a reader's bound to the built branch, with the
+   * plan: its summaries over edited rows go where its policy drops them, and
+   * the removed rows leave its window, which drops what its strategy folded
+   * of them (in legacy mode, where there is no window, the strategy is told
+   * they left where its policy drops what folds them). `sourceRecord` is the
+   * reader's record before the mutation, which holds the removed rows.
+   */
+  private async applyReaderShare(plan: HistoryMutationPlan, share: PlannedReader, sourceRecord: readonly StoredMessage[]): Promise<void> {
+    const mutable = isHistoryMutationStrategy(this.strategy) ? this.strategy : null;
+    for (const target of plan.targets) {
+      if (target.kind === 'edit_summary') continue;
+      const folding = share.covering.find((c) => c.opIndex === target.opIndex);
+      const drop = folding?.foldedPolicy === 'drop_covering_summaries' ? folding.coveringSummaries : [];
+      if (target.kind === 'edit_message') {
+        if (drop.length === 0) continue;
+        if (!mutable) throw new Error(`the ${this.strategy.name} strategy keeps no summaries`);
+        mutable.dropSummaries(drop, this.createStrategyContext());
+      } else if (this.windowIndex.mode() === 'presented') {
+        this.retractRemoved(target.messageIds);
+      } else if (drop.length > 0) {
+        const taking = new Set(target.messageIds);
+        await this.strategy.onRetracted?.(sourceRecord.filter((row) => taking.has(row.id)), this.createStrategyContext(), { undone: false, removed: true, ids: target.messageIds });
+      }
+    }
+    this.store.sync();
   }
 
   private async applyPlannedOps(plan: HistoryMutationPlan, stamp: Omit<MessageEditStamp, 'label'>): Promise<void> {

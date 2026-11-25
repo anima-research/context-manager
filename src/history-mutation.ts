@@ -162,6 +162,26 @@ type PlannedRemoval = {
 
 export type PlannedTarget = PlannedSummaryEdit | PlannedMessageEdit | PlannedRemoval;
 
+/**
+ * What a mutation does to a reader: another manager on the store, with a
+ * strategy namespace of its own, whose window or summaries hold the rows it
+ * changes (another resident on the slot, or an agent that merges it).
+ */
+export interface PlannedReader {
+  /** The reader's strategy namespace, which names its window and its summaries in the store. */
+  namespace: string;
+  /** The rows the mutation edits or removes that the reader's window holds or its summaries fold, in the plan's order. */
+  heldIds: MessageId[];
+  /** For each op over messages whose rows the reader's summaries fold: those summaries, with every summary above them, and the policy that decides them for this reader. */
+  covering: Array<{ opIndex: number; foldedPolicy: FoldedEditPolicy | FoldedRemovePolicy; coveringSummaries: string[] }>;
+  /** The reader's summaries the mutation drops, by those policies. */
+  droppedSummaries: string[];
+  /** As the plan's own, for the reader's thinking-binding record. */
+  invalidatesThinkingBinding: boolean;
+  /** As the plan's own, for the reader's window. */
+  invalidatesKvPrefixFrom?: { messageId: MessageId; sequence: Sequence };
+}
+
 /** What a manifest would do, read from the history as it stands, and what refuses it. Planning writes nothing. */
 export interface HistoryMutationPlan {
   valid: boolean;
@@ -177,6 +197,8 @@ export interface HistoryMutationPlan {
   invalidatesThinkingBinding: boolean;
   /** The first stored row whose rendering changes: a provider's prefix cache is rewritten from here once. */
   invalidatesKvPrefixFrom?: { messageId: MessageId; sequence: Sequence };
+  /** What the mutation does to each reader the caller named, in the order named. */
+  readers: PlannedReader[];
 }
 
 export interface HistoryState {
@@ -272,7 +294,11 @@ function covering(memory: HistoryMemory | null, rows: ReadonlySet<MessageId>): s
 }
 
 
-export function planMutation(state: HistoryState, manifest: HistoryMutationManifest): HistoryMutationPlan {
+export function planMutation(
+  state: HistoryState,
+  manifest: HistoryMutationManifest,
+  readers: ReadonlyArray<{ namespace: string; state: HistoryState }> = [],
+): HistoryMutationPlan {
   const violations: MutationViolation[] = [];
   const refuse = (opIndex: number, code: MutationViolationCode, message: string, targetId?: string, remediation?: Record<string, unknown>) => {
     violations.push({ opIndex, code, message, ...(targetId !== undefined ? { targetId } : {}), ...(remediation ? { remediation } : {}) });
@@ -496,6 +522,40 @@ export function planMutation(state: HistoryState, manifest: HistoryMutationManif
     if (!splitOps.has(split.opIndex)) refuse(split.opIndex, 'TOOL_PAIR_SPLIT', `the store refuses the edit of message ${split.messageId}: ${split.reason}`, split.messageId);
   }
 
+  const messageTargets = targets.filter((target) => target.kind !== 'edit_summary');
+  const readerPlans = readers.map(({ namespace, state: reader }): PlannedReader => {
+    const inView = new Set(reader.view.map((row) => row.id));
+    const heldIds: MessageId[] = [];
+    const byOp: PlannedReader['covering'] = [];
+    const seeds = new Set<string>();
+    for (const target of messageTargets) {
+      const ids = target.kind === 'edit_message' ? [target.messageId] : target.messageIds;
+      for (const id of ids) if (inView.has(id) || covering(reader.memory, new Set([id])).length > 0) heldIds.push(id);
+      const coveringSummaries = covering(reader.memory, new Set(ids));
+      if (coveringSummaries.length === 0) continue;
+      const op = manifest.ops[target.opIndex]!;
+      const foldedPolicy = target.kind === 'edit_message'
+        ? target.foldedPolicy
+        : (op.kind === 'remove_messages' ? op.foldedPolicy : undefined) ?? (reader.windowMode === 'presented' ? 'drop_covering_summaries' : 'refuse');
+      byOp.push({ opIndex: target.opIndex, foldedPolicy, coveringSummaries });
+      if (foldedPolicy === 'refuse') {
+        refuse(target.opIndex, 'FOLDED_ROW_REQUIRES_POLICY',
+          `the summaries of reader ${namespace} fold ${target.kind === 'edit_message' ? `message ${target.messageId}` : 'the messages removed'}: [${coveringSummaries.join(', ')}]; choose foldedPolicy 'drop_covering_summaries'${target.kind === 'edit_message' ? " or 'leave_summaries'" : ''}`,
+          ids[0], { readerNamespace: namespace, coveringSummaries });
+      } else if (foldedPolicy === 'drop_covering_summaries') {
+        for (const id of coveringSummaries) seeds.add(id);
+      }
+    }
+    for (const split of [...introducedToolSplits(reader.record, applied(reader.record)), ...introducedToolSplits(reader.view, applied(reader.view))]) {
+      const key = `${split.messageId}\u0000${split.message}`;
+      if (splitsSeen.has(key)) continue;
+      splitsSeen.add(key);
+      refuse(touchedBy.get(split.messageId) ?? touchedBy.get(split.partnerId ?? '') ?? -1, 'TOOL_PAIR_SPLIT', `reader ${namespace}: ${split.message}`, split.messageId, { ...split.remediation, readerNamespace: namespace });
+    }
+    const droppedSummaries = [...withSummariesAbove(reader.memory?.summaries ?? [], seeds)];
+    return { namespace, heldIds, covering: byOp, droppedSummaries, ...windowEffects(reader, reader.record, messageTargets, droppedSummaries) };
+  });
+
   const summaries = state.memory?.summaries ?? [];
   const dropped = withSummariesAbove(summaries, new Set([...seedsByOp.values()].flatMap((seeds) => [...seeds])));
   for (const target of targets) {
@@ -504,12 +564,45 @@ export function planMutation(state: HistoryState, manifest: HistoryMutationManif
     refuse(target.opIndex, 'EDITED_SUMMARY_DROPPED', `summary ${target.summaryId} is edited here, and the policy of op ${droppingOps.join(', ')} drops it: edit it or drop it`, target.summaryId, { droppingOps });
   }
   const droppedSummaries = [...dropped];
-  const sequences = new Map(state.rows.map((row) => [row.id, row.sequence] as const));
+  const planSha256 = createHash('sha256')
+    .update(canonicalJson({
+      sourceBranch: state.branch,
+      targets: targets.map(hashedTarget),
+      droppedSummaries: [...droppedSummaries].sort(),
+      readers: readerPlans.map((r) => ({ namespace: r.namespace, heldIds: r.heldIds, covering: r.covering, droppedSummaries: [...r.droppedSummaries].sort() })),
+    }), 'utf8')
+    .digest('hex');
+  return {
+    valid: violations.length === 0,
+    violations,
+    sourceBranch: state.branch,
+    planSha256,
+    targets,
+    droppedSummaries,
+    ...windowEffects(state, state.rows, targets, droppedSummaries),
+    readers: readerPlans,
+  };
+}
+
+/**
+ * Where a mutation changes what a manager's compile renders: the first row
+ * of its window that changes, and whether a changed row lies inside its
+ * thinking-binding record. `rows` are the rows whose sequences place a
+ * change: the manager's own slot for the manager, the merged record for a
+ * reader, whose window can hold another slot's rows.
+ */
+function windowEffects(
+  state: HistoryState,
+  rows: readonly StoredMessage[],
+  targets: readonly PlannedTarget[],
+  droppedSummaries: readonly string[],
+): Pick<HistoryMutationPlan, 'invalidatesThinkingBinding' | 'invalidatesKvPrefixFrom'> {
+  const sequences = new Map(rows.map((row) => [row.id, row.sequence] as const));
   const viewPosition = new Map(state.view.map((row, i) => [row.id, i] as const));
-  const changed = changedRows(summaries, targets, droppedSummaries, (id) => sequences.has(id));
+  const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id));
   const firstInView = state.view.find((row) => sequences.has(row.id))?.id;
   const rowsChanged = changed.fromStart
-    ? [...changed.rows, ...state.rows.slice(0, 1).map((row) => row.id), ...(firstInView !== undefined ? [firstInView] : [])]
+    ? [...changed.rows, ...rows.slice(0, 1).map((row) => row.id), ...(firstInView !== undefined ? [firstInView] : [])]
     : changed.rows;
   let kvFrom: MessageId | undefined;
   let earliest: Sequence | undefined;
@@ -519,16 +612,7 @@ export function planMutation(state: HistoryState, manifest: HistoryMutationManif
     const at = viewPosition.get(id);
     if (at !== undefined && sequence !== undefined && (kvFrom === undefined || at < viewPosition.get(kvFrom)!)) kvFrom = id;
   }
-  const planSha256 = createHash('sha256')
-    .update(canonicalJson({ sourceBranch: state.branch, targets: targets.map(hashedTarget), droppedSummaries: [...droppedSummaries].sort() }), 'utf8')
-    .digest('hex');
   return {
-    valid: violations.length === 0,
-    violations,
-    sourceBranch: state.branch,
-    planSha256,
-    targets,
-    droppedSummaries,
     invalidatesThinkingBinding: earliest !== undefined && state.thinkingBoundThrough !== undefined && earliest <= state.thinkingBoundThrough,
     ...(kvFrom !== undefined ? { invalidatesKvPrefixFrom: { messageId: kvFrom, sequence: sequences.get(kvFrom)! } } : {}),
   };
@@ -784,6 +868,45 @@ export function snapshotOf(state: HistoryState): HistorySnapshot {
   };
 }
 
+function summaryMismatches(sourceIds: readonly string[], droppedSummaries: readonly string[], written: HistoryState): string[] {
+  const out: string[] = [];
+  const summaries = new Set((written.memory?.summaries ?? []).map((s) => s.id));
+  const dropped = new Set(droppedSummaries);
+  const keeps = sourceIds.filter((id) => !dropped.has(id));
+  for (const id of keeps) if (!summaries.has(id)) out.push(`summary ${id} is gone`);
+  const kept = new Set(keeps);
+  for (const id of summaries) if (!kept.has(id)) out.push(dropped.has(id) ? `summary ${id} is still there` : `summary ${id} is there, and the source didn't hold it`);
+  return out;
+}
+
+/**
+ * How a reader's history on the built branch differs from what the plan
+ * does to it: a removed row its window index still holds (`stillInWindow`,
+ * since a window's reads leave out a row the record lost before the index
+ * does), an edited row its record holds other than as planned, or summaries
+ * other than its source's without its planned drops.
+ */
+export function readerReadBackMismatches(
+  plan: HistoryMutationPlan,
+  reader: PlannedReader,
+  sourceSummaryIds: readonly string[],
+  written: HistoryState,
+  stillInWindow: readonly MessageId[],
+): string[] {
+  const out: string[] = [];
+  const record = new Map(written.record.map((row) => [row.id, row] as const));
+  for (const id of stillInWindow) out.push(`message ${id} is still in its window`);
+  for (const target of plan.targets) {
+    if (target.kind === 'edit_message') {
+      const row = record.get(target.messageId);
+      const sha256 = row ? messageContentSha256(row.content) : undefined;
+      if (sha256 !== undefined && sha256 !== target.afterSha256) out.push(`message ${target.messageId}'s content has sha256 ${sha256}, not ${target.afterSha256}`);
+    }
+  }
+  out.push(...summaryMismatches(sourceSummaryIds, reader.droppedSummaries, written));
+  return out.map((mismatch) => `reader ${reader.namespace}: ${mismatch}`);
+}
+
 /** What an apply records on each message it edits (`metadata.historyMutation`). */
 export interface MessageEditStamp {
   by: string;
@@ -823,12 +946,8 @@ export function readBackMismatches(
   }
   const sourceIds = new Set(source.rows.map((row) => row.id));
   for (const row of written.rows.slice(expected.length)) if (sourceIds.has(row.id)) out.push(`message ${row.id} is still there`);
+  out.push(...summaryMismatches(source.summaryIds, plan.droppedSummaries, written));
   const summaries = new Map((written.memory?.summaries ?? []).map((s) => [s.id, s] as const));
-  const dropped = new Set(plan.droppedSummaries);
-  const keeps = source.summaryIds.filter((id) => !dropped.has(id));
-  for (const id of keeps) if (!summaries.has(id)) out.push(`summary ${id} is gone`);
-  const kept = new Set(keeps);
-  for (const id of summaries.keys()) if (!kept.has(id)) out.push(dropped.has(id) ? `summary ${id} is still there` : `summary ${id} is there, and the source didn't hold it`);
   for (const target of plan.targets) {
     if (target.kind !== 'edit_summary') continue;
     for (const id of [target.summaryId, ...target.carriedBy]) {

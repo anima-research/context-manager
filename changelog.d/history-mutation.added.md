@@ -33,20 +33,20 @@
     (`rawItem`, `rawXml`) of each block that it changes, so that a formatter
     sends the new text.
   - `applyHistoryMutation(manifest, { targetBranch, expectedSourceBranch,
-    expectedPlanSha256, by, strategy?, beforeSwitch? })` makes the plan
-    again and refuses a plan that drifted. It forks `targetBranch` from the
-    head with every state. A manager on that branch makes the writes, with a
-    fresh instance of the strategy (`ContextStrategy.cloneForScratch`, or
-    `strategy`). After `beforeSwitch`, a fresh open reads the branch back.
-    The rows must be the source's, with the plan's edits and removals. The
-    summaries must be the source's, without the plan's drops. Otherwise the
-    apply refuses (`READBACK_MISMATCH`). New rows after the source's rows
-    are allowed, such as a notice that `beforeSwitch` writes. The apply also
-    refuses an anomaly that the source didn't have (`INVARIANT_BROKEN`). It
-    refuses a source that moved while the branch was built (`SOURCE_MOVED`):
-    a record written to the source, the store on another branch, or the
-    target branch replaced. Only then does it switch the store to the
-    branch.
+    expectedPlanSha256, by, strategy?, beforeSwitch?, readers? })` makes the
+    plan again and refuses a plan that drifted. It forks `targetBranch` from
+    the head with every state. A manager on that branch makes the writes,
+    with a fresh instance of the strategy
+    (`ContextStrategy.cloneForScratch`, or `strategy`). After
+    `beforeSwitch`, a fresh open reads the branch back. The rows must be the
+    source's, with the plan's edits and removals. The summaries must be the
+    source's, without the plan's drops. Otherwise the apply refuses
+    (`READBACK_MISMATCH`). New rows after the source's rows are allowed,
+    such as a notice that `beforeSwitch` writes. The apply also refuses an
+    anomaly that the source didn't have (`INVARIANT_BROKEN`). It refuses a
+    source that moved while the branch was built (`SOURCE_MOVED`): a record
+    written to the source, the store on another branch, or the target branch
+    replaced. Only then does it switch the store to the branch.
   - A failure before that switch, or a process that stops, leaves the store
     and every manager on it on the source branch. A failure in the process
     also deletes the branch built. Where that deletion fails, the error
@@ -57,12 +57,25 @@
   - Nothing else should write the history while an apply runs. After it, the
     host re-initializes each other manager on the store, as after
     `switchBranch`.
+  - The plan, the preview and the apply take `readers`: the other managers
+    on the store that read the rows the mutation changes, such as another
+    agent on the slot, or one that merges it. Each reader gets the rules of
+    the manager's own window, by the op's `foldedPolicy` and the reader's
+    own window mode. So its summaries over an edited or removed row can
+    refuse the plan, and so can a tool pair split in its record or its
+    window. The plan says what the mutation does to each reader
+    (`readers`), and `planSha256` covers it. Before `beforeSwitch`, the
+    apply reconciles each reader on the target branch with a fresh instance
+    of the reader's strategy: the removed rows leave its window, and the
+    summaries that the plan drops for it go. A fresh open reads each reader
+    back too. So a failure before the switch leaves every reader as it was.
   - `compileMutationPreview(manifest, { by, budget?, injections?,
-    selectOptions?, strategy? })` builds the mutation the same way on a
-    scratch branch, compiles there with `dryRun`, and deletes the branch. So
-    a preview writes to the store, though the manager's branch doesn't move.
-    The scratch strategy gets the live strategy's rendering frontier, as
-    `derive` does, so that the live strategy's hot settings apply there too.
+    selectOptions?, strategy?, readers? })` builds the mutation the same way
+    on a scratch branch, compiles there with `dryRun`, and deletes the
+    branch. So a preview writes to the store, though the manager's branch
+    doesn't move. The scratch strategy gets the live strategy's rendering
+    frontier, as `derive` does, so that the live strategy's hot settings
+    apply there too.
   - `checkHistoryInvariants()` lists the anomalies of a history as it
     stands. These are malformed or empty content, a body that lacks shards,
     a tool call or result without its partner, a system change between a
