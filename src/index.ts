@@ -167,6 +167,10 @@ export {
   isDerivationManifestStrategy,
 } from './types/index.js';
 
+// JSON-compatible compression instruction selection and recipe validation.
+export { validateCompressionInstructions } from './compression-instructions.js';
+export type { CompressionInstructions, CompressionInstructionTemplates, CompressionInstructionValues } from './compression-instructions.js';
+
 export type {
   CompressionQuarantineBinding,
   CompressionQuarantineRecordView,

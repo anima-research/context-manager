@@ -82,7 +82,7 @@ This ordering would have tested `L3-458` early in the Mythos incident.
 
 For one candidate at a time:
 
-- locate canonical pair:
+- locate canonical pair (with a custom compression `opening`, only before the opening):
   - Context Manager: `[CM] Recall memory <parent>.`
   - assistant: `<parent.content>`
 - replace that pair with, for each direct child in source order:
