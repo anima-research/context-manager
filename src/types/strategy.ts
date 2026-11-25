@@ -3181,10 +3181,12 @@ export interface SummaryEntry {
    * one source. Its text, `responseContent`, `tokens`, `created` and
    * `provenance` are that summary's own, copied when it was carried, so
    * `provenance` names the request that authored the text, at the level it
-   * was written for. The copy is not kept in step with the summary: a
-   * compile and a summarizer request read the text from the summary carried
-   * as it stands, so a repair that rewrites a summary in place edits that
-   * summary, not the entries that carry it.
+   * was written for. A compile and a summarizer request read the text from
+   * the summary carried as it stands, so a repair that rewrites a summary in
+   * place edits that summary, not the entries that carry it.
+   * `editSummaryText` keeps them in step: it writes the new text, tokens and
+   * `external` to each entry that carries the summary it edits, and drops
+   * their response blocks and provenance, as it does the summary's.
    *
    * The entry is a carry only while that summary is its one source. A
    * topology repair can give it another (an adoption, a re-homed fragment)
@@ -3196,8 +3198,9 @@ export interface SummaryEntry {
    * Set when the text came from outside the strategy's own compression
    * calls: an operator installed it as the result of the work, or replaced
    * the text of an existing summary (`importExternalMemory`,
-   * `editSummaryText`). Absent on every other entry. Nothing renders it and
-   * no selection reads it. An entry that has it has no `provenance`: that
+   * `editSummaryText`). Absent on every other entry. No selection reads it.
+   * Under `recallEnvelope: 'xml'`, the recall envelope of the entry, and of
+   * each entry that carries it, names `by` as `editedBy`. An entry that has it has no `provenance`: that
    * records a model's accepted answer, and here there is none. An installed
    * entry names the request it answers in `external.requestHash`; an edit
    * drops the `provenance` of the call that wrote the text it replaced,

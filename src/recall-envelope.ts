@@ -47,7 +47,8 @@ export function buildRecallEnvelopeTags(summary: SummaryEntry, mode: 'xml' | 'ba
     const first = summary.sourceRange?.first;
     const last = summary.sourceRange?.last;
     if (first && last) attributes.push(`span="${first}..${last}"`);
-    if (summary.external?.by) attributes.push(`editedBy="${attributeValue(summary.external.by)}"`);
+    const by = summary.external?.by;
+    if (typeof by === 'string' && by !== '') attributes.push(`editedBy="${attributeValue(by)}"`);
   }
   const open = attributes.length > 0
     ? `<${RECALL_ENVELOPE_TAG} ${attributes.join(' ')}>`

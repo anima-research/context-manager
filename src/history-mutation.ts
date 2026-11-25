@@ -7,9 +7,10 @@ import { toolPairSplitReason } from './message-store.js';
 import { findUnpairedToolBlocks } from './normalize-tool-messages.js';
 import { releaseReplacedRawForms } from './raw-forms.js';
 import { crossedSummaryIds } from './repair/topology.js';
+import { storedJson } from './stored-json.js';
 import { planSummaryEdit, summariesFoldingRows, textSha256, withSummariesAbove } from './summary-edit.js';
 import { isThinkingBlock } from './thinking-binding.js';
-import type { MessageId, Sequence, StoredMessage } from './types/message.js';
+import type { MessageId, MessageMetadata, Sequence, StoredMessage } from './types/message.js';
 import type { SummaryEntry, SummaryLevel } from './types/strategy.js';
 import { contentForWrite, MalformedContentError, malformedContentPlaces } from './well-formed-content.js';
 
@@ -510,7 +511,8 @@ export function planMutation(
     const content = editedContent.get(row.id);
     return [content ? { ...row, content } : row];
   });
-  for (const split of [...introducedToolSplits(state.record, applied(state.record)), ...introducedToolSplits(state.view, applied(state.view))]) {
+  const changeable = (id: MessageId) => position.has(id);
+  for (const split of [...introducedToolSplits(state.record, applied(state.record), changeable), ...introducedToolSplits(state.view, applied(state.view), changeable)]) {
     const key = `${split.messageId}\u0000${split.message}`;
     if (splitsSeen.has(key)) continue;
     splitsSeen.add(key);
@@ -546,14 +548,14 @@ export function planMutation(
         for (const id of coveringSummaries) seeds.add(id);
       }
     }
-    for (const split of [...introducedToolSplits(reader.record, applied(reader.record)), ...introducedToolSplits(reader.view, applied(reader.view))]) {
+    for (const split of [...introducedToolSplits(reader.record, applied(reader.record), changeable), ...introducedToolSplits(reader.view, applied(reader.view), changeable)]) {
       const key = `${split.messageId}\u0000${split.message}`;
       if (splitsSeen.has(key)) continue;
       splitsSeen.add(key);
       refuse(touchedBy.get(split.messageId) ?? touchedBy.get(split.partnerId ?? '') ?? -1, 'TOOL_PAIR_SPLIT', `reader ${namespace}: ${split.message}`, split.messageId, { ...split.remediation, readerNamespace: namespace });
     }
     const droppedSummaries = [...withSummariesAbove(reader.memory?.summaries ?? [], seeds)];
-    return { namespace, heldIds, covering: byOp, droppedSummaries, ...windowEffects(reader, reader.record, messageTargets, droppedSummaries) };
+    return { namespace, heldIds, covering: byOp, droppedSummaries, ...windowEffects(reader, messageTargets, droppedSummaries) };
   });
 
   const summaries = state.memory?.summaries ?? [];
@@ -579,7 +581,7 @@ export function planMutation(
     planSha256,
     targets,
     droppedSummaries,
-    ...windowEffects(state, state.rows, targets, droppedSummaries),
+    ...windowEffects(state, targets, droppedSummaries),
     readers: readerPlans,
   };
 }
@@ -587,16 +589,16 @@ export function planMutation(
 /**
  * Where a mutation changes what a manager's compile renders: the first row
  * of its window that changes, and whether a changed row lies inside its
- * thinking-binding record. `rows` are the rows whose sequences place a
- * change: the manager's own slot for the manager, the merged record for a
- * reader, whose window can hold another slot's rows.
+ * thinking-binding record. A change is placed by the rows of its record,
+ * every slot the manager merges, since a summary can fold another slot's
+ * rows beside its own.
  */
 function windowEffects(
   state: HistoryState,
-  rows: readonly StoredMessage[],
   targets: readonly PlannedTarget[],
   droppedSummaries: readonly string[],
 ): Pick<HistoryMutationPlan, 'invalidatesThinkingBinding' | 'invalidatesKvPrefixFrom'> {
+  const rows = state.record;
   const sequences = new Map(rows.map((row) => [row.id, row.sequence] as const));
   const viewPosition = new Map(state.view.map((row, i) => [row.id, i] as const));
   const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id));
@@ -677,7 +679,8 @@ interface ToolSplit {
   remediation: Record<string, unknown>;
 }
 
-function introducedToolSplits(before: readonly StoredMessage[], after: readonly StoredMessage[]): ToolSplit[] {
+/** `changeable` says whether a mutation of this manager can target a message: one of its own slot's. */
+function introducedToolSplits(before: readonly StoredMessage[], after: readonly StoredMessage[], changeable: (id: MessageId) => boolean): ToolSplit[] {
   const splits: ToolSplit[] = [];
   const unpairedKeys = (rows: readonly StoredMessage[]) => {
     const counts = new Map<string, { count: number; messageId: MessageId; kind: string; toolId: string }>();
@@ -699,7 +702,9 @@ function introducedToolSplits(before: readonly StoredMessage[], after: readonly 
       messageId: now.messageId,
       ...(partnerId !== undefined ? { partnerId } : {}),
       message: `the ${now.kind} ${now.toolId} in message ${now.messageId} would be left with no ${now.kind === 'tool_use' ? 'result' : 'call'}` +
-        (partnerId !== undefined ? ` (its partner was in message ${partnerId}): change both together` : ''),
+        (partnerId === undefined ? ''
+          : changeable(partnerId) && changeable(now.messageId) ? ` (its partner was in message ${partnerId}): change both together`
+            : ` (its partner was in message ${partnerId}; message ${changeable(partnerId) ? now.messageId : partnerId} is in a slot this manager merges, which its mutation can't change): leave the pair as it is`),
       remediation: { toolId: now.toolId, orphanedMessageId: now.messageId, ...(partnerId !== undefined ? { partnerMessageId: partnerId } : {}) },
     });
   }
@@ -857,25 +862,93 @@ export interface HistoryMutationReceipt {
 }
 
 export interface HistorySnapshot {
-  rows: Array<{ id: MessageId; sha256: string }>;
-  summaryIds: string[];
+  /** The record's rows (every slot the manager merges), in record order, as the store keeps them. */
+  record: Array<{ id: MessageId; sha256: string; participant: string; metadata: MessageMetadata }>;
+  /** Each summary, with the sha256 of what it renders: its text and its response blocks. */
+  summaries: Array<{ id: string; rendered: string }>;
 }
+
+const renderedSha256 = (summary: SummaryEntry): string =>
+  createHash('sha256').update(canonicalJson({ content: summary.content, responseContent: summary.responseContent ?? null }), 'utf8').digest('hex');
 
 export function snapshotOf(state: HistoryState): HistorySnapshot {
   return {
-    rows: state.rows.map((row) => ({ id: row.id, sha256: messageContentSha256(row.content) })),
-    summaryIds: (state.memory?.summaries ?? []).map((s) => s.id),
+    record: state.record.map((row) => ({
+      id: row.id, sha256: messageContentSha256(row.content), participant: row.participant, metadata: { ...row.metadata },
+    })),
+    summaries: (state.memory?.summaries ?? []).map((s) => ({ id: s.id, rendered: renderedSha256(s) })),
   };
 }
 
-function summaryMismatches(sourceIds: readonly string[], droppedSummaries: readonly string[], written: HistoryState): string[] {
+/** `value` as the store gives it back: JSON, with each lone surrogate half as U+FFFD (storedJson). */
+const asStored = (value: unknown): string => canonicalJson(JSON.parse(storedJson(value).toString('utf8')));
+
+/**
+ * How a record on the built branch differs from the source's with the plan's
+ * edits and removals: a row missing, out of place or still there, a row's
+ * content, participant or metadata other than the source's, or an edited
+ * row other than the plan's content with the edit's stamp beside its old
+ * metadata. Rows after the source's are allowed.
+ */
+function recordMismatches(plan: HistoryMutationPlan, source: HistorySnapshot, written: readonly StoredMessage[], stamp: Omit<MessageEditStamp, 'label'>): string[] {
   const out: string[] = [];
-  const summaries = new Set((written.memory?.summaries ?? []).map((s) => s.id));
+  const edits = new Map<MessageId, Extract<PlannedTarget, { kind: 'edit_message' }>>();
+  const removed = new Set<MessageId>();
+  for (const target of plan.targets) {
+    if (target.kind === 'edit_message') edits.set(target.messageId, target);
+    else if (target.kind === 'remove_messages') for (const id of target.messageIds) removed.add(id);
+  }
+  const expected = source.record.filter((row) => !removed.has(row.id));
+  for (const [i, row] of expected.entries()) {
+    const got = written[i];
+    if (got?.id !== row.id) {
+      out.push(got ? `message ${got.id} stands where ${row.id} should` : `message ${row.id} is missing`);
+      break;
+    }
+    const edit = edits.get(row.id);
+    const want = edit ? edit.afterSha256 : row.sha256;
+    const sha256 = messageContentSha256(got.content);
+    if (sha256 !== want) out.push(`message ${row.id}'s content has sha256 ${sha256}, not ${want}`);
+    if (got.participant !== row.participant) out.push(`message ${row.id} is by ${got.participant}, not ${row.participant}`);
+    const metadata = edit ? asStored({ ...row.metadata, historyMutation: { ...stamp, label: edit.label } }) : canonicalJson(row.metadata);
+    if (canonicalJson(got.metadata ?? {}) !== metadata) {
+      out.push(edit ? `message ${row.id} doesn't record the edit as made beside its metadata (metadata.historyMutation)` : `message ${row.id}'s metadata changed`);
+    }
+  }
+  const sourceIds = new Set(source.record.map((row) => row.id));
+  for (const row of written.slice(expected.length)) if (sourceIds.has(row.id)) out.push(`message ${row.id} is still there`);
+  return out;
+}
+
+/**
+ * How the summaries on the built branch differ from the source's without
+ * `droppedSummaries`: one gone, still there or new, or one that renders
+ * other than it did, apart from `edited`, whose text the edit changed. A new
+ * entry that carries a summary the branch holds (`carriedFrom`), and renders
+ * what it renders, is the strategy's own carry, which a drop's merge check
+ * can write (`carryStrandedSummaries`).
+ */
+function summaryMismatches(source: HistorySnapshot, droppedSummaries: readonly string[], written: HistoryState, edited: ReadonlySet<string> = new Set()): string[] {
+  const out: string[] = [];
+  const summaries = new Map((written.memory?.summaries ?? []).map((s) => [s.id, s] as const));
   const dropped = new Set(droppedSummaries);
-  const keeps = sourceIds.filter((id) => !dropped.has(id));
-  for (const id of keeps) if (!summaries.has(id)) out.push(`summary ${id} is gone`);
-  const kept = new Set(keeps);
-  for (const id of summaries) if (!kept.has(id)) out.push(dropped.has(id) ? `summary ${id} is still there` : `summary ${id} is there, and the source didn't hold it`);
+  const keeps = source.summaries.filter((s) => !dropped.has(s.id));
+  for (const kept of keeps) {
+    const summary = summaries.get(kept.id);
+    if (!summary) out.push(`summary ${kept.id} is gone`);
+    else if (!edited.has(kept.id) && renderedSha256(summary) !== kept.rendered) out.push(`summary ${kept.id} renders other than it did`);
+  }
+  const kept = new Set(keeps.map((s) => s.id));
+  for (const [id, summary] of summaries) {
+    if (kept.has(id)) continue;
+    if (dropped.has(id)) {
+      out.push(`summary ${id} is still there`);
+      continue;
+    }
+    const carried = summary.carriedFrom !== undefined ? summaries.get(summary.carriedFrom) : undefined;
+    if (carried && renderedSha256(carried) === renderedSha256(summary)) continue;
+    out.push(`summary ${id} is there, and the source didn't hold it`);
+  }
   return out;
 }
 
@@ -883,27 +956,20 @@ function summaryMismatches(sourceIds: readonly string[], droppedSummaries: reado
  * How a reader's history on the built branch differs from what the plan
  * does to it: a removed row its window index still holds (`stillInWindow`,
  * since a window's reads leave out a row the record lost before the index
- * does), an edited row its record holds other than as planned, or summaries
- * other than its source's without its planned drops.
+ * does), its record other than the source's with the plan's edits and
+ * removals, or summaries other than its source's without its planned drops.
  */
 export function readerReadBackMismatches(
   plan: HistoryMutationPlan,
   reader: PlannedReader,
-  sourceSummaryIds: readonly string[],
+  source: HistorySnapshot,
   written: HistoryState,
+  stamp: Omit<MessageEditStamp, 'label'>,
   stillInWindow: readonly MessageId[],
 ): string[] {
-  const out: string[] = [];
-  const record = new Map(written.record.map((row) => [row.id, row] as const));
-  for (const id of stillInWindow) out.push(`message ${id} is still in its window`);
-  for (const target of plan.targets) {
-    if (target.kind === 'edit_message') {
-      const row = record.get(target.messageId);
-      const sha256 = row ? messageContentSha256(row.content) : undefined;
-      if (sha256 !== undefined && sha256 !== target.afterSha256) out.push(`message ${target.messageId}'s content has sha256 ${sha256}, not ${target.afterSha256}`);
-    }
-  }
-  out.push(...summaryMismatches(sourceSummaryIds, reader.droppedSummaries, written));
+  const out = stillInWindow.map((id) => `message ${id} is still in its window`);
+  out.push(...recordMismatches(plan, source, written.record, stamp));
+  out.push(...summaryMismatches(source, reader.droppedSummaries, written));
   return out.map((mismatch) => `reader ${reader.namespace}: ${mismatch}`);
 }
 
@@ -922,32 +988,11 @@ export function readBackMismatches(
   written: HistoryState,
   stamp: Omit<MessageEditStamp, 'label'>,
 ): string[] {
-  const out: string[] = [];
-  const edits = new Map<MessageId, Extract<PlannedTarget, { kind: 'edit_message' }>>();
-  const removed = new Set<MessageId>();
-  for (const target of plan.targets) {
-    if (target.kind === 'edit_message') edits.set(target.messageId, target);
-    else if (target.kind === 'remove_messages') for (const id of target.messageIds) removed.add(id);
-  }
-  const expected = source.rows.filter((row) => !removed.has(row.id));
-  for (const [i, row] of expected.entries()) {
-    const got = written.rows[i];
-    if (got?.id !== row.id) {
-      out.push(got ? `message ${got.id} stands where ${row.id} should` : `message ${row.id} is missing`);
-      break;
-    }
-    const edit = edits.get(row.id);
-    const want = edit ? edit.afterSha256 : row.sha256;
-    const sha256 = messageContentSha256(got.content);
-    if (sha256 !== want) out.push(`message ${row.id}'s content has sha256 ${sha256}, not ${want}`);
-    if (edit && canonicalJson(got.metadata?.historyMutation) !== canonicalJson({ ...stamp, label: edit.label })) {
-      out.push(`message ${row.id} doesn't record the edit as made (metadata.historyMutation)`);
-    }
-  }
-  const sourceIds = new Set(source.rows.map((row) => row.id));
-  for (const row of written.rows.slice(expected.length)) if (sourceIds.has(row.id)) out.push(`message ${row.id} is still there`);
-  out.push(...summaryMismatches(source.summaryIds, plan.droppedSummaries, written));
+  const out = recordMismatches(plan, source, written.record, stamp);
+  const edited = new Set(plan.targets.flatMap((target) => (target.kind === 'edit_summary' ? [target.summaryId, ...target.carriedBy] : [])));
+  out.push(...summaryMismatches(source, plan.droppedSummaries, written, edited));
   const summaries = new Map((written.memory?.summaries ?? []).map((s) => [s.id, s] as const));
+  const by = asStored({ by: stamp.by, ...(stamp.note !== undefined ? { note: stamp.note } : {}) });
   for (const target of plan.targets) {
     if (target.kind !== 'edit_summary') continue;
     for (const id of [target.summaryId, ...target.carriedBy]) {
@@ -955,6 +1000,10 @@ export function readBackMismatches(
       if (!summary) continue;
       if (textSha256(summary.content) !== target.afterSha256) out.push(`summary ${id}'s text has sha256 ${textSha256(summary.content)}, not ${target.afterSha256}`);
       else if (target.dropResponseContent && (summary.responseContent?.length ?? 0) > 0) out.push(`summary ${id} still renders its response blocks`);
+      const external = summary.external;
+      if (!external || canonicalJson({ by: external.by, ...(external.note !== undefined ? { note: external.note } : {}) }) !== by) {
+        out.push(`summary ${id} doesn't record the edit as made (external)`);
+      }
     }
   }
   return out;

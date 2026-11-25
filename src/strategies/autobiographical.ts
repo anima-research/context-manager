@@ -16018,8 +16018,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * carries it up a level reads the new text and is written as its copy
    * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
    * reported and left alone. The store's history keeps each entry as it was.
-   * Without `apply` nothing is written. Refused as SummaryTextEditOptions
-   * says.
+   * The carriers are written first and the summary last, so a write that
+   * fails leaves the summary that a compile reads as it was, and the same
+   * edit can be asked for again. Without `apply` nothing is written. Refused
+   * as SummaryTextEditOptions says, and, before anything is written, where
+   * the stored summaries no longer hold the summary or one of its carriers.
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -16038,17 +16041,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       parents: plan.parents,
     };
     if (!options.apply) return edit;
-    const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
-    for (const written of [entry, ...plan.carriedBy.map((carrier) => this.summaryById(carrier.id)!)]) {
-      written.content = body;
-      written.tokens = edit.tokens;
-      delete written.responseContent;
-      delete written.provenance;
-      delete written.stitched;
-      written.external = external;
-      this.writeStoredSummary(written, 'editSummaryText', 'new text');
+    const carriers = plan.carriedBy.map((carrier) => this.summaryById(carrier.id)!);
+    if (this.store) {
+      const stored = this.store.getStateJson(this.summariesStateId);
+      const held = new Set(Array.isArray(stored) ? stored.map((item: unknown) => (typeof item === 'object' && item !== null && 'id' in item ? item.id : undefined)) : []);
+      const missing = [entry, ...carriers].filter((s) => !held.has(s.id)).map((s) => s.id);
+      if (missing.length > 0) {
+        throw new Error(`summary ${missing.join(', ')} isn't in the stored summaries: another handle changed them since this strategy read them; open the store again`);
+      }
     }
-    this._answerCostCache.clear();
+    const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    const rewrite = (summary: SummaryEntry) => {
+      summary.content = body;
+      summary.tokens = edit.tokens;
+      delete summary.responseContent;
+      delete summary.provenance;
+      delete summary.stitched;
+      summary.external = external;
+    };
+    try {
+      for (const written of [...carriers, entry]) {
+        const next = { ...written };
+        rewrite(next);
+        this.writeStoredSummary(next, 'editSummaryText', 'new text');
+        rewrite(written);
+      }
+    } finally {
+      this._answerCostCache.clear();
+    }
     return edit;
   }
 
@@ -19694,7 +19714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const recallEnvelope = isRecallEnveloped(this.config.recallEnvelope) ? this.config.recallEnvelope : 'none';
     const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
-    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
+    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration, s.external?.by ?? null]);
     const cached = this._answerCostCache.get(key);
     if (cached !== undefined) return cached;
     const estimate = this.estimateTokens(this.liveWindowAnswerContent(s));

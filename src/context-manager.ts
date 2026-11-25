@@ -577,6 +577,12 @@ function editStamp(by: Omit<ExternalMemoryProvenance, 'at'>, at: number, sourceB
   return { by: by.by, at, ...(by.note !== undefined ? { note: by.note } : {}), sourceBranch };
 }
 
+function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutation', by: Omit<ExternalMemoryProvenance, 'at'>): void {
+  if (typeof by.by !== 'string' || by.by.trim() === '') {
+    throw new Error(`ContextManager.${operation}: a mutation names who makes it, which its edits record and a recall envelope shows: give a \`by\` that isn't blank`);
+  }
+}
+
 /**
  * Context Manager - the main interface for managing conversation context.
  *
@@ -1820,7 +1826,7 @@ export class ContextManager {
    * would hold part of the body. A fork would also move the store's branch,
    * which stops the write.
    */
-  private refuseCutWhileWritingShards(operation: 'branchAt' | 'branchSequenceOf' | 'fork' | 'derive'): void {
+  private refuseCutWhileWritingShards(operation: 'branchAt' | 'branchSequenceOf' | 'fork' | 'derive' | 'compileMutationPreview' | 'applyHistoryMutation'): void {
     if (!this.writingShards) return;
     throw new Error(
       `ContextManager.${operation} refused: a sharded addMessage is storing its shards, and a cut now would come before ` +
@@ -4701,6 +4707,7 @@ export class ContextManager {
       if (reader.store !== this.store) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} reads another store`);
       if (namespaces.has(reader.strategyNamespace)) throw new Error(`ContextManager.${operation}: two managers have strategy namespace ${reader.strategyNamespace}`);
       reader.requireInitialized(operation);
+      if (operation === 'applyHistoryMutation') reader.refuseCutWhileWritingShards(operation);
       namespaces.add(reader.strategyNamespace);
       out.push({ manager: reader, namespace: reader.strategyNamespace, state: reader.historyState() });
     }
@@ -4749,6 +4756,8 @@ export class ContextManager {
     },
   ): Promise<{ plan: HistoryMutationPlan; compiled: CompileResult }> {
     this.requireInitialized('compileMutationPreview');
+    this.refuseCutWhileWritingShards('compileMutationPreview');
+    requireEditor('compileMutationPreview', options.by);
     const plan = this.planHistoryMutation(manifest, options);
     if (!plan.valid) throw new HistoryMutationError(`the plan has ${plan.violations.length} violation(s)`, plan.violations, plan);
     const scratch = `preview-mutation/${randomUUID()}`;
@@ -4794,10 +4803,12 @@ export class ContextManager {
    * the source meanwhile refuses it, though the write itself stays on the
    * source, as does one that `beforeSwitch` or the given strategy makes
    * through another handle. Whatever fails before the switch, or a process
-   * that stops, leaves the store on the source branch, and an apply that
-   * fails in process deletes the branch it built, or throws BRANCH_LEFT
+   * that stops, leaves the store where it was: on the source branch, unless
+   * something else moved it meanwhile (SOURCE_MOVED names where). An apply
+   * that fails in process deletes the branch it built, or throws BRANCH_LEFT
    * naming it where that deletion fails, with whether the branch is still
-   * there or deleted with its deletion not yet saved. The switch moves every manager on
+   * there or deleted with its deletion not yet saved; a process that stops
+   * leaves it, as a preview leaves its scratch branch. The switch moves every manager on
    * the store: once this returns, the host re-initializes each other one
    * (setStrategy(getStrategy())), as after switchBranch. Where the store
    * moves to the branch and the switch then doesn't complete (its checkpoint
@@ -4834,6 +4845,8 @@ export class ContextManager {
     },
   ): Promise<HistoryMutationReceipt> {
     this.requireInitialized('applyHistoryMutation');
+    this.refuseCutWhileWritingShards('applyHistoryMutation');
+    requireEditor('applyHistoryMutation', options.by);
     if ((this.store as { pinnedBranch?: () => string | null }).pinnedBranch?.() != null) {
       throw new Error('ContextManager.applyHistoryMutation: this manager is bound to a branch and can\'t move the store; apply through a manager on the store itself');
     }
@@ -4858,7 +4871,7 @@ export class ContextManager {
     const touched = readers.flatMap((reader, i) => {
       const share = plan.readers[i]!;
       if (share.heldIds.length === 0 && share.droppedSummaries.length === 0) return [];
-      return [{ ...reader, share, summaryIds: (reader.state.memory?.summaries ?? []).map((s) => s.id), baseline: historyAnomalies(reader.state) }];
+      return [{ ...reader, share, source: snapshotOf(reader.state), baseline: historyAnomalies(reader.state) }];
     });
     const stamp = editStamp(options.by, this.now(), plan.sourceBranch);
     const sourceId = this.store.currentBranch().id;
@@ -4892,14 +4905,14 @@ export class ContextManager {
       const mismatches = readBackMismatches(plan, source, written, stamp);
       const broken = introducedAnomalies(baseline, historyAnomalies(written)).map((a) => a.message);
       const removed = plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : []));
-      for (const { manager, namespace, share, summaryIds, baseline: readerBaseline } of touched) {
+      for (const { manager, namespace, share, source: readerSource, baseline: readerBaseline } of touched) {
         const cold = await manager.managerOnBranch(options.targetBranch, undefined, false);
         reader = cold;
         const readerWritten = cold.historyState();
         const stillInWindow = removed.filter((id) => cold.ordinalOf(id) !== undefined);
         reader.close();
         reader = undefined;
-        mismatches.push(...readerReadBackMismatches(plan, share, summaryIds, readerWritten, stillInWindow));
+        mismatches.push(...readerReadBackMismatches(plan, share, readerSource, readerWritten, stamp, stillInWindow));
         broken.push(...introducedAnomalies(readerBaseline, historyAnomalies(readerWritten)).map((a) => `reader ${namespace}: ${a.message}`));
       }
       if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${options.targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
@@ -4928,11 +4941,12 @@ export class ContextManager {
       targets: plan.targets,
       droppedSummaries: [...plan.droppedSummaries],
     });
+    const generation = observeStoreBranch(this.store).generation;
     try {
       await this.switchBranch(options.targetBranch);
     } catch (error) {
       const now = this.store.currentBranch();
-      if (now.id === sourceId) {
+      if (now.id === sourceId && observeStoreBranch(this.store).generation === generation) {
         this.deleteBuiltBranch(options.targetBranch, created.id, plan, error);
         throw error;
       }
@@ -4950,13 +4964,17 @@ export class ContextManager {
       if (this.store.listBranches().some(built)) this.store.deleteBranch(branch);
     } catch (cleanup) {
       const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
-      const left = this.store.listBranches().some(built)
-        ? 'it is still there: delete it by hand'
-        : 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it';
-      const message = `${failure !== undefined ? `${why(failure)}; and ` : ''}deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
+      const left = !this.store.listBranches().some(built)
+        ? 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it'
+        : this.store.currentBranch().name === branch
+          ? 'the store is on it: switch the store to another branch, then delete it'
+          : 'it is still there: delete it by hand';
+      const leftMessage = `deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
+      const message = failure !== undefined ? `${why(failure)}; and ${leftMessage}` : leftMessage;
+      const listed = failure instanceof HistoryMutationError;
       throw new HistoryMutationError(
         message,
-        [...(failure instanceof HistoryMutationError ? failure.violations : []), { opIndex: -1, code: 'BRANCH_LEFT', targetId: branch, message }],
+        [...(listed ? failure.violations : []), { opIndex: -1, code: 'BRANCH_LEFT', targetId: branch, message: listed ? leftMessage : message }],
         plan,
         { cause: failure ?? cleanup },
       );

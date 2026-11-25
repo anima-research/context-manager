@@ -37,8 +37,9 @@
   records who supplied such a text, and for an installed one the sha256 of
   the request it answers. An entry that has it has no `provenance`, which
   stays what it was: the record of a model's accepted answer. Entries
-  without `external` are unchanged, nothing renders it and no selection
-  reads it. The operations are also methods:
+  without `external` are unchanged, and no selection reads it. Under
+  `recallEnvelope: 'xml'`, a recall envelope names its `by` (`editedBy`).
+  The operations are also methods:
   `ContextManager.exportMemoryRequest`, `importExternalMemory` and
   `editSummaryText`, over the strategy's methods of the same names
   (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,

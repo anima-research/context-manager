@@ -18,7 +18,8 @@
     - merged parents, unless `parentPolicy` says to leave or drop them;
     - a folded message, unless `foldedPolicy` says to drop or leave what
       folds it;
-    - empty, malformed or sharded content, or part of a body;
+    - an empty summary text, malformed content, an edit of a shard, or the
+      removal of part of a body;
     - a tool call split from its result, or a system change put between
       them;
     - a change to a message that keeps a thinking block;
@@ -48,12 +49,17 @@
     written to the source, the store on another branch, or the target branch
     replaced. Only then does it switch the store to the branch.
   - A failure before that switch, or a process that stops, leaves the store
-    and every manager on it on the source branch. A failure in the process
-    also deletes the branch built. Where that deletion fails, the error
-    (`BRANCH_LEFT`) names the branch. It says whether the branch is still
-    there, or deleted with the deletion not saved yet. The switch can fail
-    after the store has moved to the branch. The mutation is then applied,
-    and the error (`APPLIED_INIT_FAILED`) carries the receipt.
+    where it was, and every manager on it with it. That is the source
+    branch, unless something else moved the store meanwhile, which refuses
+    the apply (`SOURCE_MOVED`). A failure in the process also deletes the
+    branch built. Where that deletion fails, the error (`BRANCH_LEFT`) names
+    the branch. It says whether the branch is still there, or deleted with
+    the deletion not saved yet. A process that stops leaves the branch, as a
+    preview leaves its scratch branch (`preview-mutation/<uuid>`), and an
+    apply can't build on that name until it is deleted. The switch can fail
+    after the store has moved to the branch, or move the store to the branch
+    and lose it to another selection. The mutation is then applied, and the
+    error (`APPLIED_INIT_FAILED`) carries the receipt.
   - Nothing else should write the history while an apply runs. After it, the
     host re-initializes each other manager on the store, as after
     `switchBranch`.

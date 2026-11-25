@@ -162,7 +162,11 @@ export function releaseEditedRawForms(
  * releaseEditedRawForms for content that replaces `before` whole, as a
  * history mutation's caller gives it: a block of `after` equal to a block of
  * `before` (canonical JSON) is that block kept, and any other block gives up
- * every raw form it carries, so a replay never stands in for changed fields.
+ * every raw form it carries, an opaque carrier's item included, so a replay
+ * never stands in for changed fields. Where the kept blocks don't stand in
+ * `before`'s order, each of them is a moved block
+ * (releaseSharedRawFormsOnMove), since a raw form they share replays the old
+ * order.
  */
 export function releaseReplacedRawForms(before: readonly ContentBlock[], after: readonly ContentBlock[]): ContentBlock[] {
   const unused = new Map<string, ContentBlock[]>();
@@ -170,7 +174,19 @@ export function releaseReplacedRawForms(before: readonly ContentBlock[], after: 
     const key = canonicalJson(block);
     unused.set(key, [...(unused.get(key) ?? []), block]);
   }
-  return releaseEditedRawForms(before, after.map((block) => unused.get(canonicalJson(block))?.shift() ?? withoutRawForms(block)));
+  const matched = after.map((block) => unused.get(canonicalJson(block))?.shift() ?? withoutAnyRawForm(block));
+  const places = matched.map((block) => before.indexOf(block)).filter((at) => at >= 0);
+  const inOrder = places.every((at, i) => i === 0 || (places[i - 1] ?? -1) < at);
+  return releaseEditedRawForms(before, inOrder ? matched : matched.map((block) => (before.includes(block) ? releaseSharedRawFormsOnMove(block, before) : block)));
+}
+
+function withoutAnyRawForm(block: ContentBlock): ContentBlock {
+  const carrier = block as ContentBlock & RawFormCarrier;
+  if (carrier.rawXml === undefined && carrier.rawItem === undefined) return block;
+  const copy = { ...carrier };
+  delete copy.rawXml;
+  delete copy.rawItem;
+  return copy;
 }
 
 /**
