@@ -32,6 +32,7 @@ import type { ContextEntry, SummaryEntry } from '../src/types/index.js';
 import {
   rawFormKeys,
   releaseEditedRawForms,
+  releaseReplacedRawForms,
   releaseSharedRawFormsOnMove,
   releaseTrailingReasoning,
   releaseVanishedRawForms,
@@ -202,6 +203,19 @@ describe('raw forms: keys and release', () => {
     // Reasoning at the end of a message pairs with nothing, and keeps its id.
     const rs9 = { type: 'redacted_thinking', data: 'nine', rawItem: { type: 'reasoning', id: 'rs_9' } } as ContentBlock;
     assert.equal(releaseSharedRawFormsOnMove(rs9, [fc1, rs9]), rs9);
+  });
+
+  it('content that replaces a message gives up a raw form its kept blocks share once they move, and a changed opaque carrier gives up its item', () => {
+    const big = xmlUse('a', '/big');
+    const small = xmlUse('b', '/small');
+    const swapped = releaseReplacedRawForms([big, small], [{ ...small }, { ...big }]);
+    assert.deepEqual(swapped.map((block) => rawOf(block).rawXml), [undefined, undefined], 'the shared <function_calls> would replay the old order');
+    const inOrder = releaseReplacedRawForms([big, small], [{ ...big }, { ...small }]);
+    assert.deepEqual(inOrder.map((block) => rawOf(block).rawXml), [CALLS_XML, CALLS_XML], 'in its order it is still true');
+    const carrier = opaqueCarrier();
+    const redacted = releaseReplacedRawForms([carrier], [{ ...carrier, text: '[redacted]' } as ContentBlock]);
+    assert.equal(rawOf(redacted[0]!).rawItem, undefined);
+    assert.deepEqual(redacted[0], { type: 'text', text: '[redacted]' });
   });
 
   it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {

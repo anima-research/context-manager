@@ -280,4 +280,39 @@ describe('history mutation plan', () => {
       ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result'],
     ]);
   });
+
+  it('places a change by the rows of every slot the manager merges', () => {
+    const aux = row('x0', 0, 'Other', text('from a merged slot'));
+    const record = [aux, ...ROWS];
+    const memory: HistoryMemory = { summaries: [summary('L1-x', 1, ['x0', 'm0'], 'x0', 'm0')], chunkRecords: [] };
+    const plan = planMutation(state({ record, view: record, memory, thinkingBoundThrough: 0 }), {
+      ops: [{ kind: 'edit_summary', summaryId: 'L1-x', expectedSha256: textSha256('memory L1-x'), newText: 'by hand' }],
+    });
+    assert.deepEqual(plan.violations, []);
+    assert.deepEqual(plan.invalidatesKvPrefixFrom, { messageId: 'x0', sequence: 0 });
+    assert.equal(plan.invalidatesThinkingBinding, true, 'the merged slot\'s row lies inside the thinking record');
+  });
+
+  it('reads back every slot of the record, and lets an entry the strategy carried stand beside the summary it carries', () => {
+    const aux = row('x0', 0, 'Other', text('from a merged slot'));
+    const s = state({ record: [aux, ...ROWS], memory: MEMORY });
+    const plan = planMutation(s, { ops: [editMessage('m6', text('noted, again'), { foldedPolicy: 'leave_summaries' })] });
+    assert.deepEqual(plan.violations, []);
+    const stamp = { by: 'operator', at: 0, sourceBranch: 'main' };
+    const target = plan.targets[0]!;
+    assert.ok(target.kind === 'edit_message');
+    const edited = { ...ROWS[6]!, content: target.content, metadata: { historyMutation: { ...stamp, label: target.label } } };
+    const written = (record: StoredMessage[], summaries: readonly SummaryEntry[] = MEMORY.summaries) =>
+      state({ rows: record.slice(1), record, memory: { summaries, chunkRecords: MEMORY.chunkRecords } });
+    const asPlanned = [aux, ...ROWS.slice(0, 6), edited];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned), stamp), []);
+    assert.deepEqual(
+      readBackMismatches(plan, snapshotOf(s), written([{ ...aux, content: text('changed aside') }, ...asPlanned.slice(1)]), stamp),
+      [`message x0's content has sha256 ${messageContentSha256(text('changed aside'))}, not ${sha('x0', [aux])}`],
+    );
+    const carry = summary('L4-k', 4, ['L3-c'], 'm0', 'm6', { carriedFrom: 'L3-c', content: 'memory L3-c' });
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...MEMORY.summaries, carry]), stamp), [], 'a carry renders what it carries');
+    const stray = summary('L4-z', 4, ['L3-c'], 'm0', 'm6');
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...MEMORY.summaries, stray]), stamp), ['summary L4-z is there, and the source didn\'t hold it']);
+  });
 });

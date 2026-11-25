@@ -359,7 +359,7 @@ describe('external-memory', () => {
     assert.equal(l1.level, 1);
   });
 
-  it('edits one summary\'s text: lineage kept, carrier dropped on request, parents reported and left alone', async () => {
+  it('edits one summary\'s text: lineage kept, response blocks dropped on request, parents reported and left alone', async () => {
     const path = await residentStore();
     await asResident(path, answers, (manager) => manager.tick());
     const all = summariesOf(path);
