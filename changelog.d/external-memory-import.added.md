@@ -33,7 +33,8 @@
     no response blocks), and are reported. The summaries merged over the old
     text are reported and left as they are. The summary and its carriers are
     written in one write of the summaries, so they never part. A write that
-    throws may still have landed, and the strategy then holds the new text.
+    throws may still have landed: the error says so, and the strategy holds
+    the new text where it could read the store back and found it there.
     The edit is refused, before anything is written, where the stored
     summaries can't be shown to be as the strategy holds them: after another
     handle's write, or where reading them fails.
@@ -43,9 +44,9 @@
   the request it answers. An entry that has it has no `provenance`, which
   stays what it was: the record of a model's accepted answer. Entries
   without `external` are unchanged. Under `recallEnvelope: 'xml'`, a recall
-  envelope names its `by` (`editedBy`), so selection prices the envelope
-  with that name. Nothing else of selection reads `external`. The
-  operations are also methods:
+  envelope names its `by`, where that isn't empty (`editedBy`), so
+  selection prices the envelope with that name. Nothing else of selection
+  reads `external`. The operations are also methods:
   `ContextManager.exportMemoryRequest`, `importExternalMemory` and
   `editSummaryText`, over the strategy's methods of the same names
   (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,

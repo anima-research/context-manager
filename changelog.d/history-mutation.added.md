@@ -6,7 +6,7 @@
     target that its caller read, which `describeMutationTarget` gives. The
     plan writes nothing. It returns each target before and after, the
     summaries that the mutation drops, the first row whose rendering
-    changes, whether a changed row lies inside the thinking-binding record,
+    may change (an estimate that errs early), whether a changed row lies inside the thinking-binding record,
     and a `planSha256` of all that it reports, its violations included, with
     each summary that it drops as the store holds it.
   - The plan refuses each of these, and says what to change:
@@ -18,7 +18,8 @@
       `dropResponseContent`;
     - merged parents, unless `parentPolicy` says to leave or drop them;
     - a folded message, unless `foldedPolicy` says to drop or leave what
-      folds it;
+      folds it, except a removal from a presented window, which drops what
+      folds it by default, as the window's removal does;
     - an empty summary text, malformed content, an edit of a shard, or the
       removal of part of a body;
     - a tool call split from its result, or a system change put between
@@ -27,7 +28,12 @@
     - a summary that one op edits and another op's policy drops;
     - an edit that the store's own tool-pair check would refuse after the
       batch's earlier ops;
-    - the removal of every message.
+    - the removal of every message;
+    - an op of no known kind, or a field of the wrong type or value
+      (`MALFORMED_OP`);
+    - summaries in a strategy's memory, the manager's or a reader's, that
+      aren't the ones the store holds, which another handle wrote since
+      (`STALE_MEMORY`): that manager is initialized again first.
   - An edited message takes a required `label` that names who changed it.
     The label goes first in the content, unless a text block holds it
     already. The message's metadata records the edit (`historyMutation`),
@@ -109,16 +115,20 @@
     view filter applied.
   - Under `recallEnvelope: 'xml'`, the recall envelope of a summary gains
     `editedBy` when the summary's text came from outside the strategy and
-    names who wrote it (`external.by` isn't blank). Its carriers gain it
+    names who wrote it (`external.by` isn't empty). Its carriers gain it
     too. The value escapes `&`, `<`, `>`, `"` and line breaks as character
     references. A summary stored with
     `external` before this change gains it as well. A compile that renders
     such a summary sends different bytes once.
   - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`. The
     store's edit event still carries the content alone.
-  - New exports: `HistoryMutationError` and the types of
-    `src/history-mutation.ts` (among them `MessageEditStamp`, the shape of
-    `metadata.historyMutation`); `messageContentSha256` and `textSha256`,
+  - New exports: `HistoryMutationError`, and the types that an op, a plan,
+    a receipt, an anomaly and a violation use (`HistoryMutationManifest`,
+    `HistoryMutationOp`, the policies, `HistoryMutationPlan`,
+    `PlannedTarget`, `PlannedReader`, `HistoryMutationReceipt`,
+    `HistoryAnomaly`, `HistoryInvariantCode`, `MutationViolation`,
+    `MutationViolationCode`, `MutationTargetDescription`, and
+    `MessageEditStamp`, the shape of `metadata.historyMutation`); `messageContentSha256` and `textSha256`,
     the sha256s that an op names for a message and a summary;
     `HistoryMutationStrategy` and its guard `isHistoryMutationStrategy`,
     what a strategy implements for its summaries to be changed; and

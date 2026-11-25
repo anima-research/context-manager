@@ -2852,9 +2852,9 @@ export class ContextManager {
       if (now.id === from || now.name !== name) throw error;
       unsaved = error;
     }
-    selected?.();
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
+    selected?.();
     let requested: StoreBranchGeneration;
     try {
       requested = markStoreBranchSwitch(this.store);
@@ -4813,6 +4813,7 @@ export class ContextManager {
       compiled = await staging.compile(options.budget, options.injections, { ...options.selectOptions, dryRun: true });
       staging.close();
     } catch (error) {
+      if (staging) await Promise.allSettled([...staging.retractedCalls]);
       staging?.close();
       this.deleteBuiltBranch(scratch, created.id, plan, error);
       throw error;
@@ -4890,6 +4891,7 @@ export class ContextManager {
     this.requireInitialized('applyHistoryMutation');
     this.refuseCutWhileWritingShards('applyHistoryMutation');
     const by = requireEditor('applyHistoryMutation', options.by);
+    const { targetBranch } = options;
     if ((this.store as { pinnedBranch?: () => string | null }).pinnedBranch?.() != null) {
       throw new Error('ContextManager.applyHistoryMutation: this manager is bound to a branch and can\'t move the store; apply through a manager on the store itself');
     }
@@ -4906,8 +4908,8 @@ export class ContextManager {
       refuse('PLAN_DRIFT', `the plan made now has sha256 ${plan.planSha256}, not ${options.expectedPlanSha256}: the history, the manifest or the readers changed since that plan was made; read the plan this error carries`);
     }
     if (!plan.valid) throw invalidPlan(plan);
-    if (this.store.listBranches().some((branch) => branch.name === options.targetBranch)) {
-      refuse('TARGET_BRANCH_EXISTS', `branch ${options.targetBranch} exists`);
+    if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
+      refuse('TARGET_BRANCH_EXISTS', `branch ${targetBranch} exists`);
     }
     const source = snapshotOf(state);
     const baseline = historyAnomalies(state);
@@ -4916,9 +4918,9 @@ export class ContextManager {
     const sourceId = this.store.currentBranch().id;
     let created: { id: string };
     try {
-      created = this.store.createBranch(options.targetBranch, plan.sourceBranch);
+      created = this.store.createBranch(targetBranch, plan.sourceBranch);
     } catch (error) {
-      this.deleteBuiltBranch(options.targetBranch, undefined, plan, error);
+      this.deleteBuiltBranch(targetBranch, undefined, plan, error);
       throw error;
     }
     let fromSequence: number;
@@ -4926,20 +4928,20 @@ export class ContextManager {
     let reader: ContextManager | undefined;
     try {
       fromSequence = this.store.currentSequence();
-      staging = await this.managerOnBranch(options.targetBranch, options.strategy, true);
+      staging = await this.managerOnBranch(targetBranch, options.strategy, true);
       await staging.applyPlannedOps(plan, stamp);
       const view = staging.store;
       staging.close();
       staging = undefined;
       for (const { manager, share, strategy } of shares) {
-        staging = await manager.managerOnBranch(options.targetBranch, strategy, false);
+        staging = await manager.managerOnBranch(targetBranch, strategy, false);
         await staging.applyReaderShare(plan, share);
         staging.close();
         staging = undefined;
       }
-      await options.beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch: options.targetBranch });
+      await options.beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch });
       const removed = plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : []));
-      const own = await this.managerOnBranch(options.targetBranch, options.strategy, false);
+      const own = await this.managerOnBranch(targetBranch, options.strategy, false);
       reader = own;
       const written = own.historyState();
       const stillInWindow = removed.filter((id) => own.ordinalOf(id) !== undefined);
@@ -4948,7 +4950,7 @@ export class ContextManager {
       const mismatches = readBackMismatches(plan, source, written, stamp, stillInWindow);
       const broken = introducedAnomalies(baseline, historyAnomalies(written)).map((a) => a.message);
       for (const { manager, namespace, share, source: readerSource, baseline: readerBaseline, strategy } of shares) {
-        const cold = await manager.managerOnBranch(options.targetBranch, strategy, false);
+        const cold = await manager.managerOnBranch(targetBranch, strategy, false);
         reader = cold;
         const readerWritten = cold.historyState();
         const stillInWindow = removed.filter((id) => cold.ordinalOf(id) !== undefined);
@@ -4957,27 +4959,28 @@ export class ContextManager {
         mismatches.push(...readerReadBackMismatches(plan, share, readerSource, readerWritten, stamp, stillInWindow));
         broken.push(...introducedAnomalies(readerBaseline, historyAnomalies(readerWritten)).map((a) => `reader ${namespace}: ${a.message}`));
       }
-      if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${options.targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
-      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${options.targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.join('; ')}`);
-      const built = this.store.listBranches().find((branch) => branch.name === options.targetBranch);
+      if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
+      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.join('; ')}`);
+      const built = this.store.listBranches().find((branch) => branch.name === targetBranch);
       if (this.store.currentBranch().id !== sourceId || this.store.currentSequence() !== fromSequence || built?.id !== created.id) {
-        refuse('SOURCE_MOVED', `the store moved while the apply built ${options.targetBranch}: ` + (
+        refuse('SOURCE_MOVED', `the store moved while the apply built ${targetBranch}: ` + (
           this.store.currentBranch().id !== sourceId ? `it is on ${this.store.currentBranch().name}, not ${plan.sourceBranch}`
             : this.store.currentSequence() !== fromSequence ? `${plan.sourceBranch} took records after sequence ${fromSequence}, which the branch doesn't hold`
-              : `${options.targetBranch} is not the branch the apply built`
+              : `${targetBranch} is not the branch the apply built`
         ) + ': plan again once nothing else writes the history');
       }
       this.store.sync();
     } catch (error) {
+      if (staging) await Promise.allSettled([...staging.retractedCalls]);
       staging?.close();
       reader?.close();
-      this.deleteBuiltBranch(options.targetBranch, created.id, plan, error);
+      this.deleteBuiltBranch(targetBranch, created.id, plan, error);
       throw error;
     }
     let toSequence = 0;
     const receipt = (): HistoryMutationReceipt => ({
       sourceBranch: plan.sourceBranch,
-      targetBranch: options.targetBranch,
+      targetBranch,
       fromSequence,
       toSequence,
       planSha256: plan.planSha256,
@@ -4986,17 +4989,17 @@ export class ContextManager {
     });
     let switched = false;
     try {
-      await this.selectBranch(options.targetBranch, false, () => {
+      await this.selectBranch(targetBranch, false, () => {
         switched = true;
         toSequence = this.store.currentSequence();
       });
     } catch (error) {
       const now = this.store.currentBranch();
       if (!switched) {
-        this.deleteBuiltBranch(options.targetBranch, created.id, plan, error);
+        this.deleteBuiltBranch(targetBranch, created.id, plan, error);
         throw error;
       }
-      const message = `the mutation is applied on ${options.targetBranch}: the store moved to it, and the switch didn't complete ` +
+      const message = `the mutation is applied on ${targetBranch}: the store moved to it, and the switch didn't complete ` +
         `(${error instanceof Error ? error.message : String(error)}); the store is on ${now.name} now: getStore().sync() saves a switch whose ` +
         'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is';
       throw new HistoryMutationError(message, [{ opIndex: -1, code: 'APPLIED_INIT_FAILED', message }], plan, { cause: error, receipt: receipt() });
@@ -5033,8 +5036,9 @@ export class ContextManager {
     let unusable: unknown;
     if (clone) {
       try {
-        clone.call(strategy);
-        return () => clone.call(strategy);
+        const made: unknown = clone.call(strategy);
+        if (typeof made === 'object' && made !== null) return () => clone.call(strategy);
+        unusable = new Error('its cloneForScratch returned no strategy');
       } catch (error) {
         unusable = error;
       }
@@ -5096,7 +5100,7 @@ export class ContextManager {
   private async applyReaderShare(plan: HistoryMutationPlan, share: PlannedReader): Promise<void> {
     for (const target of plan.targets) {
       if (target.kind === 'edit_summary') continue;
-      if (target.kind === 'remove_messages' && this.windowIndex.mode() === 'presented') {
+      if (target.kind === 'remove_messages') {
         this.retractRemoved(target.messageIds);
         await this.settleRetractions();
       }
@@ -5145,7 +5149,7 @@ export class ContextManager {
             if (from === to && !this.messageStore.get(from)?.bodyGroupId) this.removeMessage(from);
             else this.removeMessages(from, to);
           }
-          if (this.windowIndex.mode() === 'presented') await this.settleRetractions();
+          await this.settleRetractions();
           if (target.foldedPolicy === 'drop_covering_summaries') this.dropStillHeld(target.coveringSummaries);
           break;
         }
@@ -5917,8 +5921,8 @@ export class ContextManager {
 
   private async settleRetractions(): Promise<void> {
     await Promise.all(this.retractedCalls);
-    const failure = this.retractionFailures?.[0];
-    if (failure !== undefined) {
+    if (this.retractionFailures !== undefined && this.retractionFailures.length > 0) {
+      const failure = this.retractionFailures[0];
       throw new Error(`the ${this.strategy.name} strategy's onRetracted failed on the branch: ${failure instanceof Error ? failure.message : String(failure)}`, { cause: failure });
     }
   }

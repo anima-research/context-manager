@@ -22,6 +22,10 @@ export type FoldedRemovePolicy = 'refuse' | 'drop_covering_summaries';
 /** What happens to the summaries merged over a summary whose text an edit replaces. */
 export type ParentPolicy = 'refuse' | 'leave_parents' | 'drop_parents';
 
+const FOLDED_EDIT_POLICIES: readonly FoldedEditPolicy[] = ['refuse', 'drop_covering_summaries', 'leave_summaries'];
+const FOLDED_REMOVE_POLICIES: readonly FoldedRemovePolicy[] = ['refuse', 'drop_covering_summaries'];
+const PARENT_POLICIES: readonly ParentPolicy[] = ['refuse', 'leave_parents', 'drop_parents'];
+
 /**
  * One change of a history mutation. Each op names what the caller read: the
  * sha256 of its current form (describeMutationTarget gives it), so a change
@@ -94,6 +98,8 @@ export type MutationViolationCode =
   | 'FOLDED_ROW_REQUIRES_POLICY'
   | 'EDITED_SUMMARY_DROPPED'
   | 'STRATEGY_UNSUPPORTED'
+  | 'MALFORMED_OP'
+  | 'STALE_MEMORY'
   // An apply's own, beyond its plan's: the branch or plan it was given isn't
   // the one it finds, its target branch exists, the branch it built reads
   // back other than planned or breaks a rule the source didn't, the source
@@ -197,7 +203,7 @@ export interface HistoryMutationPlan {
   droppedSummaries: string[];
   /** A target lies at or before the end of the thinking-binding record, so the next binding compile sends what follows it without thinking. */
   invalidatesThinkingBinding: boolean;
-  /** The first stored row whose rendering changes: a provider's prefix cache is rewritten from here once. */
+  /** The first stored row whose rendering may change, an estimate that errs early: a provider's prefix cache is rewritten from here once. */
   invalidatesKvPrefixFrom?: { messageId: MessageId; sequence: Sequence };
   /** What the mutation does to each reader the caller named, in the order named. */
   readers: PlannedReader[];
@@ -300,6 +306,53 @@ function covering(memory: HistoryMemory | null, rows: ReadonlySet<MessageId>): s
 }
 
 
+function malformedOps(manifest: unknown): Array<{ opIndex: number; message: string }> {
+  const ops = typeof manifest === 'object' && manifest !== null ? (manifest as { ops?: unknown }).ops : undefined;
+  if (!Array.isArray(ops)) return [{ opIndex: -1, message: 'the manifest has no `ops` array' }];
+  const out: Array<{ opIndex: number; message: string }> = [];
+  const isString = (value: unknown): value is string => typeof value === 'string';
+  const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
+  ops.forEach((op: unknown, opIndex) => {
+    if (typeof op !== 'object' || op === null || Array.isArray(op)) {
+      out.push({ opIndex, message: `op ${opIndex} is not an object` });
+      return;
+    }
+    const fields = op as Record<string, unknown>;
+    const want = (field: string, ok: (value: unknown) => boolean, what: string, optional = false) => {
+      if ((optional && fields[field] === undefined) || ok(fields[field])) return;
+      out.push({ opIndex, message: `op ${opIndex}'s \`${field}\` isn't ${what}` });
+    };
+    const oneOf = (values: readonly string[]) => (value: unknown) => isString(value) && values.includes(value);
+    switch (fields.kind) {
+      case 'edit_summary':
+        want('summaryId', isString, 'a string');
+        want('expectedSha256', isString, 'a string');
+        want('newText', isString, 'a string');
+        want('expectedAfterSha256', isString, 'a string', true);
+        want('dropResponseContent', isBoolean, 'a boolean', true);
+        want('parentPolicy', oneOf(PARENT_POLICIES), `one of ${PARENT_POLICIES.join(', ')}`, true);
+        break;
+      case 'edit_message':
+        want('messageId', isString, 'a string');
+        want('expectedSha256', isString, 'a string');
+        want('content', Array.isArray, 'an array of content blocks');
+        want('label', isString, 'a string');
+        want('expectedAfterSha256', isString, 'a string', true);
+        want('foldedPolicy', oneOf(FOLDED_EDIT_POLICIES), `one of ${FOLDED_EDIT_POLICIES.join(', ')}`, true);
+        break;
+      case 'remove_messages':
+        want('messageIds', (value) => Array.isArray(value) && value.length > 0 && value.every(isString), 'a non-empty array of strings');
+        want('expectedSha256ById', (value) => typeof value === 'object' && value !== null && !Array.isArray(value) && Object.values(value).every(isString), 'an object of strings');
+        want('expandBodyGroups', isBoolean, 'a boolean', true);
+        want('foldedPolicy', oneOf(FOLDED_REMOVE_POLICIES), `one of ${FOLDED_REMOVE_POLICIES.join(', ')}`, true);
+        break;
+      default:
+        out.push({ opIndex, message: `op ${opIndex} has kind ${JSON.stringify(fields.kind)}, which is none of edit_summary, edit_message and remove_messages` });
+    }
+  });
+  return out;
+}
+
 export function planMutation(
   state: HistoryState,
   manifest: HistoryMutationManifest,
@@ -309,7 +362,16 @@ export function planMutation(
   const refuse = (opIndex: number, code: MutationViolationCode, message: string, targetId?: string, remediation?: Record<string, unknown>) => {
     violations.push({ opIndex, code, message, ...(targetId !== undefined ? { targetId } : {}), ...(remediation ? { remediation } : {}) });
   };
-  if (manifest.ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops');
+  const malformed = malformedOps(manifest);
+  for (const { opIndex, message } of malformed) refuse(opIndex, 'MALFORMED_OP', message);
+  const ops = malformed.length > 0 ? [] : manifest.ops;
+  if (malformed.length === 0 && ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops');
+  const stale = (memory: HistoryMemory | null) => memory?.stored !== undefined && memory.stored !== memory.summaries;
+  const restart = 're-initialize that manager (setStrategy(getStrategy())) and plan again';
+  if (stale(state.memory)) refuse(-1, 'STALE_MEMORY', `the strategy's summaries in memory aren't the ones the store holds, which another handle wrote since: ${restart}`);
+  for (const { namespace, state: reader } of readers) {
+    if (stale(reader.memory)) refuse(-1, 'STALE_MEMORY', `reader ${namespace}: its strategy's summaries in memory aren't the ones the store holds, which another handle wrote since: ${restart}`, undefined, { readerNamespace: namespace });
+  }
 
   const position = new Map(state.rows.map((row, i) => [row.id, i] as const));
   const targets: PlannedTarget[] = [];
@@ -336,7 +398,7 @@ export function planMutation(
   let rowsNow: StoredMessage[] = [...state.rows];
   const guardSplits: Array<{ opIndex: number; messageId: MessageId; reason: string }> = [];
 
-  manifest.ops.forEach((op, opIndex) => {
+  ops.forEach((op, opIndex) => {
     switch (op.kind) {
       case 'edit_summary': {
         if (seenSummaries.has(op.summaryId)) {
@@ -427,7 +489,7 @@ export function planMutation(
         if (content.some(isThinkingBlock) && canonicalJson(content) !== canonicalJson(row.content)) {
           refuse(opIndex, 'STALE_THINKING_IN_EDITED_MESSAGE', `the new content of ${op.messageId} keeps thinking blocks and changes the message: a provider verifies their signatures over the turn they were made in; leave them out`, op.messageId);
         }
-        const afterSha256 = messageContentSha256(content);
+        const afterSha256 = storedSha256(content);
         if (op.expectedAfterSha256 !== undefined && op.expectedAfterSha256 !== afterSha256) {
           refuse(opIndex, 'AFTER_SHA_MISMATCH', `the content as written has sha256 ${afterSha256}, not ${op.expectedAfterSha256}`, op.messageId, { afterSha256 });
         }
@@ -540,7 +602,7 @@ export function planMutation(
       for (const id of ids) if (inWindow.has(id) || covering(reader.memory, new Set([id])).length > 0) heldIds.push(id);
       const coveringSummaries = covering(reader.memory, new Set(ids));
       if (coveringSummaries.length === 0) continue;
-      const op = manifest.ops[target.opIndex]!;
+      const op = ops[target.opIndex]!;
       const foldedPolicy = target.kind === 'edit_message'
         ? target.foldedPolicy
         : (op.kind === 'remove_messages' ? op.foldedPolicy : undefined) ?? (reader.windowMode === 'presented' ? 'drop_covering_summaries' : 'refuse');
@@ -620,7 +682,7 @@ function windowEffects(
     const at = windowAt.get(id);
     if (content === undefined || at === undefined || !(state.viewKeeps?.({ ...state.window[at]!, content }) ?? true)) return undefined;
     const next = state.window.slice(at + 1).find((row) => viewPosition.has(row.id));
-    return (next ? viewPosition.get(next.id)! : state.view.length) - 0.5;
+    return (next ? viewPosition.get(next.id)! : state.view.length) - 1 + (at + 1) / (state.window.length + 1);
   };
   const sent = (id: MessageId): boolean => positionOf(id) !== undefined;
   const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id), sent);

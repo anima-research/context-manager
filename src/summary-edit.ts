@@ -73,7 +73,7 @@ export function describeSummaryEditRefusal(id: string, refusal: SummaryEditRefus
     case 'CAS_MISMATCH':
       return `summary ${id}'s text has sha256 ${refusal.actualSha256}, not the ${refusal.expectedSha256} given: read it again`;
     case 'RESPONSE_CONTENT_SHADOW':
-      return `summary ${id}, or an entry that carries it, renders ${refusal.responseBlocks} verbatim response block(s) in place of its text; drop them with the new text (dropResponseContent, or the CLI's --drop-response-content)`;
+      return `summary ${id}, or an entry that carries it, holds ${refusal.responseBlocks} verbatim response block(s), which the edit drops with the text they matched; drop them with the new text (dropResponseContent, or the CLI's --drop-response-content)`;
     case 'EMPTY_CONTENT':
       return 'the memory text is empty';
     default: {

@@ -256,7 +256,9 @@ export interface ContextStrategy {
    * compression by itself, for a manager that builds a history mutation on a
    * branch of its own (ContextManager.compileMutationPreview,
    * applyHistoryMutation). Absent where the strategy can't be built again
-   * from what it holds; those calls then take a strategy from their caller.
+   * from what it holds; for the manager that makes the change, those calls
+   * then take a strategy from their caller, and a reader needs one of its
+   * own.
    */
   cloneForScratch?(): ContextStrategy;
 
@@ -3200,8 +3202,8 @@ export interface SummaryEntry {
    * the text of an existing summary (`importExternalMemory`,
    * `editSummaryText`). Absent on every other entry. Under
    * `recallEnvelope: 'xml'`, the recall envelope of the entry, and of each
-   * entry that carries it, names `by` as `editedBy`, and selection prices
-   * that envelope; nothing else of selection reads it. An entry that has it has no `provenance`: that
+   * entry that carries it, names a `by` that isn't empty as `editedBy`, and
+   * selection prices that envelope; nothing else of selection reads it. An entry that has it has no `provenance`: that
    * records a model's accepted answer, and here there is none. An installed
    * entry names the request it answers in `external.requestHash`; an edit
    * drops the `provenance` of the call that wrote the text it replaced,
@@ -3265,7 +3267,7 @@ export interface SummaryTextEdit {
   prior: { sha256: string; length: number; tokens: number };
   /** The new text's token stamp: an estimate from its length (`Math.ceil(length / 3)`), as for any summary text no provider measured. */
   tokens: number;
-  /** Verbatim response blocks the entry carried, which go with the text they matched (so do its `provenance` and `stitched`). */
+  /** The most verbatim response blocks that the entry, or one that carries it, held: they go with the text they matched (so do its `provenance` and `stitched`). */
   droppedResponseBlocks: number;
   /**
    * Entries that carry the summary up a level (`carriedFrom`), nearest first.

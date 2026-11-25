@@ -43,7 +43,9 @@
  * An opaque item (a Responses item membrane has no block for: an encrypted
  * compaction item, a hosted tool's call such as a web search, a custom tool
  * call) rides on a zero-width text block whose raw item is its whole content:
- * no field can render it. So an opaque carrier is never released. In a
+ * no field can render it. So an opaque carrier is never released, except
+ * where content that replaces a message holds a changed copy of one, which
+ * would replay the old item. In a
  * pairing it is an item like any other, so a hosted tool's call is the
  * follower of the reasoning that led to it. A pairing released through one
  * leaves it whole, with its id. So where its reasoning is stripped and it
@@ -183,7 +185,7 @@ export function releaseReplacedRawForms(before: readonly ContentBlock[], after: 
     const span = placeOf.slice(kept[0], kept[kept.length - 1]! + 1);
     if (span.length !== last - first + 1 || span.some((place, k) => place !== first + k)) for (const key of keys) moved.add(key);
   }
-  const held = new Set(byKey.keys());
+  const held = new Set(before.flatMap(rawFormValues));
   const matched = after.map((block, j) => {
     const place = placeOf[j];
     return place === undefined ? withoutHeldRawForms(block, held) : withoutRawForms(before[place]!, moved);
@@ -191,11 +193,17 @@ export function releaseReplacedRawForms(before: readonly ContentBlock[], after: 
   return releaseEditedRawForms(before, matched);
 }
 
+function rawFormValues(block: ContentBlock): string[] {
+  const xml = xmlKey(block);
+  const raw = (block as RawFormCarrier).rawItem;
+  return [...(xml !== undefined ? [xml] : []), ...(raw && typeof raw === 'object' ? [`item:${canonicalJson(raw)}`] : [])];
+}
+
 function withoutHeldRawForms(block: ContentBlock, held: ReadonlySet<string>): ContentBlock {
   const xml = xmlKey(block);
-  const item = itemKey(block);
+  const raw = (block as RawFormCarrier).rawItem;
   const dropXml = xml !== undefined && held.has(xml);
-  const dropItem = item !== undefined && held.has(item);
+  const dropItem = raw !== null && typeof raw === 'object' && held.has(`item:${canonicalJson(raw)}`);
   if (!dropXml && !dropItem) return block;
   const copy = { ...block } as ContentBlock & RawFormCarrier;
   if (dropXml) delete copy.rawXml;
