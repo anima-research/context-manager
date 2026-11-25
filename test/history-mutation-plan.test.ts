@@ -388,6 +388,47 @@ describe('history mutation plan', () => {
     assert.deepEqual(codes([{ ...op, dropResponseContent: true }], state({ memory })), []);
   });
 
+  it('refuses a manifest whose ops aren\'t of a known kind, or whose fields haven\'t their types', () => {
+    const malformed = (manifest: unknown) => planMutation(state(), manifest as Parameters<typeof planMutation>[1]).violations.map((v) => [v.code, v.opIndex]);
+    assert.deepEqual(malformed({ ops: [{ kind: 'redact_message', messageId: 'm3' }] }), [['MALFORMED_OP', 0]]);
+    assert.deepEqual(malformed({}), [['MALFORMED_OP', -1]]);
+    assert.deepEqual(malformed({ ops: [editMessage('m3', text('x')), { ...editMessage('m6', text('x')), label: 5 }] }), [['MALFORMED_OP', 1]]);
+    assert.deepEqual(malformed({ ops: [{ ...remove('m3'), foldedPolicy: 'leave_summaries' }] }), [['MALFORMED_OP', 0]]);
+    assert.deepEqual(malformed({ ops: [{ ...remove('m3'), messageIds: [] }] }), [['MALFORMED_OP', 0]]);
+    assert.deepEqual(malformed({ ops: [{ ...remove('m3'), expectedSha256ById: { m3: 7 } }] }), [['MALFORMED_OP', 0]]);
+    assert.deepEqual(malformed({ ops: [{ kind: 'edit_summary', summaryId: 'L1-a', expectedSha256: 'x', newText: 'y', parentPolicy: 'keep' }] }), [['MALFORMED_OP', 0]]);
+    const plan = planMutation(state(), { ops: [{ kind: 'redact_message' }] } as unknown as Parameters<typeof planMutation>[1]);
+    assert.deepEqual(plan.targets, [], 'a malformed manifest plans nothing');
+    assert.match(plan.violations[0]!.message, /op 0 has kind "redact_message", which is none of edit_summary, edit_message and remove_messages/);
+  });
+
+  it('refuses to plan where a strategy\'s summaries in memory aren\'t the ones the store holds', () => {
+    const fresh: HistoryMemory = { ...MEMORY, stored: MEMORY.summaries };
+    const stale: HistoryMemory = { ...MEMORY, stored: [...MEMORY.summaries] };
+    const codes = (own: HistoryMemory, reader: HistoryMemory) => planMutation(state({ memory: own }), { ops: [editMessage('m6', text('x'), { foldedPolicy: 'leave_summaries' })] },
+      [{ namespace: 'b', state: state({ memory: reader }) }]).violations.filter((v) => v.code === 'STALE_MEMORY').map((v) => v.remediation?.readerNamespace ?? 'own');
+    assert.deepEqual(codes(fresh, fresh), []);
+    assert.deepEqual(codes(stale, fresh), ['own']);
+    assert.deepEqual(codes(fresh, stale), ['b']);
+  });
+
+  it('places rows that an edit brings into the view in window order, whatever the manifest\'s order', () => {
+    const rows = [row('r0', 1, 'User', text('visible')), row('r1', 2, 'Ada', text('hidden one')), row('r2', 3, 'User', text('hidden two')), row('r3', 4, 'Ada', text('visible end'))];
+    const keeps = (r: StoredMessage) => !r.content.some((b) => b.type === 'text' && b.text.includes('hidden'));
+    const s = state({ rows, window: rows, view: rows.filter(keeps), viewKeeps: keeps });
+    const shown = (id: string, to: string): HistoryMutationOp => ({ kind: 'edit_message', messageId: id, expectedSha256: messageContentSha256(rows.find((r) => r.id === id)!.content), content: text(to), label: '[edited by Clement]' });
+    const plan = planMutation(s, { ops: [shown('r2', 'shown two'), shown('r1', 'shown one')] });
+    assert.deepEqual(plan.violations, []);
+    assert.deepEqual(plan.invalidatesKvPrefixFrom, { messageId: 'r1', sequence: 2 });
+  });
+
+  it('names the content an edit writes by its sha256 as the store keeps it', () => {
+    const plan = planMutation(state(), { ops: [editMessage('m3', text('half a pair \uD800'))] });
+    const target = plan.targets[0]!;
+    assert.ok(target.kind === 'edit_message');
+    assert.equal(target.afterSha256, messageContentSha256([...text('[edited by Clement]'), ...text('half a pair \uFFFD')]));
+  });
+
   it('reads back an edited summary as the edit writes it, and nothing more', () => {
     const memory: HistoryMemory = { summaries: [summary('L1-q', 1, ['m6'], 'm6', 'm6', { stitched: { split: 'r' } })], chunkRecords: [] };
     const s = state({ memory });

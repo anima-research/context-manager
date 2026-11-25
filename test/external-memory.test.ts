@@ -379,7 +379,7 @@ describe('external-memory', () => {
     const applied = await run([...args, '--apply']);
     assert.equal(applied.code, 0, applied.stderr);
     assert.match(applied.stdout, new RegExp(`old text: ${target.content.length} chars, ${target.tokens} tokens, sha256 ${sha256(target.content)}`));
-    assert.match(applied.stdout, /verbatim response blocks dropped: 2/);
+    assert.match(applied.stdout, /verbatim response blocks dropped \(the most on one entry\): 2/);
     assert.match(applied.stdout, new RegExp(`merged over the old text, left as they are: ${parent.id} \\(L2\\)`));
 
     const after = summariesOf(path);
@@ -412,7 +412,7 @@ describe('external-memory', () => {
     for (const apply of [[], ['--apply']]) {
       const refused = await run(['edit', path, '--namespace', NS, '--id', target.id, '--body-file', bodyFile('By hand.'), '--by', 'operator', ...apply]);
       assert.equal(refused.code, 1);
-      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, renders 2 verbatim response block\\(s\\)`));
+      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, holds 2 verbatim response block\\(s\\), which the edit drops`));
     }
     assert.equal(memory(path), before, 'nothing is written');
   });

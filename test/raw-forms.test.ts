@@ -258,6 +258,9 @@ describe('raw forms: keys and release', () => {
     const restated = itemText('restated', { type: 'message', id: 'msg_9', role: 'assistant', content: [{ type: 'output_text', text: 'restated' }] });
     assert.equal(rawOf(releaseReplacedRawForms([part], [restated])[0]!).rawItem, rawOf(restated).rawItem, 'and so is a new message item');
     assert.equal(rawOf(releaseReplacedRawForms([part], [{ ...part, text: 'reworded' } as ContentBlock])[0]!).rawItem, undefined, 'a copy of the old item still goes');
+    const searched = searchCall();
+    const updated = { type: 'text', text: '', rawItem: { type: 'web_search_call', id: 'ws_1', status: 'failed' } } as ContentBlock;
+    assert.equal(rawOf(releaseReplacedRawForms([searched], [updated])[0]!).rawItem, rawOf(updated).rawItem, 'and so is an item that keeps an old id with new contents');
   });
 
   it('content that replaces a message keeps the rawXml that is a block\'s content', () => {
@@ -278,7 +281,7 @@ describe('raw forms: keys and release', () => {
 });
 
 describe('raw forms: opaque carriers, drops and appends', () => {
-  it('an opaque carrier keeps its raw item, and is the follower of the reasoning before it', () => {
+  it('an opaque carrier keeps its raw item where a release asks, and is the follower of the reasoning before it', () => {
     const think = reasoning();
     const search = searchCall();
     const parts = [itemText('first part'), itemText('second part')];
