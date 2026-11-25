@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { carriesItsSource } from './strategies/merge-runs.js';
+import type { MessageId } from './types/message.js';
 import { getSummaryParentId, type SummaryEntry, type SummaryTextEdit, type SummaryTextEditOptions } from './types/strategy.js';
 
 /** sha256 (hex) of a text as UTF-8: how a summary's text is named in an edit's compare-and-swap. */
@@ -80,4 +81,42 @@ export function describeSummaryEditRefusal(id: string, refusal: SummaryEditRefus
       return _exhaustive;
     }
   }
+}
+
+/**
+ * The L1s that fold one of `rows`: each L1 listing one among its sources,
+ * and the L1 of each chunk record holding one. What a let-go of the rows
+ * drops starts from these (withSummariesAbove).
+ */
+export function summariesFoldingRows(
+  summaries: ReadonlyArray<Pick<SummaryEntry, 'id' | 'level' | 'sourceIds'>>,
+  records: ReadonlyArray<{ sourceIds: readonly string[]; summaryId?: string }>,
+  rows: ReadonlySet<MessageId>,
+): Set<string> {
+  const seeds = new Set<string>();
+  for (const summary of summaries) {
+    if (summary.level === 1 && summary.sourceIds.some((id) => rows.has(id))) seeds.add(summary.id);
+  }
+  for (const record of records) {
+    if (record.summaryId && record.sourceIds.some((id) => rows.has(id))) seeds.add(record.summaryId);
+  }
+  return seeds;
+}
+
+/** `seeds`, with every summary above one of them: each summary above L1 with a source among them, again and again. */
+export function withSummariesAbove(
+  summaries: ReadonlyArray<Pick<SummaryEntry, 'id' | 'level' | 'sourceIds'>>,
+  seeds: ReadonlySet<string>,
+): Set<string> {
+  const dropped = new Set(seeds);
+  for (let grew = dropped.size > 0; grew;) {
+    grew = false;
+    for (const summary of summaries) {
+      if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
+        dropped.add(summary.id);
+        grew = true;
+      }
+    }
+  }
+  return dropped;
 }

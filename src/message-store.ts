@@ -19,7 +19,7 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
-import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody, type BodyShard } from './body-runs.js';
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 import { storedJson } from './stored-json.js';
 
@@ -52,6 +52,92 @@ function toolIds(content: unknown, type: 'tool_use' | 'tool_result'): string[] {
     if (block?.type === type && typeof id === 'string') ids.push(id);
   }
   return ids;
+}
+
+/** A stored message as the tool-pair rule reads it: its id, its content and its place in a body. */
+export interface ToolPairRow extends BodyShard {
+  id: MessageId;
+  content: unknown;
+}
+
+/**
+ * Why a write of `content` at `index`, in rows `at` reads of a slot of
+ * `length`, would part a tool call from its result, or null: the rule
+ * MessageStore.refuseToolPairSplit applies to each write.
+ */
+export function toolPairSplitReason(at: (i: number) => ToolPairRow | null, length: number, content: unknown, index: number): string | null {
+  // A body is one step of either walk, read whole: ingress sharding puts a
+  // message's non-text blocks, its calls and results, on its first shard.
+  const bodyAt = (i: number): { from: number; to: number; shards: ToolPairRow[] } => {
+    const from = bodyStart(at, i);
+    const to = bodyEnd(length, at, i);
+    const shards: ToolPairRow[] = [];
+    for (let k = from; k <= to; k++) shards.push(at(k)!);
+    return { from, to, shards };
+  };
+  const holds = (shards: ToolPairRow[], type: string): boolean => shards.some((shard) => holdsBlock(shard.content, type));
+  const idsIn = (shards: ToolPairRow[], type: 'tool_use' | 'tool_result'): string[] =>
+    shards.flatMap((shard) => toolIds(shard.content, type));
+  const change = holdsBlock(content, 'system_change');
+  const answers = change ? [] : toolIds(content, 'tool_result');
+  if (change || answers.length > 0) {
+    // Back over changes and results, to the nearest body holding a call.
+    const answered = new Set<string>();
+    let changeBetween: ToolPairRow | undefined;
+    const calls = new Map<string, MessageId>();
+    for (let i = index - 1; i >= 0; ) {
+      const { from, shards } = bodyAt(i);
+      if (holds(shards, 'tool_use')) {
+        // The body's calls left open by its own blocks, read in order
+        // across its shards, each by the shard that holds it.
+        const holder = new Map<string, MessageId>();
+        for (const shard of shards) for (const id of toolIds(shard.content, 'tool_use')) holder.set(id, shard.id);
+        for (const [id, open] of callsInOrder(shards.flatMap((shard) => shard.content))) if (open) calls.set(id, holder.get(id)!);
+        break;
+      }
+      if (holds(shards, 'system_change')) changeBetween ??= shards[0];
+      else if (holds(shards, 'tool_result')) for (const id of idsIn(shards, 'tool_result')) answered.add(id);
+      else break;
+      i = from - 1;
+    }
+    if (calls.size > 0) {
+      if (change) {
+        const open = [...calls].filter(([id]) => !answered.has(id));
+        if (open.length > 0) {
+          return (
+            `a system change can't go between a tool call and its result, and message ${open[0]![1]} holds a tool_use ` +
+              `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.`
+          );
+        }
+      } else if (changeBetween) {
+        const id = answers.find((answer) => calls.has(answer));
+        if (id !== undefined) {
+          return (
+            `a tool_result can't follow a system change (message ${changeBetween.id}) that follows its tool call ` +
+              `(${id}, message ${calls.get(id)}). Remove the change and write it after the result.`
+          );
+        }
+      }
+    }
+  }
+  if (index < length && holdsBlock(content, 'tool_use')) {
+    // Forward over changes and results, while a call here is unanswered.
+    const open = new Set([...callsInOrder(content)].filter(([, stillOpen]) => stillOpen).map(([id]) => id));
+    for (let i = index + 1; i < length && open.size > 0; ) {
+      const { to, shards } = bodyAt(i);
+      if (holds(shards, 'tool_use')) break;
+      if (holds(shards, 'system_change')) {
+        return (
+          `a tool_use (${[...open].join(', ')}) can't go before a system change (message ${shards[0]!.id}) that comes before its result; ` +
+            "a change goes after the call's result."
+        );
+      }
+      if (!holds(shards, 'tool_result')) break;
+      for (const id of idsIn(shards, 'tool_result')) open.delete(id);
+      i = to + 1;
+    }
+  }
+  return null;
 }
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
@@ -854,78 +940,8 @@ export class MessageStore {
    */
   refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
     const length = this.length();
-    const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
-    // A body is one step of either walk, read whole: ingress sharding puts a
-    // message's non-text blocks, its calls and results, on its first shard.
-    const bodyAt = (i: number): { from: number; to: number; shards: StoredMessageInternal[] } => {
-      const from = bodyStart(at, i);
-      const to = bodyEnd(length, at, i);
-      const shards: StoredMessageInternal[] = [];
-      for (let k = from; k <= to; k++) shards.push(at(k)!);
-      return { from, to, shards };
-    };
-    const holds = (shards: StoredMessageInternal[], type: string): boolean => shards.some((shard) => holdsBlock(shard.content, type));
-    const idsIn = (shards: StoredMessageInternal[], type: 'tool_use' | 'tool_result'): string[] =>
-      shards.flatMap((shard) => toolIds(shard.content, type));
-    const change = holdsBlock(content, 'system_change');
-    const answers = change ? [] : toolIds(content, 'tool_result');
-    if (change || answers.length > 0) {
-      // Back over changes and results, to the nearest body holding a call.
-      const answered = new Set<string>();
-      let changeBetween: StoredMessageInternal | undefined;
-      const calls = new Map<string, MessageId>();
-      for (let i = index - 1; i >= 0; ) {
-        const { from, shards } = bodyAt(i);
-        if (holds(shards, 'tool_use')) {
-          // The body's calls left open by its own blocks, read in order
-          // across its shards, each by the shard that holds it.
-          const holder = new Map<string, MessageId>();
-          for (const shard of shards) for (const id of toolIds(shard.content, 'tool_use')) holder.set(id, shard.id);
-          for (const [id, open] of callsInOrder(shards.flatMap((shard) => shard.content))) if (open) calls.set(id, holder.get(id)!);
-          break;
-        }
-        if (holds(shards, 'system_change')) changeBetween ??= shards[0];
-        else if (holds(shards, 'tool_result')) for (const id of idsIn(shards, 'tool_result')) answered.add(id);
-        else break;
-        i = from - 1;
-      }
-      if (calls.size > 0) {
-        if (change) {
-          const open = [...calls].filter(([id]) => !answered.has(id));
-          if (open.length > 0) {
-            throw new Error(
-              `${what}: a system change can't go between a tool call and its result, and message ${open[0]![1]} holds a tool_use ` +
-                `(${open.map(([id]) => id).join(', ')}) with no result between it and this change. Write it after the result, where membrane sends a change of tools or system text anyway; for a call that will get none, store a result for it first or remove the call.`,
-            );
-          }
-        } else if (changeBetween) {
-          const id = answers.find((answer) => calls.has(answer));
-          if (id !== undefined) {
-            throw new Error(
-              `${what}: a tool_result can't follow a system change (message ${changeBetween.id}) that follows its tool call ` +
-                `(${id}, message ${calls.get(id)}). Remove the change and write it after the result.`,
-            );
-          }
-        }
-      }
-    }
-    if (index < length && holdsBlock(content, 'tool_use')) {
-      // Forward over changes and results, while a call here is unanswered.
-      const open = new Set([...callsInOrder(content)].filter(([, stillOpen]) => stillOpen).map(([id]) => id));
-      for (let i = index + 1; i < length && open.size > 0; ) {
-        const { to, shards } = bodyAt(i);
-        if (holds(shards, 'tool_use')) break;
-        if (holds(shards, 'system_change')) {
-          throw new Error(
-            `${what}: a tool_use (${[...open].join(', ')}) can't go before a system change (message ${shards[0]!.id}) that comes before its result; ` +
-              "a change goes after the call's result.",
-          );
-        }
-        if (!holds(shards, 'tool_result')) break;
-        for (const id of idsIn(shards, 'tool_result')) open.delete(id);
-        i = to + 1;
-      }
-    }
+    const reason = toolPairSplitReason((i) => (i >= 0 && i < length ? this.getInternal(i) : null), length, content, index);
+    if (reason !== null) throw new Error(`${what}: ${reason}`);
   }
 
   /**

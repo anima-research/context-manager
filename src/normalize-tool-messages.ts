@@ -126,23 +126,18 @@ export function answeredCallIndexes(blocks: readonly ContentBlock[]): Array<numb
 export function stripUnpairedToolBlocks<T extends { participant: string; content: ContentBlock[] }>(
   messages: readonly T[],
 ): Array<{ participant: string; content: ContentBlock[] }> {
-  const starts: number[] = [];
-  const blocks: ContentBlock[] = [];
-  for (const msg of messages) {
-    starts.push(blocks.length);
-    for (const block of msg.content) blocks.push(block);
+  const unpaired = new Map<number, Set<number>>();
+  for (const { message, block } of findUnpairedToolBlocks(messages)) {
+    let blocks = unpaired.get(message);
+    if (!blocks) unpaired.set(message, (blocks = new Set()));
+    blocks.add(block);
   }
-  const paired = new Set<number>();
-  answeredCallIndexes(blocks).forEach((call, at) => {
-    if (call === undefined) return;
-    paired.add(call);
-    paired.add(at);
-  });
   return messages.map((msg, m) => {
-    const trimmed = msg.content.filter((block, b) => (block.type === 'tool_use' || block.type === 'tool_result' ? paired.has(starts[m]! + b) : true));
-    if (trimmed.length === msg.content.length) {
+    const dropped = unpaired.get(m);
+    if (!dropped) {
       return { participant: msg.participant, content: msg.content };
     }
+    const trimmed = msg.content.filter((_block, b) => !dropped.has(b));
     return {
       participant: msg.participant,
       // A dropped block may share its raw replay form with a block that stays
@@ -153,4 +148,46 @@ export function stripUnpairedToolBlocks<T extends { participant: string; content
         : [{ type: 'text', text: '[tool call omitted]' }],
     };
   });
+}
+
+/** A `tool_use` or `tool_result` block that no block of the other kind answers (findUnpairedToolBlocks). */
+export interface UnpairedToolBlock {
+  /** Index of the message in the list given. */
+  message: number;
+  /** Index of the block in that message's content. */
+  block: number;
+  kind: 'tool_use' | 'tool_result';
+  /** The call's id: a `tool_use`'s `id`, a `tool_result`'s `toolUseId`. */
+  toolId: string;
+}
+
+/**
+ * Each `tool_use` that no `tool_result` in the message list answers, and
+ * each `tool_result` that answers no `tool_use` there, in list order. A
+ * result answers the nearest call before it with its id
+ * (answeredCallIndexes), so a call is answered only by a result with its id
+ * that follows it before the next call with that id.
+ */
+export function findUnpairedToolBlocks(messages: ReadonlyArray<{ content: readonly ContentBlock[] }>): UnpairedToolBlock[] {
+  const at: Array<{ message: number; block: number }> = [];
+  const blocks: ContentBlock[] = [];
+  messages.forEach((msg, message) => {
+    msg.content.forEach((block, index) => {
+      at.push({ message, block: index });
+      blocks.push(block);
+    });
+  });
+  const paired = new Set<number>();
+  answeredCallIndexes(blocks).forEach((call, i) => {
+    if (call === undefined) return;
+    paired.add(call);
+    paired.add(i);
+  });
+  const unpaired: UnpairedToolBlock[] = [];
+  blocks.forEach((block, i) => {
+    if (paired.has(i)) return;
+    if (block.type === 'tool_use') unpaired.push({ ...at[i]!, kind: 'tool_use', toolId: block.id });
+    else if (block.type === 'tool_result') unpaired.push({ ...at[i]!, kind: 'tool_result', toolId: block.toolUseId });
+  });
+  return unpaired;
 }

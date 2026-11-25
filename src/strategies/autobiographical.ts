@@ -104,7 +104,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
-import { describeSummaryEditRefusal, planSummaryEdit } from '../summary-edit.js';
+import { describeSummaryEditRefusal, planSummaryEdit, summariesFoldingRows, withSummariesAbove } from '../summary-edit.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
@@ -9123,13 +9123,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const view = ctx.messageStore;
     // The L1s holding a row that left among their sources, the L1 of each
     // chunk record holding one, and (in unfold) every summary above them.
-    const seeds = new Set<string>();
-    for (const summary of this.summaries) {
-      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
-    }
-    for (const record of this.chunkRecords) {
-      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
-    }
+    const seeds = summariesFoldingRows(this.summaries, this.chunkRecords, leaving);
 
     // A row that left and is in the window again, presented again before
     // this was heard, stays in a record that holds it beside a row of its
@@ -9202,16 +9196,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     seeds: ReadonlySet<string>,
     sourcesOf: (record: ChunkRecord) => MessageId[] | undefined,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
-    const dropped = new Set(seeds);
-    for (let grew = dropped.size > 0; grew;) {
-      grew = false;
-      for (const summary of this.summaries) {
-        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
-          dropped.add(summary.id);
-          grew = true;
-        }
-      }
-    }
+    const dropped = withSummariesAbove(this.summaries, seeds);
 
     const refolded: string[] = [];
     const emptied: string[] = [];
