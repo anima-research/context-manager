@@ -10,6 +10,7 @@ import { Membrane, MockAdapter, OpenAIResponsesFormatter, type ContentBlock } fr
 
 import { ContextManager, AutobiographicalStrategy, HistoryMutationError, KnowledgeStrategy, MessageStore, PassthroughStrategy } from '../src/index.js';
 import type { HistoryMutationManifest, HistoryMutationOp, HistoryMutationPlan, SummaryEntry } from '../src/index.js';
+import { markStoreBranchSwitch } from '../src/branch-generation.js';
 import { residentStrategyOptions } from '../scripts/resident-settings.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'history-mutation-'));
@@ -35,7 +36,6 @@ class AnswerOf extends AutobiographicalStrategy {
     return this.estimateTokens(this.liveWindowAnswerContent(this.summaries.find((s) => s.id === id)!));
   }
 
-  /** Another instance's edit, as a take-up of the store would bring it in: no memo cleared here. */
   takeUpEditor(id: string, by: string): void {
     const summary = this.summaries.find((s) => s.id === id)!;
     summary.external = { by, at: 0 };
@@ -67,7 +67,6 @@ async function residentStore(): Promise<string> {
 
 const NS_B = 'agents/Bea';
 
-/** Two residents on one message slot, each with summaries of its own over the slot's rows. */
 async function twoResidentStore(): Promise<string> {
   const path = join(dir, `store-${stores++}`);
   const strategy = () => new AutobiographicalStrategy({ ...RESIDENT, mergeThreshold: 99 } as never);
@@ -98,7 +97,6 @@ async function residents<T>(
   }
 }
 
-/** A row that both residents' summaries fold. */
 function foldedByBoth(a: ContextManager, b: ContextManager): string {
   const id = a.getAllMessages().map((row) => row.id).find((rowId) => [a, b].every((manager) => {
     const described = manager.describeMutationTarget({ messageId: rowId });
@@ -310,7 +308,6 @@ describe('history mutation', () => {
     });
   });
 
-  /** A resident whose first summary is carried up a level by an entry of its own, `L2-carry`. */
   async function carriedStore(): Promise<{ path: string; under: SummaryEntry; carrier: SummaryEntry }> {
     const path = join(dir, `store-${stores++}`);
     const first = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, mergeThreshold: 99 } as never), membrane });
@@ -349,7 +346,7 @@ describe('history mutation', () => {
           const summaries = view.getStateJson(`${NS}/autobio:summaries`) as SummaryEntry[];
           view.setStateJson(`${NS}/autobio:summaries`, summaries.map((s) => (s.id === carrier.id ? { ...s, content: 'the old copy' } : s)));
         },
-      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && /summary L2-carry's text/.test(String(error)));
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && /summary L2-carry's content other than the edit writes/.test(String(error)));
       await manager.applyHistoryMutation(manifest, {
         targetBranch: 'surgery/carried', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
         strategy: () => new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never),
@@ -367,25 +364,28 @@ describe('history mutation', () => {
     }
   });
 
-  it('writes a summary\'s carriers before the summary, so an edit a write cut short can be asked for again as it was', async () => {
+  it('writes a summary and its carriers in one write, so an edit a write cut short leaves them as they were and can be asked for again', async () => {
     const { path, under, carrier } = await carriedStore();
     await resident(path, async (manager) => {
       const described = manager.describeMutationTarget({ summaryId: under.id });
       assert.ok(described?.kind === 'summary');
       const store = manager.getStore();
-      const edit = store.editStateItem.bind(store);
-      let writes = 0;
-      store.editStateItem = (id: string, index: number, value: Buffer) => {
-        if (id === `${NS}/autobio:summaries` && ++writes === 2) throw new Error('the disk is full');
-        return edit(id, index, value);
+      const set = store.setStateJson.bind(store);
+      const summariesId = `${NS}/autobio:summaries`;
+      store.setStateJson = (id: string, value: unknown) => {
+        if (id === summariesId) throw new Error('the disk is full');
+        return set(id, value);
       };
       const ask = () => manager.editSummaryText(under.id, 'Carried, by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: described.sha256 });
       try {
         assert.throws(ask, /the disk is full/);
       } finally {
-        store.editStateItem = edit;
+        store.setStateJson = set;
       }
-      assert.equal(manager.getSummary(under.id)?.content, under.content, 'the summary a compile reads is as it was');
+      assert.deepEqual([manager.getSummary(under.id)?.content, manager.getSummary(carrier.id)?.content], [under.content, carrier.content], 'neither changed in memory');
+      assert.deepEqual(summariesOn(manager, 'main').filter((s) => s.id === under.id || s.id === carrier.id).map((s) => s.content), [under.content, carrier.content], 'nor in the store');
+      const compiled = rendered((await manager.compile(undefined, undefined, { dryRun: true })).messages);
+      assert.ok(!compiled.includes('Carried, by hand.'), 'a compile renders neither as edited');
       ask();
       assert.equal(manager.getSummary(under.id)?.content, 'Carried, by hand.');
       assert.equal(manager.getSummary(carrier.id)?.content, 'Carried, by hand.');
@@ -393,17 +393,25 @@ describe('history mutation', () => {
     });
   });
 
-  it('refuses a summary edit where the stored summaries no longer hold the summary', async () => {
-    const path = await residentStore();
+  it('refuses a summary edit where the stored summaries aren\'t as the strategy holds them', async () => {
+    const { path, under, carrier } = await carriedStore();
     await resident(path, async (manager) => {
-      const { target } = l1Edit(manager);
+      const described = manager.describeMutationTarget({ summaryId: under.id });
+      assert.ok(described?.kind === 'summary');
       const summariesId = `${NS}/autobio:summaries`;
-      manager.getStore().setStateJson(summariesId, (manager.getStore().getStateJson(summariesId) as SummaryEntry[]).filter((s) => s.id !== target.id));
-      assert.throws(
-        () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true }),
-        new RegExp(`summary ${target.id} isn't in the stored summaries`),
-      );
-      assert.equal(manager.getSummary(target.id)?.content, target.content, 'nothing changed in memory either');
+      const store = manager.getStore();
+      const held = store.getStateJson(summariesId) as SummaryEntry[];
+      const ask = () => manager.editSummaryText(under.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: described.sha256 });
+      for (const [what, stored] of [
+        ['the summary is gone', held.filter((s) => s.id !== under.id)],
+        ['a carrier is gone', held.filter((s) => s.id !== carrier.id)],
+        ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text', mergedInto: 'L3-elsewhere' } : s))],
+      ] as const) {
+        store.setStateJson(summariesId, stored);
+        assert.throws(ask, /the stored summaries aren't as this strategy holds them/, what);
+        assert.deepEqual(store.getStateJson(summariesId), stored, `${what}: nothing written`);
+        assert.equal(manager.getSummary(under.id)?.content, under.content, `${what}: nothing changed in memory`);
+      }
     });
   });
 
@@ -594,6 +602,11 @@ describe('history mutation', () => {
       }
       await moved;
       assert.ok(caught instanceof HistoryMutationError && caught.violations[0]?.code === 'APPLIED_INIT_FAILED', `${back}: ${String(caught)}`);
+      assert.deepEqual(
+        [caught.receipt?.sourceBranch, caught.receipt?.targetBranch, caught.receipt?.planSha256, caught.receipt?.targets],
+        ['main', 'surgery/superseded', plan.planSha256, plan.targets],
+        `${back}: the error carries the receipt of the mutation it applied`,
+      );
       assert.equal(manager.getStore().currentBranch().name, back);
       assert.ok(branchNames(manager).includes('surgery/superseded'), `${back}: the branch that holds the mutation stays`);
       assert.equal(summariesOn(manager, 'surgery/superseded').find((s) => s.id === target.id)?.content, 'The first stretch, by hand.');
@@ -616,7 +629,7 @@ describe('history mutation', () => {
       await assert.rejects(applyWith('surgery/overwritten', async ({ view }) => {
         const summaries = view.getStateJson(summariesId) as SummaryEntry[];
         view.setStateJson(summariesId, summaries.map((s) => (s.id === op.summaryId ? { ...s, content: 'something else' } : s)));
-      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && /text has sha256/.test(String(error)));
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`summary ${op.summaryId}'s content other than the edit writes`).test(String(error)));
       const other = before.summaries.find((s) => s.level === 1 && s.id !== op.summaryId && !s.mergedInto)!;
       await assert.rejects(applyWith('surgery/dropped', async ({ view }) => {
         view.setStateJson(summariesId, (view.getStateJson(summariesId) as SummaryEntry[]).filter((s) => s.id !== other.id));
@@ -632,7 +645,11 @@ describe('history mutation', () => {
       }), refusedWith('INVARIANT_BROKEN'));
       await assert.rejects(applyWith('surgery/other-text', async ({ view }) => {
         view.setStateJson(summariesId, (view.getStateJson(summariesId) as SummaryEntry[]).map((s) => (s.id === other.id ? { ...s, content: 'rewritten aside' } : s)));
-      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`summary ${other.id} renders other than it did`).test(String(error)));
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`summary ${other.id}'s content changed`).test(String(error)));
+      const spoken = before.summaries.find((s) => s.id !== op.summaryId && (s.responseContent?.length ?? 0) > 0)!;
+      await assert.rejects(applyWith('surgery/respoken', async ({ view }) => {
+        view.setStateJson(summariesId, (view.getStateJson(summariesId) as SummaryEntry[]).map((s) => (s.id === spoken.id ? { ...s, responseContent: [{ type: 'text', text: 'said otherwise' }] } : s)));
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`summary ${spoken.id}'s responseContent changed`).test(String(error)));
       await assert.rejects(applyWith('surgery/attributed', async ({ view }) => {
         view.setStateJson(summariesId, (view.getStateJson(summariesId) as SummaryEntry[]).map((s) => (s.id === op.summaryId ? { ...s, external: { by: 'someone else', at: 0 } } : s)));
       }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`summary ${op.summaryId} doesn't record the edit as made \\(external\\)`).test(String(error)));
@@ -872,7 +889,11 @@ describe('history mutation', () => {
       const branches = branchNames(a);
       await assert.rejects(a.applyHistoryMutation(manifest, {
         targetBranch: 'surgery/failed', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
-        beforeSwitch: async () => { throw new Error('the host failed'); },
+        beforeSwitch: async ({ view }) => {
+          const onBranch = new Set(((view.getStateJson(`${NS_B}/autobio:summaries`) ?? []) as SummaryEntry[]).map((s) => s.id));
+          assert.ok(plan.readers[0]!.droppedSummaries.length > 0 && plan.readers[0]!.droppedSummaries.every((dropped) => !onBranch.has(dropped)), 'setup: the reader is reconciled on the branch');
+          throw new Error('the host failed');
+        },
       }), /the host failed/);
       assert.equal(a.currentBranch().name, 'main');
       assert.deepEqual(branchNames(a), branches);
@@ -882,11 +903,13 @@ describe('history mutation', () => {
   });
 
   it('refuses to switch to a branch where a reader reads back other than planned', async () => {
+    let asked = 0;
     class Keeping extends AutobiographicalStrategy {
       constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
         super(settings);
       }
       override dropSummaries(): string[] {
+        asked++;
         return [];
       }
       override cloneForScratch(): Keeping {
@@ -904,6 +927,7 @@ describe('history mutation', () => {
       await assert.rejects(a.applyHistoryMutation(manifest, {
         targetBranch: 'surgery/kept', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
       }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`${NS_B}.*is still there`).test(String(error)));
+      assert.ok(asked > 0, 'the reader was asked to drop them before the readback');
       assert.equal(a.currentBranch().name, 'main');
     }, () => new Keeping({ ...RESIDENT, autoTickOnNewMessage: false } as never));
   });
@@ -958,7 +982,7 @@ describe('history mutation', () => {
     }
   });
 
-  it('refuses a reader that is the manager itself, is named twice, or reads another store', async () => {
+  it('refuses a reader that is the manager itself, is named twice, shares a strategy namespace, reads another store, or keeps summaries with no strategy for the branch', async () => {
     const path = await twoResidentStore();
     const elsewhere = await ContextManager.open({ path: await residentStore(), namespace: NS_B, strategy: new PassthroughStrategy() });
     try {
@@ -968,10 +992,242 @@ describe('history mutation', () => {
         assert.throws(() => a.planHistoryMutation(manifest, { readers: [a] }), /the manager itself/);
         assert.throws(() => a.planHistoryMutation(manifest, { readers: [b, b] }), /named twice/);
         assert.throws(() => a.planHistoryMutation(manifest, { readers: [elsewhere] }), /another store/);
+        const twin = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: new PassthroughStrategy() });
+        const mine = await ContextManager.open({ store: a.getStore(), namespace: NS, strategy: new PassthroughStrategy() });
+        const subclassed = await ContextManager.open({ store: a.getStore(), namespace: 'agents/Cy', strategy: new AnswerOf({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+        try {
+          assert.throws(() => a.planHistoryMutation(manifest, { readers: [b, twin] }), new RegExp(`two managers have strategy namespace ${NS_B}`));
+          assert.throws(() => a.planHistoryMutation(manifest, { readers: [mine] }), new RegExp(`two managers have strategy namespace ${NS}`));
+          assert.throws(() => a.planHistoryMutation(manifest, { readers: [subclassed] }), /agents\/Cy runs the autobiographical strategy, which keeps summaries or hears rows leave its window/);
+          await assert.rejects(a.compileMutationPreview(manifest, { by: { by: 'operator' }, readers: [a] }), /^Error: ContextManager\.compileMutationPreview: a reader is the manager itself/);
+          const branches = branchNames(a);
+          await assert.rejects(a.applyHistoryMutation(manifest, {
+            targetBranch: 'surgery/no-clone', expectedSourceBranch: 'main', expectedPlanSha256: a.planHistoryMutation(manifest).planSha256, by: { by: 'operator' }, readers: [subclassed],
+          }), /^Error: ContextManager\.applyHistoryMutation: the reader with strategy namespace agents\/Cy/);
+          assert.deepEqual(branchNames(a), branches, 'refused before a branch is made');
+        } finally {
+          subclassed.close();
+          mine.close();
+          twin.close();
+        }
       });
     } finally {
       elsewhere.close();
     }
+  });
+
+  it('reconciles a reader whose strategy keeps nothing of what it folds through a stand-in, and reads back every reader it names', async () => {
+    class Plain extends PassthroughStrategy {}
+    const path = join(dir, `store-${stores++}`);
+    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new Plain(), auxiliaryMessageViews: [{}] });
+    try {
+      side.addMessage('Ada', [{ type: 'text', text: 'a row of the side\'s own' }]);
+      side.presentRows([]);
+      const id = main.addMessage('User', [{ type: 'text', text: 'a row the side was never shown' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(main, id), content: [{ type: 'text', text: 'redacted' }], label: '[redacted by operator]' }] };
+      const plan = main.planHistoryMutation(manifest, { readers: [side] });
+      assert.deepEqual(plan.violations, []);
+      assert.deepEqual(plan.readers[0]!.heldIds, [], 'setup: the mutation changes nothing the side holds');
+      const sideSlot = main.getStore().listStates().map((state) => state.id).find((stateId) => stateId === 'agents/Side/messages')!;
+      assert.ok(sideSlot, 'setup: the side keeps a slot of its own');
+      const applyWith = (targetBranch: string, beforeSwitch?: (ctx: { view: JsStore }) => Promise<void>) => main.applyHistoryMutation(manifest, {
+        targetBranch, expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [side], ...(beforeSwitch ? { beforeSwitch } : {}),
+      });
+      await assert.rejects(applyWith('surgery/aside', async ({ view }) => {
+        const stored = view.getStateItemJson(sideSlot, 0) as Record<string, unknown>;
+        view.editStateItem(sideSlot, 0, Buffer.from(JSON.stringify({ ...stored, content: [{ type: 'text', text: 'rewritten aside' }] })));
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && /reader agents\/Side: message [^ ]+'s content/.test(String(error)));
+      await assert.rejects(applyWith('surgery/unanswered', async ({ view }) => {
+        new MessageStore(view, { namespace: 'agents/Side' }).append('User', [{ type: 'tool_result', toolUseId: 'no-such-call', content: 'an answer to nothing' }]);
+      }), (error: unknown) => refusedWith('INVARIANT_BROKEN')(error) && /reader agents\/Side: /.test(String(error)));
+      await applyWith('surgery/redacted');
+      await side.setStrategy(side.getStrategy());
+      assert.equal(side.currentBranch().name, 'surgery/redacted');
+      assert.match(rendered((await side.compile(undefined, undefined, { dryRun: true })).messages), /a row of the side's own/);
+    } finally {
+      side.close();
+      main.close();
+    }
+  });
+
+  it('takes a presented row the reader\'s view filter hides out of its window too', async () => {
+    const path = await twoResidentStore();
+    let last = '';
+    const a = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane, viewFilter: (row) => row.id !== last });
+    try {
+      a.presentRows([]);
+      b.presentRows([]);
+      last = a.addMessage('User', [{ type: 'text', text: 'a late row' }]);
+      a.presentRows([last]);
+      b.presentRows([last]);
+      assert.notEqual(b.ordinalOf(last), undefined, 'setup: the reader\'s window holds the row');
+      assert.deepEqual(coveringOf(b, last), [], 'setup: and nothing of the reader\'s folds it');
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [last], expectedSha256ById: { [last]: messageSha(a, last) } }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.deepEqual(plan.violations, []);
+      assert.deepEqual(plan.readers[0]!.heldIds, [last]);
+      await a.applyHistoryMutation(manifest, { targetBranch: 'surgery/hidden', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b] });
+      await b.setStrategy(b.getStrategy());
+      assert.equal(b.ordinalOf(last), undefined);
+      assert.deepEqual(b.retractAbsentRows(), []);
+    } finally {
+      b.close();
+      a.close();
+    }
+  });
+
+  it('refuses removing a row a legacy reader folds unless its policy drops what folds it, and then has the reader let go of it', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const folded = summariesIn(b, NS_B, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const removal = { kind: 'remove_messages' as const, messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(a, id)])) };
+      const refused = a.planHistoryMutation({ ops: [removal] }, { readers: [b] });
+      assert.ok(refused.violations.some((v) => v.code === 'FOLDED_ROW_REQUIRES_POLICY' && v.remediation?.readerNamespace === NS_B), JSON.stringify(refused.violations));
+      const manifest: HistoryMutationManifest = { ops: [{ ...removal, foldedPolicy: 'drop_covering_summaries' }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.deepEqual(plan.violations, []);
+      assert.ok(plan.readers[0]!.droppedSummaries.includes(folded.id));
+      await a.applyHistoryMutation(manifest, { targetBranch: 'surgery/legacy-removed', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b] });
+      await b.setStrategy(b.getStrategy());
+      for (const dropped of plan.readers[0]!.droppedSummaries) assert.equal(b.getSummary(dropped), null, `${dropped} is dropped from the reader`);
+    });
+  });
+
+  it('waits for a reader\'s strategy to let go of the rows it was told left before going on', async () => {
+    const events: string[] = [];
+    class SlowLetGo extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
+        super(settings);
+      }
+      override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await super.onRetracted(...args);
+        events.push('let go');
+      }
+      override cloneForScratch(): SlowLetGo {
+        return new SlowLetGo({ ...this.settings, autoTickOnNewMessage: false });
+      }
+    }
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      a.presentRows([]);
+      b.presentRows([]);
+      const folded = summariesIn(b, NS_B, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(a, id)])) }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      await a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/slow', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+        beforeSwitch: async () => { events.push('beforeSwitch'); },
+      });
+      assert.deepEqual(events.slice(0, 2), ['let go', 'beforeSwitch']);
+      assert.ok(summariesIn(b, NS_B, 'surgery/slow').every((s) => !plan.readers[0]!.droppedSummaries.includes(s.id)));
+    }, () => new SlowLetGo({ ...RESIDENT, autoTickOnNewMessage: false } as never));
+  });
+
+  it('refuses an apply while a reader stores the shards of a sharded addMessage', async () => {
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = join(dir, `store-${stores++}`);
+    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new Sharding() });
+    try {
+      const id = main.addMessage('User', [{ type: 'text', text: 'an earlier row' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(main, id), content: [{ type: 'text', text: 'redacted' }], label: '[redacted by operator]' }] };
+      const plan = main.planHistoryMutation(manifest, { readers: [side] });
+      let asked: Promise<unknown> | undefined;
+      side.onMessage((event) => {
+        if (event.type !== 'add' || asked) return;
+        asked = main.applyHistoryMutation(manifest, { targetBranch: 'surgery/reader-mid-add', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [side] });
+      });
+      side.addMessage('Ada', [{ type: 'text', text: 'one ' }, { type: 'text', text: 'two ' }, { type: 'text', text: 'three' }]);
+      assert.ok(asked, 'setup: the apply was asked for');
+      await assert.rejects(asked, /^Error: ContextManager\.applyHistoryMutation refused: a sharded addMessage is storing its shards/);
+      assert.deepEqual(branchNames(main), ['main']);
+    } finally {
+      side.close();
+      main.close();
+    }
+  });
+
+  it('reports a plan that drifted as PLAN_DRIFT before what the plan made now refuses', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const op = { kind: 'edit_message' as const, messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text' as const, text: 'a row rewritten' }], label: '[edited by operator]' };
+      const agreed = a.planHistoryMutation({ ops: [{ ...op, foldedPolicy: 'leave_summaries' }] });
+      await assert.rejects(a.applyHistoryMutation({ ops: [op] }, {
+        targetBranch: 'surgery/drifted', expectedSourceBranch: 'main', expectedPlanSha256: agreed.planSha256, by: { by: 'operator' }, readers: [b],
+      }), (error: unknown) => error instanceof HistoryMutationError && error.violations.map((v) => v.code).join() === 'PLAN_DRIFT' && error.plan?.valid === false);
+    });
+  });
+
+  it('refuses a plan whose dropped summary changed since it was made', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row rewritten' }],
+        label: '[edited by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      const dropped = plan.droppedSummaries.find((summaryId) => a.describeMutationTarget({ summaryId })?.kind === 'summary' && !a.getSummary(summaryId)?.carriedFrom)!;
+      const described = a.describeMutationTarget({ summaryId: dropped });
+      assert.ok(described?.kind === 'summary');
+      a.editSummaryText(dropped, 'Edited since the plan.', { by: 'someone' }, { apply: true, dropResponseContent: true, expectedPriorSha256: described.sha256 });
+      await assert.rejects(a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/edited-since', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+      }), refusedWith('PLAN_DRIFT'));
+    });
+  });
+
+  it('refuses a native switch that didn\'t happen as not applied, even where another selection moved the store meanwhile', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      const branches = branchNames(manager);
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => {
+        if (name !== 'surgery/refused') return native(name);
+        native('elsewhere');
+        markStoreBranchSwitch(store);
+        native('main');
+        markStoreBranchSwitch(store);
+        throw new Error('the native switch refused');
+      };
+      try {
+        await assert.rejects(manager.applyHistoryMutation(manifest, {
+          targetBranch: 'surgery/refused', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+        }), (error: unknown) => /the native switch refused/.test(String(error)) && !refusedWith('APPLIED_INIT_FAILED')(error));
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'main');
+      assert.deepEqual(branchNames(manager), branches, 'the branch it built is deleted');
+    });
+  });
+
+  it('refuses a preview or an apply that names no one who makes it', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      for (const by of [undefined, null, { by: '  ' }, { by: 7 }]) {
+        await assert.rejects(manager.compileMutationPreview(manifest, { by: by as never }), /compileMutationPreview: a mutation names who makes it/, String(by));
+        await assert.rejects(manager.applyHistoryMutation(manifest, {
+          targetBranch: 'surgery/nobody', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: by as never,
+        }), /applyHistoryMutation: a mutation names who makes it/, String(by));
+      }
+    });
   });
 
   it('sends an edited message as edited where a replay form stood in for its text', async () => {
@@ -1096,6 +1352,24 @@ describe('history mutation', () => {
       assert.equal(strategy.price(target.id).estimate, strategy.freshPrice(target.id));
       strategy.takeUpEditor(target.id, 'another instance\'s editor, whose name is longer still');
       assert.equal(strategy.price(target.id).estimate, strategy.freshPrice(target.id), 'the memo is keyed by who edited the text');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('prices a summary edited again by the same editor by its new text', async () => {
+    const path = await residentStore();
+    const strategy = new AnswerOf({ ...RESIDENT, autoTickOnNewMessage: false } as never);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy, membrane });
+    try {
+      const { target } = l1Edit(manager);
+      const plain = 'plain words in a quiet row, said slowly';
+      const dense = '{}[],:"'.repeat(10).slice(0, plain.length);
+      manager.editSummaryText(target.id, plain, { by: 'a' }, { apply: true, dropResponseContent: true });
+      const before = strategy.price(target.id).estimate;
+      manager.editSummaryText(target.id, dense, { by: 'a' }, { apply: true });
+      assert.notEqual(strategy.freshPrice(target.id), before, 'setup: the same length and editor, and another price');
+      assert.equal(strategy.price(target.id).estimate, strategy.freshPrice(target.id));
     } finally {
       manager.close();
     }

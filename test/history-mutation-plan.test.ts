@@ -49,7 +49,8 @@ const MEMORY: HistoryMemory = {
 
 function state(over: Partial<HistoryState> = {}): HistoryState {
   const rows = over.rows ?? ROWS;
-  return { branch: 'main', rows, record: rows, view: rows, memory: null, windowMode: 'legacy', ...over };
+  const view = over.view ?? rows;
+  return { branch: 'main', rows, record: rows, window: view, view, memory: null, windowMode: 'legacy', ...over };
 }
 
 const inOrder = (ids: string[], rows: readonly StoredMessage[] = ROWS) => ids.map((id) => rows.find((r) => r.id === id)!);
@@ -281,6 +282,30 @@ describe('history mutation plan', () => {
     ]);
   });
 
+  it('holds a reader to the rows its window holds, filtered from its view or not, and places its effects by what it sends', () => {
+    const reader = state({ window: inOrder(['m0', 'm6']), view: inOrder(['m0']), windowMode: 'presented', thinkingBoundThrough: 7 });
+    const plan = planMutation(state(), { ops: [{ ...remove('m6'), expectedSha256ById: { m6: sha('m6') } }, editMessage('m3', text('it says b'))] }, [{ namespace: 'b', state: reader }]);
+    assert.deepEqual(plan.violations, []);
+    assert.deepEqual(plan.readers[0]!.heldIds, ['m6'], 'its view filter hides m6, and its window holds it; its window never held m3');
+    assert.equal(plan.readers[0]!.invalidatesThinkingBinding, false, 'it never sent m3 or m6');
+    assert.equal(plan.readers[0]!.invalidatesKvPrefixFrom, undefined);
+    const unsent = planMutation(state({ view: inOrder(['m0', 'm6']), windowMode: 'presented', thinkingBoundThrough: 7 }), { ops: [editMessage('m3', text('it says b'))] });
+    assert.equal(unsent.invalidatesThinkingBinding, false, 'nor does the manager change what it sent');
+    assert.equal(unsent.invalidatesKvPrefixFrom, undefined);
+  });
+
+  it('binds the plan to what it reports of each reader, and to the summaries it drops as they are held', () => {
+    const manifest = { ops: [editMessage('m6', text('noted, again'), { foldedPolicy: 'drop_covering_summaries' }), editMessage('m3', text('it says b'), { foldedPolicy: 'drop_covering_summaries' })] };
+    const reader = (over: Partial<HistoryState>) => [{ namespace: 'b', state: state({ windowMode: 'presented', ...over }) }];
+    const sha256 = (own: Partial<HistoryState>, of: Partial<HistoryState>) => planMutation(state(own), manifest, reader(of)).planSha256;
+    assert.notEqual(sha256({}, { thinkingBoundThrough: 4 }), sha256({}, { thinkingBoundThrough: 3 }), 'the reader\'s thinking record');
+    assert.notEqual(sha256({}, { view: inOrder(['m6', 'm3']) }), sha256({}, { view: inOrder(['m3', 'm6']) }), 'where the reader\'s window first changes');
+    assert.notEqual(sha256({ thinkingBoundThrough: 4 }, {}), sha256({ thinkingBoundThrough: 3 }, {}), 'the manager\'s own thinking record');
+    const edited = { summaries: MEMORY.summaries.map((s) => (s.id === 'L1-b' ? { ...s, content: 'edited since' } : s)), chunkRecords: MEMORY.chunkRecords };
+    assert.notEqual(sha256({ memory: MEMORY }, {}), sha256({ memory: edited }, {}), 'a summary it drops');
+    assert.notEqual(sha256({}, { memory: MEMORY }), sha256({}, { memory: edited }), 'a summary it drops of the reader\'s');
+  });
+
   it('places a change by the rows of every slot the manager merges', () => {
     const aux = row('x0', 0, 'Other', text('from a merged slot'));
     const record = [aux, ...ROWS];
@@ -310,9 +335,58 @@ describe('history mutation plan', () => {
       readBackMismatches(plan, snapshotOf(s), written([{ ...aux, content: text('changed aside') }, ...asPlanned.slice(1)]), stamp),
       [`message x0's content has sha256 ${messageContentSha256(text('changed aside'))}, not ${sha('x0', [aux])}`],
     );
-    const carry = summary('L4-k', 4, ['L3-c'], 'm0', 'm6', { carriedFrom: 'L3-c', content: 'memory L3-c' });
-    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...MEMORY.summaries, carry]), stamp), [], 'a carry renders what it carries');
+    const top = MEMORY.summaries[3]!;
+    const carry: SummaryEntry = { ...top, id: 'L4-k', level: 4, sourceLevel: 3, sourceIds: ['L3-c'], carriedFrom: 'L3-c' };
+    const carried = [...MEMORY.summaries.slice(0, 3), { ...top, mergedInto: 'L4-k' }];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...carried, carry]), stamp), [], 'the strategy\'s carry of a summary it holds');
+    const unmarked = [...MEMORY.summaries, carry];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, unmarked), stamp), ['summary L4-k is there, and the source didn\'t hold it'], 'its source isn\'t merged into it');
+    const reworded = [...carried, { ...carry, content: 'another memory' }];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, reworded), stamp), ['summary L4-k is there, and the source didn\'t hold it', 'summary L3-c\'s mergedInto changed'], 'it renders other than what it carries');
     const stray = summary('L4-z', 4, ['L3-c'], 'm0', 'm6');
     assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...MEMORY.summaries, stray]), stamp), ['summary L4-z is there, and the source didn\'t hold it']);
+  });
+
+  it('reads back each field of a row and of a summary, as the store keeps it', () => {
+    const lone = row('m7', 8, 'Ada', text('half a pair \uD800'));
+    const memory: HistoryMemory = { summaries: [...MEMORY.summaries, summary('L1-q', 1, ['m7'], 'm7', 'm7', { content: 'a memory \uD800' })], chunkRecords: [] };
+    const s = state({ rows: [...ROWS, lone], memory });
+    const plan = planMutation(s, { ops: [editMessage('m6', text('noted, again'), { foldedPolicy: 'leave_summaries' })] });
+    assert.deepEqual(plan.violations, []);
+    const stamp = { by: 'operator', at: 0, sourceBranch: 'main' };
+    const target = plan.targets[0]!;
+    assert.ok(target.kind === 'edit_message');
+    const edited = { ...ROWS[6]!, content: target.content, metadata: { historyMutation: { ...stamp, label: target.label } } };
+    const asStoredRow = { ...lone, content: text('half a pair \uFFFD') };
+    const asStoredSummary = { ...memory.summaries[4]!, content: 'a memory \uFFFD' };
+    const written = (rows: StoredMessage[], summaries: SummaryEntry[]) => state({ rows, memory: { summaries, chunkRecords: [] } });
+    const rows = [...ROWS.slice(0, 6), edited, asStoredRow];
+    const summaries = [...MEMORY.summaries, asStoredSummary];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(rows, summaries), stamp), [], 'a lone surrogate half reads back as U+FFFD');
+    const reshard = [...ROWS.slice(0, 5), { ...ROWS[5]!, shardIndex: 2 }, edited, asStoredRow];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(reshard, summaries), stamp), ['message m5\'s shardIndex changed']);
+    const reattributed = [{ ...MEMORY.summaries[0]!, external: { by: 'someone', at: 0 } }, ...summaries.slice(1)];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(rows, reattributed), stamp), ['summary L1-a\'s external changed']);
+    const respoken = [...summaries.slice(0, 4), { ...asStoredSummary, responseContent: [{ type: 'text', text: 'said again' }] }];
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(rows, respoken as SummaryEntry[]), stamp), ['summary L1-q\'s responseContent changed']);
+  });
+
+  it('reads back an edited summary as the edit writes it, and nothing more', () => {
+    const memory: HistoryMemory = { summaries: [summary('L1-q', 1, ['m6'], 'm6', 'm6', { stitched: { split: 'r' } })], chunkRecords: [] };
+    const s = state({ memory });
+    const plan = planMutation(s, { ops: [{ kind: 'edit_summary', summaryId: 'L1-q', expectedSha256: textSha256('memory L1-q'), newText: 'by hand' }] });
+    assert.deepEqual(plan.violations, []);
+    const target = plan.targets[0]!;
+    assert.ok(target.kind === 'edit_summary');
+    const stamp = { by: 'operator', at: 0, sourceBranch: 'main' };
+    const { stitched: _stitched, ...rest } = memory.summaries[0]!;
+    const asEdited: SummaryEntry = { ...rest, content: 'by hand', tokens: target.tokens, external: { by: 'operator', at: 5 } };
+    const written = (summaries: SummaryEntry[]) => state({ memory: { summaries, chunkRecords: [] } });
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written([asEdited]), stamp), []);
+    assert.deepEqual(
+      readBackMismatches(plan, snapshotOf(s), written([{ ...asEdited, responseContent: [{ type: 'text', text: 'not planned' }] } as SummaryEntry]), stamp),
+      ['summary L1-q\'s responseContent other than the edit writes'],
+    );
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written([{ ...asEdited, external: { by: 'someone else', at: 5 } }]), stamp), ['summary L1-q doesn\'t record the edit as made (external)']);
   });
 });

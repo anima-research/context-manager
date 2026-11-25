@@ -218,6 +218,47 @@ describe('raw forms: keys and release', () => {
     assert.deepEqual(redacted[0], { type: 'text', text: '[redacted]' });
   });
 
+  it('content that replaces a message keeps a shared raw form only where its blocks stand as they stood, with nothing between them', () => {
+    const first = itemText('first part');
+    const second = itemText('second part');
+    const inserted = releaseReplacedRawForms([first, second], [{ ...first }, { type: 'text', text: 'a note' }, { ...second }]);
+    assert.deepEqual(inserted.map((block) => rawOf(block).rawItem), [undefined, undefined, undefined], 'the item would replay both parts before the note');
+    const lead = { type: 'text', text: 'lead' } as ContentBlock;
+    const moved = releaseReplacedRawForms([lead, first, second], [{ ...first }, { ...second }, { ...lead }]);
+    assert.deepEqual(moved.map((block) => rawOf(block).rawItem), [MESSAGE_ITEM, MESSAGE_ITEM, undefined], 'the two parts moved together, in order');
+  });
+
+  it('content that replaces a message gives up only the raw forms whose blocks moved apart', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const x = { type: 'tool_result', toolUseId: 'call_1', content: 'x', rawItem: { type: 'function_call_output', id: 'fco_1' } } as ContentBlock;
+    const y = itemText('after', { type: 'message', id: 'msg_2', role: 'assistant', content: [] });
+    const after = releaseReplacedRawForms([rs1, fc1, x, y], [{ ...rs1 }, { ...fc1 }, { ...y }, { ...x }]);
+    assert.deepEqual(after.map((block) => rawOf(block).rawItem), [rawOf(rs1).rawItem, rawOf(fc1).rawItem, rawOf(y).rawItem, rawOf(x).rawItem], 'each item stands alone or with its pairing, as it stood');
+    const crossed = releaseReplacedRawForms([rs1, fc1, x], [{ ...fc1 }, { ...rs1 }, { ...x }]);
+    assert.deepEqual(crossed.map((block) => rawOf(block).rawItem), [undefined, undefined, rawOf(x).rawItem], 'the reasoning moved after the call it led to');
+  });
+
+  it('content that replaces a message matches a repeated block by its place', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const part = itemText('a part');
+    const before = [rs1, part, part];
+    const after = releaseReplacedRawForms(before, before.map((block) => ({ ...block })));
+    assert.deepEqual(after.map((block) => rawOf(block).rawItem), [rawOf(rs1).rawItem, MESSAGE_ITEM, MESSAGE_ITEM]);
+    const one = releaseReplacedRawForms(before, [{ ...rs1 }, { ...part }]);
+    assert.deepEqual(one.map((block) => rawOf(block).rawItem), [undefined, undefined], 'one copy of the part is gone');
+  });
+
+  it('content that replaces a message keeps the rawXml that is a block\'s content', () => {
+    const use = xmlUse('a', '/big');
+    const changed = '<function_calls>\n<invoke name="fs:write"/>\n</function_calls>';
+    const after = releaseReplacedRawForms([use, attempt()], [{ ...use }, attempt(changed)]);
+    assert.equal(rawOf(after[1]!).rawXml, changed, 'a changed tool_attempt is written as given');
+    const added = releaseReplacedRawForms([use], [{ ...use }, attempt()]);
+    assert.equal(rawOf(added[1]!).rawXml, CALLS_XML, 'and so is a new one');
+    assert.equal(rawOf(releaseReplacedRawForms([use], [{ ...use, input: { path: '/other' } } as ContentBlock])[0]!).rawXml, undefined, 'a changed tool_use gives up its replay');
+  });
+
   it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {
     const think = reasoning();
     const search = searchCall();
