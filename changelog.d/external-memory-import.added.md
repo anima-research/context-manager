@@ -32,9 +32,11 @@
     new text. They are written again as its copy (text, tokens, `external`,
     no response blocks), and are reported. The summaries merged over the old
     text are reported and left as they are. The summary and its carriers are
-    written in one write of the summaries. The edit is refused, before
-    anything is written, where the stored summaries aren't as the strategy
-    holds them, such as after another handle's write.
+    written in one write of the summaries, so they never part. A write that
+    throws may still have landed, and the strategy then holds the new text.
+    The edit is refused, before anything is written, where the stored
+    summaries can't be shown to be as the strategy holds them: after another
+    handle's write, or where reading them fails.
 
   `SummaryEntry.external` (`{ by, at, note?, requestHash? }`, optional)
   records who supplied such a text, and for an installed one the sha256 of

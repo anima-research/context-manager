@@ -2811,7 +2811,10 @@ export class ContextManager {
    * mutations and strategy operations stay blocked until a successful
    * switchBranch() or setStrategy(). Inspection and close remain available.
    * If a newer initialization supersedes this one, the call rejects with
-   * InitializationSupersededError naming the branch it selected.
+   * InitializationSupersededError naming the branch it selected. Where the
+   * store selects the branch and then fails to save the selection, the
+   * switch is in effect and unsaved: the call rejects, saying so, the
+   * strategy isn't initialized there, and getStore().sync() saves it.
    *
    * The switch moves the store's branch, which every manager on the store
    * follows, and starts a new branch generation. Every other manager's
@@ -2827,9 +2830,19 @@ export class ContextManager {
   }
 
   private async selectBranch(name: string, created: boolean, selected?: () => void): Promise<void> {
-    // A rejected native selection leaves the loaded branch usable. Once the
-    // switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
-    this.store.switchBranch(name);
+    // A rejected native selection leaves the loaded branch usable. Chronicle
+    // selects the branch before it checkpoints the selection, and a failed
+    // checkpoint leaves the selection in effect: that is a switch, unsaved.
+    // Once the switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
+    const from = this.store.currentBranch().id;
+    let unsaved: unknown;
+    try {
+      this.store.switchBranch(name);
+    } catch (error) {
+      const now = this.store.currentBranch();
+      if (now.id === from || now.name !== name) throw error;
+      unsaved = error;
+    }
     selected?.();
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
@@ -2841,6 +2854,13 @@ export class ContextManager {
         `Branch selection ${name}${created ? ' (created)' : ''} uncertain: earlier effects may have completed; ` +
         `inspect the store and selected branch before retrying; recover with switchBranch() or setStrategy(): ` +
         `${cause instanceof Error ? cause.message : String(cause)}`, { cause },
+      );
+    }
+    if (unsaved !== undefined) {
+      throw new Error(
+        `Branch selection ${name}${created ? ' (created)' : ''} took effect, and saving it failed: getStore().sync() saves it, ` +
+        `and setStrategy(getStrategy()) initializes this manager on it: ${unsaved instanceof Error ? unsaved.message : String(unsaved)}`,
+        { cause: unsaved },
       );
     }
     if (attempt !== this.initializationAttempt) {
@@ -4660,14 +4680,18 @@ export class ContextManager {
   private historyState(): HistoryState {
     const memory = isHistoryMutationStrategy(this.strategy) ? this.strategy.historyMemory() : null;
     const binding = readBindingRecord(this.store, this.strategyNamespace).record;
+    const window = this.presentedMessageView().getAll();
+    const windowMode = this.windowIndex.mode();
     return {
       branch: this.store.currentBranch().name,
       rows: this.messageStore.getAll(),
       record: this.mergedMessageView().getAll(),
-      window: this.presentedMessageView().getAll(),
+      window,
       view: this.strategyMessageView().getAll(),
       memory,
-      windowMode: this.windowIndex.mode(),
+      windowMode,
+      ...(windowMode === 'presented' ? { windowOrdinals: window.map((row) => ({ id: row.id, ordinal: this.windowIndex.ordinalOf(row.id) })) } : {}),
+      ...(this.viewFilter ? { viewKeeps: this.viewFilter } : {}),
       ...(binding ? { thinkingBoundThrough: recordedThrough(binding) } : {}),
     };
   }
@@ -4799,8 +4823,9 @@ export class ContextManager {
    * else the branch needs through `view` (such as other residents' states),
    * and a fresh open of the branch reads it back: its rows must be the
    * source's with the plan's edits and removals (rows appended after them
-   * are allowed), its summaries the source's without the plan's drops, and
-   * it must break no rule the source keeps (READBACK_MISMATCH,
+   * are allowed), its window the source's without the removed rows, each
+   * row at its place, its summaries the source's without the plan's drops,
+   * and it must break no rule the source keeps (READBACK_MISMATCH,
    * INVARIANT_BROKEN). Then, with no await between, the apply refuses
    * (SOURCE_MOVED) unless the store is still on the source branch, at the
    * head it was forked at, and the target branch is the one it built; and
@@ -4830,7 +4855,8 @@ export class ContextManager {
    * keeps no summaries and has no onRetracted): the rows the plan removes
    * leave its window, with what its strategy folded of them, and its
    * summaries the plan drops go. Each is read back too, by a fresh open: no
-   * removed row in its window, the edited rows as planned in its record,
+   * removed row in its window and every other row at its place there, the
+   * edited rows as planned in its record,
    * its summaries its source's without its planned drops, and no rule
    * broken that its source keeps. The host re-initializes each reader once
    * this returns, as it does every other manager.

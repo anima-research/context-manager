@@ -7,8 +7,8 @@
     plan writes nothing. It returns each target before and after, the
     summaries that the mutation drops, the first row whose rendering
     changes, whether a changed row lies inside the thinking-binding record,
-    and a `planSha256` of all that it reports, with each summary that it
-    drops as the strategy holds it.
+    and a `planSha256` of all that it reports, its violations included, with
+    each summary that it drops as the store holds it.
   - The plan refuses each of these, and says what to change:
     - a target that changed since its caller read it, a target named twice,
       or a target that isn't there;
@@ -41,8 +41,10 @@
     with a fresh instance of the strategy
     (`ContextStrategy.cloneForScratch`, or `strategy`). After
     `beforeSwitch`, a fresh open reads the branch back. The rows must be the
-    source's, with the plan's edits and removals. The summaries must be the
-    source's, without the plan's drops. Otherwise the apply refuses
+    source's, with the plan's edits and removals. A presented window must
+    hold the source window's rows, less the removed ones, each at its place.
+    The summaries must be the source's, without the plan's drops. Otherwise
+    the apply refuses
     (`READBACK_MISMATCH`). New rows after the source's rows are allowed,
     such as a notice that `beforeSwitch` writes. The apply also refuses an
     anomaly that the source didn't have (`INVARIANT_BROKEN`). Where the
@@ -63,9 +65,10 @@
     the deletion not saved yet. A process that stops leaves the branch, as a
     preview leaves its scratch branch (`preview-mutation/<uuid>`), and an
     apply can't build on that name until it is deleted. The switch can fail
-    after the store has moved to the branch, or move the store to the branch
-    and lose it to another selection. The mutation is then applied, and the
-    error (`APPLIED_INIT_FAILED`) carries the receipt.
+    after the store has moved to the branch, such as where the store can't
+    save the switch, or move the store to the branch and lose it to another
+    selection. The mutation is then applied, and the error
+    (`APPLIED_INIT_FAILED`) carries the receipt.
   - Nothing else should write the history while an apply runs. After it, the
     host re-initializes each other manager on the store, as after
     `switchBranch`.

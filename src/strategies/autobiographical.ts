@@ -8897,7 +8897,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * stored record the load leaves out, with no id or no rows, which no
    * write of this instance's puts back, doesn't read as another writer's.
    */
-  private storeWrittenElsewhere(): boolean {
+  private storeWrittenElsewhere(unreadable = false): boolean {
     const store = this.store;
     if (!store) return false;
     try {
@@ -8912,7 +8912,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (this.chunkPersistenceEnabled &&
           differs(this.chunksStateId, this.chunkRecords, (stored) => loadedChunkRecords<ChunkRecord>(stored)));
     } catch {
-      return false;
+      return unreadable;
     }
   }
 
@@ -16019,10 +16019,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
    * reported and left alone. The store's history keeps each entry as it was.
    * The summary and its carriers are written in one write of the summaries,
-   * so a write that fails leaves them all as they were, and the same edit
-   * can be asked for again. Without `apply` nothing is written. Refused as
-   * SummaryTextEditOptions says, and, before anything is written, where the
-   * stored summaries aren't as this strategy holds them.
+   * so they never part: each holds the old text, or each the new. A write
+   * that throws may still have landed, and this strategy then holds the new
+   * text: read the summary before asking for the edit again. Without `apply`
+   * nothing is written. Refused as SummaryTextEditOptions says, and, before
+   * anything is written, where the stored summaries can't be shown to be as
+   * this strategy holds them (another handle wrote them, or reading them
+   * failed).
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -16041,8 +16044,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       parents: plan.parents,
     };
     if (!options.apply) return edit;
-    if (this.store && this.storeWrittenElsewhere()) {
-      throw new Error('the stored summaries aren\'t as this strategy holds them: another handle changed them since this strategy read them; open the store again');
+    if (this.store && this.storeWrittenElsewhere(true)) {
+      throw new Error('the stored summaries can\'t be shown to be as this strategy holds them: another handle changed them since this strategy read them, or reading them failed; nothing was written: open the store again');
     }
     const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
     const rewritten = new Set([id, ...plan.carriedBy.map((carrier) => carrier.id)]);
@@ -16076,7 +16079,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   historyMemory(): ReturnType<HistoryMutationStrategy['historyMemory']> {
     this.requireLoadedBranch('historyMemory');
-    return { summaries: this.summaries, chunkRecords: this.chunkRecords };
+    const store = this.store;
+    const read = !store || this.stillHeldAsStored(this.summariesStateId) ? this.summaries : store.getStateJson(this.summariesStateId);
+    const stored: readonly unknown[] = Array.isArray(read) ? read : [];
+    return { summaries: this.summaries, chunkRecords: this.chunkRecords, stored };
   }
 
   /**

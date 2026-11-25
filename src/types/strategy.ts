@@ -3319,10 +3319,15 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
  * AutobiographicalStrategy and its subclasses.
  */
 export interface HistoryMutationStrategy extends ExternalMemoryStrategy {
-  /** Its summaries and chunk records as it holds them now. Read only. */
+  /**
+   * Its summaries and chunk records as it holds them now, and its summaries
+   * as the store holds them (`stored`), which differ where another handle
+   * wrote them since this strategy read them. Read only.
+   */
   historyMemory(): {
     summaries: readonly SummaryEntry[];
     chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+    stored: readonly unknown[];
   };
   /**
    * Drop the summaries `seeds` names, with every summary above them; each

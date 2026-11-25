@@ -211,12 +211,18 @@ export interface HistoryState {
   view: readonly StoredMessage[];
   memory: HistoryMemory | null;
   windowMode: 'legacy' | 'presented';
+  /** Once a host presents rows: each row of the window and its ordinal, in window order. */
+  windowOrdinals?: ReadonlyArray<{ id: MessageId; ordinal: number | undefined }>;
+  /** The manager's view filter, which decides what of the window a compile sends. */
+  viewKeeps?: (row: StoredMessage) => boolean;
   thinkingBoundThrough?: Sequence;
 }
 
 export interface HistoryMemory {
   summaries: readonly SummaryEntry[];
   chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+  /** The summaries as the store holds them, where another handle wrote them since the strategy read them; else as `summaries`. */
+  stored?: readonly unknown[];
 }
 
 /** sha256 of the canonical JSON of a message's content: how an op names the content it read. */
@@ -570,11 +576,16 @@ export function planMutation(
   const droppedSummaries = [...dropped];
   const effects = windowEffects(state, targets, droppedSummaries);
   const entries = (memory: HistoryMemory | null, ids: readonly string[]) => {
-    const byId = new Map((memory?.summaries ?? []).map((s) => [s.id, s] as const));
-    return [...ids].sort().map((id) => byId.get(id) ?? { id });
+    const byId = new Map<string, unknown>();
+    for (const entry of memory?.stored ?? memory?.summaries ?? []) {
+      if (typeof entry === 'object' && entry !== null && 'id' in entry && typeof entry.id === 'string') byId.set(entry.id, entry);
+    }
+    return [...ids].sort().map((id) => asStored(byId.get(id) ?? { id }));
   };
   const planSha256 = createHash('sha256')
     .update(canonicalJson({
+      valid: violations.length === 0,
+      violations,
       sourceBranch: state.branch,
       targets,
       droppedSummaries: entries(state.memory, droppedSummaries),
@@ -602,7 +613,19 @@ function windowEffects(
   const rows = state.record;
   const sequences = new Map(rows.map((row) => [row.id, row.sequence] as const));
   const viewPosition = new Map(state.view.map((row, i) => [row.id, i] as const));
-  const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id), (id) => viewPosition.has(id));
+  const windowAt = new Map(state.window.map((row, i) => [row.id, i] as const));
+  const edited = new Map(targets.flatMap((target) => (target.kind === 'edit_message' ? [[target.messageId, target.content] as const] : [])));
+  const positionOf = (id: MessageId): number | undefined => {
+    const held = viewPosition.get(id);
+    if (held !== undefined) return held;
+    const content = edited.get(id);
+    const at = windowAt.get(id);
+    if (content === undefined || at === undefined || !(state.viewKeeps?.({ ...state.window[at]!, content }) ?? true)) return undefined;
+    const next = state.window.slice(at + 1).find((row) => viewPosition.has(row.id));
+    return (next ? viewPosition.get(next.id)! : state.view.length) - 0.5;
+  };
+  const sent = (id: MessageId): boolean => positionOf(id) !== undefined;
+  const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id), sent);
   const firstInView = state.view.find((row) => sequences.has(row.id))?.id;
   const rowsChanged = changed.fromStart
     ? [...changed.rows, ...rows.slice(0, 1).map((row) => row.id), ...(firstInView !== undefined ? [firstInView] : [])]
@@ -612,8 +635,8 @@ function windowEffects(
   for (const id of rowsChanged) {
     const sequence = sequences.get(id);
     if (sequence !== undefined && (earliest === undefined || sequence < earliest)) earliest = sequence;
-    const at = viewPosition.get(id);
-    if (at !== undefined && sequence !== undefined && (kvFrom === undefined || at < viewPosition.get(kvFrom)!)) kvFrom = id;
+    const at = positionOf(id);
+    if (at !== undefined && sequence !== undefined && (kvFrom === undefined || at < positionOf(kvFrom)!)) kvFrom = id;
   }
   return {
     invalidatesThinkingBinding: earliest !== undefined && state.thinkingBoundThrough !== undefined && earliest <= state.thinkingBoundThrough,
@@ -844,6 +867,7 @@ export interface HistoryMutationReceipt {
 export interface HistorySnapshot {
   record: Array<{ id: MessageId; sha256: string; fields: Omit<StoredMessage, 'content'> }>;
   summaries: SummaryEntry[];
+  window?: ReadonlyArray<{ id: MessageId; ordinal: number | undefined }>;
 }
 
 const asStored = (value: unknown): string => canonicalJson(JSON.parse(storedJson(value ?? null).toString('utf8')));
@@ -854,7 +878,24 @@ export function snapshotOf(state: HistoryState): HistorySnapshot {
   return {
     record: state.record.map(({ content, ...fields }) => ({ id: fields.id, sha256: storedSha256(content), fields: { ...fields, ...(fields.metadata ? { metadata: { ...fields.metadata } } : {}) } })),
     summaries: (state.memory?.summaries ?? []).map((summary) => structuredClone(summary)),
+    ...(state.windowOrdinals ? { window: state.windowOrdinals.map((at) => ({ ...at })) } : {}),
   };
+}
+
+function windowMismatches(plan: HistoryMutationPlan, source: HistorySnapshot, written: HistoryState): string[] {
+  if (!source.window) return [];
+  if (!written.windowOrdinals) return ['its window is no longer presented'];
+  const removed = new Set(plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : [])));
+  const want = source.window.filter((at) => !removed.has(at.id));
+  const got = new Map(written.windowOrdinals.map((at) => [at.id, at.ordinal] as const));
+  const out: string[] = [];
+  for (const { id, ordinal } of want) {
+    if (!got.has(id)) out.push(`message ${id} left its window`);
+    else if (got.get(id) !== ordinal) out.push(`message ${id} moved in its window from ordinal ${ordinal} to ${got.get(id)}`);
+  }
+  const kept = new Set(want.map((at) => at.id));
+  for (const { id } of written.windowOrdinals) if (!kept.has(id)) out.push(`message ${id} is in its window, and the source's window didn't hold it`);
+  return out;
 }
 
 function differing(got: object, want: object, omit: readonly string[] = []): string[] {
@@ -961,6 +1002,7 @@ export function readerReadBackMismatches(
   stillInWindow: readonly MessageId[],
 ): string[] {
   const out = stillInWindow.map((id) => `message ${id} is still in its window`);
+  out.push(...windowMismatches(plan, source, written));
   out.push(...recordMismatches(plan, source, written.record, stamp));
   out.push(...summaryMismatches(source, reader.droppedSummaries, written));
   return out.map((mismatch) => `reader ${reader.namespace}: ${mismatch}`);
@@ -983,5 +1025,9 @@ export function readBackMismatches(
 ): string[] {
   const edits = new Map<string, PlannedSummaryEdit>();
   for (const target of plan.targets) if (target.kind === 'edit_summary') for (const id of [target.summaryId, ...target.carriedBy]) edits.set(id, target);
-  return [...recordMismatches(plan, source, written.record, stamp), ...summaryMismatches(source, plan.droppedSummaries, written, edits, stamp)];
+  return [
+    ...windowMismatches(plan, source, written),
+    ...recordMismatches(plan, source, written.record, stamp),
+    ...summaryMismatches(source, plan.droppedSummaries, written, edits, stamp),
+  ];
 }
