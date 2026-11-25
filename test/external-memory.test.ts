@@ -241,7 +241,7 @@ describe('external-memory', () => {
     assert.ok(said(request).includes(first.content), 'setup: its request recalls the first merge');
 
     // The recalled memory's text changes: the work is the same, and its request isn't.
-    const edited = await run(['edit', path, '--namespace', NS, '--id', first.id, '--body-file', bodyFile('The first stretch, rewritten.'), '--by', 'operator', '--apply']);
+    const edited = await run(['edit', path, '--namespace', NS, '--id', first.id, '--body-file', bodyFile('The first stretch, rewritten.'), '--by', 'operator', '--drop-response-content', '--apply']);
     assert.equal(edited.code, 0, edited.stderr);
     const before = memory(path);
     const importArgs = ['import', path, '--namespace', NS, '--descriptor', file, '--body-file', bodyFile(BODY), '--by', 'operator'];
@@ -359,7 +359,7 @@ describe('external-memory', () => {
     assert.equal(l1.level, 1);
   });
 
-  it('edits one summary\'s text: lineage kept, carrier dropped, parents reported and left alone', async () => {
+  it('edits one summary\'s text: lineage kept, response blocks dropped on request, parents reported and left alone', async () => {
     const path = await residentStore();
     await asResident(path, answers, (manager) => manager.tick());
     const all = summariesOf(path);
@@ -369,7 +369,7 @@ describe('external-memory', () => {
     assert.equal(target.provenance?.model, MODEL, 'setup: and the provenance of the call that wrote it');
 
     const text = bodyFile('The second stretch, rewritten by hand.');
-    const args = ['edit', path, '--namespace', NS, '--id', target.id, '--body-file', text, '--by', 'operator'];
+    const args = ['edit', path, '--namespace', NS, '--id', target.id, '--body-file', text, '--by', 'operator', '--drop-response-content'];
     const before = memory(path);
     const dry = await run(args);
     assert.equal(dry.code, 0, dry.stderr);
@@ -379,7 +379,7 @@ describe('external-memory', () => {
     const applied = await run([...args, '--apply']);
     assert.equal(applied.code, 0, applied.stderr);
     assert.match(applied.stdout, new RegExp(`old text: ${target.content.length} chars, ${target.tokens} tokens, sha256 ${sha256(target.content)}`));
-    assert.match(applied.stdout, /verbatim response blocks dropped: 2/);
+    assert.match(applied.stdout, /verbatim response blocks dropped \(the most on one entry\): 2/);
     assert.match(applied.stdout, new RegExp(`merged over the old text, left as they are: ${parent.id} \\(L2\\)`));
 
     const after = summariesOf(path);
@@ -402,6 +402,331 @@ describe('external-memory', () => {
     const missing = await run(['edit', path, '--namespace', NS, '--id', 'L1-9999', '--body-file', text, '--by', 'operator', '--apply']);
     assert.equal(missing.code, 1);
     assert.match(missing.stderr, /no summary L1-9999/);
+  });
+
+  it('refuses to edit a summary whose verbatim response blocks would render in place of the new text, unless they are dropped', async () => {
+    const path = await residentStore();
+    const target = summariesOf(path).find((s) => (s.responseContent?.length ?? 0) > 0)!;
+    assert.ok(target, 'setup: a summary that renders its response blocks');
+    const before = memory(path);
+    for (const apply of [[], ['--apply']]) {
+      const refused = await run(['edit', path, '--namespace', NS, '--id', target.id, '--body-file', bodyFile('By hand.'), '--by', 'operator', ...apply]);
+      assert.equal(refused.code, 1);
+      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, holds 2 verbatim response block\\(s\\) of the old text; dropResponseContent \\(or the CLI's --drop-response-content\\) deletes them`));
+    }
+    assert.equal(memory(path), before, 'nothing is written');
+  });
+
+  it('refuses an edit whose expected text is not the summary\'s, and makes the one whose text is', async () => {
+    const path = await residentStore();
+    const target = summariesOf(path)[0]!;
+    await asResident(path, answers, async (manager) => {
+      const options = { apply: true, dropResponseContent: true };
+      assert.throws(
+        () => manager.editSummaryText(target.id, 'By hand.', { by: 'operator' }, { ...options, expectedPriorSha256: sha256('another text') }),
+        new RegExp(`summary ${target.id}'s text has sha256 ${sha256(target.content)}, not the ${sha256('another text')} given`),
+      );
+      assert.equal(manager.getSummary(target.id)?.content, target.content, 'the refused edit wrote nothing');
+      const edit = manager.editSummaryText(target.id, 'By hand.', { by: 'operator' }, { ...options, expectedPriorSha256: sha256(target.content) });
+      assert.equal(edit.applied, true);
+    });
+    assert.equal(summariesOf(path).find((s) => s.id === target.id)?.content, 'By hand.');
+  });
+
+  it('refuses to edit an entry that carries a summary up a level, naming that summary, and reports the carrier when the summary is edited', async () => {
+    const { path, under, carrier } = await carriedStore();
+    await asResident(path, answers, async (manager) => {
+      assert.equal(manager.getSummary(carrier.id)?.carriedFrom, under.id, 'setup: the resident keeps the carried entry');
+      const stored = () => JSON.stringify(manager.getStore().getStateJson(`${NS}/autobio:summaries`));
+      const before = stored();
+      for (const apply of [false, true]) {
+        assert.throws(
+          () => manager.editSummaryText(carrier.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true, apply }),
+          new RegExp(`summary ${carrier.id} carries ${under.id} up a level, .*: edit ${under.id}`),
+          `apply: ${apply}`,
+        );
+      }
+      assert.equal(stored(), before, 'the refused edits wrote nothing');
+      assert.equal(manager.getSummary(carrier.id)?.content, carrier.content, 'and changed nothing in memory');
+      const edit = manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true, apply: true });
+      assert.deepEqual(edit.carriedBy, [{ id: carrier.id, level: 2 }]);
+      assert.deepEqual(edit.parents, [], 'a carrier is not merged over the text: it reads it as it stands');
+    });
+    const after = summariesOf(path);
+    const edited = after.find((s) => s.id === under.id)!;
+    const carried = after.find((s) => s.id === carrier.id)!;
+    assert.deepEqual(
+      [carried.content, carried.tokens, carried.external, carried.responseContent, carried.provenance],
+      [edited.content, edited.tokens, edited.external, undefined, undefined],
+      'the carrier is written as the edited summary\'s copy again',
+    );
+    assert.equal(carried.carriedFrom, under.id);
+  });
+
+  /** A resident's store whose second summary an L2 entry carries up a level, copying its text and response blocks. */
+  async function carriedStore(): Promise<{ path: string; under: SummaryEntry; carrier: SummaryEntry }> {
+    const path = await residentStore();
+    const under = summariesOf(path)[1]!;
+    const carrier: SummaryEntry = {
+      id: 'L2-carry', level: 2, sourceLevel: 1, sourceIds: [under.id], carriedFrom: under.id, sourceRange: under.sourceRange,
+      content: under.content, tokens: under.tokens, created: under.created,
+      ...(under.responseContent ? { responseContent: under.responseContent } : {}),
+    };
+    assert.ok(carrier.responseContent?.length, 'setup: the carrier holds a copy of the response blocks');
+    read(path, (store) => {
+      const all = store.getStateJson(`${NS}/autobio:summaries`) as SummaryEntry[];
+      store.setStateJson(`${NS}/autobio:summaries`, [...all.map((s) => (s.id === under.id ? { ...s, mergedInto: carrier.id } : s)), carrier]);
+      store.sync();
+    });
+    return { path, under, carrier };
+  }
+
+  it('writes a summary and its carriers in one write, so an edit whose write fails before it lands leaves them as they were and can be asked for again', async () => {
+    const { path, under, carrier } = await carriedStore();
+    const summariesId = `${NS}/autobio:summaries`;
+    await asResident(path, answers, async (manager) => {
+      const store = manager.getStore();
+      const set = store.setStateJson.bind(store);
+      const ask = () => manager.editSummaryText(under.id, 'Carried, by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: sha256(under.content) });
+      store.setStateJson = (id: string, value: unknown) => {
+        if (id === summariesId) throw new Error('the disk is full');
+        return set(id, value);
+      };
+      try {
+        assert.throws(ask, /threw, and it didn't land: the store and the strategy hold the old text, and the edit can be asked for again \(the disk is full\)/);
+      } finally {
+        store.setStateJson = set;
+      }
+      assert.deepEqual([manager.getSummary(under.id)?.content, manager.getSummary(carrier.id)?.content], [under.content, carrier.content], 'neither changed in memory');
+      const stored = () => (store.getStateJson(summariesId) as SummaryEntry[]).filter((s) => s.id === under.id || s.id === carrier.id).map((s) => s.content);
+      assert.deepEqual(stored(), [under.content, carrier.content], 'nor in the store');
+      let writes = 0;
+      store.setStateJson = (id: string, value: unknown) => {
+        if (id === summariesId) writes++;
+        return set(id, value);
+      };
+      try {
+        ask();
+      } finally {
+        store.setStateJson = set;
+      }
+      assert.equal(writes, 1, 'asked again, the summary and its carrier go in one write');
+      assert.deepEqual([manager.getSummary(under.id)?.content, manager.getSummary(carrier.id)?.content], ['Carried, by hand.', 'Carried, by hand.']);
+      assert.deepEqual(stored(), ['Carried, by hand.', 'Carried, by hand.']);
+    });
+  });
+
+  it('refuses a summary edit where the stored summaries aren\'t as the strategy holds them, and writes nothing', async () => {
+    const { path, under, carrier } = await carriedStore();
+    const summariesId = `${NS}/autobio:summaries`;
+    await asResident(path, answers, async (manager) => {
+      const store = manager.getStore();
+      const held = store.getStateJson(summariesId) as SummaryEntry[];
+      const ask = () => manager.editSummaryText(under.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: sha256(under.content) });
+      for (const [what, stored] of [
+        ['the summary is gone', held.filter((s) => s.id !== under.id)],
+        ['a carrier is gone', held.filter((s) => s.id !== carrier.id)],
+        ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text' } : s))],
+      ] as const) {
+        store.setStateJson(summariesId, stored);
+        assert.throws(ask, /is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them/, what);
+        assert.deepEqual(store.getStateJson(summariesId), stored, `${what}: nothing written`);
+        assert.equal(manager.getSummary(under.id)?.content, under.content, `${what}: nothing changed in memory`);
+      }
+    });
+  });
+
+  it('refuses a summary edit where reading the stored summaries to compare them fails, and writes nothing', async () => {
+    const path = await residentStore();
+    const summariesId = `${NS}/autobio:summaries`;
+    await asResident(path, answers, async (manager) => {
+      const store = manager.getStore();
+      const held = store.getStateJson(summariesId) as SummaryEntry[];
+      const target = held[0]!;
+      const other = held[1]!;
+      const newer = held.map((s) => (s.id === other.id ? { ...s, content: 'a newer text of another summary' } : s));
+      store.setStateJson(summariesId, newer);
+      const get = store.getStateJson.bind(store);
+      let failures = 0;
+      store.getStateJson = (id: string) => {
+        if (id === summariesId && failures++ === 0) throw new Error('the read failed');
+        return get(id);
+      };
+      try {
+        assert.throws(
+          () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: sha256(target.content) }),
+          /is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them/,
+        );
+      } finally {
+        store.getStateJson = get;
+      }
+      assert.equal(failures, 1, 'setup: the compare read failed');
+      assert.deepEqual(store.getStateJson(summariesId), newer, 'nothing written');
+      assert.equal(manager.getSummary(target.id)?.content, target.content, 'nothing changed in memory');
+    });
+  });
+
+  it('holds an edit a summary write made before it threw, so asking again finds the new text', async () => {
+    const path = await residentStore();
+    const summariesId = `${NS}/autobio:summaries`;
+    await asResident(path, answers, async (manager) => {
+      const store = manager.getStore();
+      const target = (store.getStateJson(summariesId) as SummaryEntry[])[0]!;
+      const set = store.setStateJson.bind(store);
+      store.setStateJson = (id: string, value: unknown) => {
+        const written = set(id, value);
+        if (id === summariesId) throw new Error('the write landed, and then failed');
+        return written;
+      };
+      const ask = () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: sha256(target.content) });
+      try {
+        assert.throws(ask, /threw, and it landed: the strategy holds the new text \(the write landed, and then failed\)/);
+      } finally {
+        store.setStateJson = set;
+      }
+      assert.equal(manager.getSummary(target.id)?.content, 'Edited by hand.', 'memory holds what the store holds');
+      assert.equal((store.getStateJson(summariesId) as SummaryEntry[]).find((s) => s.id === target.id)?.content, 'Edited by hand.');
+      assert.throws(ask, /not the [0-9a-f]{64} given: read it again/, 'asking again finds the new text');
+    });
+  });
+
+  it('prices a summary edited again by its new text, where the new text is as long as the old', async () => {
+    class Priced extends AutobiographicalStrategy {
+      price(id: string): number {
+        return this.recallAnswerCost(this.summaries.find((s) => s.id === id)!).estimate;
+      }
+
+      freshPrice(id: string): number {
+        return this.estimateTokens(this.liveWindowAnswerContent(this.summaries.find((s) => s.id === id)!));
+      }
+    }
+    const path = await residentStore();
+    const target = summariesOf(path)[0]!;
+    const strategy = new Priced({ ...RESIDENT, autoTickOnNewMessage: false } as never);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy, membrane: membraneOf(answers) });
+    try {
+      const plain = 'plain words in a quiet row, said slowly';
+      const dense = '{}[],:"'.repeat(10).slice(0, plain.length);
+      manager.editSummaryText(target.id, plain, { by: 'operator' }, { apply: true, dropResponseContent: true });
+      const before = strategy.price(target.id);
+      manager.editSummaryText(target.id, dense, { by: 'operator' }, { apply: true });
+      assert.notEqual(strategy.freshPrice(target.id), before, 'setup: the same length and editor, and another price');
+      assert.equal(strategy.price(target.id), strategy.freshPrice(target.id));
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses an edit that leaves a carrier\'s own response blocks, rewrites carriers two levels up, and finds a carrier whose summary doesn\'t point to it', async () => {
+    const { path, under, carrier } = await carriedStore();
+    const top: SummaryEntry = { ...carrier, id: 'L3-carry', level: 3, sourceLevel: 2, sourceIds: [carrier.id], carriedFrom: carrier.id };
+    const summariesId = `${NS}/autobio:summaries`;
+    read(path, (store) => {
+      const all = store.getStateJson(summariesId) as SummaryEntry[];
+      const { responseContent: _blocks, ...bare } = all.find((s) => s.id === under.id)!;
+      store.setStateJson(summariesId, [...all.map((s) => (s.id === under.id ? bare : s.id === carrier.id ? { ...s, mergedInto: top.id } : s)), top]);
+      store.sync();
+    });
+    await asResident(path, answers, async (manager) => {
+      assert.equal(manager.getSummary(under.id)?.responseContent, undefined, 'setup: the summary holds no response blocks');
+      assert.ok(manager.getSummary(carrier.id)?.responseContent?.length, 'setup: its carrier still does');
+      assert.throws(
+        () => manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { apply: true }),
+        new RegExp(`summary ${under.id}, or an entry that carries it, holds ${carrier.responseContent!.length} verbatim response block`),
+      );
+      const edit = manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { apply: true, dropResponseContent: true });
+      assert.deepEqual(edit.carriedBy, [{ id: carrier.id, level: 2 }, { id: top.id, level: 3 }]);
+    });
+    for (const id of [under.id, carrier.id, top.id]) {
+      const stored = summariesOf(path).find((s) => s.id === id)!;
+      assert.deepEqual([stored.content, stored.responseContent], ['By hand.', undefined], id);
+    }
+
+    const loose = await carriedStore();
+    read(loose.path, (store) => {
+      const all = store.getStateJson(summariesId) as SummaryEntry[];
+      store.setStateJson(summariesId, all.map((s) => {
+        if (s.id !== loose.under.id) return s;
+        const { mergedInto: _pointer, ...unpointed } = s;
+        return unpointed;
+      }));
+      store.sync();
+    });
+    await asResident(loose.path, answers, async (manager) => {
+      const edit = manager.editSummaryText(loose.under.id, 'By hand.', { by: 'operator' }, { apply: true, dropResponseContent: true });
+      assert.deepEqual(edit.carriedBy, [{ id: loose.carrier.id, level: 2 }], 'a carrier whose summary has no pointer to it');
+    });
+    assert.equal(summariesOf(loose.path).find((s) => s.id === loose.carrier.id)?.content, 'By hand.');
+  });
+
+  it('refuses work after a write that threw where reading the store back fails, until the strategy is initialized again', async () => {
+    const path = await residentStore();
+    const summariesId = `${NS}/autobio:summaries`;
+    const target = summariesOf(path)[0]!;
+    await asResident(path, answers, async (manager) => {
+      const store = manager.getStore();
+      const set = store.setStateJson.bind(store);
+      const get = store.getStateJson.bind(store);
+      let failed = false;
+      store.setStateJson = (id: string, value: unknown) => {
+        if (id === summariesId) {
+          failed = true;
+          throw new Error('the disk is full');
+        }
+        return set(id, value);
+      };
+      store.getStateJson = (id: string) => {
+        if (failed && id === summariesId) throw new Error('the read failed');
+        return get(id);
+      };
+      const ask = () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true });
+      try {
+        assert.throws(ask, /threw, and it may have landed, and reading the store back failed: the strategy refuses work until it is initialized again/);
+      } finally {
+        store.setStateJson = set;
+        store.getStateJson = get;
+      }
+      assert.throws(ask, /requires reinitialization/, 'the strategy refuses work');
+      await manager.setStrategy(manager.getStrategy());
+      assert.equal(manager.getSummary(target.id)?.content, target.content, 'initialized again, it holds what the store holds');
+      assert.equal(ask().applied, true);
+    });
+    assert.equal(summariesOf(path).find((s) => s.id === target.id)?.content, 'Edited by hand.');
+  });
+
+  it('prices a summary by its text again once it takes up the summaries another handle wrote', async () => {
+    class Priced extends AutobiographicalStrategy {
+      price(id: string): number {
+        return this.recallAnswerCost(this.summaries.find((s) => s.id === id)!).estimate;
+      }
+
+      freshPrice(id: string): number {
+        return this.estimateTokens(this.liveWindowAnswerContent(this.summaries.find((s) => s.id === id)!));
+      }
+    }
+    const path = await residentStore();
+    const target = summariesOf(path)[0]!;
+    const strategy = new Priced({ ...RESIDENT, autoTickOnNewMessage: false } as never);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy, membrane: membraneOf(answers) });
+    try {
+      const prose = 'a plain memory in words '.repeat(4);
+      const dense = '.,;:!?'.repeat(prose.length / 6);
+      manager.editSummaryText(target.id, prose, { by: 'operator' }, { apply: true, dropResponseContent: true });
+      const proseCost = strategy.price(target.id);
+      manager.presentRows([]);
+      const late = manager.addMessage('User', [{ type: 'text', text: 'a row to let go of' }]);
+      manager.presentRows([late]);
+      const store = manager.getStore();
+      const summariesId = `${NS}/autobio:summaries`;
+      store.setStateJson(summariesId, (store.getStateJson(summariesId) as SummaryEntry[]).map((s) => (s.id === target.id ? { ...s, content: dense } : s)));
+      manager.retractRows([late]);
+      for (let i = 0; i < 50 && manager.getSummary(target.id)?.content !== dense; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(manager.getSummary(target.id)?.content, dense, 'setup: the let-go took up the stored summaries');
+      assert.notEqual(strategy.freshPrice(target.id), proseCost, 'setup: the two texts price apart');
+      assert.equal(strategy.price(target.id), strategy.freshPrice(target.id));
+    } finally {
+      manager.close();
+    }
   });
 
   it('checks the invocation whole before anything is opened', async () => {
