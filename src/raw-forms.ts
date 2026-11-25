@@ -183,21 +183,24 @@ export function releaseReplacedRawForms(before: readonly ContentBlock[], after: 
     const span = placeOf.slice(kept[0], kept[kept.length - 1]! + 1);
     if (span.length !== last - first + 1 || span.some((place, k) => place !== first + k)) for (const key of keys) moved.add(key);
   }
+  const held = new Set(byKey.keys());
   const matched = after.map((block, j) => {
     const place = placeOf[j];
-    return place === undefined ? withoutAnyRawForm(block) : withoutRawForms(before[place]!, moved);
+    return place === undefined ? withoutHeldRawForms(block, held) : withoutRawForms(before[place]!, moved);
   });
   return releaseEditedRawForms(before, matched);
 }
 
-function withoutAnyRawForm(block: ContentBlock): ContentBlock {
-  const carrier = block as ContentBlock & RawFormCarrier;
-  const replayed = xmlKey(block) !== undefined;
-  if (!replayed && carrier.rawItem === undefined) return block;
-  const copy = { ...carrier };
-  if (replayed) delete copy.rawXml;
-  delete copy.rawItem;
-  return copy;
+function withoutHeldRawForms(block: ContentBlock, held: ReadonlySet<string>): ContentBlock {
+  const xml = xmlKey(block);
+  const item = itemKey(block);
+  const dropXml = xml !== undefined && held.has(xml);
+  const dropItem = item !== undefined && held.has(item);
+  if (!dropXml && !dropItem) return block;
+  const copy = { ...block } as ContentBlock & RawFormCarrier;
+  if (dropXml) delete copy.rawXml;
+  if (dropItem) delete copy.rawItem;
+  return copy as ContentBlock;
 }
 
 /**

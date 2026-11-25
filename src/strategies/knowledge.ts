@@ -43,7 +43,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
   /** A new instance with this one's settings that starts no compression by itself (ContextStrategy.cloneForScratch). */
   cloneForScratch(): ContextStrategy {
     if (Object.getPrototypeOf(this) !== KnowledgeStrategy.prototype) {
-      throw new Error(`${this.name}: a subclass of KnowledgeStrategy gives its own cloneForScratch, or the caller gives a strategy`);
+      throw new Error(`${this.name}: a subclass of KnowledgeStrategy gives its own cloneForScratch`);
     }
     return new KnowledgeStrategy({ ...this.knowledgeConfig, ...this.config, autoTickOnNewMessage: false, logEffectiveConfig: false });
   }

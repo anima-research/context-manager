@@ -31,9 +31,10 @@
   - An edited message takes a required `label` that names who changed it.
     The label goes first in the content, unless a text block holds it
     already. The message's metadata records the edit (`historyMutation`),
-    beside the metadata that it had. The edit drops the raw replay forms
-    (`rawItem`, `rawXml`) of each block that it changes, so that a formatter
-    sends the new text.
+    beside the metadata that it had. Each block that the edit changes loses
+    the raw replay forms (`rawItem`, `rawXml`) that the old content held, so
+    that a formatter sends the new text. A raw form that the old content
+    didn't hold is the caller's, and stays.
   - `applyHistoryMutation(manifest, { targetBranch, expectedSourceBranch,
     expectedPlanSha256, by, strategy?, beforeSwitch?, readers? })` makes the
     plan again and refuses a plan that drifted. It forks `targetBranch` from
@@ -104,14 +105,21 @@
     stands. These are malformed or empty content, a body that lacks shards,
     a tool call or result without its partner, a system change between a
     call and its result, and crossed summaries. It reads tool pairs in
-    record order and in the window's order.
+    record order and in the order that a compile reads the window, with the
+    view filter applied.
   - Under `recallEnvelope: 'xml'`, the recall envelope of a summary gains
-    `editedBy` when the summary's text came from outside the strategy
-    (`external`). Its carriers gain it too. The value escapes `&`, `<`, `>`,
-    `"` and line breaks as character references. A summary stored with
+    `editedBy` when the summary's text came from outside the strategy and
+    names who wrote it (`external.by` isn't blank). Its carriers gain it
+    too. The value escapes `&`, `<`, `>`, `"` and line breaks as character
+    references. A summary stored with
     `external` before this change gains it as well. A compile that renders
     such a summary sends different bytes once.
-  - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`.
-    `findUnpairedToolBlocks` is exported. `src/history-mutation.ts` holds
-    the types and `HistoryMutationError`. Among the types,
-    `MessageEditStamp` is the shape of `metadata.historyMutation`.
+  - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`. The
+    store's edit event still carries the content alone.
+  - New exports: `HistoryMutationError` and the types of
+    `src/history-mutation.ts` (among them `MessageEditStamp`, the shape of
+    `metadata.historyMutation`); `messageContentSha256` and `textSha256`,
+    the sha256s that an op names for a message and a summary;
+    `HistoryMutationStrategy` and its guard `isHistoryMutationStrategy`,
+    what a strategy implements for its summaries to be changed; and
+    `findUnpairedToolBlocks` with its `UnpairedToolBlock`.

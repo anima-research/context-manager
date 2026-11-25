@@ -51,7 +51,7 @@ export function planSummaryEdit(
   if (options.expectedPriorSha256 !== undefined && options.expectedPriorSha256 !== sha256) {
     refusals.push({ code: 'CAS_MISMATCH', expectedSha256: options.expectedPriorSha256, actualSha256: sha256 });
   }
-  const responseBlocks = entry.responseContent?.length ?? 0;
+  const responseBlocks = Math.max(...[entry, ...carriedBy.flatMap((carrier) => byId.get(carrier.id) ?? [])].map((s) => s.responseContent?.length ?? 0));
   if (responseBlocks > 0 && options.dropResponseContent !== true) refusals.push({ code: 'RESPONSE_CONTENT_SHADOW', responseBlocks });
   if (body.trim().length === 0) refusals.push({ code: 'EMPTY_CONTENT' });
 
@@ -73,7 +73,7 @@ export function describeSummaryEditRefusal(id: string, refusal: SummaryEditRefus
     case 'CAS_MISMATCH':
       return `summary ${id}'s text has sha256 ${refusal.actualSha256}, not the ${refusal.expectedSha256} given: read it again`;
     case 'RESPONSE_CONTENT_SHADOW':
-      return `summary ${id} renders ${refusal.responseBlocks} verbatim response block(s) in place of its text; drop them with the new text (dropResponseContent, or the CLI's --drop-response-content)`;
+      return `summary ${id}, or an entry that carries it, renders ${refusal.responseBlocks} verbatim response block(s) in place of its text; drop them with the new text (dropResponseContent, or the CLI's --drop-response-content)`;
     case 'EMPTY_CONTENT':
       return 'the memory text is empty';
     default: {
@@ -83,11 +83,6 @@ export function describeSummaryEditRefusal(id: string, refusal: SummaryEditRefus
   }
 }
 
-/**
- * The L1s that fold one of `rows`: each L1 listing one among its sources,
- * and the L1 of each chunk record holding one. What a let-go of the rows
- * drops starts from these (withSummariesAbove).
- */
 export function summariesFoldingRows(
   summaries: ReadonlyArray<Pick<SummaryEntry, 'id' | 'level' | 'sourceIds'>>,
   records: ReadonlyArray<{ sourceIds: readonly string[]; summaryId?: string }>,
@@ -103,7 +98,6 @@ export function summariesFoldingRows(
   return seeds;
 }
 
-/** `seeds`, with every summary above one of them: each summary above L1 with a source among them, again and again. */
 export function withSummariesAbove(
   summaries: ReadonlyArray<Pick<SummaryEntry, 'id' | 'level' | 'sourceIds'>>,
   seeds: ReadonlySet<string>,

@@ -54,17 +54,11 @@ function toolIds(content: unknown, type: 'tool_use' | 'tool_result'): string[] {
   return ids;
 }
 
-/** A stored message as the tool-pair rule reads it: its id, its content and its place in a body. */
 export interface ToolPairRow extends BodyShard {
   id: MessageId;
   content: unknown;
 }
 
-/**
- * Why a write of `content` at `index`, in rows `at` reads of a slot of
- * `length`, would part a tool call from its result, or null: the rule
- * MessageStore.refuseToolPairSplit applies to each write.
- */
 export function toolPairSplitReason(at: (i: number) => ToolPairRow | null, length: number, content: unknown, index: number): string | null {
   // A body is one step of either walk, read whole: ingress sharding puts a
   // message's non-text blocks, its calls and results, on its first shard.
@@ -953,7 +947,8 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    *
    * `options.mergeMetadata` sets those keys of the message's metadata in the
-   * same write; the rest of its metadata stays.
+   * same write; the rest of its metadata stays. The edit event carries the
+   * content alone: a listener reads the message for its metadata.
    */
   edit(messageId: MessageId, newContent: ContentBlock[], options: { mergeMetadata?: Record<string, unknown> } = {}): void {
     newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);

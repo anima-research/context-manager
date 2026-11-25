@@ -35,7 +35,7 @@ export class PassthroughStrategy implements ContextStrategy {
   /** A new instance (ContextStrategy.cloneForScratch). A subclass builds its own. */
   cloneForScratch(): ContextStrategy {
     if (Object.getPrototypeOf(this) !== PassthroughStrategy.prototype) {
-      throw new Error(`${this.name}: a subclass of PassthroughStrategy gives its own cloneForScratch, or the caller gives a strategy`);
+      throw new Error(`${this.name}: a subclass of PassthroughStrategy gives its own cloneForScratch`);
     }
     return new PassthroughStrategy();
   }

@@ -4023,6 +4023,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.diag.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
     }
     this.summaries = settled.summaries;
+    this._answerCostCache.clear();
     if (settlingRepaired(settled)) {
       // Read before the write, which moves the branch's sequence past the
       // summaries as they were. A repair that dropped only empty summaries,
@@ -16020,8 +16021,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * reported and left alone. The store's history keeps each entry as it was.
    * The summary and its carriers are written in one write of the summaries,
    * so they never part: each holds the old text, or each the new. A write
-   * that throws may still have landed, and this strategy then holds the new
-   * text: read the summary before asking for the edit again. Without `apply`
+   * that throws may still have landed: the error says so, and this strategy
+   * holds the new text where it could read the store back and found it
+   * there. Read the summary before asking for the edit again. Without `apply`
    * nothing is written. Refused as SummaryTextEditOptions says, and, before
    * anything is written, where the stored summaries can't be shown to be as
    * this strategy holds them (another handle wrote them, or reading them
@@ -16067,7 +16069,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             landed = false;
           }
           if (landed) this.summaries = summaries;
-          throw error;
+          throw new Error(
+            `the write of summary ${id}'s edit threw, and it ${landed ? 'landed' : 'may have landed'}: read the summary before asking for the edit again (${error instanceof Error ? error.message : String(error)})`,
+            { cause: error },
+          );
         }
       }
       this.summaries = summaries;
@@ -16115,7 +16120,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   cloneForScratch(): ContextStrategy {
     if (Object.getPrototypeOf(this) !== AutobiographicalStrategy.prototype) {
-      throw new Error(`${this.name}: a subclass of AutobiographicalStrategy gives its own cloneForScratch, or the caller gives a strategy`);
+      throw new Error(`${this.name}: a subclass of AutobiographicalStrategy gives its own cloneForScratch`);
     }
     return new AutobiographicalStrategy({ ...this.config, autoTickOnNewMessage: false, logEffectiveConfig: false });
   }

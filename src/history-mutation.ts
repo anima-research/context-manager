@@ -211,9 +211,7 @@ export interface HistoryState {
   view: readonly StoredMessage[];
   memory: HistoryMemory | null;
   windowMode: 'legacy' | 'presented';
-  /** Once a host presents rows: each row of the window and its ordinal, in window order. */
   windowOrdinals?: ReadonlyArray<{ id: MessageId; ordinal: number | undefined }>;
-  /** The manager's view filter, which decides what of the window a compile sends. */
   viewKeeps?: (row: StoredMessage) => boolean;
   thinkingBoundThrough?: Sequence;
 }
@@ -221,7 +219,6 @@ export interface HistoryState {
 export interface HistoryMemory {
   summaries: readonly SummaryEntry[];
   chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
-  /** The summaries as the store holds them, where another handle wrote them since the strategy read them; else as `summaries`. */
   stored?: readonly unknown[];
 }
 
@@ -589,6 +586,7 @@ export function planMutation(
       sourceBranch: state.branch,
       targets,
       droppedSummaries: entries(state.memory, droppedSummaries),
+      editedSummaries: entries(state.memory, targets.flatMap((target) => (target.kind === 'edit_summary' ? [target.summaryId, ...target.carriedBy] : []))),
       ...effects,
       readers: readerPlans.map((r, i) => ({ ...r, droppedSummaries: entries(readers[i]!.state.memory, r.droppedSummaries) })),
     }), 'utf8')
@@ -936,6 +934,8 @@ function recordMismatches(plan: HistoryMutationPlan, source: HistorySnapshot, wr
   return out;
 }
 
+const removesRows = (plan: HistoryMutationPlan): boolean => plan.targets.some((target) => target.kind === 'remove_messages');
+
 const POINTERS = ['parentId', 'mergedInto'] as const;
 const CARRIED_AS = ['id', 'level', 'sourceLevel', 'sourceIds', 'carriedFrom', ...POINTERS];
 
@@ -943,6 +943,7 @@ function summaryMismatches(
   source: HistorySnapshot,
   droppedSummaries: readonly string[],
   written: HistoryState,
+  mayCarry: boolean,
   edits: ReadonlyMap<string, PlannedSummaryEdit> = new Map(),
   by?: Omit<MessageEditStamp, 'label'>,
 ): string[] {
@@ -954,7 +955,7 @@ function summaryMismatches(
   for (const [id, summary] of branch) {
     if (before.has(id)) continue;
     const carried = summary.carriedFrom !== undefined ? branch.get(summary.carriedFrom) : undefined;
-    const isCarry = carried !== undefined && carriesItsSource(summary) && summary.level === carried.level + 1
+    const isCarry = mayCarry && carried !== undefined && carriesItsSource(summary) && summary.level === carried.level + 1
       && summary.sourceLevel === carried.level && carried.mergedInto === id && differing(summary, carried, CARRIED_AS).length === 0;
     if (isCarry) carries.set(id, carried.id);
     else out.push(`summary ${id} is there, and the source didn't hold it`);
@@ -977,8 +978,9 @@ function summaryMismatches(
     const edit = edits.get(was.id);
     const changed = [...differing(got, edit ? editedEntry(was, edit) : was, [...POINTERS, ...(edit ? ['external'] : [])]), ...pointersMoved(got, was)];
     if (changed.length > 0) out.push(`summary ${was.id}'s ${changed.join(', ')} ${edit ? 'other than the edit writes' : 'changed'}`);
-    if (edit && by && asStored({ by: got.external?.by, note: got.external?.note }) !== asStored({ by: by.by, note: by.note })) {
-      out.push(`summary ${was.id} doesn't record the edit as made (external)`);
+    if (edit && by) {
+      const { at, ...named } = got.external ?? { at: undefined };
+      if (typeof at !== 'number' || asStored(named) !== asStored({ by: by.by, note: by.note })) out.push(`summary ${was.id} doesn't record the edit as made (external)`);
     }
   }
   for (const id of carries.keys()) {
@@ -1001,11 +1003,12 @@ export function readerReadBackMismatches(
   stamp: Omit<MessageEditStamp, 'label'>,
   stillInWindow: readonly MessageId[],
 ): string[] {
-  const out = stillInWindow.map((id) => `message ${id} is still in its window`);
-  out.push(...windowMismatches(plan, source, written));
-  out.push(...recordMismatches(plan, source, written.record, stamp));
-  out.push(...summaryMismatches(source, reader.droppedSummaries, written));
-  return out.map((mismatch) => `reader ${reader.namespace}: ${mismatch}`);
+  return [
+    ...stillInWindow.map((id) => `message ${id} is still in its window`),
+    ...windowMismatches(plan, source, written),
+    ...recordMismatches(plan, source, written.record, stamp),
+    ...summaryMismatches(source, reader.droppedSummaries, written, reader.droppedSummaries.length > 0 || removesRows(plan)),
+  ].map((mismatch) => `reader ${reader.namespace}: ${mismatch}`);
 }
 
 /** What an apply records on each message it edits (`metadata.historyMutation`). */
@@ -1022,12 +1025,14 @@ export function readBackMismatches(
   source: HistorySnapshot,
   written: HistoryState,
   stamp: Omit<MessageEditStamp, 'label'>,
+  stillInWindow: readonly MessageId[] = [],
 ): string[] {
   const edits = new Map<string, PlannedSummaryEdit>();
   for (const target of plan.targets) if (target.kind === 'edit_summary') for (const id of [target.summaryId, ...target.carriedBy]) edits.set(id, target);
   return [
+    ...stillInWindow.map((id) => `message ${id} is still in its window`),
     ...windowMismatches(plan, source, written),
     ...recordMismatches(plan, source, written.record, stamp),
-    ...summaryMismatches(source, plan.droppedSummaries, written, edits, stamp),
+    ...summaryMismatches(source, plan.droppedSummaries, written, plan.droppedSummaries.length > 0 || removesRows(plan), edits, stamp),
   ];
 }

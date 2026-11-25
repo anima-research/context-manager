@@ -22,7 +22,6 @@ type Command = 'export-request' | 'import' | 'edit';
 
 const COMMON = ['--namespace', '--message-slot'];
 const WRITE = ['--body-file', '--by', '--note'];
-/** The options each subcommand takes with a value; its flags (FLAGS) take none. */
 const VALUE_OPTIONS: Record<Command, readonly string[]> = {
   'export-request': [...COMMON, '--level', '--chunk', '--out', '--model', '--participant', '--recipe', '--tools-log'],
   import: [...COMMON, ...WRITE, '--descriptor'],
