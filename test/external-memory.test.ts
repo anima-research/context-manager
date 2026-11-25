@@ -412,7 +412,7 @@ describe('external-memory', () => {
     for (const apply of [[], ['--apply']]) {
       const refused = await run(['edit', path, '--namespace', NS, '--id', target.id, '--body-file', bodyFile('By hand.'), '--by', 'operator', ...apply]);
       assert.equal(refused.code, 1);
-      assert.match(refused.stderr, new RegExp(`summary ${target.id} renders 2 verbatim response block\\(s\\)`));
+      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, renders 2 verbatim response block\\(s\\)`));
     }
     assert.equal(memory(path), before, 'nothing is written');
   });
@@ -448,10 +448,13 @@ describe('external-memory', () => {
     });
     await asResident(path, answers, async (manager) => {
       assert.equal(manager.getSummary(carrier.id)?.carriedFrom, under.id, 'setup: the resident keeps the carried entry');
-      assert.throws(
-        () => manager.editSummaryText(carrier.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true }),
-        new RegExp(`summary ${carrier.id} carries ${under.id} up a level, .*: edit ${under.id}`),
-      );
+      for (const apply of [false, true]) {
+        assert.throws(
+          () => manager.editSummaryText(carrier.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true, apply }),
+          new RegExp(`summary ${carrier.id} carries ${under.id} up a level, .*: edit ${under.id}`),
+          `apply: ${apply}`,
+        );
+      }
       const edit = manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { dropResponseContent: true, apply: true });
       assert.deepEqual(edit.carriedBy, [{ id: carrier.id, level: 2 }]);
       assert.deepEqual(edit.parents, [], 'a carrier is not merged over the text: it reads it as it stands');

@@ -73,7 +73,7 @@ describe('history mutation plan', () => {
     assert.deepEqual(codes([editMessage('m3', text('x'), { expectedAfterSha256: sha('m0') })]), ['AFTER_SHA_MISMATCH']);
   });
 
-  it('puts the label first in an edited message, once, and refuses a blank one', () => {
+  it('puts the label first in an edited message unless a text block holds it, and refuses a blank one', () => {
     const plan = planMutation(state(), { ops: [editMessage('m3', text('it says b'))] });
     assert.equal(plan.valid, true);
     const target = plan.targets[0]!;
@@ -304,6 +304,9 @@ describe('history mutation plan', () => {
     const edited = { summaries: MEMORY.summaries.map((s) => (s.id === 'L1-b' ? { ...s, content: 'edited since' } : s)), chunkRecords: MEMORY.chunkRecords };
     assert.notEqual(sha256({ memory: MEMORY }, {}), sha256({ memory: edited }, {}), 'a summary it drops');
     assert.notEqual(sha256({}, { memory: MEMORY }), sha256({}, { memory: edited }), 'a summary it drops of the reader\'s');
+    const summaryEdit = { ops: [{ kind: 'edit_summary' as const, summaryId: 'L1-b', expectedSha256: textSha256('memory L1-b'), newText: 'by hand', parentPolicy: 'leave_parents' as const }] };
+    const storedSince = { ...MEMORY, stored: MEMORY.summaries.map((s) => (s.id === 'L1-b' ? { ...s, content: 'edited since' } : s)) };
+    assert.notEqual(planMutation(state({ memory: MEMORY }), summaryEdit).planSha256, planMutation(state({ memory: storedSince }), summaryEdit).planSha256, 'a summary it edits, as the store holds it');
   });
 
   it('places a change by the rows of every slot the manager merges', () => {
@@ -338,13 +341,20 @@ describe('history mutation plan', () => {
     const top = MEMORY.summaries[3]!;
     const carry: SummaryEntry = { ...top, id: 'L4-k', level: 4, sourceLevel: 3, sourceIds: ['L3-c'], carriedFrom: 'L3-c' };
     const carried = [...MEMORY.summaries.slice(0, 3), { ...top, mergedInto: 'L4-k' }];
-    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...carried, carry]), stamp), [], 'the strategy\'s carry of a summary it holds');
+    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...carried, carry]), stamp), ['summary L4-k is there, and the source didn\'t hold it', 'summary L3-c\'s mergedInto changed'], 'a change that drops nothing and removes nothing makes no carry');
+    const spare = row('m7', 8, 'User', text('a spare row'));
+    const withSpare = state({ rows: [...ROWS, spare], record: [aux, ...ROWS, spare], memory: MEMORY });
+    const removal = planMutation(withSpare, { ops: [{ kind: 'remove_messages', messageIds: ['m7'], expectedSha256ById: { m7: messageContentSha256(spare.content) } }] });
+    assert.deepEqual(removal.violations, []);
+    assert.deepEqual(removal.droppedSummaries, [], 'setup: the removal drops nothing');
+    assert.deepEqual(readBackMismatches(removal, snapshotOf(withSpare), written([aux, ...ROWS], [...carried, carry]), stamp), [], 'the strategy\'s carry of a summary it holds, after rows leave');
+    const afterRemoval = (summaries: readonly SummaryEntry[]) => readBackMismatches(removal, snapshotOf(withSpare), written([aux, ...ROWS], summaries), stamp);
     const unmarked = [...MEMORY.summaries, carry];
-    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, unmarked), stamp), ['summary L4-k is there, and the source didn\'t hold it'], 'its source isn\'t merged into it');
+    assert.deepEqual(afterRemoval(unmarked), ['summary L4-k is there, and the source didn\'t hold it'], 'its source isn\'t merged into it');
     const reworded = [...carried, { ...carry, content: 'another memory' }];
-    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, reworded), stamp), ['summary L4-k is there, and the source didn\'t hold it', 'summary L3-c\'s mergedInto changed'], 'it renders other than what it carries');
+    assert.deepEqual(afterRemoval(reworded), ['summary L4-k is there, and the source didn\'t hold it', 'summary L3-c\'s mergedInto changed'], 'it renders other than what it carries');
     const stray = summary('L4-z', 4, ['L3-c'], 'm0', 'm6');
-    assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(asPlanned, [...MEMORY.summaries, stray]), stamp), ['summary L4-z is there, and the source didn\'t hold it']);
+    assert.deepEqual(afterRemoval([...MEMORY.summaries, stray]), ['summary L4-z is there, and the source didn\'t hold it']);
   });
 
   it('reads back each field of a row and of a summary, as the store keeps it', () => {
@@ -371,6 +381,13 @@ describe('history mutation plan', () => {
     assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written(rows, respoken as SummaryEntry[]), stamp), ['summary L1-q\'s responseContent changed']);
   });
 
+  it('refuses a summary edit where an entry that carries the summary renders response blocks', () => {
+    const memory: HistoryMemory = { summaries: MEMORY.summaries.map((s) => (s.id === 'L3-c' ? { ...s, responseContent: [{ type: 'text', text: 'memory L2-p' }] } : s)), chunkRecords: MEMORY.chunkRecords };
+    const op: HistoryMutationOp = { kind: 'edit_summary', summaryId: 'L2-p', expectedSha256: textSha256('memory L2-p'), newText: 'by hand' };
+    assert.deepEqual(codes([op], state({ memory })), ['RESPONSE_CONTENT_SHADOW']);
+    assert.deepEqual(codes([{ ...op, dropResponseContent: true }], state({ memory })), []);
+  });
+
   it('reads back an edited summary as the edit writes it, and nothing more', () => {
     const memory: HistoryMemory = { summaries: [summary('L1-q', 1, ['m6'], 'm6', 'm6', { stitched: { split: 'r' } })], chunkRecords: [] };
     const s = state({ memory });
@@ -388,5 +405,8 @@ describe('history mutation plan', () => {
       ['summary L1-q\'s responseContent other than the edit writes'],
     );
     assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written([{ ...asEdited, external: { by: 'someone else', at: 5 } }]), stamp), ['summary L1-q doesn\'t record the edit as made (external)']);
+    for (const external of [{ by: 'operator', at: 5, requestHash: 'not the edit\'s' }, { by: 'operator' }]) {
+      assert.deepEqual(readBackMismatches(plan, snapshotOf(s), written([{ ...asEdited, external } as SummaryEntry]), stamp), ['summary L1-q doesn\'t record the edit as made (external)'], JSON.stringify(external));
+    }
   });
 });

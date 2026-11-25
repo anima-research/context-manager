@@ -157,6 +157,25 @@ async function apply(manager: ContextManager, manifest: HistoryMutationManifest,
   });
 }
 
+function heldGate(): { pass(): Promise<void>; held(): Promise<void>; open(): void } {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  let waiting = false;
+  const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+  return {
+    pass: async () => {
+      waiting = true;
+      await opened;
+    },
+    held: async () => {
+      for (let i = 0; i < 200 && !waiting; i++) await turn();
+      assert.ok(waiting, 'setup: the hook was called');
+      for (let i = 0; i < 50; i++) await turn();
+    },
+    open: () => open(),
+  };
+}
+
 describe('history mutation', () => {
   it('edits a summary on a new branch, moves the store there, and leaves the source branch as it was', async () => {
     const path = await residentStore();
@@ -191,6 +210,9 @@ describe('history mutation', () => {
         await assert.rejects(run, (error: unknown) => error instanceof HistoryMutationError && error.violations.some((v) => v.code === code));
       };
       await refusal(() => apply(manager, { ops: [{ ...op, expectedSha256: '0'.repeat(64) }] }, 'x'), 'CAS_MISMATCH');
+      for (const asked of [apply(manager, { ops: [{ ...op, expectedSha256: '0'.repeat(64) }] }, 'x'), manager.compileMutationPreview({ ops: [{ ...op, expectedSha256: '0'.repeat(64) }] }, { by: { by: 'operator' } })]) {
+        await assert.rejects(asked, (error: unknown) => error instanceof Error && /^the plan has 1 violation\(s\): CAS_MISMATCH \(op 0\): summary [^ ]+'s text has sha256 [0-9a-f]{64}, not 0{64}/.test(error.message));
+      }
       await refusal(() => manager.applyHistoryMutation(manifest, { targetBranch: 'x', expectedSourceBranch: 'other', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }), 'BRANCH_MISMATCH');
       for (const by of ['', '  ']) {
         await assert.rejects(manager.applyHistoryMutation(manifest, { targetBranch: 'x', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by } }), /give a `by` that isn't blank/);
@@ -254,6 +276,7 @@ describe('history mutation', () => {
       assert.deepEqual(refused.violations.map((v) => v.code), ['FOLDED_ROW_REQUIRES_POLICY']);
       const manifest: HistoryMutationManifest = { ops: [{ ...op, foldedPolicy: 'drop_covering_summaries' }] };
       const plan = manager.planHistoryMutation(manifest);
+      assert.ok(plan.droppedSummaries.includes(folded.id), 'the plan drops the summary that folds the row');
       const receipt = await apply(manager, manifest, 'surgery/folded', plan);
       assert.deepEqual([...receipt.droppedSummaries].sort(), [...plan.droppedSummaries].sort());
       for (const dropped of plan.droppedSummaries) assert.equal(manager.getSummary(dropped), null, `${dropped} is dropped`);
@@ -337,7 +360,7 @@ describe('history mutation', () => {
       assert.ok(described?.kind === 'summary');
       assert.deepEqual(described.carriedBy, [carrier.id]);
       const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_summary', summaryId: under.id, expectedSha256: described.sha256, newText: 'Carried, by hand.', dropResponseContent: true }] };
-      await assert.rejects(apply(manager, manifest, 'surgery/carried'), /a subclass of AutobiographicalStrategy gives its own cloneForScratch, or the caller gives a strategy/);
+      await assert.rejects(apply(manager, manifest, 'surgery/carried'), /a subclass of AutobiographicalStrategy gives its own cloneForScratch: give a strategy/);
       const plan = manager.planHistoryMutation(manifest);
       await assert.rejects(manager.applyHistoryMutation(manifest, {
         targetBranch: 'surgery/carried', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
@@ -364,7 +387,7 @@ describe('history mutation', () => {
     }
   });
 
-  it('writes a summary and its carriers in one write, so an edit a write cut short leaves them as they were and can be asked for again', async () => {
+  it('writes a summary and its carriers in one write, so an edit whose write fails before it lands leaves them as they were and can be asked for again', async () => {
     const { path, under, carrier } = await carriedStore();
     await resident(path, async (manager) => {
       const described = manager.describeMutationTarget({ summaryId: under.id });
@@ -378,15 +401,25 @@ describe('history mutation', () => {
       };
       const ask = () => manager.editSummaryText(under.id, 'Carried, by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: described.sha256 });
       try {
-        assert.throws(ask, /the disk is full/);
+        assert.throws(ask, /threw, and it may have landed: read the summary before asking for the edit again \(the disk is full\)/);
       } finally {
         store.setStateJson = set;
       }
+      let writes = 0;
+      store.setStateJson = (id: string, value: unknown) => {
+        if (id === summariesId) writes++;
+        return set(id, value);
+      };
       assert.deepEqual([manager.getSummary(under.id)?.content, manager.getSummary(carrier.id)?.content], [under.content, carrier.content], 'neither changed in memory');
       assert.deepEqual(summariesOn(manager, 'main').filter((s) => s.id === under.id || s.id === carrier.id).map((s) => s.content), [under.content, carrier.content], 'nor in the store');
       const compiled = rendered((await manager.compile(undefined, undefined, { dryRun: true })).messages);
       assert.ok(!compiled.includes('Carried, by hand.'), 'a compile renders neither as edited');
-      ask();
+      try {
+        ask();
+      } finally {
+        store.setStateJson = set;
+      }
+      assert.equal(writes, 1, 'asked again, the summary and its carrier go in one write');
       assert.equal(manager.getSummary(under.id)?.content, 'Carried, by hand.');
       assert.equal(manager.getSummary(carrier.id)?.content, 'Carried, by hand.');
       assert.deepEqual(summariesOn(manager, 'main').filter((s) => s.id === under.id || s.id === carrier.id).map((s) => s.content), ['Carried, by hand.', 'Carried, by hand.']);
@@ -405,7 +438,7 @@ describe('history mutation', () => {
       for (const [what, stored] of [
         ['the summary is gone', held.filter((s) => s.id !== under.id)],
         ['a carrier is gone', held.filter((s) => s.id !== carrier.id)],
-        ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text', mergedInto: 'L3-elsewhere' } : s))],
+        ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text' } : s))],
       ] as const) {
         store.setStateJson(summariesId, stored);
         assert.throws(ask, /the stored summaries can't be shown to be as this strategy holds them/, what);
@@ -1098,12 +1131,13 @@ describe('history mutation', () => {
 
   it('waits for a reader\'s strategy to let go of the rows it was told left before going on', async () => {
     const events: string[] = [];
+    const gate = heldGate();
     class SlowLetGo extends AutobiographicalStrategy {
       constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
         super(settings);
       }
       override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        await gate.pass();
         await super.onRetracted(...args);
         events.push('let go');
       }
@@ -1119,40 +1153,64 @@ describe('history mutation', () => {
       const ids = [...folded.sourceIds];
       const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(a, id)])) }] };
       const plan = a.planHistoryMutation(manifest, { readers: [b] });
-      await a.applyHistoryMutation(manifest, {
+      const applied = a.applyHistoryMutation(manifest, {
         targetBranch: 'surgery/slow', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
         beforeSwitch: async () => { events.push('beforeSwitch'); },
       });
+      await gate.held();
+      assert.deepEqual(events, [], 'nothing goes on while the let-go is held');
+      gate.open();
+      await applied;
       assert.deepEqual(events.slice(0, 2), ['let go', 'beforeSwitch']);
       assert.ok(summariesIn(b, NS_B, 'surgery/slow').every((s) => !plan.readers[0]!.droppedSummaries.includes(s.id)));
     }, () => new SlowLetGo({ ...RESIDENT, autoTickOnNewMessage: false } as never));
   });
 
-  it('refuses an apply while a reader stores the shards of a sharded addMessage', async () => {
+  it('refuses a preview or an apply while a reader stores the shards of a sharded addMessage', async () => {
     class Sharding extends PassthroughStrategy {
       chunkIngressMessage(_participant: string, content: ContentBlock[]) {
         return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
       }
     }
+    for (const operation of ['compileMutationPreview', 'applyHistoryMutation'] as const) {
+      const path = join(dir, `store-${stores++}`);
+      const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+      const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new Sharding() });
+      try {
+        const id = main.addMessage('User', [{ type: 'text', text: 'an earlier row' }]);
+        const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(main, id), content: [{ type: 'text', text: 'redacted' }], label: '[redacted by operator]' }] };
+        const plan = main.planHistoryMutation(manifest, { readers: [side] });
+        let asked: Promise<unknown> | undefined;
+        side.onMessage((event) => {
+          if (event.type !== 'add' || asked) return;
+          asked = operation === 'compileMutationPreview'
+            ? main.compileMutationPreview(manifest, { by: { by: 'operator' }, readers: [side] })
+            : main.applyHistoryMutation(manifest, { targetBranch: 'surgery/reader-mid-add', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [side] });
+        });
+        side.addMessage('Ada', [{ type: 'text', text: 'one ' }, { type: 'text', text: 'two ' }, { type: 'text', text: 'three' }]);
+        assert.ok(asked, `setup: the ${operation} was asked for`);
+        await assert.rejects(asked, new RegExp(`^Error: ContextManager\\.${operation} refused: a sharded addMessage is storing its shards`));
+        assert.deepEqual(branchNames(main), ['main'], operation);
+      } finally {
+        side.close();
+        main.close();
+      }
+    }
+  });
+
+  it('says that a plan drifts where the history, the manifest or the readers changed', async () => {
     const path = join(dir, `store-${stores++}`);
-    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
-    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new Sharding() });
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
-      const id = main.addMessage('User', [{ type: 'text', text: 'an earlier row' }]);
-      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(main, id), content: [{ type: 'text', text: 'redacted' }], label: '[redacted by operator]' }] };
-      const plan = main.planHistoryMutation(manifest, { readers: [side] });
-      let asked: Promise<unknown> | undefined;
-      side.onMessage((event) => {
-        if (event.type !== 'add' || asked) return;
-        asked = main.applyHistoryMutation(manifest, { targetBranch: 'surgery/reader-mid-add', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [side] });
-      });
-      side.addMessage('Ada', [{ type: 'text', text: 'one ' }, { type: 'text', text: 'two ' }, { type: 'text', text: 'three' }]);
-      assert.ok(asked, 'setup: the apply was asked for');
-      await assert.rejects(asked, /^Error: ContextManager\.applyHistoryMutation refused: a sharded addMessage is storing its shards/);
-      assert.deepEqual(branchNames(main), ['main']);
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const op = { kind: 'edit_message' as const, messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text' as const, text: 'as edited' }] };
+      const plan = manager.planHistoryMutation({ ops: [op] });
+      await assert.rejects(
+        manager.applyHistoryMutation({ ops: [{ ...op, content: [{ type: 'text', text: 'edited otherwise' }] }] }, { targetBranch: 'surgery/drift', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }),
+        (error: unknown) => refusedWith('PLAN_DRIFT')(error) && /the history, the manifest or the readers changed since that plan was made/.test(String(error)),
+      );
     } finally {
-      side.close();
-      main.close();
+      manager.close();
     }
   });
 
@@ -1250,6 +1308,11 @@ describe('history mutation', () => {
         });
         return JSON.stringify(adapter.getLastRequest()?.messages);
       };
+      const op = manifest.ops[0]!;
+      assert.ok(op.kind === 'edit_message');
+      const stale = await sent([{ participant: 'Ada', content: op.content }]);
+      assert.match(stale, /Monday/, 'setup: sent as the edit gives it, the kept replay form sends the old text');
+      assert.doesNotMatch(stale, /Tuesday/, 'setup: and not the new');
       const preview = await manager.compileMutationPreview(manifest, { by: { by: 'operator' } });
       await apply(manager, manifest, 'surgery/replayed');
       const compiled = await manager.compile(undefined, undefined, { dryRun: true });
@@ -1270,17 +1333,14 @@ describe('history mutation', () => {
       const plan = manager.planHistoryMutation(manifest);
       const store = manager.getStore();
       const { createBranch, deleteBranch } = { createBranch: store.createBranch.bind(store), deleteBranch: store.deleteBranch.bind(store) };
-      store.createBranch = (name: string, from?: string | null) => {
-        createBranch(name, from);
-        throw new Error('the checkpoint of the new branch failed');
-      };
-      await assert.rejects(apply(manager, manifest, 'surgery/created', plan), /the checkpoint of the new branch failed/);
-      store.createBranch = createBranch;
+      store.createBranch = (name: string, from?: string | null) => (name === 'surgery/created' ? withBranchFileBlocked(path, () => createBranch(name, from)) : createBranch(name, from));
+      try {
+        await assert.rejects(apply(manager, manifest, 'surgery/created', plan));
+      } finally {
+        store.createBranch = createBranch;
+      }
       assert.ok(!branchNames(manager).includes('surgery/created'), 'a branch created in memory before its checkpoint failed is deleted');
-      store.deleteBranch = (name: string) => {
-        deleteBranch(name);
-        throw new Error('the checkpoint of the deletion failed');
-      };
+      store.deleteBranch = (name: string) => (name === 'surgery/unsaved' ? withBranchFileBlocked(path, () => deleteBranch(name)) : deleteBranch(name));
       try {
         await assert.rejects(
           manager.applyHistoryMutation(manifest, {
@@ -1293,6 +1353,12 @@ describe('history mutation', () => {
         store.deleteBranch = deleteBranch;
       }
       assert.equal(manager.currentBranch().name, 'main');
+      assert.ok(!branchNames(manager).includes('surgery/unsaved'), 'the deletion holds in memory');
+      store.sync();
+    });
+    await resident(path, async (manager) => {
+      assert.equal(manager.currentBranch().name, 'main');
+      assert.ok(!branchNames(manager).some((name) => name === 'surgery/created' || name === 'surgery/unsaved'), 'saved, neither branch is there on a reopen');
     });
   });
 
@@ -1393,7 +1459,6 @@ describe('history mutation', () => {
       assert.deepEqual(manager.checkHistoryInvariants(), []);
     });
   });
-  /** Run `body` with the store's branch file unwritable, as a full or failing disk leaves it: chronicle's switch selects the branch, then its checkpoint fails. */
   function withBranchFileBlocked<T>(path: string, body: () => T): T {
     const file = join(path, 'branches.bin');
     renameSync(file, `${file}.held`);
@@ -1545,7 +1610,7 @@ describe('history mutation', () => {
       };
       const ask = () => manager.editSummaryText(target.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: op.expectedSha256 });
       try {
-        assert.throws(ask, /the write landed, and then failed/);
+        assert.throws(ask, /threw, and it landed: read the summary before asking for the edit again \(the write landed, and then failed\)/);
       } finally {
         store.setStateJson = set;
       }
@@ -1648,6 +1713,235 @@ describe('history mutation', () => {
           a.close();
         }
       }
+    }
+  });
+  it('waits for its own strategy on the branch to let go of the rows it removes before going on', async () => {
+    const events: string[] = [];
+    const gate = heldGate();
+    class HeldLetGo extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0], private readonly staged = false) {
+        super(settings);
+      }
+      override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
+        if (this.staged) await gate.pass();
+        await super.onRetracted(...args);
+        if (this.staged) events.push('let go');
+      }
+      override cloneForScratch(): HeldLetGo {
+        return new HeldLetGo({ ...this.settings, autoTickOnNewMessage: false }, true);
+      }
+    }
+    const path = await residentStore();
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new HeldLetGo({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    try {
+      manager.presentRows([]);
+      const folded = summariesOn(manager, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(manager, id)])) }] };
+      const plan = manager.planHistoryMutation(manifest);
+      assert.deepEqual(plan.violations, []);
+      const applied = manager.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/held', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+        beforeSwitch: async () => { events.push('beforeSwitch'); },
+      });
+      await gate.held();
+      assert.deepEqual(events, [], 'nothing goes on while the let-go is held');
+      gate.open();
+      await applied;
+      assert.deepEqual(events.slice(0, 2), ['let go', 'beforeSwitch']);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses to switch where a strategy on the branch fails to let go of the rows it removes', async () => {
+    class FailingLetGo extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0], private readonly staged = false) {
+        super(settings);
+      }
+      override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
+        await super.onRetracted(...args);
+        if (this.staged) throw new Error('its own record of the let-go failed to write');
+      }
+      override cloneForScratch(): FailingLetGo {
+        return new FailingLetGo({ ...this.settings, autoTickOnNewMessage: false }, true);
+      }
+    }
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      a.presentRows([]);
+      b.presentRows([]);
+      const folded = summariesIn(b, NS_B, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(a, id)])) }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.deepEqual(plan.violations, []);
+      const branches = branchNames(a);
+      await assert.rejects(
+        a.applyHistoryMutation(manifest, { targetBranch: 'surgery/unheard', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b] }),
+        /the autobiographical strategy's onRetracted failed on the branch: its own record of the let-go failed to write/,
+      );
+      assert.equal(a.currentBranch().name, 'main');
+      assert.deepEqual(branchNames(a), branches, 'the branch it built is deleted');
+    }, () => new FailingLetGo({ ...RESIDENT, autoTickOnNewMessage: false } as never));
+  });
+
+  it('drops each summary its plan drops where the strategy doesn\'t hear rows leave', async () => {
+    class Unhearing extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
+        super(settings);
+        Object.defineProperty(this, 'onRetracted', { value: undefined });
+      }
+      override cloneForScratch(): Unhearing {
+        return new Unhearing({ ...this.settings, autoTickOnNewMessage: false });
+      }
+    }
+    const path = await residentStore();
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new Unhearing({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    try {
+      assert.equal(manager.getStrategy().onRetracted, undefined, 'setup: the strategy has no onRetracted');
+      const folded = summariesOn(manager, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(manager, id)])), foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const plan = manager.planHistoryMutation(manifest);
+      assert.deepEqual(plan.violations, []);
+      assert.ok(plan.droppedSummaries.includes(folded.id), 'setup: the plan drops the summary that folds the rows');
+      await manager.applyHistoryMutation(manifest, { targetBranch: 'surgery/unheard', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } });
+      assert.equal(manager.currentBranch().name, 'surgery/unheard');
+      const left = new Set(summariesOn(manager, 'surgery/unheard').map((s) => s.id));
+      assert.deepEqual(plan.droppedSummaries.filter((id) => left.has(id)), []);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('names the editor it was asked with, though the caller changes it while it runs', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager, 'A memory named by its editor.');
+      let text = '';
+      for (let maxTokens = 2_000; maxTokens >= 400 && !text.includes('editedBy='); maxTokens -= 100) {
+        const by = { by: 'operator' };
+        const asked = manager.compileMutationPreview(manifest, { by, budget: { maxTokens, reserveForResponse: 50 } });
+        by.by = 'someone else';
+        text = rendered((await asked).compiled.messages);
+      }
+      assert.match(text, /editedBy="operator">\nA memory named by its editor\./);
+    });
+  });
+
+  it('reports the head of the branch at the switch, before the manager initializes there', async () => {
+    let store: JsStore | undefined;
+    class WritesOnInit extends PassthroughStrategy {
+      async initialize(): Promise<void> {
+        if (store) new MessageStore(store, { namespace: 'agents/Log' }).append('User', [{ type: 'text', text: 'initialized here' }]);
+      }
+    }
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new WritesOnInit() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      const plan = manager.planHistoryMutation(manifest);
+      const native = manager.getStore();
+      const switchBranch = native.switchBranch.bind(native);
+      let atSwitch: number | undefined;
+      native.switchBranch = (name: string) => {
+        const switched = switchBranch(name);
+        if (name === 'surgery/headed') atSwitch = native.currentSequence();
+        return switched;
+      };
+      store = native;
+      let receipt: Awaited<ReturnType<ContextManager['applyHistoryMutation']>>;
+      try {
+        receipt = await manager.applyHistoryMutation(manifest, {
+          targetBranch: 'surgery/headed', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, strategy: () => new PassthroughStrategy(),
+        });
+      } finally {
+        native.switchBranch = switchBranch;
+        store = undefined;
+      }
+      assert.ok(atSwitch !== undefined && native.currentSequence() > atSwitch, 'setup: the manager wrote on the branch as it initialized there');
+      assert.equal(receipt.toSequence, atSwitch);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('deletes the branch it made where reading the source\'s head then fails', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const currentSequence = store.currentSequence.bind(store);
+      store.currentSequence = () => {
+        if (store.listBranches().some((b) => b.name === 'surgery/unread')) throw new Error('the head could not be read');
+        return currentSequence();
+      };
+      try {
+        await assert.rejects(
+          manager.applyHistoryMutation(manifest, { targetBranch: 'surgery/unread', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }),
+          /the head could not be read/,
+        );
+      } finally {
+        store.currentSequence = currentSequence;
+      }
+      assert.deepEqual(branchNames(manager), ['main']);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses to switch to a branch where a removed row keeps a place in the manager\'s window', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const kept = manager.addMessage('User', [{ type: 'text', text: 'keep me' }]);
+      const gone = manager.addMessage('Ada', [{ type: 'text', text: 'remove me' }]);
+      manager.presentRows([kept, gone]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [gone], expectedSha256ById: { [gone]: messageSha(manager, gone) } }] };
+      const plan = manager.planHistoryMutation(manifest);
+      assert.deepEqual(plan.violations, []);
+      await assert.rejects(manager.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/tombstone', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+        beforeSwitch: async ({ view }) => {
+          view.appendToStateJson(`${NS}/window`, { id: gone });
+        },
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`message ${gone} is still in its window`).test(String(error)));
+      assert.equal(manager.currentBranch().name, 'main');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('prices a summary by its text again once it takes up the summaries another handle wrote', async () => {
+    const path = await residentStore();
+    const strategy = new AnswerOf({ ...RESIDENT, autoTickOnNewMessage: false } as never);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy, membrane });
+    try {
+      const { target } = l1Edit(manager);
+      const prose = 'a plain memory in words '.repeat(4);
+      const dense = '.,;:!?'.repeat(prose.length / 6);
+      manager.editSummaryText(target.id, prose, { by: 'operator' }, { apply: true, dropResponseContent: true });
+      const proseCost = strategy.price(target.id).estimate;
+      manager.presentRows([]);
+      const late = manager.addMessage('User', [{ type: 'text', text: 'a row to let go of' }]);
+      manager.presentRows([late]);
+      const store = manager.getStore();
+      const summariesId = `${NS}/autobio:summaries`;
+      store.setStateJson(summariesId, (store.getStateJson(summariesId) as SummaryEntry[]).map((s) => (s.id === target.id ? { ...s, content: dense } : s)));
+      manager.retractRows([late]);
+      for (let i = 0; i < 50 && manager.getSummary(target.id)?.content !== dense; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(manager.getSummary(target.id)?.content, dense, 'setup: the let-go took up the stored summaries');
+      assert.notEqual(strategy.freshPrice(target.id), proseCost, 'setup: the two texts price apart');
+      assert.equal(strategy.price(target.id).estimate, strategy.freshPrice(target.id));
+    } finally {
+      manager.close();
     }
   });
 });

@@ -249,6 +249,17 @@ describe('raw forms: keys and release', () => {
     assert.deepEqual(one.map((block) => rawOf(block).rawItem), [undefined, undefined], 'one copy of the part is gone');
   });
 
+  it('content that replaces a message keeps a raw form that the old content didn\'t hold, an opaque carrier\'s item among them', () => {
+    const part = itemText('a part');
+    const fresh = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_9', encrypted_content: 'new' } } as ContentBlock;
+    const added = releaseReplacedRawForms([part], [{ ...part }, fresh]);
+    assert.deepEqual(added.map((block) => rawOf(block).rawItem), [MESSAGE_ITEM, rawOf(fresh).rawItem], 'a new opaque item is the caller\'s');
+    assert.equal(rawOf(releaseReplacedRawForms([opaqueCarrier()], [fresh])[0]!).rawItem, rawOf(fresh).rawItem, 'and so is one that replaces another');
+    const restated = itemText('restated', { type: 'message', id: 'msg_9', role: 'assistant', content: [{ type: 'output_text', text: 'restated' }] });
+    assert.equal(rawOf(releaseReplacedRawForms([part], [restated])[0]!).rawItem, rawOf(restated).rawItem, 'and so is a new message item');
+    assert.equal(rawOf(releaseReplacedRawForms([part], [{ ...part, text: 'reworded' } as ContentBlock])[0]!).rawItem, undefined, 'a copy of the old item still goes');
+  });
+
   it('content that replaces a message keeps the rawXml that is a block\'s content', () => {
     const use = xmlUse('a', '/big');
     const changed = '<function_calls>\n<invoke name="fs:write"/>\n</function_calls>';
