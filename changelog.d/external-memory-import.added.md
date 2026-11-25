@@ -22,10 +22,23 @@
     is read out of it as out of a model's answer. It carries no reasoning.
   - `edit` replaces the text of one summary by id, with the file's text
     stored the same way: lineage untouched, tokens stamped from the new
-    text, and what described the call that wrote the old text dropped (its
-    verbatim response blocks, its `provenance`, its split-stitch record).
-    The summaries merged over the old text are reported and left as they
-    are.
+    text's length, and what described the call that wrote the old text
+    dropped (its `provenance` and its split-stitch record). A summary that
+    renders verbatim response blocks in place of its text is edited only
+    with `--drop-response-content`, which drops them too. An entry that
+    carries another summary of the store up a level (`carriedFrom`) is
+    refused. The refusal names that summary, whose text a compile reads in
+    the entry's place. The entries that carry the edited summary read the
+    new text. They are written again as its copy (text, tokens, `external`,
+    no response blocks), and are reported. The summaries merged over the old
+    text are reported and left as they are. The summary and its carriers are
+    written in one write of the summaries, so they never part. A write that
+    throws says whether it landed, as the store reads back, and the strategy
+    then holds what the store holds. Where the read back fails, the strategy
+    refuses work until it is initialized again. The edit is refused, before
+    anything is written, where the stored summaries or chunk records can't
+    be shown to be as the strategy holds them: after another handle's write,
+    or where reading them fails.
 
   `SummaryEntry.external` (`{ by, at, note?, requestHash? }`, optional)
   records who supplied such a text, and for an installed one the sha256 of
@@ -36,7 +49,9 @@
   `ContextManager.exportMemoryRequest`, `importExternalMemory` and
   `editSummaryText`, over the strategy's methods of the same names
   (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,
-  `MemoryWorkTarget`, `ExternalMemoryProvenance` and `SummaryTextEdit`. They
-  are for a resident that isn't running, called with no tick or other
-  compression in progress on the manager: none waits for compression in
-  flight, or is kept apart from it.
+  `MemoryWorkTarget`, `ExternalMemoryProvenance`, `SummaryTextEdit` and
+  `SummaryTextEditOptions` (`apply`, `dropResponseContent`, and
+  `expectedPriorSha256`, which refuses the edit unless it is the sha256 of
+  the summary's text). They are for a resident that isn't running, called
+  with no tick or other compression in progress on the manager: none waits
+  for compression in flight, or is kept apart from it.

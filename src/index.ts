@@ -123,6 +123,7 @@ export type {
   MemoryWorkItem,
   MemoryWorkTarget,
   SummaryTextEdit,
+  SummaryTextEditOptions,
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
   AddMessageOptions,

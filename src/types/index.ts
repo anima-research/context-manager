@@ -82,6 +82,7 @@ export type {
   MemoryWorkItem,
   MemoryWorkTarget,
   SummaryTextEdit,
+  SummaryTextEditOptions,
   ProtectedRange,
   PinLevelOptions,
   SearchQuery,

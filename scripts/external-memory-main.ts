@@ -14,7 +14,7 @@ const USAGE = [
   '  external-memory import <store-path> --namespace <ns> [--message-slot isolated|shared]',
   '      --descriptor <file> --body-file <file> --by <who> [--note <text>] [--apply]',
   '  external-memory edit <store-path> --namespace <ns> [--message-slot isolated|shared]',
-  '      --id <summary-id> --body-file <file> --by <who> [--note <text>] [--apply]',
+  '      --id <summary-id> --body-file <file> --by <who> [--note <text>] [--drop-response-content] [--apply]',
 ].join('\n');
 
 type Slot = 'isolated' | 'shared';
@@ -22,11 +22,15 @@ type Command = 'export-request' | 'import' | 'edit';
 
 const COMMON = ['--namespace', '--message-slot'];
 const WRITE = ['--body-file', '--by', '--note'];
-/** The options each subcommand takes with a value; --apply, where taken, has none. */
 const VALUE_OPTIONS: Record<Command, readonly string[]> = {
   'export-request': [...COMMON, '--level', '--chunk', '--out', '--model', '--participant', '--recipe', '--tools-log'],
   import: [...COMMON, ...WRITE, '--descriptor'],
   edit: [...COMMON, ...WRITE, '--id'],
+};
+const FLAGS: Record<Command, readonly string[]> = {
+  'export-request': [],
+  import: ['--apply'],
+  edit: ['--apply', '--drop-response-content'],
 };
 
 class UsageError extends Error {}
@@ -34,7 +38,7 @@ class UsageError extends Error {}
 interface Invocation {
   command: Command;
   storePath: string;
-  apply: boolean;
+  flags: Set<string>;
   options: Map<string, string>;
 }
 
@@ -46,12 +50,12 @@ function invocation(args: string[]): Invocation {
   }
   if (storePath === undefined || storePath.startsWith('--')) throw new UsageError('the store path follows the subcommand');
   const options = new Map<string, string>();
-  let apply = false;
+  const flags = new Set<string>();
   for (let at = 0; at < rest.length; at++) {
     const name = rest[at]!;
-    if (name === '--apply' && command !== 'export-request') {
-      if (apply) throw new UsageError('option given twice: --apply');
-      apply = true;
+    if (FLAGS[command].includes(name)) {
+      if (flags.has(name)) throw new UsageError(`option given twice: ${name}`);
+      flags.add(name);
       continue;
     }
     if (!VALUE_OPTIONS[command].includes(name)) {
@@ -79,7 +83,7 @@ function invocation(args: string[]): Invocation {
       throw new UsageError(`--level takes the level a merge writes, 2 or above, not ${JSON.stringify(level)}`);
     }
   }
-  return { command, storePath, apply, options };
+  return { command, storePath, flags, options };
 }
 
 /** What an export wrote: the work, the settings the strategy read it under, and the request. */
@@ -101,7 +105,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     console.error(`${error.message}\n${USAGE}`);
     return 1;
   }
-  const { command, storePath, apply, options } = parsed;
+  const { command, storePath, flags, options } = parsed;
+  const apply = flags.has('--apply');
   const namespace = options.get('--namespace')!;
   const by = { by: options.get('--by')!, ...(options.has('--note') ? { note: options.get('--note')! } : {}) };
 
@@ -220,11 +225,14 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
 
       const sequence = store.currentSequence();
-      const edit = manager.editSummaryText(options.get('--id')!, body, by, { apply });
+      const edit = manager.editSummaryText(options.get('--id')!, body, by, { apply, dropResponseContent: flags.has('--drop-response-content') });
       console.log(`summary: ${edit.id} (L${edit.level})`);
       console.log(`old text: ${edit.prior.length} chars, ${edit.prior.tokens} tokens, sha256 ${edit.prior.sha256}`);
       console.log(`new text: ${body.length} chars, ${edit.tokens} tokens, sha256 ${sha256(body)}, by ${by.by}`);
-      console.log(`verbatim response blocks dropped: ${edit.droppedResponseBlocks}`);
+      console.log(`verbatim response blocks dropped (the most on one entry): ${edit.droppedResponseBlocks}`);
+      if (edit.carriedBy.length > 0) {
+        console.log(`carried up a level by, which read the new text: ${edit.carriedBy.map((carrier) => `${carrier.id} (L${carrier.level})`).join(', ')}`);
+      }
       console.log(edit.parents.length === 0
         ? 'merged over the old text: nothing'
         : `merged over the old text, left as they are: ${edit.parents.map((parent) => `${parent.id} (L${parent.level})`).join(', ')}`);
