@@ -297,6 +297,11 @@ describe('recallEnvelope: the delimiter is a convention, not parseable XML', () 
     assert.ok(!open.includes('span='), 'an unsourceable span must be absent, not empty');
   });
 
+  it('names who supplied a summary\'s text, with what would read as markup written as character references', () => {
+    const { open } = buildRecallEnvelopeTags(fakeSummary({ external: { by: 'A & B <x>\n"y"', at: 1 } }));
+    assert.equal(open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4" editedBy="A &#38; B &#60;x&#62;&#10;&#34;y&#34;">');
+  });
+
   it('does not touch content when the mode is none or unset', () => {
     const summary = fakeSummary();
     const content: ContentBlock[] = [{ type: 'text', text: 'zz-memory-body' }];
