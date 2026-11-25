@@ -32,6 +32,14 @@ export class PassthroughStrategy implements ContextStrategy {
     return { ready: true };
   }
 
+  /** A new instance (ContextStrategy.cloneForScratch). A subclass builds its own. */
+  cloneForScratch(): ContextStrategy {
+    if (Object.getPrototypeOf(this) !== PassthroughStrategy.prototype) {
+      throw new Error(`${this.name}: a subclass of PassthroughStrategy gives its own cloneForScratch, or the caller gives a strategy`);
+    }
+    return new PassthroughStrategy();
+  }
+
   async onNewMessage(message: StoredMessage, ctx: StrategyContext): Promise<void> {
     // No-op: context is rebuilt on select(). There is deliberately no
     // onPresented beside it, so a subclass that overrides this still hears

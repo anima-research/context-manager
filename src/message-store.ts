@@ -951,8 +951,11 @@ export class MessageStore {
    * larger sharded message). Editing one shard would silently corrupt the
    * bodyGroup's byte-faithful reassembly invariant. To replace a sharded
    * message, remove the whole bodyGroup and re-append.
+   *
+   * `options.mergeMetadata` sets those keys of the message's metadata in the
+   * same write; the rest of its metadata stays.
    */
-  edit(messageId: MessageId, newContent: ContentBlock[]): void {
+  edit(messageId: MessageId, newContent: ContentBlock[], options: { mergeMetadata?: Record<string, unknown> } = {}): void {
     newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);
     const index = this.lookupIndex(messageId);
     if (index === undefined) {
@@ -983,6 +986,7 @@ export class MessageStore {
     const updated: StoredMessageInternal = {
       ...oldMessage,
       content: storedContent,
+      ...(options.mergeMetadata ? { metadata: { ...oldMessage.metadata, ...options.mergeMetadata } } : {}),
     };
 
     const cacheWasCurrent = this.cacheIsCurrent();

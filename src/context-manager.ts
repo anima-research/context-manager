@@ -51,8 +51,14 @@ import {
   isRenderingFrontierStrategy,
   isDerivationManifestStrategy,
   isExternalMemoryStrategy,
+  isHistoryMutationStrategy,
 } from './types/index.js';
 import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
+import {
+  describeTarget, historyAnomalies, HistoryMutationError, introducedAnomalies, planMutation, readBackMismatches, snapshotOf,
+  type HistoryAnomaly, type HistoryMutationManifest, type HistoryMutationPlan, type HistoryMutationReceipt, type HistoryState,
+  type MessageEditStamp, type MutationTargetDescription, type MutationViolationCode,
+} from './history-mutation.js';
 import { isStateExistsFor } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
@@ -565,6 +571,10 @@ export class WriteOutcomeUnknownError extends Error {
 /** Rows of a message as an error names them: `message <id>`, or `<n> rows of the message (<ids>)`. */
 function rowsOfTheMessage(ids: readonly MessageId[]): string {
   return ids.length === 1 ? `message ${ids[0]}` : `${ids.length} rows of the message (${ids.join(', ')})`;
+}
+
+function editStamp(by: Omit<ExternalMemoryProvenance, 'at'>, at: number, sourceBranch: string): Omit<MessageEditStamp, 'label'> {
+  return { by: by.by, at, ...(by.note !== undefined ? { note: by.note } : {}), sourceBranch };
 }
 
 /**
@@ -1514,10 +1524,13 @@ export class ContextManager {
    * summary already built from the old content keeps it. To replace content
    * that must reach compressed memory, hold the message (holdCompression /
    * addMessage `holdCompression`) until after the edit.
+   *
+   * `options.mergeMetadata` sets those keys of the message's metadata in the
+   * same write.
    */
-  editMessage(messageId: MessageId, content: ContentBlock[]): void {
+  editMessage(messageId: MessageId, content: ContentBlock[], options?: { mergeMetadata?: Record<string, unknown> }): void {
     this.requireInitialized('editMessage');
-    this.write(() => this.messageStore.edit(messageId, content));
+    this.write(() => this.messageStore.edit(messageId, content, options));
     // Propagation handled by event listener
   }
 
@@ -4631,6 +4644,344 @@ export class ContextManager {
   /** Replace the text of one summary, leaving its lineage and the summaries merged over it as they are (see SummaryTextEditOptions). */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: SummaryTextEditOptions): SummaryTextEdit {
     return this.externalMemoryStrategy('editSummaryText').editSummaryText(id, body, by, options);
+  }
+
+  // ==========================================================================
+  // History mutation (src/history-mutation.ts)
+  // ==========================================================================
+
+  private historyState(): HistoryState {
+    const memory = isHistoryMutationStrategy(this.strategy) ? this.strategy.historyMemory() : null;
+    const binding = readBindingRecord(this.store, this.strategyNamespace).record;
+    return {
+      branch: this.store.currentBranch().name,
+      rows: this.messageStore.getAll(),
+      record: this.mergedMessageView().getAll(),
+      view: this.strategyMessageView().getAll(),
+      memory,
+      windowMode: this.windowIndex.mode(),
+      ...(binding ? { thinkingBoundThrough: recordedThrough(binding) } : {}),
+    };
+  }
+
+  /** A summary or message as a mutation names it, with the sha256 its op compares; null where there is none. */
+  describeMutationTarget(target: { summaryId: string } | { messageId: MessageId }): MutationTargetDescription | null {
+    this.requireInitialized('describeMutationTarget');
+    return describeTarget(this.historyState(), target);
+  }
+
+  /** What `manifest` would do to this manager's history as it stands, and what refuses it. Writes nothing. */
+  planHistoryMutation(manifest: HistoryMutationManifest): HistoryMutationPlan {
+    this.requireInitialized('planHistoryMutation');
+    return planMutation(this.historyState(), manifest);
+  }
+
+  /**
+   * Each anomaly of this manager's history as it stands: content a write
+   * would refuse, an empty message, a body missing shards, a tool call and
+   * result that don't pair (or have a system change between them), in record
+   * order or in the window's (auxiliary slots' rows in place), and a summary
+   * whose messages aren't contiguous (crossed, as the topology audit reads
+   * it). It reads rows as the store reads them, so a stored block the read
+   * omits isn't seen. Writes nothing.
+   */
+  checkHistoryInvariants(): HistoryAnomaly[] {
+    this.requireInitialized('checkHistoryInvariants');
+    return historyAnomalies(this.historyState());
+  }
+
+  /**
+   * The compile `manifest` would give: the mutation is built on a scratch
+   * branch (`preview-mutation/<uuid>`) forked from this manager's head, by a
+   * manager bound to it, which compiles there with `dryRun` and closes, and
+   * the branch is deleted. This manager's branch never moves, so it can run
+   * beside a live agent; the store takes the scratch branch's records and
+   * its deletion. Throws HistoryMutationError for a plan with violations,
+   * and BRANCH_LEFT, naming the scratch branch, where its deletion fails.
+   *
+   * `by` is who the apply will name, which the compile shows (a recall
+   * envelope's `editedBy`). `strategy` gives the scratch manager its
+   * strategy where this one's has no cloneForScratch; it must not compress
+   * on its own.
+   */
+  async compileMutationPreview(
+    manifest: HistoryMutationManifest,
+    options: {
+      by: Omit<ExternalMemoryProvenance, 'at'>;
+      budget?: TokenBudget;
+      injections?: ContextInjection[];
+      selectOptions?: SelectOptions;
+      strategy?: () => ContextStrategy;
+    },
+  ): Promise<{ plan: HistoryMutationPlan; compiled: CompileResult }> {
+    this.requireInitialized('compileMutationPreview');
+    const plan = this.planHistoryMutation(manifest);
+    if (!plan.valid) throw new HistoryMutationError(`the plan has ${plan.violations.length} violation(s)`, plan.violations, plan);
+    const scratch = `preview-mutation/${randomUUID()}`;
+    let created: { id: string };
+    try {
+      created = this.store.createBranch(scratch, plan.sourceBranch);
+    } catch (error) {
+      this.deleteBuiltBranch(scratch, undefined, plan, error);
+      throw error;
+    }
+    let staging: ContextManager | undefined;
+    let compiled: CompileResult;
+    try {
+      staging = await this.managerOnBranch(scratch, options.strategy, true);
+      await staging.applyPlannedOps(plan, editStamp(options.by, this.now(), plan.sourceBranch));
+      compiled = await staging.compile(options.budget, options.injections, { ...options.selectOptions, dryRun: true });
+      staging.close();
+    } catch (error) {
+      staging?.close();
+      this.deleteBuiltBranch(scratch, created.id, plan, error);
+      throw error;
+    }
+    this.deleteBuiltBranch(scratch, created.id, plan);
+    return { plan, compiled };
+  }
+
+  /**
+   * Apply `manifest` on a new branch, `targetBranch`, and move the store to
+   * it. The branch is forked from this manager's head with every state of
+   * the store, so other managers' states come along. A manager bound to it
+   * makes the writes. Then `beforeSwitch` runs, where a host writes what
+   * else the branch needs through `view` (such as other residents' states),
+   * and a fresh open of the branch reads it back: its rows must be the
+   * source's with the plan's edits and removals (rows appended after them
+   * are allowed), its summaries the source's without the plan's drops, and
+   * it must break no rule the source keeps (READBACK_MISMATCH,
+   * INVARIANT_BROKEN). Then, with no await between, the apply refuses
+   * (SOURCE_MOVED) unless the store is still on the source branch, at the
+   * head it was forked at, and the target branch is the one it built; and
+   * the store switches to the branch, in one checkpointed switch.
+   *
+   * It is for a history that nothing else writes while it runs: a write to
+   * the source meanwhile refuses it, though the write itself stays on the
+   * source, as does one that `beforeSwitch` or the given strategy makes
+   * through another handle. Whatever fails before the switch, or a process
+   * that stops, leaves the store on the source branch, and an apply that
+   * fails in process deletes the branch it built, or throws BRANCH_LEFT
+   * naming it where that deletion fails, with whether the branch is still
+   * there or deleted with its deletion not yet saved. The switch moves every manager on
+   * the store: once this returns, the host re-initializes each other one
+   * (setStrategy(getStrategy())), as after switchBranch. Where the store
+   * moves to the branch and the switch then doesn't complete (its checkpoint
+   * fails, the strategy fails to initialize, or another selection supersedes
+   * it), the mutation is applied: the error is APPLIED_INIT_FAILED, it
+   * carries the receipt, and the message says how to recover.
+   *
+   * Refused before anything is written where the plan made now has
+   * violations, its branch isn't `expectedSourceBranch` (BRANCH_MISMATCH),
+   * its sha256 isn't `expectedPlanSha256` (PLAN_DRIFT: the error carries the
+   * plan made now), or `targetBranch` exists. Not for a manager bound to a
+   * branch (a derived one), which can't move the store.
+   */
+  async applyHistoryMutation(
+    manifest: HistoryMutationManifest,
+    options: {
+      targetBranch: string;
+      expectedSourceBranch: string;
+      expectedPlanSha256: string;
+      by: Omit<ExternalMemoryProvenance, 'at'>;
+      strategy?: () => ContextStrategy;
+      beforeSwitch?: (ctx: { view: JsStore; sourceBranch: string; targetBranch: string }) => Promise<void>;
+    },
+  ): Promise<HistoryMutationReceipt> {
+    this.requireInitialized('applyHistoryMutation');
+    if ((this.store as { pinnedBranch?: () => string | null }).pinnedBranch?.() != null) {
+      throw new Error('ContextManager.applyHistoryMutation: this manager is bound to a branch and can\'t move the store; apply through a manager on the store itself');
+    }
+    const state = this.historyState();
+    const plan = planMutation(state, manifest);
+    const refuse = (code: MutationViolationCode, message: string): never => {
+      throw new HistoryMutationError(message, [{ opIndex: -1, code, message }], plan);
+    };
+    if (!plan.valid) throw new HistoryMutationError(`the plan has ${plan.violations.length} violation(s)`, plan.violations, plan);
+    if (plan.sourceBranch !== options.expectedSourceBranch) {
+      refuse('BRANCH_MISMATCH', `the store is on ${plan.sourceBranch}, not ${options.expectedSourceBranch}`);
+    }
+    if (plan.planSha256 !== options.expectedPlanSha256) {
+      refuse('PLAN_DRIFT', `the plan made now has sha256 ${plan.planSha256}, not ${options.expectedPlanSha256}: the history changed since; read the plan this error carries`);
+    }
+    if (this.store.listBranches().some((branch) => branch.name === options.targetBranch)) {
+      refuse('TARGET_BRANCH_EXISTS', `branch ${options.targetBranch} exists`);
+    }
+    const source = snapshotOf(state);
+    const baseline = historyAnomalies(state);
+    const stamp = editStamp(options.by, this.now(), plan.sourceBranch);
+    const sourceId = this.store.currentBranch().id;
+    let created: { id: string };
+    try {
+      created = this.store.createBranch(options.targetBranch, plan.sourceBranch);
+    } catch (error) {
+      this.deleteBuiltBranch(options.targetBranch, undefined, plan, error);
+      throw error;
+    }
+    const fromSequence = this.store.currentSequence();
+    let staging: ContextManager | undefined;
+    let reader: ContextManager | undefined;
+    try {
+      staging = await this.managerOnBranch(options.targetBranch, options.strategy, true);
+      await staging.applyPlannedOps(plan, stamp);
+      const view = staging.store;
+      staging.close();
+      staging = undefined;
+      await options.beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch: options.targetBranch });
+      reader = await this.managerOnBranch(options.targetBranch, options.strategy, false);
+      const written = reader.historyState();
+      reader.close();
+      reader = undefined;
+      const mismatches = readBackMismatches(plan, source, written, stamp);
+      if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${options.targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
+      const broken = introducedAnomalies(baseline, historyAnomalies(written));
+      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${options.targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.map((a) => a.message).join('; ')}`);
+      const built = this.store.listBranches().find((branch) => branch.name === options.targetBranch);
+      if (this.store.currentBranch().id !== sourceId || this.store.currentSequence() !== fromSequence || built?.id !== created.id) {
+        refuse('SOURCE_MOVED', `the store moved while the apply built ${options.targetBranch}: ` + (
+          this.store.currentBranch().id !== sourceId ? `it is on ${this.store.currentBranch().name}, not ${plan.sourceBranch}`
+            : this.store.currentSequence() !== fromSequence ? `${plan.sourceBranch} took records after sequence ${fromSequence}, which the branch doesn't hold`
+              : `${options.targetBranch} is not the branch the apply built`
+        ) + ': plan again once nothing else writes the history');
+      }
+      this.store.sync();
+    } catch (error) {
+      staging?.close();
+      reader?.close();
+      this.deleteBuiltBranch(options.targetBranch, created.id, plan, error);
+      throw error;
+    }
+    const receipt = (): HistoryMutationReceipt => ({
+      sourceBranch: plan.sourceBranch,
+      targetBranch: options.targetBranch,
+      fromSequence,
+      toSequence: this.store.listBranches().find((branch) => branch.id === created.id)?.head ?? this.store.currentSequence(),
+      planSha256: plan.planSha256,
+      targets: plan.targets,
+      droppedSummaries: [...plan.droppedSummaries],
+    });
+    try {
+      await this.switchBranch(options.targetBranch);
+    } catch (error) {
+      const now = this.store.currentBranch();
+      if (now.id === sourceId) {
+        this.deleteBuiltBranch(options.targetBranch, created.id, plan, error);
+        throw error;
+      }
+      const message = `the mutation is applied on ${options.targetBranch}: the store moved to it, and the switch didn't complete ` +
+        `(${error instanceof Error ? error.message : String(error)}); the store is on ${now.name} now: getStore().sync() saves a switch whose ` +
+        'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is';
+      throw new HistoryMutationError(message, [{ opIndex: -1, code: 'APPLIED_INIT_FAILED', message }], plan, { cause: error, receipt: receipt() });
+    }
+    return receipt();
+  }
+
+  private deleteBuiltBranch(branch: string, id: string | undefined, plan: HistoryMutationPlan, failure?: unknown): void {
+    const built = (b: { name: string; id: string }) => b.name === branch && (id === undefined || b.id === id);
+    try {
+      if (this.store.listBranches().some(built)) this.store.deleteBranch(branch);
+    } catch (cleanup) {
+      const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
+      const left = this.store.listBranches().some(built)
+        ? 'it is still there: delete it by hand'
+        : 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it';
+      const message = `${failure !== undefined ? `${why(failure)}; and ` : ''}deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
+      throw new HistoryMutationError(
+        message,
+        [...(failure instanceof HistoryMutationError ? failure.violations : []), { opIndex: -1, code: 'BRANCH_LEFT', targetId: branch, message }],
+        plan,
+        { cause: failure ?? cleanup },
+      );
+    }
+  }
+
+  private async managerOnBranch(branch: string, strategy: (() => ContextStrategy) | undefined, seed: boolean): Promise<ContextManager> {
+    if (!ContextManager.supportsDerivation(this.store)) throw new ContextDerivationUnsupportedError();
+    const fresh = strategy ? strategy() : this.strategy.cloneForScratch?.();
+    if (!fresh) throw new Error(`the ${this.strategy.name} strategy has no cloneForScratch: give a strategy`);
+    const frontier = seed && isRenderingFrontierStrategy(this.strategy) ? this.strategy.exportRenderingFrontier() : undefined;
+    const view = (this.store as unknown as JsStore & DerivableStore).view(branch);
+    const store = (namespace: string | undefined, from: MessageStore): MessageStore => {
+      if (seed) return from.deriveOnto(view);
+      const cold = new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
+      cold.setTokenCalibration(from.getTokenCalibration());
+      return cold;
+    };
+    const manager = new ContextManager(
+      view,
+      store(this.slots.messageNamespace, this.messageStore),
+      new ContextLog(view, { estimator: this.slots.tokenEstimator, namespace: this.slots.contextNamespace }),
+      fresh,
+      false,
+      this.strategyNamespace,
+      undefined,
+      false,
+      this.viewFilter,
+      this.auxiliaryStores.map((aux, i) => store(this.slots.auxiliaryNamespaces[i], aux)),
+    );
+    if (seed) manager.windowIndex.seedFrom(this.windowIndex);
+    manager.now = this.now;
+    manager.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
+    manager.toolDefinitions = this.toolDefinitions;
+    manager.systemPrompt = this.systemPrompt;
+    try {
+      if (frontier !== undefined && isRenderingFrontierStrategy(fresh)) fresh.prepareFromRenderingFrontier?.(frontier);
+      await manager.initializeStrategy(observeStoreBranch(view));
+      if (frontier !== undefined && isRenderingFrontierStrategy(fresh)) fresh.adoptRenderingFrontier(frontier);
+    } catch (error) {
+      manager.close();
+      throw error;
+    }
+    return manager;
+  }
+
+  private async applyPlannedOps(plan: HistoryMutationPlan, stamp: Omit<MessageEditStamp, 'label'>): Promise<void> {
+    const strategy = this.strategy;
+    const mutable = isHistoryMutationStrategy(strategy) ? strategy : null;
+    const by = { by: stamp.by, ...(stamp.note !== undefined ? { note: stamp.note } : {}) };
+    for (const target of plan.targets) {
+      switch (target.kind) {
+        case 'edit_summary':
+          if (!mutable) throw new Error(`the ${strategy.name} strategy keeps no summaries`);
+          mutable.editSummaryText(target.summaryId, target.newText, by, {
+            apply: true, expectedPriorSha256: target.beforeSha256, dropResponseContent: target.dropResponseContent,
+          });
+          if (target.parentPolicy === 'drop_parents' && target.mergedParents.length > 0) {
+            mutable.dropSummaries([target.mergedParents[0]!], this.createStrategyContext());
+          }
+          break;
+        case 'edit_message':
+          this.editMessage(target.messageId, target.content, { mergeMetadata: { historyMutation: { ...stamp, label: target.label } } });
+          if (target.foldedPolicy === 'drop_covering_summaries' && target.coveringSummaries.length > 0 && mutable) {
+            mutable.dropSummaries(target.coveringSummaries, this.createStrategyContext());
+          }
+          break;
+        case 'remove_messages': {
+          const listing = this.messageStore.getAll();
+          const taking = new Set(target.messageIds);
+          const rows = listing.filter((row) => taking.has(row.id));
+          const runs: Array<[MessageId, MessageId]> = [];
+          listing.forEach((row, i) => {
+            if (!taking.has(row.id)) return;
+            if (i > 0 && taking.has(listing[i - 1]!.id)) runs[runs.length - 1]![1] = row.id;
+            else runs.push([row.id, row.id]);
+          });
+          for (const [from, to] of runs) {
+            if (from === to && !this.messageStore.get(from)?.bodyGroupId) this.removeMessage(from);
+            else this.removeMessages(from, to);
+          }
+          if (this.windowIndex.mode() === 'legacy' && target.foldedPolicy === 'drop_covering_summaries' && target.coveringSummaries.length > 0) {
+            await strategy.onRetracted?.(rows, this.createStrategyContext(), { undone: false, removed: true, ids: target.messageIds });
+          }
+          break;
+        }
+        default: {
+          const _exhaustive: never = target;
+          void _exhaustive;
+        }
+      }
+    }
+    this.store.sync();
   }
 
   /**

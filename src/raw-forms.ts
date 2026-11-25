@@ -54,6 +54,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import { canonicalJson } from './canonical-json.js';
 
 type RawFormCarrier = { rawXml?: unknown; rawItem?: unknown };
 
@@ -155,6 +156,21 @@ export function releaseEditedRawForms(
     return next;
   });
   return changed ? result : after;
+}
+
+/**
+ * releaseEditedRawForms for content that replaces `before` whole, as a
+ * history mutation's caller gives it: a block of `after` equal to a block of
+ * `before` (canonical JSON) is that block kept, and any other block gives up
+ * every raw form it carries, so a replay never stands in for changed fields.
+ */
+export function releaseReplacedRawForms(before: readonly ContentBlock[], after: readonly ContentBlock[]): ContentBlock[] {
+  const unused = new Map<string, ContentBlock[]>();
+  for (const block of before) {
+    const key = canonicalJson(block);
+    unused.set(key, [...(unused.get(key) ?? []), block]);
+  }
+  return releaseEditedRawForms(before, after.map((block) => unused.get(canonicalJson(block))?.shift() ?? withoutRawForms(block)));
 }
 
 /**

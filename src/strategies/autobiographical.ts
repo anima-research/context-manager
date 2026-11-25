@@ -45,6 +45,7 @@ import type {
   MemoryWorkTarget,
   SummaryTextEdit,
   SummaryTextEditOptions,
+  HistoryMutationStrategy,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -16049,6 +16050,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     this._answerCostCache.clear();
     return edit;
+  }
+
+  historyMemory(): ReturnType<HistoryMutationStrategy['historyMemory']> {
+    this.requireLoadedBranch('historyMemory');
+    return { summaries: this.summaries, chunkRecords: this.chunkRecords };
+  }
+
+  /**
+   * Drop `seeds` with every summary above them, as a let-go of rows drops
+   * what folds them (unfold): each chunk record of a dropped L1 keeps its
+   * rows and is compressed again, and a summary the drop leaves without its
+   * parent renders and merges again. Then the chunks are rebuilt and, in
+   * hierarchical mode, the merge check runs, as after a let-go.
+   */
+  dropSummaries(seeds: readonly string[], ctx: StrategyContext): string[] {
+    this.requireBranchMutation('dropSummaries');
+    let dropped: string[] = [];
+    try {
+      dropped = this.unfold(new Set(seeds), () => undefined).dropped;
+      this._overlapBlocked.clear();
+    } finally {
+      this.rebuildChunks(ctx.messageStore);
+    }
+    if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
+      this.sweepPaidOffMergeQuarantine();
+      this.checkMergeThreshold();
+    }
+    return dropped;
+  }
+
+  /**
+   * A new instance with this one's settings that starts no compression by
+   * itself (ContextStrategy.cloneForScratch). A subclass builds its own: this
+   * one's settings don't say how to build another class.
+   */
+  cloneForScratch(): ContextStrategy {
+    if (Object.getPrototypeOf(this) !== AutobiographicalStrategy.prototype) {
+      throw new Error(`${this.name}: a subclass of AutobiographicalStrategy gives its own cloneForScratch, or the caller gives a strategy`);
+    }
+    return new AutobiographicalStrategy({ ...this.config, autoTickOnNewMessage: false, logEffectiveConfig: false });
   }
 
   /** Inventory, not solver eligibility: pins, locks, and geometry can prevent using these summaries. */

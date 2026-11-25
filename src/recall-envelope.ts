@@ -34,7 +34,10 @@ export function isRecallEnveloped(mode: RecallEnvelopeMode | undefined): mode is
  * Build the tag pair for one summary. Under `'xml'`, every attribute is
  * sourced from the record: an attribute the record cannot answer for is
  * OMITTED rather than filled with a placeholder, so a present attribute is
- * always a true one. Under `'bare'` the tags carry no attributes.
+ * always a true one. `editedBy` names who wrote the text from outside the
+ * strategy (`SummaryEntry.external`), where someone did, with `&`, `<`, `>`,
+ * `"` and line breaks written as character references. Under `'bare'` the
+ * tags carry no attributes.
  */
 export function buildRecallEnvelopeTags(summary: SummaryEntry, mode: 'xml' | 'bare' = 'xml'): RecallEnvelopeTags {
   const attributes: string[] = [];
@@ -44,11 +47,16 @@ export function buildRecallEnvelopeTags(summary: SummaryEntry, mode: 'xml' | 'ba
     const first = summary.sourceRange?.first;
     const last = summary.sourceRange?.last;
     if (first && last) attributes.push(`span="${first}..${last}"`);
+    if (summary.external?.by) attributes.push(`editedBy="${attributeValue(summary.external.by)}"`);
   }
   const open = attributes.length > 0
     ? `<${RECALL_ENVELOPE_TAG} ${attributes.join(' ')}>`
     : `<${RECALL_ENVELOPE_TAG}>`;
   return { open, close: `</${RECALL_ENVELOPE_TAG}>` };
+}
+
+function attributeValue(text: string): string {
+  return text.replace(/[&<>"\r\n]/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
 /**

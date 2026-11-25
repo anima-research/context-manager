@@ -251,6 +251,15 @@ export interface ContextStrategy {
   /** Strategy name for identification */
   readonly name: string;
 
+  /**
+   * A new, unopened instance with this one's settings that starts no
+   * compression by itself, for a manager that builds a history mutation on a
+   * branch of its own (ContextManager.compileMutationPreview,
+   * applyHistoryMutation). Absent where the strategy can't be built again
+   * from what it holds; those calls then take a strategy from their caller.
+   */
+  cloneForScratch?(): ContextStrategy;
+
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
    *  A value that isn't a positive number, such as 0, undefined, a negative
@@ -3298,6 +3307,32 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
     options?: { apply?: boolean },
   ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }>;
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: SummaryTextEditOptions): SummaryTextEdit;
+}
+
+/**
+ * Strategy whose summaries a history mutation reads and changes
+ * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
+ * AutobiographicalStrategy and its subclasses.
+ */
+export interface HistoryMutationStrategy extends ExternalMemoryStrategy {
+  /** Its summaries and chunk records as it holds them now. Read only. */
+  historyMemory(): {
+    summaries: readonly SummaryEntry[];
+    chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+  };
+  /**
+   * Drop the summaries `seeds` names, with every summary above them; each
+   * chunk record of a dropped L1 keeps its rows and is compressed again, and
+   * the summaries a drop leaves without a parent render and merge again.
+   * Returns the ids dropped.
+   */
+  dropSummaries(seeds: readonly string[], ctx: StrategyContext): string[];
+}
+
+export function isHistoryMutationStrategy(s: ContextStrategy): s is HistoryMutationStrategy {
+  return isExternalMemoryStrategy(s)
+    && 'dropSummaries' in s && typeof s.dropSummaries === 'function'
+    && 'historyMemory' in s && typeof s.historyMemory === 'function';
 }
 
 export function isExternalMemoryStrategy(s: ContextStrategy): s is ExternalMemoryStrategy {
