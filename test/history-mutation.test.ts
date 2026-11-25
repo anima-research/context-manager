@@ -59,6 +59,58 @@ async function residentStore(): Promise<string> {
   return path;
 }
 
+const NS_B = 'agents/Bea';
+
+/** Two residents on one message slot, each with summaries of its own over the slot's rows. */
+async function twoResidentStore(): Promise<string> {
+  const path = join(dir, `store-${stores++}`);
+  const strategy = () => new AutobiographicalStrategy({ ...RESIDENT, mergeThreshold: 99 } as never);
+  const a = await ContextManager.open({ path, namespace: NS, strategy: strategy(), membrane });
+  for (let i = 0; i < 40; i++) a.addMessage(i % 2 ? 'Ada' : 'User', [{ type: 'text', text: `raw-${i} ${'substantive '.repeat(12)}` }]);
+  const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: strategy(), membrane });
+  for (const manager of [a, b]) {
+    await manager.compile();
+    for (let i = 0; i < 12; i++) await manager.tick();
+  }
+  b.close();
+  a.close();
+  return path;
+}
+
+async function residents<T>(
+  path: string,
+  body: (a: ContextManager, b: ContextManager) => Promise<T>,
+  strategyOfB: () => AutobiographicalStrategy = () => new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never),
+): Promise<T> {
+  const a = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+  const b = await ContextManager.open({ store: a.getStore(), namespace: NS_B, strategy: strategyOfB(), membrane });
+  try {
+    return await body(a, b);
+  } finally {
+    b.close();
+    a.close();
+  }
+}
+
+/** A row that both residents' summaries fold. */
+function foldedByBoth(a: ContextManager, b: ContextManager): string {
+  const id = a.getAllMessages().map((row) => row.id).find((rowId) => [a, b].every((manager) => {
+    const described = manager.describeMutationTarget({ messageId: rowId });
+    return described?.kind === 'message' && described.coveringSummaries.length > 0;
+  }));
+  assert.ok(id, 'setup: a row both residents fold');
+  return id;
+}
+
+function coveringOf(manager: ContextManager, id: string): string[] {
+  const described = manager.describeMutationTarget({ messageId: id });
+  assert.ok(described?.kind === 'message', `setup: message ${id} is described`);
+  return described.coveringSummaries;
+}
+
+const summariesIn = (manager: ContextManager, namespace: string, branch: string): SummaryEntry[] =>
+  ((manager.getStore() as ViewStore).view(branch).getStateJson(`${namespace}/autobio:summaries`) ?? []) as SummaryEntry[];
+
 async function resident<T>(path: string, body: (manager: ContextManager) => Promise<T>): Promise<T> {
   const manager = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
   try {
@@ -631,6 +683,169 @@ describe('history mutation', () => {
       assert.deepEqual(plan.violations.map((v) => v.code), ['TOOL_PAIR_SPLIT']);
     } finally {
       side.close();
+    }
+  });
+
+  it('plans what a change does to each reader of its rows, and refuses a reader\'s summaries over a row without a policy', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const op = { kind: 'edit_message' as const, messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text' as const, text: 'a row rewritten' }], label: '[edited by operator]' };
+      const refused = a.planHistoryMutation({ ops: [op] }, { readers: [b] });
+      assert.deepEqual(
+        refused.violations.map((v) => [v.code, v.remediation?.readerNamespace]),
+        [['FOLDED_ROW_REQUIRES_POLICY', undefined], ['FOLDED_ROW_REQUIRES_POLICY', NS_B]],
+      );
+      const leftByA = a.planHistoryMutation({ ops: [{ ...op, foldedPolicy: 'leave_summaries' }] }, { readers: [b] });
+      assert.deepEqual(leftByA.violations, [], 'the op\'s policy is the readers\' too');
+      assert.deepEqual(leftByA.readers[0]?.droppedSummaries, []);
+
+      const manifest: HistoryMutationManifest = { ops: [{ ...op, foldedPolicy: 'drop_covering_summaries' }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.deepEqual(plan.violations, []);
+      assert.deepEqual(plan.readers.map((r) => r.namespace), [NS_B]);
+      assert.deepEqual([...plan.readers[0]!.droppedSummaries].sort(), [...coveringOf(b, id)].sort());
+      assert.deepEqual(plan.readers[0]!.heldIds, [id]);
+      assert.equal(plan.readers[0]!.invalidatesKvPrefixFrom?.messageId !== undefined, true, 'its window changes from a row');
+      assert.ok(!plan.droppedSummaries.some((s) => plan.readers[0]!.droppedSummaries.includes(s) && !coveringOf(a, id).includes(s)), 'each manager drops its own');
+
+      const without = a.planHistoryMutation(manifest);
+      assert.deepEqual(without.readers, []);
+      assert.notEqual(without.planSha256, plan.planSha256, 'the plan\'s sha256 covers what it does to each reader');
+      await assert.rejects(a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/drift', expectedSourceBranch: 'main', expectedPlanSha256: without.planSha256, by: { by: 'operator' }, readers: [b],
+      }), refusedWith('PLAN_DRIFT'));
+    });
+  });
+
+  it('reconciles each reader on the branch before the switch: its summaries over an edited row go, and its compile shows the row as edited', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row rewritten' }],
+        label: '[edited by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const bSource = summariesIn(b, NS_B, 'main');
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      const preview = await a.compileMutationPreview(manifest, { by: { by: 'operator' }, readers: [b] });
+      assert.equal(preview.plan.planSha256, plan.planSha256, 'the preview plans as the apply does');
+      await a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/both', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+      });
+      await b.setStrategy(b.getStrategy());
+      assert.ok(plan.readers[0]!.droppedSummaries.length > 0, 'setup: the reader drops summaries');
+      for (const dropped of plan.readers[0]!.droppedSummaries) assert.equal(b.getSummary(dropped), null, `${dropped} is dropped from the reader`);
+      assert.deepEqual(summariesIn(b, NS_B, 'main'), bSource, 'the reader\'s summaries on the source are as they were');
+      const compiled = await b.compile({ maxTokens: 100_000, reserveForResponse: 50 }, undefined, { dryRun: true });
+      assert.match(rendered(compiled.messages), /\[edited by operator\]\na row rewritten/);
+    });
+  });
+
+  it('takes removed rows out of each presented reader\'s window, with what folds them, before the switch', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      a.presentRows([]);
+      b.presentRows([]);
+      const folded = summariesIn(b, NS_B, 'main').find((s) => s.level === 1)!;
+      const ids = [...folded.sourceIds];
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(a, id)])) }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      assert.deepEqual(plan.violations, []);
+      assert.ok(plan.readers[0]!.droppedSummaries.includes(folded.id));
+      await a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/removed-both', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+      });
+      await b.setStrategy(b.getStrategy());
+      const window = new Set(b.getPresentedMessages().map((row) => row.id));
+      for (const id of ids) {
+        assert.ok(!window.has(id), `${id} left the reader's window`);
+        assert.equal(b.ordinalOf(id), undefined);
+      }
+      for (const dropped of plan.readers[0]!.droppedSummaries) assert.equal(b.getSummary(dropped), null, `${dropped} is dropped from the reader`);
+      assert.deepEqual(b.retractAbsentRows(), [], 'nothing is left for a boot to take out');
+    });
+  });
+
+  it('leaves each reader as it was when the apply fails before the switch', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row rewritten' }],
+        label: '[edited by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      const bSource = summariesIn(b, NS_B, 'main');
+      const branches = branchNames(a);
+      await assert.rejects(a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/failed', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+        beforeSwitch: async () => { throw new Error('the host failed'); },
+      }), /the host failed/);
+      assert.equal(a.currentBranch().name, 'main');
+      assert.deepEqual(branchNames(a), branches);
+      assert.deepEqual(summariesIn(b, NS_B, 'main'), bSource);
+      for (const id of plan.readers[0]!.droppedSummaries) assert.ok(b.getSummary(id), `${id} is still the reader's`);
+    });
+  });
+
+  it('refuses to switch to a branch where a reader reads back other than planned', async () => {
+    class Keeping extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
+        super(settings);
+      }
+      override dropSummaries(): string[] {
+        return [];
+      }
+      override cloneForScratch(): Keeping {
+        return new Keeping({ ...this.settings, autoTickOnNewMessage: false });
+      }
+    }
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row rewritten' }],
+        label: '[edited by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const plan = a.planHistoryMutation(manifest, { readers: [b] });
+      await assert.rejects(a.applyHistoryMutation(manifest, {
+        targetBranch: 'surgery/kept', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
+      }), (error: unknown) => refusedWith('READBACK_MISMATCH')(error) && new RegExp(`${NS_B}.*is still there`).test(String(error)));
+      assert.equal(a.currentBranch().name, 'main');
+    }, () => new Keeping({ ...RESIDENT, autoTickOnNewMessage: false } as never));
+  });
+
+  it('refuses a change that splits a tool pair in a reader\'s record', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new PassthroughStrategy(), auxiliaryMessageViews: [{}] });
+    try {
+      main.addMessage('User', [{ type: 'text', text: 'read file a' }]);
+      const call = main.addMessage('Ada', [{ type: 'text', text: 'looking' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      side.addMessage('User', [{ type: 'tool_result', toolUseId: 't1', content: 'file a' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [call], expectedSha256ById: { [call]: messageSha(main, call) } }] };
+      assert.deepEqual(main.planHistoryMutation(manifest).violations, [], 'setup: the call is unanswered in the manager\'s own record');
+      assert.deepEqual(main.planHistoryMutation(manifest, { readers: [side] }).violations.map((v) => v.code), ['TOOL_PAIR_SPLIT']);
+    } finally {
+      side.close();
+      main.close();
+    }
+  });
+
+  it('refuses a reader that is the manager itself, is named twice, or reads another store', async () => {
+    const path = await twoResidentStore();
+    const elsewhere = await ContextManager.open({ path: await residentStore(), namespace: NS_B, strategy: new PassthroughStrategy() });
+    try {
+      await residents(path, async (a, b) => {
+        const id = a.getAllMessages()[0]!.id;
+        const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'x' }], label: '[x]', foldedPolicy: 'leave_summaries' }] };
+        assert.throws(() => a.planHistoryMutation(manifest, { readers: [a] }), /the manager itself/);
+        assert.throws(() => a.planHistoryMutation(manifest, { readers: [b, b] }), /named twice/);
+        assert.throws(() => a.planHistoryMutation(manifest, { readers: [elsewhere] }), /another store/);
+      });
+    } finally {
+      elsewhere.close();
     }
   });
 
