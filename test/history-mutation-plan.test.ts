@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
 
 import {
-  describeTarget, historyAnomalies, messageContentSha256, planMutation, readBackMismatches, snapshotOf,
+  describeTarget, historyAnomalies, introducedAnomalies, messageContentSha256, planMutation, readBackMismatches, snapshotOf,
   type HistoryMemory, type HistoryMutationOp, type HistoryState,
 } from '../src/history-mutation.js';
 import { textSha256 } from '../src/summary-edit.js';
@@ -266,6 +266,13 @@ describe('history mutation plan', () => {
     assert.deepEqual(historyAnomalies(state({ memory: MEMORY })), [], 'the fixture itself has none');
   });
 
+  it('reads back a window that the record was and that is presented now as changed', () => {
+    const s = state();
+    const plan = planMutation(s, { ops: [remove('m6')] });
+    const written = { ...s, rows: ROWS.slice(0, 6), record: ROWS.slice(0, 6), view: ROWS.slice(0, 1), window: ROWS.slice(0, 1), windowMode: 'presented' as const, windowOrdinals: [{ id: 'm0', ordinal: 0 }] };
+    assert.ok(readBackMismatches(plan, snapshotOf(s), written, { by: 'operator', at: 0, sourceBranch: 'main' }).includes('its window is presented now, and the source\'s window was the record'));
+  });
+
   it('reads back a removal of the last row as not made while the row is still there', () => {
     const s = state();
     const plan = planMutation(s, { ops: [remove('m6')] });
@@ -273,12 +280,20 @@ describe('history mutation plan', () => {
     assert.deepEqual(readBackMismatches(plan, snapshotOf(s), s, { by: 'operator', at: 0, sourceBranch: 'main' }), ['message m6 is still there']);
   });
 
+  it('counts a tool pair split that an edit brings into the view as new, though the record held it', () => {
+    const hidden = row('mh', 8, 'Ada', [{ type: 'tool_use', id: 'tz', name: 'read', input: { path: 'z' } }]);
+    const rows = [...ROWS, hidden];
+    const before = historyAnomalies(state({ rows, view: ROWS }));
+    const after = historyAnomalies(state({ rows, view: rows }));
+    assert.deepEqual(introducedAnomalies(before, after).map((a) => [a.code, a.targetId, a.message]), [['TOOL_PAIR_SPLIT', 'mh', 'the tool_use tz in message mh has no result, in the record and the view']]);
+  });
+
   it('names a system change inside a tool pair once per call, by the call\'s message', () => {
     const change = row('mc', 2.5, 'system', [{ type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock]);
     const again = row('m2b', 3.5, 'User', [{ type: 'tool_result', toolUseId: 't1', content: 'file a, again' }]);
     const anomalies = historyAnomalies(state({ rows: [...ROWS.slice(0, 2), change, ROWS[2]!, again, ...ROWS.slice(3)] }));
     assert.deepEqual(anomalies.filter((a) => /system change/.test(a.message)).map((a) => [a.targetId, a.message]), [
-      ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result'],
+      ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result, in the record and the view'],
     ]);
   });
 
@@ -306,7 +321,7 @@ describe('history mutation plan', () => {
     assert.notEqual(sha256({}, { memory: MEMORY }), sha256({}, { memory: edited }), 'a summary it drops of the reader\'s');
     const summaryEdit = { ops: [{ kind: 'edit_summary' as const, summaryId: 'L1-b', expectedSha256: textSha256('memory L1-b'), newText: 'by hand', parentPolicy: 'leave_parents' as const }] };
     const storedSince = { ...MEMORY, stored: MEMORY.summaries.map((s) => (s.id === 'L1-b' ? { ...s, content: 'edited since' } : s)) };
-    assert.notEqual(planMutation(state({ memory: MEMORY }), summaryEdit).planSha256, planMutation(state({ memory: storedSince }), summaryEdit).planSha256, 'a summary it edits, as the store holds it');
+    assert.ok(planMutation(state({ memory: storedSince }), summaryEdit).violations.some((v) => v.code === 'STALE_MEMORY'), 'a summary it edits that the store holds otherwise refuses the plan, which changes its sha256');
   });
 
   it('places a change by the rows of every slot the manager merges', () => {
@@ -406,6 +421,8 @@ describe('history mutation plan', () => {
     cyclic.content = [cyclic];
     assert.deepEqual(malformed({ ops: [editMessage('m2', [cyclic as unknown as ContentBlock])] }), [['MALFORMED_OP', 0]], 'content that isn\'t plain data');
     assert.deepEqual(malformed({ ops: [{ kind: 10n }] }), [['MALFORMED_OP', 0]], 'a kind that JSON can\'t write');
+    const swapped = Object.assign(Object.create({ toJSON: () => ({ kind: 'unknown' }) }), editMessage('m3', text('x')));
+    assert.deepEqual(malformed({ ops: [swapped] }), [['MALFORMED_OP', 0]], 'the op as its copy reads, which the plan works on');
     assert.match(planMutation(state(), { ops: [{ ...editMessage('m3', text('x')), label: 5 }] } as unknown as Parameters<typeof planMutation>[1]).violations[0]!.message, /op 0's `label` is a number, not a string/);
     const plan = planMutation(state(), { ops: [{ kind: 'redact_message' }] } as unknown as Parameters<typeof planMutation>[1]);
     assert.deepEqual(plan.targets, [], 'a malformed manifest plans nothing');

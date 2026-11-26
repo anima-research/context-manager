@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { Membrane, MockAdapter, OpenAIResponsesFormatter, type ContentBlock } from '@animalabs/membrane';
 
-import { ContextManager, AutobiographicalStrategy, HistoryMutationError, KnowledgeStrategy, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, isHistoryMutationStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, HistoryMutationError, KnowledgeStrategy, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, isHistoryMutationStrategy, messageContentSha256 } from '../src/index.js';
 import type { HistoryMutationManifest, HistoryMutationOp, HistoryMutationPlan, SummaryEntry } from '../src/index.js';
 import { markStoreBranchSwitch } from '../src/branch-generation.js';
 import { residentStrategyOptions } from '../scripts/resident-settings.js';
@@ -1619,7 +1619,10 @@ describe('history mutation', () => {
         ['a reader\'s', NS_B, (plan: HistoryMutationPlan) => plan.readers[0]!.droppedSummaries],
         ['the manager\'s', NS, (plan: HistoryMutationPlan) => plan.droppedSummaries],
       ] as const) {
+        await a.setStrategy(a.getStrategy());
+        await b.setStrategy(b.getStrategy());
         const plan = a.planHistoryMutation(manifest, { readers: [b] });
+        assert.deepEqual(plan.violations, [], `${whose}, setup: the plan agreed is valid`);
         await editElsewhere(namespace, dropped(plan), `Edited through another handle (${whose}).`);
         await assert.rejects(a.applyHistoryMutation(manifest, {
           targetBranch: `surgery/elsewhere-${namespace}`, expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [b],
@@ -2151,7 +2154,7 @@ describe('history mutation', () => {
       assert.match(refused[0]!.message, /the passthrough strategy has no historyMemory\(\)/);
       own.addMessage('User', [{ type: 'text', text: 'a row of its own' }]);
       const ownId = own.addMessage('User', [{ type: 'text', text: 'another' }]);
-      const ownPlan = own.planHistoryMutation({ ops: [{ kind: 'remove_messages', messageIds: [ownId], expectedSha256ById: { [ownId]: messageSha(own, ownId) } }] });
+      const ownPlan = own.planHistoryMutation({ ops: [{ kind: 'remove_messages', messageIds: [ownId], expectedSha256ById: { [ownId]: messageContentSha256(own.getAllMessages().find((m) => m.id === ownId)!.content) } }] });
       assert.deepEqual(ownPlan.violations.map((v) => [v.code, v.opIndex]), [['STRATEGY_UNSUPPORTED', -1]]);
       const plan = main.planHistoryMutation(manifest, { readers: [windowed] });
       assert.deepEqual(plan.violations, [], 'the library\'s windowed passthrough keeps no summaries');
@@ -2168,8 +2171,8 @@ describe('history mutation', () => {
   it('refuses the apply where telling a strategy on the branch that rows left fails before its hook runs', async () => {
     const path = await residentStore();
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
-    const proto = ContextManager.prototype as unknown as { notifyRetracted: (this: ContextManager, ...args: unknown[]) => void };
-    const notifyRetracted = proto.notifyRetracted;
+    const proto = ContextManager.prototype as unknown as { notifyRetractedNow: (this: ContextManager, ...args: unknown[]) => void };
+    const notifyRetracted = proto.notifyRetractedNow;
     try {
       manager.presentRows([]);
       const folded = summariesOn(manager, 'main').find((s) => s.level === 1)!;
@@ -2178,7 +2181,7 @@ describe('history mutation', () => {
       const plan = manager.planHistoryMutation(manifest);
       assert.deepEqual(plan.violations, []);
       const branches = branchNames(manager);
-      proto.notifyRetracted = function (this: ContextManager, ...args: unknown[]) {
+      proto.notifyRetractedNow = function (this: ContextManager, ...args: unknown[]) {
         if (this !== manager) throw new Error('zz the manager\'s own work around the hook failed');
         return notifyRetracted.apply(this, args);
       };
@@ -2189,7 +2192,7 @@ describe('history mutation', () => {
       assert.equal(manager.currentBranch().name, 'main');
       assert.deepEqual(branchNames(manager), branches);
     } finally {
-      proto.notifyRetracted = notifyRetracted;
+      proto.notifyRetractedNow = notifyRetracted;
       manager.close();
     }
   });
@@ -2209,12 +2212,60 @@ describe('history mutation', () => {
         return switchBranch(name);
       };
       try {
-        await assert.rejects(manager.switchBranch('asked'), /zz the switch went elsewhere/);
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked failed, and the store moved to elsewhere: .*zz the switch went elsewhere/);
       } finally {
         store.switchBranch = switchBranch;
       }
       assert.equal(store.currentBranch().name, 'elsewhere');
       assert.throws(() => manager.planHistoryMutation(l1Edit(manager).manifest), /requires successful strategy initialization/);
+      store.switchBranch = (name: string) => {
+        switchBranch(name);
+        throw undefined;
+      };
+      try {
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked took effect, and saving it failed/, 'a native error of any value');
+      } finally {
+        store.switchBranch = switchBranch;
+      }
     });
+  });
+  it('refuses a drop it can\'t make, where a strategy shows its summaries and has no dropSummaries()', async () => {
+    let rowId = '';
+    class ShowsOnly extends PassthroughStrategy {
+      historyMemory() {
+        const summaries = [{ id: 'S1', level: 1, sourceLevel: 0, sourceIds: [rowId], sourceRange: { first: rowId, last: rowId }, content: 'memory S1', tokens: 3, created: 1 } as SummaryEntry];
+        return { summaries, chunkRecords: [], stored: summaries };
+      }
+
+      override cloneForScratch(): ShowsOnly {
+        return new ShowsOnly();
+      }
+    }
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new ShowsOnly() });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'an earlier row' }]);
+      rowId = manager.addMessage('User', [{ type: 'text', text: 'a folded row' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: rowId, expectedSha256: messageSha(manager, rowId), label: '[edited by operator]', content: [{ type: 'text', text: 'edited' }], foldedPolicy: 'drop_covering_summaries' }] };
+      const plan = manager.planHistoryMutation(manifest);
+      assert.deepEqual([plan.violations, plan.droppedSummaries], [[], ['S1']], 'setup: the plan drops the summary');
+      await assert.rejects(manager.compileMutationPreview(manifest, { by: { by: 'operator' } }), /holds summaries the plan drops \(S1\), and has no dropSummaries\(\)/);
+      assert.equal(manager.currentBranch().name, 'main');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses to describe or check a history whose strategy has no historyMemory()', async () => {
+    class Hidden extends PassthroughStrategy {}
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new Hidden() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      assert.throws(() => manager.describeMutationTarget({ messageId: id }), /the passthrough strategy has no historyMemory\(\), so its summaries can't be read/);
+      assert.throws(() => manager.checkHistoryInvariants(), /has no historyMemory\(\)/);
+    } finally {
+      manager.close();
+    }
   });
 });
