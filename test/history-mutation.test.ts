@@ -2341,4 +2341,29 @@ describe('history mutation', () => {
       main.close();
     }
   });
+  it('compiles what beforeCompile writes on the scratch branch, and deletes the branch whether or not it throws', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      const branches = branchNames(manager);
+      let source: string | undefined;
+      const { compiled } = await manager.compileMutationPreview(manifest, {
+        by: { by: 'operator' },
+        beforeCompile: async ({ manager: scratch, sourceBranch }) => {
+          source = sourceBranch;
+          scratch.addMessage('User', [{ type: 'text', text: 'zz a notice written there' }]);
+        },
+      });
+      assert.equal(source, 'main');
+      assert.match(rendered(compiled.messages), /as edited[\s\S]*zz a notice written there/);
+      assert.deepEqual(branchNames(manager), branches);
+      assert.ok(!manager.getAllMessages().some((m) => JSON.stringify(m.content).includes('zz a notice')), 'nothing reaches the live branch');
+      await assert.rejects(manager.compileMutationPreview(manifest, { by: { by: 'operator' }, beforeCompile: async () => { throw new Error('zz the notice failed'); } }), /zz the notice failed/);
+      assert.deepEqual(branchNames(manager), branches, 'a beforeCompile that throws leaves no branch');
+    } finally {
+      manager.close();
+    }
+  });
 });
