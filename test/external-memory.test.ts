@@ -412,7 +412,7 @@ describe('external-memory', () => {
     for (const apply of [[], ['--apply']]) {
       const refused = await run(['edit', path, '--namespace', NS, '--id', target.id, '--body-file', bodyFile('By hand.'), '--by', 'operator', ...apply]);
       assert.equal(refused.code, 1);
-      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, holds 2 verbatim response block\\(s\\), which the edit drops`));
+      assert.match(refused.stderr, new RegExp(`summary ${target.id}, or an entry that carries it, holds 2 verbatim response block\\(s\\), which render in place of the text; dropResponseContent \\(or the CLI's --drop-response-content\\) deletes them`));
     }
     assert.equal(memory(path), before, 'nothing is written');
   });

@@ -397,19 +397,57 @@ describe('history mutation plan', () => {
     assert.deepEqual(malformed({ ops: [{ ...remove('m3'), messageIds: [] }] }), [['MALFORMED_OP', 0]]);
     assert.deepEqual(malformed({ ops: [{ ...remove('m3'), expectedSha256ById: { m3: 7 } }] }), [['MALFORMED_OP', 0]]);
     assert.deepEqual(malformed({ ops: [{ kind: 'edit_summary', summaryId: 'L1-a', expectedSha256: 'x', newText: 'y', parentPolicy: 'keep' }] }), [['MALFORMED_OP', 0]]);
+    assert.deepEqual(malformed({ ops: [{ ...remove('m3'), foldPolicy: 'refuse' }] }), [['MALFORMED_OP', 0]], 'a misspelled policy');
+    assert.deepEqual(malformed({ ops: [{ kind: 'edit_summary', summaryId: 'L1-a', expectedSha256: 'x', newText: 'y', foldedPolicy: 'refuse' }] }), [['MALFORMED_OP', 0]], 'a policy of another kind');
+    assert.deepEqual(malformed({ ops: [editMessage('m3', text('x'))], note: 'why' }), [['MALFORMED_OP', -1]], 'a field no manifest has');
+    assert.deepEqual(malformed({ ops: new Array(1) }), [['MALFORMED_OP', 0]], 'a hole');
+    assert.deepEqual(malformed({ ops: [editMessage('m3', text('x')), editMessage('m6', ['noted' as unknown as ContentBlock])] }), [['MALFORMED_OP', 1]], 'a block that is no object');
+    const cyclic: Record<string, unknown> = { type: 'tool_result', toolUseId: 't1' };
+    cyclic.content = [cyclic];
+    assert.deepEqual(malformed({ ops: [editMessage('m2', [cyclic as unknown as ContentBlock])] }), [['MALFORMED_OP', 0]], 'content that isn\'t plain data');
+    assert.deepEqual(malformed({ ops: [{ kind: 10n }] }), [['MALFORMED_OP', 0]], 'a kind that JSON can\'t write');
+    assert.match(planMutation(state(), { ops: [{ ...editMessage('m3', text('x')), label: 5 }] } as unknown as Parameters<typeof planMutation>[1]).violations[0]!.message, /op 0's `label` is a number, not a string/);
     const plan = planMutation(state(), { ops: [{ kind: 'redact_message' }] } as unknown as Parameters<typeof planMutation>[1]);
     assert.deepEqual(plan.targets, [], 'a malformed manifest plans nothing');
     assert.match(plan.violations[0]!.message, /op 0 has kind "redact_message", which is none of edit_summary, edit_message and remove_messages/);
+    const owned = [editMessage('m3', text('as planned'))];
+    const planned = planMutation(state(), { ops: owned });
+    (owned[0]!.content[0] as { text: string }).text = 'changed after the plan';
+    const target = planned.targets[0]!;
+    assert.ok(target.kind === 'edit_message' && JSON.stringify(target.content).includes('as planned'), 'the plan holds its own copy of the content');
   });
 
   it('refuses to plan where a strategy\'s summaries in memory aren\'t the ones the store holds', () => {
     const fresh: HistoryMemory = { ...MEMORY, stored: MEMORY.summaries };
-    const stale: HistoryMemory = { ...MEMORY, stored: [...MEMORY.summaries] };
+    const stale: HistoryMemory = { ...MEMORY, stored: MEMORY.summaries.map((s, i) => (i === 0 ? { ...s, content: 'written elsewhere' } : s)) };
+    const copied: HistoryMemory = { ...MEMORY, stored: structuredClone(MEMORY.summaries) };
     const codes = (own: HistoryMemory, reader: HistoryMemory) => planMutation(state({ memory: own }), { ops: [editMessage('m6', text('x'), { foldedPolicy: 'leave_summaries' })] },
       [{ namespace: 'b', state: state({ memory: reader }) }]).violations.filter((v) => v.code === 'STALE_MEMORY').map((v) => v.remediation?.readerNamespace ?? 'own');
     assert.deepEqual(codes(fresh, fresh), []);
+    assert.deepEqual(codes(copied, copied), [], 'a copy that holds the same summaries is not stale');
     assert.deepEqual(codes(stale, fresh), ['own']);
     assert.deepEqual(codes(fresh, stale), ['b']);
+  });
+
+  it('refuses a strategy whose summaries it can\'t see, the manager\'s or a reader\'s', () => {
+    const refused = (own: Partial<HistoryState>, reader: Partial<HistoryState>) => planMutation(state(own), { ops: [editMessage('m6', text('x'))] }, [{ namespace: 'b', state: state(reader) }])
+      .violations.filter((v) => v.code === 'STRATEGY_UNSUPPORTED').map((v) => v.remediation?.readerNamespace ?? 'own');
+    assert.deepEqual(refused({}, {}), [], 'a strategy that keeps no summaries');
+    assert.deepEqual(refused({ hiddenStrategy: 'custom' }, {}), ['own']);
+    assert.deepEqual(refused({}, { hiddenStrategy: 'custom' }), ['b']);
+    const summaryEdit = planMutation(state({ hiddenStrategy: 'custom' }), { ops: [{ kind: 'edit_summary', summaryId: 'L1-a', expectedSha256: 'x', newText: 'y' }] });
+    assert.deepEqual(summaryEdit.violations.map((v) => [v.code, v.opIndex]), [['STRATEGY_UNSUPPORTED', -1]], 'said once, for the strategy');
+    assert.match(summaryEdit.violations[0]!.message, /the custom strategy has no historyMemory\(\)/);
+  });
+
+  it('reports no change to the thinking record or the cache for an edit that writes the content a message holds', () => {
+    const rows = [...ROWS.slice(0, 6), row('m6', 7, 'Ada', [...text('[edited by Clement]'), ...text('noted')])];
+    const same = planMutation(state({ rows, thinkingBoundThrough: 7 }), { ops: [{ ...editMessage('m6', text('noted')), expectedSha256: sha('m6', rows) }] });
+    assert.deepEqual(same.violations, []);
+    assert.equal(same.invalidatesThinkingBinding, false);
+    assert.equal(same.invalidatesKvPrefixFrom, undefined);
+    const other = planMutation(state({ rows, thinkingBoundThrough: 7 }), { ops: [{ ...editMessage('m6', text('noted, again')), expectedSha256: sha('m6', rows) }] });
+    assert.equal(other.invalidatesThinkingBinding, true);
   });
 
   it('places rows that an edit brings into the view in window order, whatever the manifest\'s order', () => {

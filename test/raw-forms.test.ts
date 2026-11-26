@@ -205,7 +205,7 @@ describe('raw forms: keys and release', () => {
     assert.equal(releaseSharedRawFormsOnMove(rs9, [fc1, rs9]), rs9);
   });
 
-  it('content that replaces a message gives up a raw form its kept blocks share once they move, and a changed opaque carrier gives up its item', () => {
+  it('content that replaces a message gives up a raw form its kept blocks share once their order changes, and a changed opaque carrier gives up its item', () => {
     const big = xmlUse('a', '/big');
     const small = xmlUse('b', '/small');
     const swapped = releaseReplacedRawForms([big, small], [{ ...small }, { ...big }]);
@@ -218,7 +218,7 @@ describe('raw forms: keys and release', () => {
     assert.deepEqual(redacted[0], { type: 'text', text: '[redacted]' });
   });
 
-  it('content that replaces a message keeps a shared raw form only where its blocks stand as they stood, with nothing between them', () => {
+  it('content that replaces a message keeps a shared raw form only where its blocks stay together in their order, with nothing between them', () => {
     const first = itemText('first part');
     const second = itemText('second part');
     const inserted = releaseReplacedRawForms([first, second], [{ ...first }, { type: 'text', text: 'a note' }, { ...second }]);
@@ -249,7 +249,7 @@ describe('raw forms: keys and release', () => {
     assert.deepEqual(one.map((block) => rawOf(block).rawItem), [undefined, undefined], 'one copy of the part is gone');
   });
 
-  it('content that replaces a message keeps a raw form that the old content didn\'t hold, an opaque carrier\'s item among them', () => {
+  it('content that replaces a message keeps a raw form that the old content didn\'t hold, and gives up a copy of one it held', () => {
     const part = itemText('a part');
     const fresh = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_9', encrypted_content: 'new' } } as ContentBlock;
     const added = releaseReplacedRawForms([part], [{ ...part }, fresh]);
@@ -261,6 +261,9 @@ describe('raw forms: keys and release', () => {
     const searched = searchCall();
     const updated = { type: 'text', text: '', rawItem: { type: 'web_search_call', id: 'ws_1', status: 'failed' } } as ContentBlock;
     assert.equal(rawOf(releaseReplacedRawForms([searched], [updated])[0]!).rawItem, rawOf(updated).rawItem, 'and so is an item that keeps an old id with new contents');
+    const sameId = itemText('new words', { ...rawOf(part).rawItem as object, content: [{ type: 'output_text', text: 'new words' }] });
+    assert.notDeepEqual(rawOf(sameId).rawItem, rawOf(part).rawItem, 'setup: the same id, new contents');
+    assert.deepEqual(rawOf(releaseReplacedRawForms([part], [sameId])[0]!).rawItem, rawOf(sameId).rawItem, 'a message item too, which no opaque carrier holds');
   });
 
   it('content that replaces a message keeps the rawXml that is a block\'s content', () => {
@@ -273,7 +276,7 @@ describe('raw forms: keys and release', () => {
     assert.equal(rawOf(releaseReplacedRawForms([use], [{ ...use, input: { path: '/other' } } as ContentBlock])[0]!).rawXml, undefined, 'a changed tool_use gives up its replay');
   });
 
-  it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {
+  it('a moved opaque carrier keeps its item even in a pairing', () => {
     const think = reasoning();
     const search = searchCall();
     assert.equal(releaseSharedRawFormsOnMove(search, [think, search]), search);
