@@ -4,7 +4,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 
 import {
   describeTarget, historyAnomalies, introducedAnomalies, messageContentSha256, planMutation, readBackMismatches, snapshotOf,
-  type HistoryMemory, type HistoryMutationOp, type HistoryState,
+  type HistoryMemory, type HistoryMutationOp, type HistoryState, type UnlistedNamespace,
 } from '../src/history-mutation.js';
 import { textSha256 } from '../src/summary-edit.js';
 import type { StoredMessage } from '../src/types/message.js';
@@ -278,6 +278,31 @@ describe('history mutation plan', () => {
     const plan = planMutation(s, { ops: [remove('m6')] });
     assert.equal(plan.valid, true);
     assert.deepEqual(readBackMismatches(plan, snapshotOf(s), s, { by: 'operator', at: 0, sourceBranch: 'main' }), ['message m6 is still there']);
+  });
+
+  it('refuses a namespace the caller left out whose chunk records cover a row, or whose window holds a removed row, and binds the plan to what it ignores', () => {
+    const other = (over: Partial<UnlistedNamespace>): UnlistedNamespace => ({ namespace: 'agents/Ghost', summaries: [], records: [], windowHolds: () => false, ...over });
+    const unlisted = (o: UnlistedNamespace, ignore: string[] = []) => planMutation(state(), { ops: [remove('m3')] }, [], { namespaces: [o], ignore }).violations.map((v) => [v.code, v.remediation?.readerNamespace]);
+    assert.deepEqual(unlisted(other({})), [], 'a namespace that holds none of the rows');
+    assert.deepEqual(unlisted(other({ records: [{ id: 'c-9', sourceIds: ['m3'], compressed: true, summaryId: 'S9' }] })), [['UNLISTED_READER', 'agents/Ghost']]);
+    assert.deepEqual(unlisted(other({ windowHolds: (id) => id === 'm3' })), [['UNLISTED_READER', 'agents/Ghost']]);
+    assert.deepEqual(unlisted(other({ windowHolds: (id) => id === 'm3' }), ['agents/Ghost']), []);
+    const sha = (ignore: string[]) => planMutation(state(), { ops: [remove('m3')] }, [], { namespaces: [], ignore }).planSha256;
+    assert.notEqual(sha([]), sha(['agents/Nobody']), 'the plan\'s sha256 covers the namespaces it ignores');
+  });
+
+  it('checks the tool pairs of the view that an edit leaves, with a row that the filter takes in or out', () => {
+    const shown = (r: StoredMessage) => !r.content.some((b) => b.type === 'text' && b.text.includes('HIDE'));
+    const call = { type: 'tool_use', id: 'tx', name: 'read', input: { path: 'x' } } as ContentBlock;
+    const result = { type: 'tool_result', toolUseId: 'tx', content: 'x' } as ContentBlock;
+    const hiddenPair = [row('h0', 1, 'User', text('hello')), row('h1', 2, 'Ada', [...text('HIDE'), call]), row('h2', 3, 'User', [result, ...text('HIDE')]), row('h3', 4, 'Ada', text('done'))];
+    const s = state({ rows: hiddenPair, window: hiddenPair, view: hiddenPair.filter(shown), viewKeeps: shown });
+    const revealed = planMutation(s, { ops: [{ kind: 'edit_message', messageId: 'h1', expectedSha256: sha('h1', hiddenPair), content: [call], label: '[edited by Clement]' }] });
+    assert.ok(revealed.violations.some((v) => v.code === 'TOOL_PAIR_SPLIT' && v.targetId === 'h1'), JSON.stringify(revealed.violations));
+    const shownPair = [row('h0', 1, 'User', text('hello')), row('h1', 2, 'Ada', [call]), row('h2', 3, 'User', [result]), row('h3', 4, 'Ada', text('done'))];
+    const t = state({ rows: shownPair, window: shownPair, view: shownPair.filter(shown), viewKeeps: shown });
+    const hidden = planMutation(t, { ops: [{ kind: 'edit_message', messageId: 'h2', expectedSha256: sha('h2', shownPair), content: [result, ...text('HIDE')], label: '[edited by Clement]' }] });
+    assert.ok(hidden.violations.some((v) => v.code === 'TOOL_PAIR_SPLIT'), JSON.stringify(hidden.violations));
   });
 
   it('counts a tool pair split that an edit brings into the view as new, though the record held it', () => {

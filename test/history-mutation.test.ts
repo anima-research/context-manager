@@ -9,7 +9,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { Membrane, MockAdapter, OpenAIResponsesFormatter, type ContentBlock } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, HistoryMutationError, KnowledgeStrategy, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, isHistoryMutationStrategy, messageContentSha256 } from '../src/index.js';
-import type { HistoryMutationManifest, HistoryMutationOp, HistoryMutationPlan, SummaryEntry } from '../src/index.js';
+import type { HistoryMemorySource, HistoryMutationManifest, HistoryMutationOp, HistoryMutationPlan, SummaryEntry } from '../src/index.js';
 import { markStoreBranchSwitch } from '../src/branch-generation.js';
 import { residentStrategyOptions } from '../scripts/resident-settings.js';
 
@@ -253,7 +253,7 @@ describe('history mutation', () => {
         budget = { ...budget, maxTokens: budget.maxTokens - 100 };
         preview = await manager.compileMutationPreview(full, { budget, by: { by: 'operator', note: 'by hand' } });
       }
-      assert.match(rendered(preview.compiled.messages), /editedBy="operator">\nA memory rewritten before it was applied\./, 'setup: a budget at which the edited summary renders');
+      assert.match(rendered(preview.compiled.messages), /writtenBy="operator">\nA memory rewritten before it was applied\./, 'setup: a budget at which the edited summary renders');
       assert.equal(manager.currentBranch().name, 'main');
       assert.equal(manager.getStore().currentSequence(), sequence, 'the source branch takes no record');
       assert.deepEqual(branchNames(manager), branches, 'the scratch branch is gone');
@@ -326,10 +326,10 @@ describe('history mutation', () => {
       const { manifest } = l1Edit(manager);
       await apply(manager, manifest, 'surgery/envelope');
       let text = '';
-      for (let maxTokens = 2_000; maxTokens >= 400 && !text.includes('editedBy='); maxTokens -= 100) {
+      for (let maxTokens = 2_000; maxTokens >= 400 && !text.includes('writtenBy='); maxTokens -= 100) {
         text = rendered((await manager.compile({ maxTokens, reserveForResponse: 50 }, undefined, { dryRun: true })).messages);
       }
-      assert.match(text, /<cm-recall [^>]*editedBy="operator">\nThe first stretch, by hand\./);
+      assert.match(text, /<cm-recall [^>]*writtenBy="operator">\nThe first stretch, by hand\./);
     });
   });
 
@@ -376,7 +376,7 @@ describe('history mutation', () => {
         targetBranch: 'surgery/carried', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
         strategy: () => new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never),
       });
-      assert.match(rendered([{ content: strategy.answer(carrier.id) }]), /^<cm-recall id="L2-carry" level="2" span="[^"]+" editedBy="operator">\nCarried, by hand\.\n<\/cm-recall>$/);
+      assert.match(rendered([{ content: strategy.answer(carrier.id) }]), /^<cm-recall id="L2-carry" level="2" span="[^"]+" writtenBy="operator">\nCarried, by hand\.\n<\/cm-recall>$/);
       const edited = manager.getSummary(under.id)!;
       const carried = manager.getSummary(carrier.id)!;
       assert.deepEqual(
@@ -1056,7 +1056,7 @@ describe('history mutation', () => {
   });
 
   it('reconciles a reader whose strategy keeps nothing of what it folds through a stand-in, and reads back every reader it names', async () => {
-    class Plain extends PassthroughStrategy {
+    class Plain extends PassthroughStrategy implements HistoryMemorySource {
       historyMemory() {
         return NO_SUMMARIES;
       }
@@ -1947,13 +1947,13 @@ describe('history mutation', () => {
     await resident(path, async (manager) => {
       const { manifest } = l1Edit(manager, 'A memory named by its editor.');
       let text = '';
-      for (let maxTokens = 2_000; maxTokens >= 400 && !text.includes('editedBy='); maxTokens -= 100) {
+      for (let maxTokens = 2_000; maxTokens >= 400 && !text.includes('writtenBy='); maxTokens -= 100) {
         const by = { by: 'operator' };
         const asked = manager.compileMutationPreview(manifest, { by, budget: { maxTokens, reserveForResponse: 50 } });
         by.by = 'someone else';
         text = rendered((await asked).compiled.messages);
       }
-      assert.match(text, /editedBy="operator">\nA memory named by its editor\./);
+      assert.match(text, /writtenBy="operator">\nA memory named by its editor\./);
     });
   });
 
@@ -2266,6 +2266,79 @@ describe('history mutation', () => {
       assert.throws(() => manager.checkHistoryInvariants(), /has no historyMemory\(\)/);
     } finally {
       manager.close();
+    }
+  });
+  it('refuses a plan that leaves out a namespace whose summaries fold a row the change reaches, unless the caller names it in ignoreNamespaces', async () => {
+    const path = await twoResidentStore();
+    await residents(path, async (a, b) => {
+      const id = foldedByBoth(a, b);
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(a, id), content: [{ type: 'text', text: 'a row redacted' }],
+        label: '[redacted by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      const left = a.planHistoryMutation(manifest);
+      const unlisted = left.violations.filter((v) => v.code === 'UNLISTED_READER');
+      assert.deepEqual(unlisted.map((v) => v.remediation?.readerNamespace), [NS_B]);
+      assert.match(unlisted[0]!.message, /namespace agents\/Bea isn't among the readers, and its summaries .* fold rows the change reaches: pass its manager as a reader, or name it in ignoreNamespaces/);
+      await assert.rejects(a.applyHistoryMutation(manifest, { targetBranch: 'surgery/left-out', expectedSourceBranch: 'main', expectedPlanSha256: left.planSha256, by: { by: 'operator' } }), refusedWith('UNLISTED_READER'));
+      assert.equal(a.currentBranch().name, 'main');
+      const ignored = a.planHistoryMutation(manifest, { ignoreNamespaces: [NS_B] });
+      assert.deepEqual(ignored.violations, [], 'named, it is left as it is');
+      assert.notEqual(ignored.planSha256, a.planHistoryMutation(manifest, { readers: [b] }).planSha256, 'the plan\'s sha256 covers what it ignores');
+      assert.deepEqual(a.planHistoryMutation(manifest, { readers: [b] }).violations, [], 'passed, it is a reader');
+    });
+  });
+
+  it('says that a branch it built is left where the store can\'t be read to tell, keeping the failure', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const { deleteBranch, listBranches } = { deleteBranch: store.deleteBranch.bind(store), listBranches: store.listBranches.bind(store) };
+      let unreadable = false;
+      store.deleteBranch = (name: string) => {
+        if (name === 'surgery/unreadable') {
+          unreadable = true;
+          throw new Error('zz the deletion failed');
+        }
+        return deleteBranch(name);
+      };
+      store.listBranches = () => {
+        if (unreadable) throw new Error('zz the store can\'t be read');
+        return listBranches();
+      };
+      try {
+        await assert.rejects(
+          manager.applyHistoryMutation(manifest, {
+            targetBranch: 'surgery/unreadable', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+            beforeSwitch: async () => { throw new Error('zz the host could not reconcile'); },
+          }),
+          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && /zz the host could not reconcile; and deleting branch surgery\/unreadable, which it built, failed \(zz the deletion failed\): the store can't be read to tell whether it is still there/.test(String(error)),
+        );
+      } finally {
+        store.deleteBranch = deleteBranch;
+        store.listBranches = listBranches;
+      }
+    });
+  });
+  it('refuses a plan that leaves out a namespace whose presented window holds a removed row', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', strategy: new PassthroughStrategy() });
+    try {
+      main.addMessage('User', [{ type: 'text', text: 'an earlier row' }]);
+      const id = main.addMessage('User', [{ type: 'text', text: 'a row the side was shown' }]);
+      side.presentRows([id]);
+      assert.notEqual(side.ordinalOf(id), undefined, 'setup: the side\'s window holds the row');
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [id], expectedSha256ById: { [id]: messageSha(main, id) } }] };
+      const left = main.planHistoryMutation(manifest).violations.filter((v) => v.code === 'UNLISTED_READER');
+      assert.deepEqual(left.map((v) => v.remediation?.readerNamespace), ['agents/Side']);
+      assert.match(left[0]!.message, new RegExp(`its window holds ${id}, which the change removes`));
+      assert.deepEqual(main.planHistoryMutation(manifest, { readers: [side] }).violations, []);
+    } finally {
+      side.close();
+      main.close();
     }
   });
 });

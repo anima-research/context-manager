@@ -299,7 +299,7 @@ describe('recallEnvelope: the delimiter is a convention, not parseable XML', () 
 
   it('names who supplied a summary\'s text, with what would read as markup written as character references', () => {
     const { open } = buildRecallEnvelopeTags(fakeSummary({ external: { by: 'A & B <x>\n"y"', at: 1 } }));
-    assert.equal(open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4" editedBy="A &#38; B &#60;x&#62;&#10;&#34;y&#34;">');
+    assert.equal(open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4" writtenBy="A &#38; B &#60;x&#62;&#10;&#34;y&#34;">');
     const notText = fakeSummary({ external: JSON.parse('{"by": 7, "at": 1}') });
     assert.equal(buildRecallEnvelopeTags(notText).open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4">', 'a stored `by` that isn\'t text names no one');
   });
