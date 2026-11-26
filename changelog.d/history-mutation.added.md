@@ -106,9 +106,11 @@
     reader, reads another store, or keeps summaries or has `onRetracted`
     with no usable `cloneForScratch`.
   - `compileMutationPreview(manifest, { by, budget?, injections?,
-    selectOptions?, strategy?, readers?, ignoreNamespaces? })` builds the
-    manager's part of the mutation the same way on a scratch branch,
-    compiles there with `dryRun`, and deletes the branch. It plans the
+    selectOptions?, strategy?, readers?, ignoreNamespaces?, beforeCompile? })`
+    builds the manager's part of the mutation the same way on a scratch
+    branch, compiles there with `dryRun`, and deletes the branch.
+    `beforeCompile` gets the scratch manager before the compile, so a caller
+    can write there what it writes after an apply, for the compile to weigh. It plans the
     readers as the apply does, and reconciles none of them: the compile is
     the manager's. So a preview writes to the store, though the manager's
     branch doesn't move: its records stay in the store's log after the

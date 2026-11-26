@@ -4848,6 +4848,11 @@ export class ContextManager {
    * reconciled, since the compile is this manager's. Refused before
    * anything is written where `by.by` is blank, or while this manager or
    * a reader stores the shards of a sharded addMessage.
+   *
+   * `beforeCompile` gets the scratch manager after the mutation is built
+   * and before the compile, so a caller can write there what the apply's
+   * caller writes after the switch, such as a notice, for the compile to
+   * weigh as the next compile after the apply will.
    */
   async compileMutationPreview(
     manifest: HistoryMutationManifest,
@@ -4859,11 +4864,13 @@ export class ContextManager {
       strategy?: () => ContextStrategy;
       readers?: readonly ContextManager[];
       ignoreNamespaces?: readonly string[];
+      beforeCompile?: (ctx: { manager: ContextManager; sourceBranch: string }) => Promise<void>;
     },
   ): Promise<{ plan: HistoryMutationPlan; compiled: CompileResult }> {
     this.requireInitialized('compileMutationPreview');
     this.refuseCutWhileWritingShards('compileMutationPreview');
     const by = requireEditor('compileMutationPreview', options.by);
+    const { budget, injections, selectOptions, beforeCompile, strategy } = options;
     const readers = this.readersOf(options.readers, 'compileMutationPreview');
     const plan = planMutation(this.historyState(), manifest, readers, this.unlistedNamespaces(readers, options.ignoreNamespaces));
     if (!plan.valid) throw invalidPlan(plan);
@@ -4878,9 +4885,10 @@ export class ContextManager {
     let staging: ContextManager | undefined;
     let compiled: CompileResult;
     try {
-      staging = await this.managerOnBranch(scratch, options.strategy, true);
+      staging = await this.managerOnBranch(scratch, strategy, true);
       await staging.applyPlannedOps(plan, editStamp(by, this.now(), plan.sourceBranch));
-      compiled = await staging.compile(options.budget, options.injections, { ...options.selectOptions, dryRun: true });
+      await beforeCompile?.({ manager: staging, sourceBranch: plan.sourceBranch });
+      compiled = await staging.compile(budget, injections, { ...selectOptions, dryRun: true });
       staging.close();
     } catch (error) {
       if (staging) await Promise.allSettled([...staging.retractedCalls]);
