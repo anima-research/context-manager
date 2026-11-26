@@ -127,6 +127,7 @@ export type {
   ResettableStrategy,
   ExternalMemoryStrategy,
   HistoryMutationStrategy,
+  HistoryMemorySource,
   ExternalMemoryProvenance,
   MemoryWorkItem,
   MemoryWorkTarget,

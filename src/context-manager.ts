@@ -53,10 +53,10 @@ import {
   isExternalMemoryStrategy,
   isHistoryMutationStrategy,
 } from './types/index.js';
-import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, HistoryMutationStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
+import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, HistoryMemorySource, HistoryMutationStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
 import {
   describeTarget, historyAnomalies, HistoryMutationError, introducedAnomalies, planMutation, readBackMismatches, readerReadBackMismatches, snapshotOf,
-  type HistoryAnomaly, type HistoryMutationManifest, type HistoryMutationPlan, type HistoryMutationReceipt, type HistoryState,
+  type HistoryAnomaly, type HistoryMutationManifest, type HistoryMutationPlan, type HistoryMutationReceipt, type HistoryState, type UnlistedNamespace,
   type MessageEditStamp, type MutationTargetDescription, type MutationViolationCode, type PlannedReader,
 } from './history-mutation.js';
 import { isStateExistsFor } from './state-registration.js';
@@ -582,8 +582,8 @@ function keepsNoSummaries(strategy: ContextStrategy): boolean {
   return strategy.constructor === PassthroughStrategy || strategy.constructor === WindowedPassthroughStrategy;
 }
 
-function historyMemoryOf(strategy: ContextStrategy): ReturnType<HistoryMutationStrategy['historyMemory']> | null {
-  const read = (strategy as Partial<Pick<HistoryMutationStrategy, 'historyMemory'>>).historyMemory;
+function historyMemoryOf(strategy: ContextStrategy): ReturnType<HistoryMemorySource['historyMemory']> | null {
+  const read = (strategy as Partial<HistoryMemorySource>).historyMemory;
   return typeof read === 'function' ? read.call(strategy) : null;
 }
 
@@ -4755,9 +4755,10 @@ export class ContextManager {
    * that keeps summaries or has onRetracted and gives no usable
    * cloneForScratch, since an apply couldn't reconcile it.
    */
-  planHistoryMutation(manifest: HistoryMutationManifest, options: { readers?: readonly ContextManager[] } = {}): HistoryMutationPlan {
+  planHistoryMutation(manifest: HistoryMutationManifest, options: { readers?: readonly ContextManager[]; ignoreNamespaces?: readonly string[] } = {}): HistoryMutationPlan {
     this.requireInitialized('planHistoryMutation');
-    return planMutation(this.historyState(), manifest, this.readersOf(options.readers, 'planHistoryMutation'));
+    const readers = this.readersOf(options.readers, 'planHistoryMutation');
+    return planMutation(this.historyState(), manifest, readers, this.unlistedNamespaces(readers, options.ignoreNamespaces));
   }
 
   private readersOf(
@@ -4796,6 +4797,31 @@ export class ContextManager {
     return historyAnomalies(this.visibleHistoryState('checkHistoryInvariants'));
   }
 
+  private unlistedNamespaces(readers: ReadonlyArray<{ namespace: string }>, ignore: readonly string[] = []): { namespaces: UnlistedNamespace[]; ignore: readonly string[] } {
+    const listed = new Set([this.strategyNamespace, ...readers.map((r) => r.namespace)]);
+    const ids = new Set(this.store.listStates().map((state) => state.id));
+    const suffixes = ['/autobio:summaries', '/autobio:chunks', '/window'];
+    const found = new Set<string>();
+    for (const id of ids) {
+      for (const suffix of suffixes) if (id.endsWith(suffix)) found.add(id.slice(0, -suffix.length));
+    }
+    const array = (id: string): unknown[] => {
+      if (!ids.has(id)) return [];
+      const value: unknown = this.store.getStateJson(id);
+      return Array.isArray(value) ? value : [];
+    };
+    const namespaces = [...found].filter((namespace) => !listed.has(namespace)).sort().map((namespace): UnlistedNamespace => {
+      const window = ids.has(windowIndexStateId(namespace)) ? new WindowIndex(this.store, namespace, this.diag) : null;
+      return {
+        namespace,
+        summaries: array(`${namespace}/autobio:summaries`),
+        records: array(`${namespace}/autobio:chunks`),
+        windowHolds: (id) => window !== null && window.mode() === 'presented' && window.ordinalOf(id) !== undefined,
+      };
+    });
+    return { namespaces, ignore: [...ignore] };
+  }
+
   private visibleHistoryState(operation: 'describeMutationTarget' | 'checkHistoryInvariants'): HistoryState {
     const state = this.historyState();
     if (state.hiddenStrategy !== undefined) {
@@ -4810,11 +4836,12 @@ export class ContextManager {
    * manager bound to it, which compiles there with `dryRun` and closes, and
    * the branch is deleted. This manager's branch never moves, so it can run
    * beside a live agent; the store takes the scratch branch's records and
-   * its deletion. Throws HistoryMutationError for a plan with violations,
+   * its deletion, and its log keeps those records after the branch is gone.
+   * Throws HistoryMutationError for a plan with violations,
    * and BRANCH_LEFT, naming the scratch branch, where its deletion fails.
    *
    * `by` is who the apply will name, which the compile shows (a recall
-   * envelope's `editedBy`). `strategy` gives the scratch manager its
+   * envelope's `writtenBy`). `strategy` gives the scratch manager its
    * strategy where this one's has no cloneForScratch; it must not compress
    * on its own. `readers` are planned as planHistoryMutation plans them, so
    * the plan returned is the one an apply with them agrees to; none is
@@ -4831,12 +4858,14 @@ export class ContextManager {
       selectOptions?: SelectOptions;
       strategy?: () => ContextStrategy;
       readers?: readonly ContextManager[];
+      ignoreNamespaces?: readonly string[];
     },
   ): Promise<{ plan: HistoryMutationPlan; compiled: CompileResult }> {
     this.requireInitialized('compileMutationPreview');
     this.refuseCutWhileWritingShards('compileMutationPreview');
     const by = requireEditor('compileMutationPreview', options.by);
-    const plan = planMutation(this.historyState(), manifest, this.readersOf(options.readers, 'compileMutationPreview'));
+    const readers = this.readersOf(options.readers, 'compileMutationPreview');
+    const plan = planMutation(this.historyState(), manifest, readers, this.unlistedNamespaces(readers, options.ignoreNamespaces));
     if (!plan.valid) throw invalidPlan(plan);
     const scratch = `preview-mutation/${randomUUID()}`;
     let created: { id: string };
@@ -4927,6 +4956,7 @@ export class ContextManager {
       strategy?: () => ContextStrategy;
       beforeSwitch?: (ctx: { view: JsStore; sourceBranch: string; targetBranch: string }) => Promise<void>;
       readers?: readonly ContextManager[];
+      ignoreNamespaces?: readonly string[];
     },
   ): Promise<HistoryMutationReceipt> {
     this.requireInitialized('applyHistoryMutation');
@@ -4938,7 +4968,7 @@ export class ContextManager {
     }
     const readers = this.readersOf(options.readers, 'applyHistoryMutation');
     const state = this.historyState();
-    const plan = planMutation(state, manifest, readers);
+    const plan = planMutation(state, manifest, readers, this.unlistedNamespaces(readers, options.ignoreNamespaces));
     const refuse = (code: MutationViolationCode, message: string): never => {
       throw new HistoryMutationError(message, [{ opIndex: -1, code, message }], plan);
     };
@@ -5061,11 +5091,22 @@ export class ContextManager {
       if (this.store.listBranches().some(built)) this.store.deleteBranch(branch);
     } catch (cleanup) {
       const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
-      const left = !this.store.listBranches().some(built)
-        ? 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it'
-        : this.store.currentBranch().name === branch
-          ? 'the store is on it: switch the store to another branch, then delete it'
-          : 'it is still there: delete it by hand';
+      const read = <T>(of: () => T): T | undefined => {
+        try {
+          return of();
+        } catch {
+          return undefined;
+        }
+      };
+      const stands = read(() => this.store.listBranches().some(built));
+      const current = stands ? read(() => this.store.currentBranch().name) : undefined;
+      const left = stands === undefined
+        ? "the store can't be read to tell whether it is still there"
+        : !stands
+          ? 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it'
+          : current === branch
+            ? 'the store is on it: switch the store to another branch, then delete it'
+            : 'it is still there: delete it by hand';
       const leftMessage = `deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
       const message = failure !== undefined ? `${why(failure)}; and ${leftMessage}` : leftMessage;
       const listed = failure instanceof HistoryMutationError;

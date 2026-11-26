@@ -100,6 +100,7 @@ export type MutationViolationCode =
   | 'STRATEGY_UNSUPPORTED'
   | 'MALFORMED_OP'
   | 'STALE_MEMORY'
+  | 'UNLISTED_READER'
   // An apply's own, beyond its plan's: the branch or plan it was given isn't
   // the one it finds, its target branch exists, the branch it built reads
   // back other than planned or breaks a rule the source didn't, the source
@@ -221,6 +222,14 @@ export interface HistoryState {
   windowOrdinals?: ReadonlyArray<{ id: MessageId; ordinal: number | undefined }>;
   viewKeeps?: (row: StoredMessage) => boolean;
   thinkingBoundThrough?: Sequence;
+}
+
+/** What the store holds of a namespace that is neither the manager's nor a reader's: its summaries, its chunk records, and its presented window. */
+export interface UnlistedNamespace {
+  namespace: string;
+  summaries: readonly unknown[];
+  records: readonly unknown[];
+  windowHolds: (id: MessageId) => boolean;
 }
 
 export interface HistoryMemory {
@@ -385,10 +394,23 @@ function checkedOps(manifest: unknown): { malformed: Array<{ opIndex: number; me
   return { malformed: out, copies };
 }
 
+function foldsAny(entries: readonly unknown[], rows: ReadonlySet<MessageId>, summaryId: (entry: Record<string, unknown>) => unknown): string[] {
+  const out: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const fields = entry as Record<string, unknown>;
+    const id = summaryId(fields);
+    if (typeof id !== 'string' || !Array.isArray(fields.sourceIds)) continue;
+    if (fields.sourceIds.some((source) => typeof source === 'string' && rows.has(source)) && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 export function planMutation(
   state: HistoryState,
   manifest: HistoryMutationManifest,
   readers: ReadonlyArray<{ namespace: string; state: HistoryState }> = [],
+  unlisted: { namespaces: readonly UnlistedNamespace[]; ignore: readonly string[] } = { namespaces: [], ignore: [] },
 ): HistoryMutationPlan {
   const violations: MutationViolation[] = [];
   const refuse = (opIndex: number, code: MutationViolationCode, message: string, targetId?: string, remediation?: Record<string, unknown>) => {
@@ -616,7 +638,13 @@ export function planMutation(
     return [content ? { ...row, content } : row];
   });
   const changeable = (id: MessageId) => position.has(id);
-  for (const split of [...introducedToolSplits(state.record, applied(state.record), changeable), ...introducedToolSplits(state.view, applied(state.view), changeable)]) {
+  const viewAfter = (s: HistoryState): StoredMessage[] => {
+    const keeps = s.viewKeeps;
+    if (!keeps) return applied(s.view);
+    const inView = new Set(s.view.map((row) => row.id));
+    return applied(s.window).filter((row) => (editedContent.has(row.id) ? keeps(row) : inView.has(row.id)));
+  };
+  for (const split of [...introducedToolSplits(state.record, applied(state.record), changeable), ...introducedToolSplits(state.view, viewAfter(state), changeable)]) {
     const key = `${split.messageId}\u0000${split.message}`;
     if (splitsSeen.has(key)) continue;
     splitsSeen.add(key);
@@ -652,7 +680,7 @@ export function planMutation(
         for (const id of coveringSummaries) seeds.add(id);
       }
     }
-    for (const split of [...introducedToolSplits(reader.record, applied(reader.record), changeable), ...introducedToolSplits(reader.view, applied(reader.view), changeable)]) {
+    for (const split of [...introducedToolSplits(reader.record, applied(reader.record), changeable), ...introducedToolSplits(reader.view, viewAfter(reader), changeable)]) {
       const key = `${split.messageId}\u0000${split.message}`;
       if (splitsSeen.has(key)) continue;
       splitsSeen.add(key);
@@ -669,6 +697,20 @@ export function planMutation(
     const droppingOps = [...seedsByOp].filter(([, seeds]) => withSummariesAbove(summaries, seeds).has(target.summaryId)).map(([opIndex]) => opIndex);
     refuse(target.opIndex, 'EDITED_SUMMARY_DROPPED', `summary ${target.summaryId} is edited here, and the policy of op ${droppingOps.join(', ')} drops it: edit it or drop it`, target.summaryId, { droppingOps });
   }
+  const touchedRows = new Set<MessageId>([...editedContent.keys(), ...removedRows]);
+  for (const other of unlisted.namespaces) {
+    if (unlisted.ignore.includes(other.namespace)) continue;
+    const folding = [
+      ...foldsAny(other.summaries, touchedRows, (fields) => (fields.level === 1 ? fields.id : undefined)),
+      ...foldsAny(other.records, touchedRows, (fields) => fields.summaryId),
+    ].filter((id, i, all) => all.indexOf(id) === i);
+    const held = [...removedRows].filter((id) => other.windowHolds(id));
+    if (folding.length === 0 && held.length === 0) continue;
+    refuse(-1, 'UNLISTED_READER', `namespace ${other.namespace} isn't among the readers, and ` + [
+      ...(folding.length > 0 ? [`its summaries ${folding.join(', ')} fold rows the change reaches`] : []),
+      ...(held.length > 0 ? [`its window holds ${held.join(', ')}, which the change removes`] : []),
+    ].join(', and ') + ': pass its manager as a reader, or name it in ignoreNamespaces', undefined, { readerNamespace: other.namespace });
+  }
   const droppedSummaries = [...dropped];
   const effects = windowEffects(state, targets, droppedSummaries);
   const entries = (memory: HistoryMemory | null, ids: readonly string[]) => {
@@ -684,6 +726,7 @@ export function planMutation(
       violations,
       sourceBranch: state.branch,
       targets,
+      ignoreNamespaces: [...unlisted.ignore].sort(),
       droppedSummaries: entries(state.memory, droppedSummaries),
       ...effects,
       readers: readerPlans.map((r, i) => ({ ...r, droppedSummaries: entries(readers[i]!.state.memory, r.droppedSummaries) })),

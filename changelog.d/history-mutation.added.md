@@ -106,13 +106,25 @@
     reader, reads another store, or keeps summaries or has `onRetracted`
     with no usable `cloneForScratch`.
   - `compileMutationPreview(manifest, { by, budget?, injections?,
-    selectOptions?, strategy?, readers? })` builds the manager's part of the
-    mutation the same way on a scratch branch, compiles there with `dryRun`,
-    and deletes the branch. It plans the readers as the apply does, and
-    reconciles none of them: the compile is the manager's. So a preview
-    writes to the store, though the manager's branch doesn't move. The scratch strategy gets the live strategy's rendering
-    frontier, as `derive` does, so that the live strategy's hot settings
-    apply there too.
+    selectOptions?, strategy?, readers?, ignoreNamespaces? })` builds the
+    manager's part of the mutation the same way on a scratch branch,
+    compiles there with `dryRun`, and deletes the branch. It plans the
+    readers as the apply does, and reconciles none of them: the compile is
+    the manager's. So a preview writes to the store, though the manager's
+    branch doesn't move: its records stay in the store's log after the
+    branch is deleted, and a preview that a crash stops leaves its
+    `preview-mutation/<id>` branch, which `listBranches()` lists. The
+    scratch strategy gets the live strategy's rendering frontier, as
+    `derive` does, so that the live strategy's hot settings apply there too.
+  - A mutation changes what agents read, not what the store holds: the
+    source branch and the store's log keep the earlier text. So a
+    redaction isn't an erasure.
+  - The plan refuses where the store holds a namespace that isn't the
+    manager's or a reader's, and whose summaries or chunk records fold a
+    row that the change edits or removes, or whose presented window holds
+    a removed row (`UNLISTED_READER`, naming it). A caller that means to
+    leave a namespace as it is names it in `ignoreNamespaces`, which
+    `planSha256` covers.
   - `checkHistoryInvariants()` lists the anomalies of a history as it
     stands. These are malformed or empty content, a body that lacks shards,
     a tool call or result without its partner, a system change between a
@@ -120,7 +132,7 @@
     record order and in the order that a compile reads the window, with the
     view filter applied.
   - Under `recallEnvelope: 'xml'`, the recall envelope of a summary gains
-    `editedBy` when the summary's text came from outside the strategy and
+    `writtenBy` when the summary's text came from outside the strategy and
     names who wrote it (`external.by` isn't empty). Its carriers gain it
     too. The value escapes `&`, `<`, `>`, `"` and line breaks as character
     references. A summary stored with `external` before this change gains

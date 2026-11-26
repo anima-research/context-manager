@@ -44,7 +44,7 @@
   the request it answers. An entry that has it has no `provenance`, which
   stays what it was: the record of a model's accepted answer. Entries
   without `external` are unchanged. Under `recallEnvelope: 'xml'`, a recall
-  envelope names its `by`, where that isn't empty (`editedBy`), so
+  envelope names its `by`, where that isn't empty (`writtenBy`), so
   selection prices the envelope with that name. Nothing else of selection
   reads `external`. The operations are also methods:
   `ContextManager.exportMemoryRequest`, `importExternalMemory` and

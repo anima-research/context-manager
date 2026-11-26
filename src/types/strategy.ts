@@ -3202,7 +3202,7 @@ export interface SummaryEntry {
    * the text of an existing summary (`importExternalMemory`,
    * `editSummaryText`). Absent on every other entry. Under
    * `recallEnvelope: 'xml'`, the recall envelope of the entry, and of each
-   * entry that carries it, names a `by` that isn't empty as `editedBy`, and
+   * entry that carries it, names a `by` that isn't empty as `writtenBy`, and
    * selection prices that envelope; nothing else of selection reads it. An entry that has it has no `provenance`: that
    * records a model's accepted answer, and here there is none. An installed
    * entry names the request it answers in `external.requestHash`; an edit
@@ -3316,13 +3316,13 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
 }
 
 /**
- * Strategy whose summaries a history mutation reads and changes
- * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
- * AutobiographicalStrategy and its subclasses. A history mutation refuses a
- * strategy whose summaries it can't see; one that keeps none implements
- * `historyMemory()` alone, with empty lists.
+ * Strategy whose summaries a history mutation can see
+ * (ContextManager.planHistoryMutation, applyHistoryMutation). A history
+ * mutation refuses a strategy that isn't one, unless it is
+ * PassthroughStrategy or WindowedPassthroughStrategy itself. One that keeps
+ * no summaries gives empty lists.
  */
-export interface HistoryMutationStrategy extends ExternalMemoryStrategy {
+export interface HistoryMemorySource {
   /**
    * Its summaries and chunk records as it holds them now, and its summaries
    * as the store holds them (`stored`), which differ where another handle
@@ -3333,6 +3333,14 @@ export interface HistoryMutationStrategy extends ExternalMemoryStrategy {
     chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
     stored: readonly unknown[];
   };
+}
+
+/**
+ * Strategy whose summaries a history mutation reads and changes
+ * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
+ * AutobiographicalStrategy and its subclasses.
+ */
+export interface HistoryMutationStrategy extends ExternalMemoryStrategy, HistoryMemorySource {
   /**
    * Drop the summaries `seeds` names, with every summary above them; each
    * chunk record of a dropped L1 keeps its rows and is compressed again, and
