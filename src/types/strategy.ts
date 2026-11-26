@@ -3318,7 +3318,9 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
 /**
  * Strategy whose summaries a history mutation reads and changes
  * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
- * AutobiographicalStrategy and its subclasses.
+ * AutobiographicalStrategy and its subclasses. A history mutation refuses a
+ * strategy whose summaries it can't see; one that keeps none implements
+ * `historyMemory()` alone, with empty lists.
  */
 export interface HistoryMutationStrategy extends ExternalMemoryStrategy {
   /**

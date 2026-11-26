@@ -53,7 +53,7 @@ import {
   isExternalMemoryStrategy,
   isHistoryMutationStrategy,
 } from './types/index.js';
-import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
+import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, HistoryMutationStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
 import {
   describeTarget, historyAnomalies, HistoryMutationError, introducedAnomalies, planMutation, readBackMismatches, readerReadBackMismatches, snapshotOf,
   type HistoryAnomaly, type HistoryMutationManifest, type HistoryMutationPlan, type HistoryMutationReceipt, type HistoryState,
@@ -70,6 +70,7 @@ import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.j
 import { WindowIndex, WindowWriteOutcomeUnknownError, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
 import { bodyBoundsIn } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
+import { WindowedPassthroughStrategy } from './strategies/windowed-passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import { MINT_PREIMAGE_ENVELOPE_INDEX_STATE_ID } from './mint-preimage.js';
@@ -577,6 +578,15 @@ function editStamp(by: Omit<ExternalMemoryProvenance, 'at'>, at: number, sourceB
   return { by: by.by, at, ...(by.note !== undefined ? { note: by.note } : {}), sourceBranch };
 }
 
+function keepsNoSummaries(strategy: ContextStrategy): boolean {
+  return strategy.constructor === PassthroughStrategy || strategy.constructor === WindowedPassthroughStrategy;
+}
+
+function historyMemoryOf(strategy: ContextStrategy): ReturnType<HistoryMutationStrategy['historyMemory']> | null {
+  const read = (strategy as Partial<Pick<HistoryMutationStrategy, 'historyMemory'>>).historyMemory;
+  return typeof read === 'function' ? read.call(strategy) : null;
+}
+
 function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutation', by: Omit<ExternalMemoryProvenance, 'at'>): Omit<ExternalMemoryProvenance, 'at'> {
   if (typeof by !== 'object' || by === null || typeof by.by !== 'string' || by.by.trim() === '') {
     throw new Error(`ContextManager.${operation}: a mutation names who makes it, which its edits record and a recall envelope shows: give a \`by\` that isn't blank`);
@@ -586,7 +596,7 @@ function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutati
 
 function invalidPlan(plan: HistoryMutationPlan): HistoryMutationError {
   return new HistoryMutationError(
-    `the plan has ${plan.violations.length} violation(s): ${plan.violations.map((v) => `${v.code}${v.opIndex >= 0 ? ` (op ${v.opIndex})` : ''}: ${v.message}`).join('; ')}`,
+    `the plan has ${plan.violations.length} violation(s), so nothing was written: ${plan.violations.map((v) => `${v.code}${v.opIndex >= 0 ? ` (op ${v.opIndex})` : ''}: ${v.message}`).join('; ')}`,
     plan.violations,
     plan,
   );
@@ -2848,8 +2858,23 @@ export class ContextManager {
     try {
       this.store.switchBranch(name);
     } catch (error) {
-      const now = this.store.currentBranch();
-      if (now.id === from || now.name !== name) throw error;
+      let now: { id: string; name: string } | undefined;
+      try {
+        now = this.store.currentBranch();
+      } catch {
+        now = undefined;
+      }
+      if (now?.id === from) throw error;
+      if (now?.name !== name) {
+        ++this.initializationAttempt;
+        this.initializedAttempt = null;
+        try {
+          markStoreBranchSwitch(this.store);
+        } catch {
+          // The manager is invalidated either way; the error is the switch's.
+        }
+        throw error;
+      }
       unsaved = error;
     }
     const attempt = ++this.initializationAttempt;
@@ -4683,7 +4708,8 @@ export class ContextManager {
   }
 
   private historyState(): HistoryState {
-    const memory = isHistoryMutationStrategy(this.strategy) ? this.strategy.historyMemory() : null;
+    const memory = historyMemoryOf(this.strategy);
+    const hidden = memory === null && !keepsNoSummaries(this.strategy);
     const binding = readBindingRecord(this.store, this.strategyNamespace).record;
     const window = this.presentedMessageView().getAll();
     const windowMode = this.windowIndex.mode();
@@ -4694,6 +4720,7 @@ export class ContextManager {
       window,
       view: this.strategyMessageView().getAll(),
       memory,
+      ...(hidden ? { hiddenStrategy: this.strategy.name } : {}),
       windowMode,
       ...(windowMode === 'presented' ? { windowOrdinals: window.map((row) => ({ id: row.id, ordinal: this.windowIndex.ordinalOf(row.id) })) } : {}),
       ...(this.viewFilter ? { viewKeeps: this.viewFilter } : {}),
@@ -4743,7 +4770,10 @@ export class ContextManager {
       reader.requireInitialized(operation);
       if (operation !== 'planHistoryMutation') reader.refuseCutWhileWritingShards(operation);
       namespaces.add(reader.strategyNamespace);
-      out.push({ manager: reader, namespace: reader.strategyNamespace, state: reader.historyState(), strategy: reader.scratchStrategy(operation) });
+      const state = reader.historyState();
+      // A strategy the plan can't see is refused by the plan, as a violation.
+      const strategy = state.hiddenStrategy === undefined ? reader.scratchStrategy(operation) : () => reader.strategy;
+      out.push({ manager: reader, namespace: reader.strategyNamespace, state, strategy });
     }
     return out;
   }
@@ -4891,7 +4921,7 @@ export class ContextManager {
     this.requireInitialized('applyHistoryMutation');
     this.refuseCutWhileWritingShards('applyHistoryMutation');
     const by = requireEditor('applyHistoryMutation', options.by);
-    const { targetBranch } = options;
+    const { targetBranch, beforeSwitch, strategy: givenStrategy } = options;
     if ((this.store as { pinnedBranch?: () => string | null }).pinnedBranch?.() != null) {
       throw new Error('ContextManager.applyHistoryMutation: this manager is bound to a branch and can\'t move the store; apply through a manager on the store itself');
     }
@@ -4924,11 +4954,12 @@ export class ContextManager {
       throw error;
     }
     let fromSequence: number;
+    let builtHead = 0;
     let staging: ContextManager | undefined;
     let reader: ContextManager | undefined;
     try {
       fromSequence = this.store.currentSequence();
-      staging = await this.managerOnBranch(targetBranch, options.strategy, true);
+      staging = await this.managerOnBranch(targetBranch, givenStrategy, true);
       await staging.applyPlannedOps(plan, stamp);
       const view = staging.store;
       staging.close();
@@ -4939,9 +4970,9 @@ export class ContextManager {
         staging.close();
         staging = undefined;
       }
-      await options.beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch });
+      await beforeSwitch?.({ view, sourceBranch: plan.sourceBranch, targetBranch });
       const removed = plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : []));
-      const own = await this.managerOnBranch(targetBranch, options.strategy, false);
+      const own = await this.managerOnBranch(targetBranch, givenStrategy, false);
       reader = own;
       const written = own.historyState();
       const stillInWindow = removed.filter((id) => own.ordinalOf(id) !== undefined);
@@ -4969,6 +5000,7 @@ export class ContextManager {
               : `${targetBranch} is not the branch the apply built`
         ) + ': plan again once nothing else writes the history');
       }
+      builtHead = view.currentSequence();
       this.store.sync();
     } catch (error) {
       if (staging) await Promise.allSettled([...staging.retractedCalls]);
@@ -4977,7 +5009,7 @@ export class ContextManager {
       this.deleteBuiltBranch(targetBranch, created.id, plan, error);
       throw error;
     }
-    let toSequence = 0;
+    let toSequence = builtHead;
     const receipt = (): HistoryMutationReceipt => ({
       sourceBranch: plan.sourceBranch,
       targetBranch,
@@ -4994,13 +5026,18 @@ export class ContextManager {
         toSequence = this.store.currentSequence();
       });
     } catch (error) {
-      const now = this.store.currentBranch();
       if (!switched) {
         this.deleteBuiltBranch(targetBranch, created.id, plan, error);
         throw error;
       }
+      let now: string;
+      try {
+        now = `the store is on ${this.store.currentBranch().name} now`;
+      } catch (read) {
+        now = `reading which branch the store is on failed (${read instanceof Error ? read.message : String(read)})`;
+      }
       const message = `the mutation is applied on ${targetBranch}: the store moved to it, and the switch didn't complete ` +
-        `(${error instanceof Error ? error.message : String(error)}); the store is on ${now.name} now: getStore().sync() saves a switch whose ` +
+        `(this error's cause says why); ${now}: getStore().sync() saves a switch whose ` +
         'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is';
       throw new HistoryMutationError(message, [{ opIndex: -1, code: 'APPLIED_INIT_FAILED', message }], plan, { cause: error, receipt: receipt() });
     }
@@ -5043,7 +5080,7 @@ export class ContextManager {
         unusable = error;
       }
     }
-    if (!isHistoryMutationStrategy(strategy) && strategy.onRetracted === undefined) return () => new PassthroughStrategy();
+    if (keepsNoSummaries(strategy) || (strategy.onRetracted === undefined && historyMemoryOf(strategy)?.summaries.length === 0)) return () => new PassthroughStrategy();
     throw new Error(
       `ContextManager.${operation}: the reader with strategy namespace ${this.strategyNamespace} runs the ${strategy.name} strategy, which keeps summaries or hears rows leave its window, ` +
         `and gives no strategy for the branch (${unusable instanceof Error ? unusable.message : 'it has no cloneForScratch'}), so an apply can't reconcile it there`,
@@ -5521,6 +5558,7 @@ export class ContextManager {
       this.notifyRetracted(left, info);
     } catch (err) {
       // No hook of the call has run: the manager's own work around it threw.
+      this.retractionFailures?.push(err);
       if (!this.closed) this.retractedUnheard.push({ left, info });
       const rows = told.length === 1 ? `removed message ${told[0]!.id}` : `${told.length} removed messages`;
       logThrown(

@@ -16070,7 +16070,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           if (landed) this.summaries = summaries;
           throw new Error(
-            `the write of summary ${id}'s edit threw, and it ${landed ? 'landed' : 'may have landed'}: read the summary before asking for the edit again (${error instanceof Error ? error.message : String(error)})`,
+            `the write of summary ${id}'s edit threw, and it ${landed
+              ? 'landed: the strategy holds the new text'
+              : 'may have landed, while the strategy still holds the old text: initialize the manager again (setStrategy(getStrategy())) to read what the store holds, before asking for the edit again'} (${error instanceof Error ? error.message : String(error)})`,
             { cause: error },
           );
         }

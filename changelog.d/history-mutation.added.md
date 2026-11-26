@@ -4,11 +4,13 @@
     `edit_summary` edits a summary's text, `edit_message` edits a message,
     and `remove_messages` removes messages. Each op names the sha256 of the
     target that its caller read, which `describeMutationTarget` gives. The
-    plan writes nothing. It returns each target before and after, the
-    summaries that the mutation drops, the first row whose rendering
-    may change (an estimate that errs early), whether a changed row lies inside the thinking-binding record,
-    and a `planSha256` of all that it reports, its violations included, with
-    each summary that it drops as the store holds it.
+    plan writes nothing. It returns each target with the sha256 of what it
+    holds now and, for an edit, the content or text that the edit writes.
+    It also returns the summaries that the mutation drops, the first row
+    whose rendering may change (an estimate that errs early), whether a
+    changed row lies inside the thinking-binding record, and a `planSha256`
+    of all that it reports, its violations included, with each summary that
+    it drops as the strategy holds it.
   - The plan refuses each of these, and says what to change:
     - a target that changed since its caller read it, a target named twice,
       or a target that isn't there;
@@ -32,8 +34,13 @@
     - an op of no known kind, or a field of the wrong type or value
       (`MALFORMED_OP`);
     - summaries in a strategy's memory, the manager's or a reader's, that
-      aren't the ones the store holds, which another handle wrote since
-      (`STALE_MEMORY`): that manager is initialized again first.
+      differ from the ones the store holds, which another handle wrote
+      since (`STALE_MEMORY`): that manager is initialized again first;
+    - a strategy, the manager's or a reader's, that has no `historyMemory()`,
+      since the plan can't see its summaries (`STRATEGY_UNSUPPORTED`).
+      `PassthroughStrategy` and `WindowedPassthroughStrategy` themselves keep
+      none. A strategy without summaries joins with a `historyMemory()` of
+      empty lists.
   - An edited message takes a required `label` that names who changed it.
     The label goes first in the content, unless a text block holds it
     already. The message's metadata records the edit (`historyMutation`),
@@ -50,9 +57,8 @@
     `beforeSwitch`, a fresh open reads the branch back. The rows must be the
     source's, with the plan's edits and removals. A presented window must
     hold the source window's rows, less the removed ones, each at its place.
-    The summaries must be the source's, without the plan's drops. Otherwise
-    the apply refuses
-    (`READBACK_MISMATCH`). New rows after the source's rows are allowed,
+    The summaries must be the source's, with the plan's summary edits and
+    drops. Otherwise the apply refuses (`READBACK_MISMATCH`). New rows after the source's rows are allowed,
     such as a notice that `beforeSwitch` writes. The apply also refuses an
     anomaly that the source didn't have (`INVARIANT_BROKEN`). Where the
     build and the readback pass, it refuses a source that moved while the
@@ -117,9 +123,10 @@
     `editedBy` when the summary's text came from outside the strategy and
     names who wrote it (`external.by` isn't empty). Its carriers gain it
     too. The value escapes `&`, `<`, `>`, `"` and line breaks as character
-    references. A summary stored with
-    `external` before this change gains it as well. A compile that renders
-    such a summary sends different bytes once.
+    references. A summary stored with `external` before this change gains
+    it as well. A compile that renders such a summary sends different bytes
+    once, and so does a compression or merge request whose prompt holds it,
+    so that request can miss its cached prefix once.
   - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`. The
     store's edit event still carries the content alone.
   - New exports: `HistoryMutationError`, and the types that an op, a plan,

@@ -190,7 +190,8 @@ export function releaseReplacedRawForms(before: readonly ContentBlock[], after: 
     const place = placeOf[j];
     return place === undefined ? withoutHeldRawForms(block, held) : withoutRawForms(before[place]!, moved);
   });
-  return releaseEditedRawForms(before, matched);
+  const released = releaseEditedRawForms(before, matched);
+  return released === matched ? matched : released.map((block, j) => (placeOf[j] === undefined ? matched[j]! : block));
 }
 
 function rawFormValues(block: ContentBlock): string[] {
@@ -335,7 +336,8 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
  * carries alone moves with it, unless it belongs to a reasoning pairing: moved
  * alone, a reasoning item or the item it led to would keep the id that ties it
  * to a partner it no longer sits with, so it gives that item up too, as an
- * edit does. An opaque carrier keeps its item, as everywhere (see above). The
+ * edit does. An opaque carrier keeps its item, as in an edit's release (see
+ * above); only content that replaces it with a changed copy loses it. The
  * blocks left behind are reconciled with releaseEditedRawForms, which
  * releases the rest of the pairing.
  */

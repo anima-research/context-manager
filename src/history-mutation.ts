@@ -216,6 +216,7 @@ export interface HistoryState {
   window: readonly StoredMessage[];
   view: readonly StoredMessage[];
   memory: HistoryMemory | null;
+  hiddenStrategy?: string;
   windowMode: 'legacy' | 'presented';
   windowOrdinals?: ReadonlyArray<{ id: MessageId; ordinal: number | undefined }>;
   viewKeeps?: (row: StoredMessage) => boolean;
@@ -306,22 +307,50 @@ function covering(memory: HistoryMemory | null, rows: ReadonlySet<MessageId>): s
 }
 
 
+const OP_FIELDS: Record<HistoryMutationOp['kind'], readonly string[]> = {
+  edit_summary: ['kind', 'summaryId', 'expectedSha256', 'newText', 'expectedAfterSha256', 'dropResponseContent', 'parentPolicy'],
+  edit_message: ['kind', 'messageId', 'expectedSha256', 'content', 'label', 'expectedAfterSha256', 'foldedPolicy'],
+  remove_messages: ['kind', 'messageIds', 'expectedSha256ById', 'expandBodyGroups', 'foldedPolicy'],
+};
+
+function describeGiven(value: unknown): string {
+  if (typeof value === 'string') return JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
 function malformedOps(manifest: unknown): Array<{ opIndex: number; message: string }> {
-  const ops = typeof manifest === 'object' && manifest !== null ? (manifest as { ops?: unknown }).ops : undefined;
-  if (!Array.isArray(ops)) return [{ opIndex: -1, message: 'the manifest has no `ops` array' }];
-  const out: Array<{ opIndex: number; message: string }> = [];
+  if (typeof manifest !== 'object' || manifest === null) return [{ opIndex: -1, message: `the manifest is ${describeGiven(manifest)}, not an object` }];
+  const extra = Object.keys(manifest).filter((key) => key !== 'ops');
+  const ops = (manifest as { ops?: unknown }).ops;
+  if (!Array.isArray(ops)) return [{ opIndex: -1, message: `the manifest's \`ops\` is ${describeGiven(ops)}, not an array` }];
+  const out: Array<{ opIndex: number; message: string }> = extra.map((key) => ({ opIndex: -1, message: `the manifest has a field \`${key}\` that no manifest has` }));
   const isString = (value: unknown): value is string => typeof value === 'string';
   const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
-  ops.forEach((op: unknown, opIndex) => {
+  for (let opIndex = 0; opIndex < ops.length; opIndex++) {
+    const op: unknown = ops[opIndex];
     if (typeof op !== 'object' || op === null || Array.isArray(op)) {
-      out.push({ opIndex, message: `op ${opIndex} is not an object` });
-      return;
+      out.push({ opIndex, message: `op ${opIndex} is ${describeGiven(op)}, not an object` });
+      continue;
+    }
+    try {
+      JSON.stringify(op);
+    } catch (error) {
+      out.push({ opIndex, message: `op ${opIndex} isn't plain data (${error instanceof Error ? error.message : String(error)})` });
+      continue;
     }
     const fields = op as Record<string, unknown>;
     const want = (field: string, ok: (value: unknown) => boolean, what: string, optional = false) => {
       if ((optional && fields[field] === undefined) || ok(fields[field])) return;
-      out.push({ opIndex, message: `op ${opIndex}'s \`${field}\` isn't ${what}` });
+      out.push({ opIndex, message: `op ${opIndex}'s \`${field}\` is ${describeGiven(fields[field])}, not ${what}` });
     };
+    const kind = fields.kind;
+    if (isString(kind) && Object.hasOwn(OP_FIELDS, kind)) {
+      for (const field of Object.keys(fields)) {
+        if (!OP_FIELDS[kind as HistoryMutationOp['kind']].includes(field)) out.push({ opIndex, message: `op ${opIndex} (${kind}) has a field \`${field}\` that ${kind} doesn't take` });
+      }
+    }
     const oneOf = (values: readonly string[]) => (value: unknown) => isString(value) && values.includes(value);
     switch (fields.kind) {
       case 'edit_summary':
@@ -335,7 +364,7 @@ function malformedOps(manifest: unknown): Array<{ opIndex: number; message: stri
       case 'edit_message':
         want('messageId', isString, 'a string');
         want('expectedSha256', isString, 'a string');
-        want('content', Array.isArray, 'an array of content blocks');
+        want('content', (value) => Array.isArray(value) && value.every((block) => typeof block === 'object' && block !== null && !Array.isArray(block) && isString((block as { type?: unknown }).type)), 'an array of content blocks, each an object with a string `type`');
         want('label', isString, 'a string');
         want('expectedAfterSha256', isString, 'a string', true);
         want('foldedPolicy', oneOf(FOLDED_EDIT_POLICIES), `one of ${FOLDED_EDIT_POLICIES.join(', ')}`, true);
@@ -347,9 +376,9 @@ function malformedOps(manifest: unknown): Array<{ opIndex: number; message: stri
         want('foldedPolicy', oneOf(FOLDED_REMOVE_POLICIES), `one of ${FOLDED_REMOVE_POLICIES.join(', ')}`, true);
         break;
       default:
-        out.push({ opIndex, message: `op ${opIndex} has kind ${JSON.stringify(fields.kind)}, which is none of edit_summary, edit_message and remove_messages` });
+        out.push({ opIndex, message: `op ${opIndex} has kind ${describeGiven(fields.kind)}, which is none of edit_summary, edit_message and remove_messages` });
     }
-  });
+  }
   return out;
 }
 
@@ -364,10 +393,15 @@ export function planMutation(
   };
   const malformed = malformedOps(manifest);
   for (const { opIndex, message } of malformed) refuse(opIndex, 'MALFORMED_OP', message);
-  const ops = malformed.length > 0 ? [] : manifest.ops;
+  const ops: HistoryMutationOp[] = malformed.length > 0 ? [] : JSON.parse(JSON.stringify(manifest.ops));
   if (malformed.length === 0 && ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops');
-  const stale = (memory: HistoryMemory | null) => memory?.stored !== undefined && memory.stored !== memory.summaries;
+  const stale = (memory: HistoryMemory | null) => memory?.stored !== undefined && memory.stored !== memory.summaries && canonicalJson(memory.stored.map(asStored)) !== canonicalJson(memory.summaries.map(asStored));
   const restart = 're-initialize that manager (setStrategy(getStrategy())) and plan again';
+  const hidden = (name: string) => `the ${name} strategy has no historyMemory(), so the plan can't see what summaries it keeps over the rows the change reaches; a strategy that keeps none joins with a historyMemory() of empty lists`;
+  if (state.hiddenStrategy !== undefined) refuse(-1, 'STRATEGY_UNSUPPORTED', hidden(state.hiddenStrategy));
+  for (const { namespace, state: reader } of readers) {
+    if (reader.hiddenStrategy !== undefined) refuse(-1, 'STRATEGY_UNSUPPORTED', `reader ${namespace}: ${hidden(reader.hiddenStrategy)}`, undefined, { readerNamespace: namespace });
+  }
   if (stale(state.memory)) refuse(-1, 'STALE_MEMORY', `the strategy's summaries in memory aren't the ones the store holds, which another handle wrote since: ${restart}`);
   for (const { namespace, state: reader } of readers) {
     if (stale(reader.memory)) refuse(-1, 'STALE_MEMORY', `reader ${namespace}: its strategy's summaries in memory aren't the ones the store holds, which another handle wrote since: ${restart}`, undefined, { readerNamespace: namespace });
@@ -407,7 +441,7 @@ export function planMutation(
         }
         seenSummaries.add(op.summaryId);
         if (!state.memory) {
-          refuse(opIndex, 'STRATEGY_UNSUPPORTED', 'the strategy keeps no summaries', op.summaryId);
+          if (state.hiddenStrategy === undefined) refuse(opIndex, 'STRATEGY_UNSUPPORTED', 'the strategy keeps no summaries', op.summaryId);
           return;
         }
         const plan = planSummaryEdit(state.memory.summaries, op.summaryId, op.newText, {
@@ -636,7 +670,7 @@ export function planMutation(
   const effects = windowEffects(state, targets, droppedSummaries);
   const entries = (memory: HistoryMemory | null, ids: readonly string[]) => {
     const byId = new Map<string, unknown>();
-    for (const entry of memory?.stored ?? memory?.summaries ?? []) {
+    for (const entry of memory?.summaries ?? []) {
       if (typeof entry === 'object' && entry !== null && 'id' in entry && typeof entry.id === 'string') byId.set(entry.id, entry);
     }
     return [...ids].sort().map((id) => asStored(byId.get(id) ?? { id }));
@@ -648,7 +682,6 @@ export function planMutation(
       sourceBranch: state.branch,
       targets,
       droppedSummaries: entries(state.memory, droppedSummaries),
-      editedSummaries: entries(state.memory, targets.flatMap((target) => (target.kind === 'edit_summary' ? [target.summaryId, ...target.carriedBy] : []))),
       ...effects,
       readers: readerPlans.map((r, i) => ({ ...r, droppedSummaries: entries(readers[i]!.state.memory, r.droppedSummaries) })),
     }), 'utf8')
@@ -674,7 +707,9 @@ function windowEffects(
   const sequences = new Map(rows.map((row) => [row.id, row.sequence] as const));
   const viewPosition = new Map(state.view.map((row, i) => [row.id, i] as const));
   const windowAt = new Map(state.window.map((row, i) => [row.id, i] as const));
-  const edited = new Map(targets.flatMap((target) => (target.kind === 'edit_message' ? [[target.messageId, target.content] as const] : [])));
+  const before = new Map(rows.map((row) => [row.id, row.content] as const));
+  const rendered = targets.filter((target) => target.kind !== 'edit_message' || asStored(before.get(target.messageId) ?? null) !== asStored(target.content));
+  const edited = new Map(rendered.flatMap((target) => (target.kind === 'edit_message' ? [[target.messageId, target.content] as const] : [])));
   const positionOf = (id: MessageId): number | undefined => {
     const held = viewPosition.get(id);
     if (held !== undefined) return held;
@@ -685,7 +720,7 @@ function windowEffects(
     return (next ? viewPosition.get(next.id)! : state.view.length) - 1 + (at + 1) / (state.window.length + 1);
   };
   const sent = (id: MessageId): boolean => positionOf(id) !== undefined;
-  const changed = changedRows(state.memory?.summaries ?? [], targets, droppedSummaries, (id) => sequences.has(id), sent);
+  const changed = changedRows(state.memory?.summaries ?? [], rendered, droppedSummaries, (id) => sequences.has(id), sent);
   const firstInView = state.view.find((row) => sequences.has(row.id))?.id;
   const rowsChanged = changed.fromStart
     ? [...changed.rows, ...rows.slice(0, 1).map((row) => row.id), ...(firstInView !== undefined ? [firstInView] : [])]
