@@ -320,26 +320,29 @@ function describeGiven(value: unknown): string {
   return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
 }
 
-function malformedOps(manifest: unknown): Array<{ opIndex: number; message: string }> {
-  if (typeof manifest !== 'object' || manifest === null) return [{ opIndex: -1, message: `the manifest is ${describeGiven(manifest)}, not an object` }];
+function checkedOps(manifest: unknown): { malformed: Array<{ opIndex: number; message: string }>; copies: HistoryMutationOp[] } {
+  if (typeof manifest !== 'object' || manifest === null) return { malformed: [{ opIndex: -1, message: `the manifest is ${describeGiven(manifest)}, not an object` }], copies: [] };
   const extra = Object.keys(manifest).filter((key) => key !== 'ops');
   const ops = (manifest as { ops?: unknown }).ops;
-  if (!Array.isArray(ops)) return [{ opIndex: -1, message: `the manifest's \`ops\` is ${describeGiven(ops)}, not an array` }];
+  if (!Array.isArray(ops)) return { malformed: [{ opIndex: -1, message: `the manifest's \`ops\` is ${describeGiven(ops)}, not an array` }], copies: [] };
   const out: Array<{ opIndex: number; message: string }> = extra.map((key) => ({ opIndex: -1, message: `the manifest has a field \`${key}\` that no manifest has` }));
+  const copies: HistoryMutationOp[] = [];
   const isString = (value: unknown): value is string => typeof value === 'string';
   const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
   for (let opIndex = 0; opIndex < ops.length; opIndex++) {
-    const op: unknown = ops[opIndex];
-    if (typeof op !== 'object' || op === null || Array.isArray(op)) {
-      out.push({ opIndex, message: `op ${opIndex} is ${describeGiven(op)}, not an object` });
-      continue;
-    }
+    let op: unknown;
     try {
-      JSON.stringify(op);
+      const written = JSON.stringify(ops[opIndex]);
+      op = written === undefined ? undefined : JSON.parse(written);
     } catch (error) {
       out.push({ opIndex, message: `op ${opIndex} isn't plain data (${error instanceof Error ? error.message : String(error)})` });
       continue;
     }
+    if (typeof op !== 'object' || op === null || Array.isArray(op)) {
+      out.push({ opIndex, message: `op ${opIndex} is ${describeGiven(ops[opIndex])}, not an object` });
+      continue;
+    }
+    copies.push(op as HistoryMutationOp);
     const fields = op as Record<string, unknown>;
     const want = (field: string, ok: (value: unknown) => boolean, what: string, optional = false) => {
       if ((optional && fields[field] === undefined) || ok(fields[field])) return;
@@ -379,7 +382,7 @@ function malformedOps(manifest: unknown): Array<{ opIndex: number; message: stri
         out.push({ opIndex, message: `op ${opIndex} has kind ${describeGiven(fields.kind)}, which is none of edit_summary, edit_message and remove_messages` });
     }
   }
-  return out;
+  return { malformed: out, copies };
 }
 
 export function planMutation(
@@ -391,9 +394,9 @@ export function planMutation(
   const refuse = (opIndex: number, code: MutationViolationCode, message: string, targetId?: string, remediation?: Record<string, unknown>) => {
     violations.push({ opIndex, code, message, ...(targetId !== undefined ? { targetId } : {}), ...(remediation ? { remediation } : {}) });
   };
-  const malformed = malformedOps(manifest);
+  const { malformed, copies } = checkedOps(manifest);
   for (const { opIndex, message } of malformed) refuse(opIndex, 'MALFORMED_OP', message);
-  const ops: HistoryMutationOp[] = malformed.length > 0 ? [] : JSON.parse(JSON.stringify(manifest.ops));
+  const ops = malformed.length > 0 ? [] : copies;
   if (malformed.length === 0 && ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops');
   const stale = (memory: HistoryMemory | null) => memory?.stored !== undefined && memory.stored !== memory.summaries && canonicalJson(memory.stored.map(asStored)) !== canonicalJson(memory.summaries.map(asStored));
   const restart = 're-initialize that manager (setStrategy(getStrategy())) and plan again';
@@ -868,13 +871,7 @@ export interface HistoryAnomaly {
 
 export function historyAnomalies(state: HistoryState): HistoryAnomaly[] {
   const out: HistoryAnomaly[] = [];
-  const seen = new Set<string>();
-  const add = (anomaly: HistoryAnomaly) => {
-    const key = anomalyKey(anomaly);
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(anomaly);
-  };
+  const add = (anomaly: HistoryAnomaly) => out.push(anomaly);
   state.rows.forEach((row, index) => {
     const places = malformedContentPlaces(row.content);
     if (places.length > 0) add({ code: 'MALFORMED_CONTENT', targetId: row.id, message: `message ${row.id}: ${places.join('; ')}` });
@@ -886,21 +883,28 @@ export function historyAnomalies(state: HistoryState): HistoryAnomaly[] {
       }
     }
   });
-  for (const rows of [state.record, state.view]) {
+  const splits = new Map<string, { targetId: string; message: string; in: string[] }>();
+  for (const [rows, where] of [[state.record, 'the record'], [state.view, 'the view']] as const) {
+    const split = (targetId: string, message: string) => {
+      const found = splits.get(`${targetId}\u0000${message}`) ?? { targetId, message, in: [] };
+      if (!found.in.includes(where)) found.in.push(where);
+      splits.set(`${targetId}\u0000${message}`, found);
+    };
     for (const u of findUnpairedToolBlocks(rows)) {
       const id = rows[u.message]!.id;
-      add({ code: 'TOOL_PAIR_SPLIT', targetId: id, message: `the ${u.kind} ${u.toolId} in message ${id} has no ${u.kind === 'tool_use' ? 'result' : 'call'}` });
+      split(id, `the ${u.kind} ${u.toolId} in message ${id} has no ${u.kind === 'tool_use' ? 'result' : 'call'}`);
     }
     for (const pair of pairs(rows)) {
       for (let i = pair.call + 1; i < pair.result; i++) {
         if (rows[i]!.content.some((block) => (block.type as string) === 'system_change')) {
           const callId = rows[pair.call]!.id;
-          add({ code: 'TOOL_PAIR_SPLIT', targetId: callId, message: `a system change (message ${rows[i]!.id}) stands between the tool call ${pair.toolId} in message ${callId} and its result` });
+          split(callId, `a system change (message ${rows[i]!.id}) stands between the tool call ${pair.toolId} in message ${callId} and its result`);
           break;
         }
       }
     }
   }
+  for (const { targetId, message, in: places } of splits.values()) add({ code: 'TOOL_PAIR_SPLIT', targetId, message: `${message}, in ${places.join(' and ')}` });
   if (state.memory) {
     const crossed = crossedSummaryIds({
       summaries: state.memory.summaries.map((s) => ({ id: s.id, level: s.level, sourceIds: [...s.sourceIds], sourceRange: s.sourceRange })),
@@ -978,7 +982,7 @@ export function snapshotOf(state: HistoryState): HistorySnapshot {
 }
 
 function windowMismatches(plan: HistoryMutationPlan, source: HistorySnapshot, written: HistoryState): string[] {
-  if (!source.window) return [];
+  if (!source.window) return written.windowOrdinals ? ['its window is presented now, and the source\'s window was the record'] : [];
   if (!written.windowOrdinals) return ['its window is no longer presented'];
   const removed = new Set(plan.targets.flatMap((target) => (target.kind === 'remove_messages' ? target.messageIds : [])));
   const want = source.window.filter((at) => !removed.has(at.id));

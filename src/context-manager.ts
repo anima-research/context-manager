@@ -2854,7 +2854,7 @@ export class ContextManager {
     // checkpoint leaves the selection in effect: that is a switch, unsaved.
     // Once the switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
     const from = this.store.currentBranch().id;
-    let unsaved: unknown;
+    let unsaved: { error: unknown } | undefined;
     try {
       this.store.switchBranch(name);
     } catch (error) {
@@ -2871,11 +2871,15 @@ export class ContextManager {
         try {
           markStoreBranchSwitch(this.store);
         } catch {
-          // The manager is invalidated either way; the error is the switch's.
+          // Invalidated either way.
         }
-        throw error;
+        throw new Error(
+          `Branch selection ${name} failed, and the store ${now ? `moved to ${now.name}` : "can't say which branch it is on"}: the manager is uninitialized; ` +
+            `switchBranch() or setStrategy() initializes it where the store is: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
       }
-      unsaved = error;
+      unsaved = { error };
     }
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
@@ -2893,8 +2897,8 @@ export class ContextManager {
     if (unsaved !== undefined) {
       throw new Error(
         `Branch selection ${name}${created ? ' (created)' : ''} took effect, and saving it failed: getStore().sync() saves it, ` +
-        `and setStrategy(getStrategy()) initializes this manager on it: ${unsaved instanceof Error ? unsaved.message : String(unsaved)}`,
-        { cause: unsaved },
+        `and setStrategy(getStrategy()) initializes this manager on it: ${unsaved.error instanceof Error ? unsaved.error.message : String(unsaved.error)}`,
+        { cause: unsaved.error },
       );
     }
     if (attempt !== this.initializationAttempt) {
@@ -4731,7 +4735,7 @@ export class ContextManager {
   /** A summary or message as a mutation names it, with the sha256 its op compares; null where there is none. */
   describeMutationTarget(target: { summaryId: string } | { messageId: MessageId }): MutationTargetDescription | null {
     this.requireInitialized('describeMutationTarget');
-    return describeTarget(this.historyState(), target);
+    return describeTarget(this.visibleHistoryState('describeMutationTarget'), target);
   }
 
   /**
@@ -4771,7 +4775,6 @@ export class ContextManager {
       if (operation !== 'planHistoryMutation') reader.refuseCutWhileWritingShards(operation);
       namespaces.add(reader.strategyNamespace);
       const state = reader.historyState();
-      // A strategy the plan can't see is refused by the plan, as a violation.
       const strategy = state.hiddenStrategy === undefined ? reader.scratchStrategy(operation) : () => reader.strategy;
       out.push({ manager: reader, namespace: reader.strategyNamespace, state, strategy });
     }
@@ -4790,7 +4793,15 @@ export class ContextManager {
    */
   checkHistoryInvariants(): HistoryAnomaly[] {
     this.requireInitialized('checkHistoryInvariants');
-    return historyAnomalies(this.historyState());
+    return historyAnomalies(this.visibleHistoryState('checkHistoryInvariants'));
+  }
+
+  private visibleHistoryState(operation: 'describeMutationTarget' | 'checkHistoryInvariants'): HistoryState {
+    const state = this.historyState();
+    if (state.hiddenStrategy !== undefined) {
+      throw new Error(`ContextManager.${operation}: the ${state.hiddenStrategy} strategy has no historyMemory(), so its summaries can't be read`);
+    }
+    return state;
   }
 
   /**
@@ -5148,10 +5159,13 @@ export class ContextManager {
   }
 
   private dropStillHeld(planned: readonly string[]): void {
-    if (planned.length === 0 || !isHistoryMutationStrategy(this.strategy)) return;
-    const held = new Set(this.strategy.historyMemory().summaries.map((s) => s.id));
+    if (planned.length === 0) return;
+    const held = new Set(historyMemoryOf(this.strategy)?.summaries.map((s) => s.id) ?? []);
     const left = planned.filter((id) => held.has(id));
-    if (left.length > 0) this.strategy.dropSummaries(left, this.createStrategyContext());
+    if (left.length === 0) return;
+    const drop = (this.strategy as Partial<Pick<HistoryMutationStrategy, 'dropSummaries'>>).dropSummaries;
+    if (typeof drop !== 'function') throw new Error(`the ${this.strategy.name} strategy holds summaries the plan drops (${left.join(', ')}), and has no dropSummaries() to drop them`);
+    drop.call(this.strategy, left, this.createStrategyContext());
   }
 
   private async applyPlannedOps(plan: HistoryMutationPlan, stamp: Omit<MessageEditStamp, 'label'>): Promise<void> {
@@ -5558,7 +5572,6 @@ export class ContextManager {
       this.notifyRetracted(left, info);
     } catch (err) {
       // No hook of the call has run: the manager's own work around it threw.
-      this.retractionFailures?.push(err);
       if (!this.closed) this.retractedUnheard.push({ left, info });
       const rows = told.length === 1 ? `removed message ${told[0]!.id}` : `${told.length} removed messages`;
       logThrown(
@@ -5904,6 +5917,15 @@ export class ContextManager {
    * around the call, the context it builds among it, does.
    */
   private notifyRetracted(left: readonly RetractedRow[], info: Retraction): void {
+    try {
+      this.notifyRetractedNow(left, info);
+    } catch (error) {
+      this.retractionFailures?.push(error);
+      throw error;
+    }
+  }
+
+  private notifyRetractedNow(left: readonly RetractedRow[], info: Retraction): void {
     if (left.length === 0 || this.closed) return;
     // As notifyPresented's rows, the call waits for the manager's strategy,
     // whether or not the one initializing has the hook, and behind calls a
