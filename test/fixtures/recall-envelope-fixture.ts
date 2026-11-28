@@ -132,10 +132,12 @@ export async function renderHierarchicalFixture(
     });
     const manager = await ContextManager.open({ path, strategy });
 
-    const zz1 = manager.addMessage('user', textContent('zz-turn-one'));
-    const zz2 = manager.addMessage('user', textContent('zz-turn-two'));
-    const zz3 = manager.addMessage('user', textContent('zz-turn-three'));
-    const zz4 = manager.addMessage('user', textContent('zz-turn-four'));
+    const said = (turn: string): ContentBlock[] => textContent(`${turn} ` + 'words of the turn as it was first said '.repeat(8));
+    const turn = (name: string): string[] => ['a', 'b', 'c', 'd'].map((part) => manager.addMessage('user', said(`${name}-${part}`)));
+    const zz1 = turn('zz-turn-one');
+    const zz2 = turn('zz-turn-two');
+    const zz3 = turn('zz-turn-three');
+    const zz4 = turn('zz-turn-four');
     manager.addMessage('user', textContent(HIERARCHICAL_FIXTURE_LATEST_TURN_TEXT));
 
     // Two L1s merged away under the L2: anti-redundancy hides a merged L1,
@@ -146,8 +148,8 @@ export async function renderHierarchicalFixture(
       content: 'zz-memory-merged-one',
       tokens: 6,
       sourceLevel: 0,
-      sourceIds: [zz1],
-      sourceRange: { first: zz1, last: zz1 },
+      sourceIds: zz1,
+      sourceRange: { first: zz1[0]!, last: zz1[3]! },
       mergedInto: 'L2-100',
       parentId: 'L2-100',
     });
@@ -157,8 +159,8 @@ export async function renderHierarchicalFixture(
       content: 'zz-memory-merged-two',
       tokens: 6,
       sourceLevel: 0,
-      sourceIds: [zz2],
-      sourceRange: { first: zz2, last: zz2 },
+      sourceIds: zz2,
+      sourceRange: { first: zz2[0]!, last: zz2[3]! },
       mergedInto: 'L2-100',
       parentId: 'L2-100',
     });
@@ -169,7 +171,7 @@ export async function renderHierarchicalFixture(
       tokens: 13,
       sourceLevel: 1,
       sourceIds: ['L1-0', 'L1-1'],
-      sourceRange: { first: zz1, last: zz2 },
+      sourceRange: { first: zz1[0]!, last: zz2[3]! },
     });
     strategy.seedSummary({
       id: 'L1-101',
@@ -177,8 +179,8 @@ export async function renderHierarchicalFixture(
       content: HIERARCHICAL_FIXTURE_PLAIN_PROSE,
       tokens: 6,
       sourceLevel: 0,
-      sourceIds: [zz3],
-      sourceRange: { first: zz3, last: zz3 },
+      sourceIds: zz3,
+      sourceRange: { first: zz3[0]!, last: zz3[3]! },
     });
     strategy.seedSummary({
       id: 'L1-102',
@@ -186,8 +188,8 @@ export async function renderHierarchicalFixture(
       content: 'zz-memory-with-carriers',
       tokens: 6,
       sourceLevel: 0,
-      sourceIds: [zz4],
-      sourceRange: { first: zz4, last: zz4 },
+      sourceIds: zz4,
+      sourceRange: { first: zz4[0]!, last: zz4[3]! },
       responseContent: [
         { type: 'thinking', thinking: 'zz-carrier-reasoning', signature: 'zz-signature' } as ContentBlock,
         { type: 'text', text: 'zz-memory-with-carriers' },
