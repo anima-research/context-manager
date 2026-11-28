@@ -12,6 +12,342 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.29.0 — 2026-11-28
+
+### Breaking
+
+- **Hosts matching adaptive plan-check refusal text or relying on dry compile
+  outcomes:** replace matches on “Adaptive picker exhausted” or “still exceed”
+  for this refusal with the prefix `Adaptive plan check (` (#496). Prefer `instanceof OverBudgetError`
+  with `diagnostics.solver !== undefined` for plan checks, and the class alone
+  for budget refusals generally. Other refusals keep their text and diagnostics;
+  keep any existing non-plan matches. The error class, `budget`, `actual`,
+  and clearance advice are unchanged.
+  - The message starts with the solver and the plan's token count and hard
+    budget so they survive excerpting. The plan-only `pickerExhausted`
+    (printed as `exhausted=`) preserves a supplied solver flag; otherwise
+    it means no production was requested and the applied tokens are above
+    the soft target. It is not proof that nothing remains to fold.
+  - Only kv-unified reports `labelCeilingFallback` (#252), and the message
+    prints it only when true. It identifies a minimum-token cut taken after
+    hitting the search ceiling, not the reason for refusal. For example,
+    with zero grace and no request limit, a 100.25-token cut can fit a
+    100.5-token solve budget but exceed the floored rejection bound of 100,
+    yielding a true fallback flag with false exhaustion.
+  - Dry compiles used to bypass the adaptive plan check. With an over-budget
+    plan, a dry compile could succeed if the emitted context fit, refuse at
+    emission with an estimator-drift label (#300), or refuse at a different
+    gate, such as tool-pairing repair. A dry compile can now refuse at the
+    plan check with the plan's token figures and solver diagnostics instead.
+    Catch `OverBudgetError` from dry compiles even if those calls previously
+    succeeded, or use `previewContext` and inspect `fits`. If matching refusal
+    text, handle the plan-check prefix as well as any still-applicable non-plan
+    matches. On a final budget refusal, `previewContext` reports `fits: false`
+    without `entries` or `stats`, even with `render: true`.
+  - A dry plan-check refusal can now trigger a provisional-calibration retry
+    at multiplier 1. If the retry passes the remaining gates, the dry compile
+    returns normally; otherwise the final refusal stands. Without an
+    eligible retry, the first refusal stands. If a stub-room retry's plan
+    exceeds its reduced budget, dry compilation throws the original stub
+    refusal, as live compilation does. A preview reports that original
+    refusal and its fitting plan's exhaustion flag.
+  - If a live compile's dry leave probe fails the plan check, the fallback
+    warning now includes the bounded plan-check error instead of the fixed
+    “its plan is over the budget” explanation.
+
+- **Strategy subclass authors:** `AutobiographicalStrategy` reserves two new
+  protected hook names, `getCompressionOpening` and
+  `getSourceMergeInstruction`; rename any member of your own with one of
+  these names before upgrading. Overrides now receive optional arguments the
+  base class always passes on their paths: `getMergeInstruction` and
+  `getReadingMergeInstruction` the shown source level as a final argument,
+  and, when building the canonical L1 request, `separateRecallAnswers` a
+  second `recallHeadersEnd` and `applyMintCacheSeams` a fourth
+  `recallPairsEnd`. An override of either of the last two that calls `super`
+  without the bound reads recall pairs through the whole request, as before.
+
+### Added
+
+- Opt-in compression attempt logs add an `admission` breakdown for gated
+  recall expansions and both tool-prose hoists that answer, are deterministically
+  rejected by the provider, or are rejected by the admission gate. The breakdown
+  includes the base rung, provider input tokens (or unknown), accounting source,
+  added sent-form tokens, bounded input, output reserve, admitted total and budget.
+  Source-only-final accounting is distinguished from canonical accounting.
+- Provider-rejected hoists and rejected canonical-stage, source-only-final and
+  split-part requests now emit attempt traces. Provider-rejection traces describe
+  the request handed to Membrane, including a carrier-stripped retry when used;
+  if it cannot be serialized, the trace can instead report the planned request
+  as `planned-fallback`. Admission rejections report the planned request with
+  zero call latency. Interrupted calls do not emit an attempt or admission trace.
+- **Compression log consumers:** `compression:canonical-rejected` now carries the
+  rejected stage's attempt trace when available and the durable outcome otherwise.
+  Use `curveLabel` to identify the stage; the trace's request hash can differ
+  from the planned-rung hash in the durable outcome.
+- Set `CONTEXT_MANAGER_COMPRESSION_LOG` before compression starts and keep it
+  fixed until compression finishes. Changing it mid-run can omit parts of the
+  trace.
+
+- Add a JSON-compatible `compressionInstructions` option to
+  `AutobiographicalStrategy`: per-phase templates (`opening`, `chunk`,
+  `witnessedChunk`, `readingChunk`, `merge`, `witnessedMerge`, `readingMerge`,
+  `transition`) with a fixed set of placeholders, validated at construction.
+  Omitting the option, `{}`, or `preset: 'default'` keeps today's requests
+  byte-for-byte. See `docs/compression-instructions.md`.
+  - Export `validateCompressionInstructions` and the `CompressionInstructions`,
+    `CompressionInstructionTemplates` and `CompressionInstructionValues` types.
+    Validation errors are `TypeError`s that name only an allowlisted path and
+    reason, never a supplied value, key or placeholder name. Combining a
+    nonempty `witnessedInstruction` with `templates.witnessedChunk` throws
+    `Conflicting witnessed instruction configuration` at construction; an
+    empty `witnessedInstruction` is ignored.
+  - New protected hooks for subclass authors: `getCompressionOpening`, and
+    `getSourceMergeInstruction` for the source-level merge retry (its base
+    implementation uses `merge`/`witnessedMerge`, ignoring reading mode).
+  - With a custom `opening` (any configured `templates.opening`, even one
+    equal to the built-in text, or a `getCompressionOpening` override
+    returning other text), L1 requests read a recall pair only when its
+    header and answer both lie before the opening, for the resume separator,
+    the cache seams and the refusal-curve retry. The zero-recall surgery
+    script refuses a `strategyConfig` that sets `templates.opening`. The
+    autobiographical drain and external-memory scripts forward
+    `compressionInstructions` from their recipes; hosts must forward and
+    validate the option themselves.
+
+- **A memory whose text was written outside the strategy's own compression
+  calls can be installed or edited**, for work the provider refuses on every
+  attempt. `scripts/external-memory.ts` does it on a stopped resident's
+  store, a dry run unless `--apply` is given:
+  - `export-request` writes the request the strategy would send now for one
+    piece of work, the next merge into a level or the L1 of a chunk record
+    (quarantined or not), with a descriptor of the work. Nothing is sent or
+    written to the memory: work the strategy would only reach by changing
+    its own state first (say a group with a held source, which it would
+    skip, queuing the merge beside it) is refused, and the change isn't
+    made.
+  - `import` installs a text as the summary of that work, and only while the
+    strategy would still do the same work and builds the same request for
+    it (the descriptor carries the request's sha256): the tree's shape stays
+    the strategy's, and a text written for a request whose history or
+    recalled memories have changed since is refused. A dry run builds the
+    request and makes the same checks. The text takes the place of the
+    provider's answer, so the summary is written as a native one is
+    (lineage, its sources' parent, the chunk record, tokens stamped from the
+    text, the quarantine of its chunk or merge paid off). It is stored as
+    the file holds it, less the whitespace that ends it: no thinking wrapper
+    is read out of it as out of a model's answer. It carries no reasoning.
+  - `edit` replaces the text of one summary by id, with the file's text
+    stored the same way: lineage untouched, tokens stamped from the new
+    text, and what described the call that wrote the old text dropped (its
+    verbatim response blocks, its `provenance`, its split-stitch record).
+    The summaries merged over the old text are reported and left as they
+    are.
+
+  `SummaryEntry.external` (`{ by, at, note?, requestHash? }`, optional)
+  records who supplied such a text, and for an installed one the sha256 of
+  the request it answers. An entry that has it has no `provenance`, which
+  stays what it was: the record of a model's accepted answer. Entries
+  without `external` are unchanged, nothing renders it and no selection
+  reads it. The operations are also methods:
+  `ContextManager.exportMemoryRequest`, `importExternalMemory` and
+  `editSummaryText`, over the strategy's methods of the same names
+  (`isExternalMemoryStrategy`), with the types `MemoryWorkItem`,
+  `MemoryWorkTarget`, `ExternalMemoryProvenance` and `SummaryTextEdit`. They
+  are for a resident that isn't running, called with no tick or other
+  compression in progress on the manager: none waits for compression in
+  flight, or is kept apart from it.
+
+- Add optional metadata-only inspection and generation/load-bound single-key L1
+  compression-quarantine waiver APIs on the loaded autobiographical strategy,
+  through `inspectCompressionRefusalQuarantine` and
+  `releaseCompressionRefusalQuarantine`, with explicit stale/unreadable/legacy
+  outcomes. Export `isKeyedCompressionQuarantineStrategy` for feature detection
+  and the `KeyedCompressionQuarantineStrategy`, `CompressionQuarantineBinding`,
+  `CompressionQuarantineRecordView`, `CompressionQuarantineInspection`,
+  `CompressionQuarantineReleaseSelection` and `CompressionQuarantineReleaseResult`
+  types. The capability guard accepts ordinary or callable objects that have
+  both methods, and narrows only to those two methods.
+  - Inspection validates native digest metadata, reports coarse unreadable
+    reasons without store error text, and includes per-record current-config
+    shape-cap participation and same-regime counts. Historical source-only cap
+    accounting is not a prediction of today's prepared request hash.
+    Unexpected projection errors propagate.
+  - Inspection and release ignore history superseded by a checkpoint, even
+    before redaction, while resolving earlier legacy claims referenced by later
+    exhaustion events. Both report `branchUnavailable` when the branch lookup
+    fails, and both report a load lost during their projection reads rather
+    than returning results from it.
+  - A selected waiver requires a valid native family digest, compares and
+    clears under one native lock, and runs lossless checkpoint hygiene before
+    acknowledging. The branch/load binding is rechecked before progress
+    mutation and after reentrant reads, hygiene, sync and the post-read, and
+    `released` is returned only when the post-read no longer shows the
+    selected generation; a failure after mutation is reported as uncertain.
+    Raw store-handle switches the manager does not track (for example inside
+    a store adapter's own branch read) are outside this guard: writes and the
+    post-read can land on another branch, so no result says other branches
+    are untouched, and with such an adapter `released` does not prove the
+    bound branch was cleared. A waiver is not coverage or a promise of a
+    provider attempt. Short damaged ledgers have no immediate
+    repair through inspection or release. The existing optional-key
+    `clearCompressionRefusalQuarantine` remains available.
+
+### Changed
+
+- **Hosts:** context-manager accepts `@animalabs/chronicle`
+  `^0.6.0 || ^0.7.0 || ^0.8.0` (was `^0.6.0 || ^0.7.0`), so a host whose own
+  chronicle is 0.8.0 shares it with context-manager, where before
+  context-manager installed its own 0.7 beside it. A manager that opens a
+  store by its path then opens it with 0.8.0. A lockfile's 0.6 or 0.7 is still
+  admitted. A host with no chronicle of its own now gets 0.8.0 on a fresh
+  install, where it got 0.7, and opens its existing store with it: 0.8.0 opens
+  and reads a store that 0.6 or 0.7 wrote. 0.8.0 adds saved length checks to
+  `state.bin`, which 0.6 and 0.7 don't read, so a store that context-manager
+  writes on 0.8.0 still opens on them, and opens again on 0.8.0 after it took
+  writes there. chronicle 0.8.0's breaking changes reach a host through
+  context-manager: an open fsyncs the log before it returns, and refuses a
+  used store that has lost its log; a write first retries a failed fsync of
+  the log; and a branch call whose checkpoint fails undoes its change. Their
+  full notes are in
+  [chronicle 0.8.0's release](https://github.com/anima-research/chronicle/releases/tag/v0.8.0).
+  context-manager's code checks for none of the errors that these changes add
+  or change, so none of its own handling depends on them.
+- **Branch calls on chronicle 0.8.0:** when the store's switch throws in
+  `switchBranch` or `fork`, the store stays on the branch that it was on
+  before the call. When the store's branch creation throws in `derive`, `fork`
+  or `branchAt`, no new branch is left behind. A `fork` whose switch throws
+  keeps the branch that it created. With chronicle 0.6 or 0.7, the store can
+  still hold the switch or the new branch after such a throw.
+
+- **Existing compression-quarantine callers:** shared native hygiene checkpoints
+  the gate's tolerant projection at 256 events even after damaged history, and
+  retains all active holds above 1,024 rather than silently truncating them.
+  Hygiene failures, and losses of branch currency it notices mid-pass, are
+  logged at most once per load, and an earlier load's stale work can use up
+  the current load's warning. Work already stale on entry is skipped
+  silently, as is a loss during the ledger-length read when no checkpoint is
+  due; store/mutation failures still propagate. Ignored damage can be discarded by checkpoint redaction.
+- Compression-quarantine episode-end logs replace `✅ ALL CLEAR — quarantine
+  empty, debt paid` with `quarantine empty; coverage and debt payment not
+  established; alarm stands down` (or `quarantine empty after operator waiver
+  request; coverage and debt payment not established; alarm stands down`).
+  Callbacks add optional `clearReason: 'quarantine-empty' |
+  'operator-waiver-requested'` only at episode end; existing fields remain
+  compatible. Empty quarantine is not evidence of coverage or paid debt.
+- Native paid-off and success-clear loops retain the load that decided coverage
+  and each observed exhaustion generation across earlier asynchronous clears,
+  leaving replacement holds for a fresh decision. Success-clear logs branch-read
+  failures as maintenance failures rather than rejecting on them.
+  These automatic clears now use a private generation-bound
+  helper rather than the public `clearCompressionRefusalQuarantine` method;
+  overrides/wrappers of that public method no longer intercept automatic clears.
+  Checkpoints supersede legacy snapshots even when the
+  obsolete snapshot is damaged; retained checkpoint entries still validate.
+- Quarantine status and automatic-clear failure diagnostics no longer include
+  thrown error payloads (which can contain private paths or content), and no
+  longer assert that an incomplete clear left holds intact. Status alarms log
+  a fixed failure message at most once per interval, where 0.17.0 logged the
+  read's error. Maintenance warnings describe an unspecified failure, not
+  necessarily a store failure, and the former `paid-off sweep failed` and
+  `success-clear failed` lines now report incomplete maintenance whose clear
+  may have landed; inspect before retrying.
+- Alarm text formerly saying `their spans stay raw and WILL eventually exhaust
+  the context budget` now says unresolved raw spans may exhaust the budget and
+  stale holds may remain after coverage: retained quarantine records are not
+  proof of raw debt. The quarantine span and alarm-interval type docs say the
+  same (`closedAgeMs` is time since the chunk closed, and holds from earlier
+  request regimes stay active), clarifying the 0.17.0 description.
+
+- **Strategies with only `onNewMessage`:** when the `onNewMessage` delivery
+  adapter can't read the store's branch or the window mode to deliver a stored
+  row's notification, `addMessage` (and the other notifying calls) no longer
+  throw after storing. The add listener's own window-mode read runs before
+  that adapter and is not guarded: if it throws, `addMessage` still throws
+  after storing (`WriteLandedError`, or `WriteOutcomeUnknownError` when the
+  row can't be read back) and the row is not queued. Queued rows wait in
+  memory, on this manager, until a later notification finds the scope
+  readable; the retry then delivers, once each and in window order, the
+  queued rows still in the window, and a row that left the window meanwhile
+  gets no call. Close discards the rows waiting when it runs. Each
+  notification makes one attempt, and the failure is logged once per failure
+  episode, including window reads in the presentation
+  retry drain, with one recovery line on a successful adapter observation. A
+  strategy member lookup (`onPresented`, `onNewMessage`, `onRetracted`) that
+  throws is logged as a hook failure rather than failing the stored operation;
+  a retraction whose `onRetracted` lookup throws is consumed, not queued for a
+  later notification as it was when the throw propagated.
+  `stats()` adds `pendingStrategyNotifications: { presented, retracted,
+  presentationScopeFailing }` so a host can see an adapter that is stuck. A
+  custom strategy that compresses from `onNewMessage` makes no progress while
+  the lookup keeps failing. `AutobiographicalStrategy` and
+  `KnowledgeStrategy` implement `onPresented` and don't take this path;
+  `PassthroughStrategy` and `WindowedPassthroughStrategy` deliberately
+  implement only `onNewMessage` (a no-op), so their rows can wait too.
+
+### Fixed
+
+- Attribute counted compression failures to the stripped or unstripped run per
+  attempt, rather than by thrown error identity. The flag is set at stripped
+  dispatch, stays set through rejection handling (including local errors there),
+  and clears on answer. A counted failure uses the stripped key only while the
+  flag is set; local failures after an answer use the unstripped key.
+  Deterministic provider rejections end the rung's runs instead of counting
+  toward them, and aborts start none. Shared error objects no longer cause
+  cross-attempt misattribution, and primitive errors are handled. This can
+  change retry counts and when persistent failures contribute to quarantine.
+- Keep each answered canonical-stage attempt's own logged outcome when a later
+  retry succeeds, fails or is interrupted. Final attempt traces report recall
+  expansion, hoist and source-only answers that extract to empty as
+  `unusable_empty`. The early recall `compression:curve-attempt` classifies
+  the assessment snapshot, so it can report success even if final extraction
+  is empty. Split-part traces classify the trimmed raw text accepted by the fold.
+  Canonical extraction errors now report `provider_error` with
+  `malformed_content`. These trace corrections do not change which answers
+  are accepted.
+- Build L1 ladder attempt and final log receipts only when logging is enabled
+  and on a best-effort basis, so a receipt construction failure does not replace
+  the ladder's result.
+
+- Label adaptive floor warnings as dry or live and deduplicate the two lanes
+  independently, including when a warning handler calls `renderAsNewest`
+  or `previewContext`.
+  Each lane retains up to 64 fixed-size keys in FIFO order and clears only
+  its own keys on recovery. An evicted cause can warn again. Normalization
+  (including of changing UUIDs) affects only the keys, not the logged cause.
+- Shadow production warnings report the selected plan's token count, that
+  no production was requested, and whether the plan exceeds the shadow
+  rejection bound. They identify the provisional multiplier used for that
+  attempt, without predicting a live refusal stage or claiming no other
+  cut can fit. Selection behavior is unchanged.
+
+- Compression-quarantine appends, family-progress writes and checkpoint
+  hygiene stay bound to the branch the caller checked, across reentrant store
+  reads and branch changes the manager tracks or its branch reads observe, so
+  stale work can no longer write an old branch's holds or progress into a
+  branch that is initializing. A store adapter that hides raw handle switches
+  can still redirect those writes and the release's post-write reread.
+  Progress sync stays on the store that received the write, and branch guards
+  recheck the strategy generation after reentrant branch lookups. No new locks or cross-process guarantees.
+- Topology repair no longer reads or warns about a legacy quarantine snapshot
+  that a checkpoint superseded, or one beside a ledger that holds no list.
+- `switchBranch()` and `fork()` invalidate the loaded strategy as soon as the
+  store has switched, before the bookkeeping that can fail or reenter. A
+  selection that a reentrant switch superseded is rejected, as is one whose
+  branch reconciliation finds another name; an uncertain one says so and
+  names the recovery (`switchBranch()` or `setStrategy()`). Initialization no
+  longer reports success when its final branch reads close the manager or
+  start a newer initialization. Branch observation reconciles a switch made
+  inside the store's own branch read, and refuses one that never stabilizes
+  instead of looping.
+- A notification whose hook context can't be built because the manager closed
+  is no longer queued after close, and its log line says the manager is closed
+  rather than promising a later delivery. A retraction retry that encounters
+  close also discards undelivered work instead of requeuing it. A strategy-detach diagnostic whose
+  strategy name or log sink throws no longer escapes as an unhandled
+  rejection.
+
+- If a reentrant switch starts a newer initialization while `switchBranch()` or `fork()` reconciles its branch, the call rejects with `InitializationSupersededError` naming the requested branch and creation flag, instead of the generic "Branch changed during strategy initialization" error. This holds when reconciliation's branch observation stabilizes; if it never stabilizes, the call rejects with the uncertain-selection error even when a newer initialization started.
+
 ## 0.28.0 — 2026-11-19
 
 ### Added

@@ -2808,8 +2808,10 @@ export class ContextManager {
   }
 
   private async selectBranch(name: string, created: boolean): Promise<void> {
-    // A rejected native selection leaves the loaded branch usable. Once the
-    // switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
+    // On chronicle 0.8.0, a rejected native selection leaves the loaded
+    // branch usable. An earlier chronicle can keep the switch when only its
+    // checkpoint failed. Once the switch succeeds, invalidate BEFORE
+    // fallible/reentrant bookkeeping.
     this.store.switchBranch(name);
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;

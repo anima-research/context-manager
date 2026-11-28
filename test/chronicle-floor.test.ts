@@ -65,6 +65,7 @@ describe("context-manager's chronicle range", () => {
     }
     assert.equal(admits(range, '0.6.0'), true, `${range} admits chronicle 0.6.0, the release with the batched calls`);
     assert.equal(admits(range, '0.7.0'), true, `${range} admits chronicle 0.7.0, so a host on it shares its copy`);
+    assert.equal(admits(range, '0.8.0'), true, `${range} admits chronicle 0.8.0, so a host on it shares its copy`);
   });
 
   it('runs on a chronicle with each batched call', () => {
