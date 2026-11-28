@@ -198,7 +198,7 @@ describe('a branch selection that the store makes and does not save', () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
-      manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
       const store = manager.getStore();
       store.createBranch('elsewhere', 'main');
       store.createBranch('third', 'main');
@@ -229,13 +229,34 @@ describe('a branch selection that the store makes and does not save', () => {
         };
         await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => {
           assert.ok(error instanceof InitializationSupersededError);
-          assert.match(error.message, /^ContextManager\.switchBranch to branch "elsewhere" failed, and a newer initialization superseded it: zz the save failed$/);
+          assert.match(error.message, /^ContextManager\.switchBranch to branch "elsewhere" threw, and a newer initialization superseded it: zz the save failed$/);
           assert.equal((error.cause as Error).message, 'zz the save failed');
           return true;
         });
         reads = -1;
         await newer;
         assert.equal(manager.currentBranch().name, 'main', 'the newer selection stands');
+
+        for (const [where, moveTo] of [['after the switch took effect', undefined], ['with the store on a third branch', 'third']] as const) {
+          store.switchBranch = (name: string) => {
+            const branch = native(name === 'elsewhere' && moveTo ? moveTo : name);
+            if (name !== 'elsewhere') return branch;
+            reads = 0;
+            throw new Error('zz the save failed');
+          };
+          onRead = (read) => {
+            if (read === 2) newer = manager.switchBranch('main');
+          };
+          await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => {
+            assert.ok(error instanceof InitializationSupersededError, where);
+            assert.equal((error.cause as Error).message, 'zz the save failed', `${where}: the native error is the cause`);
+            return true;
+          });
+          reads = -1;
+          await newer;
+          assert.equal(manager.currentBranch().name, 'main', `${where}: the newer selection stands`);
+          assert.doesNotThrow(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), `${where}: and the manager works there`);
+        }
       } finally {
         store.switchBranch = native;
         store.currentBranch = currentBranch;
