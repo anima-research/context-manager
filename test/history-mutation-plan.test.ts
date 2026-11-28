@@ -289,6 +289,9 @@ describe('history mutation plan', () => {
     assert.deepEqual(unlisted(other({ records: [{ id: 'c-9', sourceIds: ['m3'], compressed: true, summaryId: 'S9' }] })), [['UNLISTED_READER', 'agents/Ghost']]);
     assert.deepEqual(unlisted(other({ windowHolds: (id) => id === 'm3' })), [['UNLISTED_READER', 'agents/Ghost']]);
     assert.deepEqual(unlisted(other({ windowHolds: (id) => id === 'm3' }), ['agents/Ghost']), []);
+    assert.deepEqual(unlisted(other({ records: [{ id: 'c-10', sourceIds: ['m3', 'm4'], compressed: false }] })), [['UNLISTED_READER', 'agents/Ghost']], 'an uncompressed record that holds a removed row');
+    const edited = planMutation(state(), { ops: [editMessage('m3', text('zz new'))] }, [], { namespaces: [other({ records: [{ id: 'c-10', sourceIds: ['m3'], compressed: false }] })], ignore: [] });
+    assert.ok(!edited.violations.some((v) => v.code === 'UNLISTED_READER'), 'an uncompressed record keeps an edited row, which is still there');
     const sha = (ignore: string[]) => planMutation(state(), { ops: [remove('m3')] }, [], { namespaces: [], ignore }).planSha256;
     assert.notEqual(sha([]), sha(['agents/Nobody']), 'the plan\'s sha256 covers the namespaces it ignores');
   });

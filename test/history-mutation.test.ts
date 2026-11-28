@@ -1095,6 +1095,91 @@ describe('history mutation', () => {
     }
   });
 
+  it('tells a legacy reader only of the removed rows that it held', async () => {
+    const heard: string[][] = [];
+    class Listening extends PassthroughStrategy implements HistoryMemorySource {
+      historyMemory() {
+        return NO_SUMMARIES;
+      }
+      async onRetracted(_rows: unknown, _ctx: unknown, info: { ids: readonly string[] }): Promise<void> {
+        heard.push([...info.ids]);
+      }
+      override cloneForScratch(): Listening {
+        return new Listening();
+      }
+    }
+    const path = join(dir, `store-${stores++}`);
+    const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
+    const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', isolate: true, strategy: new Listening() });
+    try {
+      side.addMessage('Ada', [{ type: 'text', text: 'a row of the side\'s own' }]);
+      main.addMessage('User', [{ type: 'text', text: 'a row that stays' }]);
+      const id = main.addMessage('User', [{ type: 'text', text: 'a row the side never held' }]);
+      assert.equal(side.windowMode(), 'legacy', 'setup: the side\'s window is legacy');
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [id], expectedSha256ById: { [id]: messageSha(main, id) } }] };
+      const plan = main.planHistoryMutation(manifest, { readers: [side] });
+      assert.deepEqual(plan.violations, []);
+      assert.deepEqual(plan.readers[0]!.heldIds, [], 'setup: the side holds none of the removed rows');
+      await main.applyHistoryMutation(manifest, { targetBranch: 'surgery/not-the-side', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' }, readers: [side] });
+      assert.deepEqual(heard, [], 'the side hears no row that it never held');
+    } finally {
+      side.close();
+      main.close();
+    }
+  });
+
+  it('applies where reading the sequence throws once just after the switch', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const native = store.currentSequence.bind(store);
+      let armed = true;
+      store.currentSequence = () => {
+        if (armed && store.currentBranch().name === 'surgery/read-fails') {
+          armed = false;
+          throw new Error('zz the sequence is unreadable');
+        }
+        return native();
+      };
+      try {
+        const receipt = await apply(manager, manifest, 'surgery/read-fails', plan);
+        assert.ok(!armed, 'setup: the read threw');
+        assert.equal(receipt.targetBranch, 'surgery/read-fails');
+        assert.equal(manager.currentBranch().name, 'surgery/read-fails');
+        assert.ok(manager.planHistoryMutation(l1Edit(manager).manifest), 'the manager is initialized on the new branch');
+      } finally {
+        store.currentSequence = native;
+      }
+    });
+  });
+
+  it('names only its own plan\'s violations where a cleanup fails after another plan\'s refusal', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      const other = manager.planHistoryMutation({ ops: [] });
+      const foreign = new HistoryMutationError('zz another plan\'s refusal', [{ opIndex: 0, code: 'CAS_MISMATCH', message: 'zz not this plan\'s' }], other);
+      const store = manager.getStore();
+      const native = store.deleteBranch.bind(store);
+      store.deleteBranch = () => {
+        throw new Error('zz the deletion failed');
+      };
+      try {
+        await assert.rejects(manager.applyHistoryMutation(manifest, {
+          targetBranch: 'surgery/left', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+          beforeSwitch: async () => {
+            throw foreign;
+          },
+        }), (error: unknown) => error instanceof HistoryMutationError && error.plan?.planSha256 === plan.planSha256 && error.violations.map((v) => v.code).join() === 'BRANCH_LEFT');
+      } finally {
+        store.deleteBranch = native;
+      }
+    });
+  });
+
   it('takes a presented row the reader\'s view filter hides out of its window too', async () => {
     const path = await twoResidentStore();
     let last = '';
