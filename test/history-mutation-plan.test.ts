@@ -107,7 +107,7 @@ describe('history mutation plan', () => {
     assert.deepEqual(codes([remove('m1', 'm2')]), []);
     const rows = [...ROWS.slice(0, 2), row('mc', 2.5, 'system', [{ type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock]), ...ROWS.slice(2)];
     const withChange = state({ rows });
-    assert.deepEqual(historyAnomalies(withChange).map((a) => a.code), ['TOOL_PAIR_SPLIT'], 'setup: the change stands between them already');
+    assert.deepEqual(historyAnomalies(withChange).map((a) => a.code), ['TOOL_PAIR_SPLIT', 'TOOL_PAIR_SPLIT'], 'setup: the change stands between them already, in the record and the view');
     assert.deepEqual(planMutation(withChange, { ops: [{ ...remove('m3'), expectedSha256ById: { m3: sha('m3', rows) } }] }).violations, [], 'a split that was there before is not the batch\'s');
   });
 
@@ -261,8 +261,10 @@ describe('history mutation plan', () => {
     assert.deepEqual(anomalies.map((a) => [a.code, a.targetId]), [
       ['INCOMPLETE_BODY', 'm4'],
       ['TOOL_PAIR_SPLIT', 'm1'],
+      ['TOOL_PAIR_SPLIT', 'm1'],
       ['TOPOLOGY_CROSSED', 'L1-x'],
     ]);
+    assert.deepEqual(anomalies.filter((a) => a.code === 'TOOL_PAIR_SPLIT').map((a) => a.message.replace(/.*, in /, 'in ')), ['in the record', 'in the view'], 'a split is named in each place where it stands');
     assert.deepEqual(historyAnomalies(state({ memory: MEMORY })), [], 'the fixture itself has none');
   });
 
@@ -310,15 +312,34 @@ describe('history mutation plan', () => {
     const rows = [...ROWS, hidden];
     const before = historyAnomalies(state({ rows, view: ROWS }));
     const after = historyAnomalies(state({ rows, view: rows }));
-    assert.deepEqual(introducedAnomalies(before, after).map((a) => [a.code, a.targetId, a.message]), [['TOOL_PAIR_SPLIT', 'mh', 'the tool_use tz in message mh has no result, in the record and the view']]);
+    assert.deepEqual(introducedAnomalies(before, after).map((a) => [a.code, a.targetId, a.message]), [['TOOL_PAIR_SPLIT', 'mh', 'the tool_use tz in message mh has no result, in the view']]);
   });
 
-  it('names a system change inside a tool pair once per call, by the call\'s message', () => {
+  it('counts no anomaly as new where an edit takes it out of the view and the record still holds it', () => {
+    const hidden = row('mh', 8, 'Ada', [{ type: 'tool_use', id: 'tz', name: 'read', input: { path: 'z' } }]);
+    const rows = [...ROWS, hidden];
+    const before = historyAnomalies(state({ rows, view: rows }));
+    assert.deepEqual(before.filter((a) => a.code === 'TOOL_PAIR_SPLIT').map((a) => a.message), [
+      'the tool_use tz in message mh has no result, in the record',
+      'the tool_use tz in message mh has no result, in the view',
+    ], 'setup: the split stands in both');
+    assert.deepEqual(introducedAnomalies(before, historyAnomalies(state({ rows, view: ROWS }))), []);
+  });
+
+  it('reads malformed content and incomplete bodies over every row the manager reads, an auxiliary slot\'s too', () => {
+    const aux = row('ma', 8, 'Ada', [{ type: 'text' } as unknown as ContentBlock]);
+    const shard = row('mb', 9, 'User', text('one shard of two'), { bodyGroupId: 'g2', shardIndex: 0, shardCount: 2 });
+    const anomalies = historyAnomalies(state({ record: [...ROWS, aux, shard] }));
+    assert.deepEqual(anomalies.filter((a) => a.code === 'MALFORMED_CONTENT' || a.code === 'INCOMPLETE_BODY').map((a) => [a.code, a.targetId]), [['MALFORMED_CONTENT', 'ma'], ['INCOMPLETE_BODY', 'mb']]);
+  });
+
+  it('names a system change inside a tool pair once per call in each place, by the call\'s message', () => {
     const change = row('mc', 2.5, 'system', [{ type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock]);
     const again = row('m2b', 3.5, 'User', [{ type: 'tool_result', toolUseId: 't1', content: 'file a, again' }]);
     const anomalies = historyAnomalies(state({ rows: [...ROWS.slice(0, 2), change, ROWS[2]!, again, ...ROWS.slice(3)] }));
     assert.deepEqual(anomalies.filter((a) => /system change/.test(a.message)).map((a) => [a.targetId, a.message]), [
-      ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result, in the record and the view'],
+      ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result, in the record'],
+      ['m1', 'a system change (message mc) stands between the tool call t1 in message m1 and its result, in the view'],
     ]);
   });
 
@@ -425,7 +446,20 @@ describe('history mutation plan', () => {
     const memory: HistoryMemory = { summaries: MEMORY.summaries.map((s) => (s.id === 'L3-c' ? { ...s, responseContent: [{ type: 'text', text: 'memory L2-p' }] } : s)), chunkRecords: MEMORY.chunkRecords };
     const op: HistoryMutationOp = { kind: 'edit_summary', summaryId: 'L2-p', expectedSha256: textSha256('memory L2-p'), newText: 'by hand' };
     assert.deepEqual(codes([op], state({ memory })), ['RESPONSE_CONTENT_SHADOW']);
+    assert.match(planMutation(state({ memory }), { ops: [op] }).violations[0]!.message, /^summary L2-p, or an entry that carries it, holds 1 verbatim response block\(s\) of the old text, which render in place of the text: dropResponseContent deletes them from the summary and each carrier$/);
     assert.deepEqual(codes([{ ...op, dropResponseContent: true }], state({ memory })), []);
+  });
+
+  it('adds a label after the tool results that a message opens with, and first otherwise', () => {
+    const result = { type: 'tool_result', toolUseId: 't1', content: 'file a, redacted' } as ContentBlock;
+    const target = (op: MessageEdit) => {
+      const t = planMutation(state(), { ops: [op] }).targets[0]!;
+      assert.ok(t.kind === 'edit_message');
+      return t.content.map((b) => (b.type === 'text' ? `text:${b.text}` : b.type));
+    };
+    assert.deepEqual(target(editMessage('m2', [result])), ['tool_result', 'text:[edited by Clement]']);
+    assert.deepEqual(target(editMessage('m2', [result, ...text('and a note')])), ['tool_result', 'text:[edited by Clement]', 'text:and a note']);
+    assert.deepEqual(target(editMessage('m3', text('it says b'))), ['text:[edited by Clement]', 'text:it says b']);
   });
 
   it('refuses a manifest whose ops aren\'t of a known kind, or whose fields haven\'t their types', () => {
@@ -451,6 +485,7 @@ describe('history mutation plan', () => {
     assert.match(planMutation(state(), { ops: [{ ...editMessage('m3', text('x')), label: 5 }] } as unknown as Parameters<typeof planMutation>[1]).violations[0]!.message, /op 0's `label` is a number, not a string/);
     const plan = planMutation(state(), { ops: [{ kind: 'redact_message' }] } as unknown as Parameters<typeof planMutation>[1]);
     assert.deepEqual(plan.targets, [], 'a malformed manifest plans nothing');
+    assert.deepEqual(planMutation(state(), { ops: [editMessage('m3', text('x')), { kind: 'redact_message' }] } as unknown as Parameters<typeof planMutation>[1]).targets, [], 'nor does one whose valid ops come first');
     assert.match(plan.violations[0]!.message, /op 0 has kind "redact_message", which is none of edit_summary, edit_message and remove_messages/);
     const owned = [editMessage('m3', text('as planned'))];
     const planned = planMutation(state(), { ops: owned });

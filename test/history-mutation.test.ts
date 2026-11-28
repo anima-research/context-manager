@@ -1371,7 +1371,7 @@ describe('history mutation', () => {
             targetBranch: 'surgery/unsaved', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
             beforeSwitch: async () => { throw new Error('the host could not reconcile its other residents'); },
           }),
-          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && /its deletion is not saved yet: getStore\(\)\.sync\(\) saves it/.test(String(error)),
+          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && /its deletion is not saved yet: sync\(\) saves it/.test(String(error)),
         );
       } finally {
         store.deleteBranch = deleteBranch;
@@ -1391,7 +1391,7 @@ describe('history mutation', () => {
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
     try {
       const id = manager.addMessage('Ada', [{ type: 'text', text: 'looking' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
-      assert.deepEqual(manager.checkHistoryInvariants().map((a) => [a.code, a.targetId]), [['TOOL_PAIR_SPLIT', id]]);
+      assert.deepEqual(manager.checkHistoryInvariants().map((a) => [a.code, a.targetId]), [['TOOL_PAIR_SPLIT', id], ['TOOL_PAIR_SPLIT', id]], 'in the record and in the view');
     } finally {
       manager.close();
     }
@@ -1554,7 +1554,7 @@ describe('history mutation', () => {
       }
       assert.ok(caught instanceof HistoryMutationError && caught.violations.map((v) => v.code).join() === 'APPLIED_INIT_FAILED', String(caught));
       assert.equal(caught.receipt?.targetBranch, 'surgery/unsaved');
-      assert.match(caught.message, /getStore\(\)\.sync\(\) saves a switch whose checkpoint failed/);
+      assert.match(caught.message, /: sync\(\) saves a switch whose checkpoint failed/);
       assert.equal(store.currentBranch().name, 'surgery/unsaved', 'the store is on the branch it built');
       assert.ok(manager.listBranches().some((b) => b.name === 'surgery/unsaved'), 'and the branch is kept');
       assert.throws(() => manager.describeMutationTarget({ messageId: id }), /requires successful strategy initialization/, 'the manager refuses work until it is initialized there');
@@ -1860,7 +1860,7 @@ describe('history mutation', () => {
         events.length = 0;
         runs = 0;
         gate = heldGate();
-        const settled = start().then(() => { events.push('done'); }, (error: unknown) => { events.push(`refused: ${error instanceof Error ? error.message : String(error)}`); });
+        const settled = start().then(() => { events.push('done'); }, (error: unknown) => { events.push(`refused: ${error instanceof Error ? error.message.replace(/^.*?branch is deleted, so the source branch holds what it held: /, '') : String(error)}`); });
         await gate.held();
         assert.equal(runs, 2, `${what}, setup: the second run failed while the first one's let-go is held`);
         assert.deepEqual(events, [], `${what} waits for the let-go it started`);
@@ -2286,6 +2286,21 @@ describe('history mutation', () => {
       assert.deepEqual(ignored.violations, [], 'named, it is left as it is');
       assert.notEqual(ignored.planSha256, a.planHistoryMutation(manifest, { readers: [b] }).planSha256, 'the plan\'s sha256 covers what it ignores');
       assert.deepEqual(a.planHistoryMutation(manifest, { readers: [b] }).violations, [], 'passed, it is a reader');
+      const store = a.getStore();
+      const getStateJson = store.getStateJson.bind(store);
+      store.getStateJson = (id: string) => {
+        if (id.startsWith(`${NS_B}/`)) throw new Error('zz that namespace can\'t be read');
+        return getStateJson(id);
+      };
+      try {
+        assert.deepEqual(a.planHistoryMutation(manifest, { ignoreNamespaces: [NS_B] }).violations, [], 'an ignored namespace\'s states aren\'t read');
+      } finally {
+        store.getStateJson = getStateJson;
+      }
+      const { compiled } = await a.compileMutationPreview(manifest, { by: { by: 'operator' }, ignoreNamespaces: [NS_B] });
+      assert.match(rendered(compiled.messages), /a row redacted/, 'the preview plans with what it ignores');
+      await a.applyHistoryMutation(manifest, { targetBranch: 'surgery/ignoring', expectedSourceBranch: 'main', expectedPlanSha256: ignored.planSha256, by: { by: 'operator' }, ignoreNamespaces: [NS_B] });
+      assert.equal(a.currentBranch().name, 'surgery/ignoring', 'and so does the apply');
     });
   });
 
@@ -2322,7 +2337,7 @@ describe('history mutation', () => {
       }
     });
   });
-  it('refuses a plan that leaves out a namespace whose presented window holds a removed row', async () => {
+  it('refuses a plan that leaves out a namespace whose presented window holds a row that the change edits or removes, or whose chunk record alone folds one', async () => {
     const path = join(dir, `store-${stores++}`);
     const main = await ContextManager.open({ path, namespace: 'agents/Main', strategy: new PassthroughStrategy() });
     const side = await ContextManager.open({ store: main.getStore(), namespace: 'agents/Side', strategy: new PassthroughStrategy() });
@@ -2334,13 +2349,124 @@ describe('history mutation', () => {
       const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: [id], expectedSha256ById: { [id]: messageSha(main, id) } }] };
       const left = main.planHistoryMutation(manifest).violations.filter((v) => v.code === 'UNLISTED_READER');
       assert.deepEqual(left.map((v) => v.remediation?.readerNamespace), ['agents/Side']);
-      assert.match(left[0]!.message, new RegExp(`its window holds ${id}, which the change removes`));
+      assert.match(left[0]!.message, new RegExp(`its window holds ${id}, which the change edits or removes`));
       assert.deepEqual(main.planHistoryMutation(manifest, { readers: [side] }).violations, []);
+      const edit: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(main, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      assert.deepEqual(main.planHistoryMutation(edit).violations.map((v) => [v.code, v.remediation?.readerNamespace]), [['UNLISTED_READER', 'agents/Side']], 'an edit of a row it holds');
+      main.getStore().registerState({ id: 'agents/Ghost/autobio:chunks', strategy: 'snapshot' });
+      main.getStore().setStateJson('agents/Ghost/autobio:chunks', [{ id: 'c-ghost', sourceIds: [id], compressed: true, summaryId: 'L1-ghost' }]);
+      const ghost = main.planHistoryMutation(edit, { readers: [side] }).violations;
+      assert.deepEqual(ghost.map((v) => [v.code, v.remediation?.readerNamespace]), [['UNLISTED_READER', 'agents/Ghost']], 'a chunk record that alone folds the row');
+      assert.match(ghost[0]!.message, /its summaries L1-ghost fold rows the change reaches/);
     } finally {
       side.close();
       main.close();
     }
   });
+  it('waits for the let-go that beforeCompile starts, and fails where it fails', async () => {
+    class StagedLetGoFails extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0], private readonly staged = false) {
+        super(settings);
+      }
+      override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
+        await super.onRetracted(...args);
+        if (this.staged) throw new Error('zz the let-go failed there');
+      }
+      override cloneForScratch(): StagedLetGoFails {
+        return new StagedLetGoFails({ ...this.settings, autoTickOnNewMessage: false }, true);
+      }
+    }
+    const path = await residentStore();
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new StagedLetGoFails({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    try {
+      const { manifest } = l1Edit(manager);
+      const id = manager.getAllMessages().at(-1)!.id;
+      const branches = branchNames(manager);
+      await assert.rejects(manager.compileMutationPreview(manifest, {
+        by: { by: 'operator' },
+        beforeCompile: async ({ manager: scratch }) => {
+          scratch.presentRows([id]);
+          scratch.retractRows([id]);
+        },
+      }), /onRetracted failed on the branch: zz the let-go failed there/);
+      assert.deepEqual(branchNames(manager), branches);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('applies a summary edit through a strategy that has no importExternalMemory()', async () => {
+    class NoImport extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
+        super(settings);
+        Object.defineProperty(this, 'importExternalMemory', { value: undefined });
+      }
+      override cloneForScratch(): NoImport {
+        return new NoImport({ ...this.settings, autoTickOnNewMessage: false });
+      }
+    }
+    const path = await residentStore();
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new NoImport({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    try {
+      assert.equal(isHistoryMutationStrategy(manager.getStrategy()), true, 'the guard asks for what a summary edit uses');
+      const { target, manifest } = l1Edit(manager, 'The first stretch, by hand, without an import.');
+      await apply(manager, manifest, 'surgery/no-import');
+      assert.equal(summariesOn(manager, 'surgery/no-import').find((s) => s.id === target.id)?.content, 'The first stretch, by hand, without an import.');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('refuses a preview whose scratch strategy can\'t show the summaries that the plan drops', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const l1 = summariesOn(manager, 'main').find((s) => s.level === 1)!;
+      const id = l1.sourceIds[0]!;
+      const manifest: HistoryMutationManifest = { ops: [{
+        kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), content: [{ type: 'text', text: 'a folded row, redacted' }],
+        label: '[redacted by operator]', foldedPolicy: 'drop_covering_summaries',
+      }] };
+      assert.deepEqual(manager.planHistoryMutation(manifest).violations, []);
+      await assert.rejects(
+        manager.compileMutationPreview(manifest, { by: { by: 'operator' }, strategy: () => new PassthroughStrategy() }),
+        new RegExp(`the passthrough strategy has no historyMemory\\(\\), so the summaries that the plan drops \\(${l1.id}[^)]*\\) can't be found in it`),
+      );
+    });
+  });
+
+  it('says to switch off a branch it built and couldn\'t delete, where the store can\'t say which branch it is on', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const { deleteBranch, currentBranch } = { deleteBranch: store.deleteBranch.bind(store), currentBranch: store.currentBranch.bind(store) };
+      let failed = false;
+      store.deleteBranch = (name: string) => {
+        if (name !== 'surgery/unsaid') return deleteBranch(name);
+        failed = true;
+        throw new Error('zz the deletion failed');
+      };
+      store.currentBranch = () => {
+        if (failed) throw new Error('zz the branch can\'t be read');
+        return currentBranch();
+      };
+      try {
+        await assert.rejects(
+          manager.applyHistoryMutation(manifest, {
+            targetBranch: 'surgery/unsaid', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
+            beforeSwitch: async () => { throw new Error('zz the host could not reconcile'); },
+          }),
+          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && /it is still there, and the store can't say which branch it is on: switch the store to another branch if it is on this one, then delete it/.test(String(error)),
+        );
+      } finally {
+        store.deleteBranch = deleteBranch;
+        store.currentBranch = currentBranch;
+      }
+      deleteBranch('surgery/unsaid');
+    });
+  });
+
   it('compiles what beforeCompile writes on the scratch branch, and deletes the branch whether or not it throws', async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
@@ -2353,6 +2479,7 @@ describe('history mutation', () => {
         by: { by: 'operator' },
         beforeCompile: async ({ manager: scratch, sourceBranch }) => {
           source = sourceBranch;
+          assert.match(rendered(scratch.getAllMessages()), /as edited/, 'the mutation is built when it runs');
           scratch.addMessage('User', [{ type: 'text', text: 'zz a notice written there' }]);
         },
       });
@@ -2360,7 +2487,12 @@ describe('history mutation', () => {
       assert.match(rendered(compiled.messages), /as edited[\s\S]*zz a notice written there/);
       assert.deepEqual(branchNames(manager), branches);
       assert.ok(!manager.getAllMessages().some((m) => JSON.stringify(m.content).includes('zz a notice')), 'nothing reaches the live branch');
-      await assert.rejects(manager.compileMutationPreview(manifest, { by: { by: 'operator' }, beforeCompile: async () => { throw new Error('zz the notice failed'); } }), /zz the notice failed/);
+      await assert.rejects(manager.compileMutationPreview(manifest, { by: { by: 'operator' }, beforeCompile: async () => { throw new Error('zz the notice failed'); } }), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /^the preview's work on branch preview-mutation\/\S+ threw, and that branch is deleted, so the source branch holds what it held: zz the notice failed$/);
+        assert.equal((error.cause as Error).message, 'zz the notice failed');
+        return true;
+      });
       assert.deepEqual(branchNames(manager), branches, 'a beforeCompile that throws leaves no branch');
     } finally {
       manager.close();
