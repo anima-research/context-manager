@@ -1222,7 +1222,7 @@ describe('history mutation', () => {
       const plan = manager.planHistoryMutation({ ops: [op] });
       await assert.rejects(
         manager.applyHistoryMutation({ ops: [{ ...op, content: [{ type: 'text', text: 'edited otherwise' }] }] }, { targetBranch: 'surgery/drift', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }),
-        (error: unknown) => refusedWith('PLAN_DRIFT')(error) && /the history, the manifest or the readers changed since that plan was made/.test(String(error)),
+        (error: unknown) => refusedWith('PLAN_DRIFT')(error) && /the history, the manifest, the readers or ignoreNamespaces changed since that plan was made/.test(String(error)),
       );
     } finally {
       manager.close();
@@ -1509,11 +1509,15 @@ describe('history mutation', () => {
       const store = JsStore.openOrCreate({ path });
       try {
         store.createBranch('probe', 'main');
-        try {
-          withBranchFileBlocked(path, () => store.switchBranch('probe'));
-        } catch {
-          // The checkpoint failed, as it is meant to.
-        }
+        let failed = false;
+        withBranchFileBlocked(path, () => {
+          try {
+            store.switchBranch('probe');
+          } catch {
+            failed = true;
+          }
+        });
+        if (!failed) throw new Error('setup: a switch whose checkpoint is blocked didn\'t fail, so the probe can\'t tell this chronicle');
         keptUnsaved = store.currentBranch().name === 'probe';
       } finally {
         store.close();
@@ -1560,7 +1564,7 @@ describe('history mutation', () => {
     });
   });
 
-  it('says a switch that landed and failed its checkpoint is applied, with its receipt and how to save it', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
+  it('says a switch that landed and failed its checkpoint is applied, with its receipt and how to save it, on a chronicle that keeps such a switch', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
@@ -1622,7 +1626,7 @@ describe('history mutation', () => {
     }
   });
 
-  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
+  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there, on a chronicle that keeps such a switch', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
@@ -1910,7 +1914,7 @@ describe('history mutation', () => {
         events.length = 0;
         runs = 0;
         gate = heldGate();
-        const settled = start().then(() => { events.push('done'); }, (error: unknown) => { events.push(`refused: ${error instanceof Error ? error.message.replace(/^.*?branch is deleted, so the source branch holds what it held: /, '') : String(error)}`); });
+        const settled = start().then(() => { events.push('done'); }, (error: unknown) => { events.push(`refused: ${error instanceof Error ? error.message.replace(/^.*?branch is deleted: the mutation wrote nothing to the source branch: /, '') : String(error)}`); });
         await gate.held();
         assert.equal(runs, 2, `${what}, setup: the second run failed while the first one's let-go is held`);
         assert.deepEqual(events, [], `${what} waits for the let-go it started`);
@@ -2250,6 +2254,7 @@ describe('history mutation', () => {
   it('leaves the manager uninitialized where a failed native switch left the store on another branch', async () => {
     const path = await residentStore();
     await resident(path, async (manager) => {
+      const { manifest } = l1Edit(manager);
       const store = manager.getStore();
       store.createBranch('elsewhere', 'main');
       store.createBranch('asked', 'main');
@@ -2267,7 +2272,7 @@ describe('history mutation', () => {
         store.switchBranch = switchBranch;
       }
       assert.equal(store.currentBranch().name, 'elsewhere');
-      assert.throws(() => manager.planHistoryMutation(l1Edit(manager).manifest), /requires successful strategy initialization/);
+      assert.throws(() => manager.planHistoryMutation(manifest), /requires successful strategy initialization/);
       store.switchBranch = (name: string) => {
         switchBranch(name);
         throw undefined;
@@ -2445,6 +2450,44 @@ describe('history mutation', () => {
     }
   });
 
+  it('compiles a preview only after the let-go that beforeCompile starts has finished', async () => {
+    const events: string[] = [];
+    class SlowLetGo extends AutobiographicalStrategy {
+      constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0], private readonly staged = false) {
+        super(settings);
+      }
+      override async onRetracted(...args: Parameters<AutobiographicalStrategy['onRetracted']>): Promise<void> {
+        await super.onRetracted(...args);
+        if (!this.staged) return;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        events.push('let go');
+      }
+      override select(...args: Parameters<AutobiographicalStrategy['select']>): ReturnType<AutobiographicalStrategy['select']> {
+        if (this.staged) events.push('compiled');
+        return super.select(...args);
+      }
+      override cloneForScratch(): SlowLetGo {
+        return new SlowLetGo({ ...this.settings, autoTickOnNewMessage: false }, true);
+      }
+    }
+    const path = await residentStore();
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new SlowLetGo({ ...RESIDENT, autoTickOnNewMessage: false } as never), membrane });
+    try {
+      const { manifest } = l1Edit(manager);
+      const id = manager.getAllMessages().at(-1)!.id;
+      await manager.compileMutationPreview(manifest, {
+        by: { by: 'operator' },
+        beforeCompile: async ({ manager: scratch }) => {
+          scratch.presentRows([id]);
+          scratch.retractRows([id]);
+        },
+      });
+      assert.deepEqual(events.filter((e, i) => e !== events[i - 1]), ['let go', 'compiled']);
+    } finally {
+      manager.close();
+    }
+  });
+
   it('applies a summary edit through a strategy that has no importExternalMemory()', async () => {
     class NoImport extends AutobiographicalStrategy {
       constructor(private readonly settings: ConstructorParameters<typeof AutobiographicalStrategy>[0]) {
@@ -2539,7 +2582,7 @@ describe('history mutation', () => {
       assert.ok(!manager.getAllMessages().some((m) => JSON.stringify(m.content).includes('zz a notice')), 'nothing reaches the live branch');
       await assert.rejects(manager.compileMutationPreview(manifest, { by: { by: 'operator' }, beforeCompile: async () => { throw new Error('zz the notice failed'); } }), (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /^the preview's work on branch preview-mutation\/\S+ threw, and that branch is deleted, so the source branch holds what it held: zz the notice failed$/);
+        assert.match(error.message, /^the preview's work on branch preview-mutation\/\S+ threw, and that branch is deleted: the mutation wrote nothing to the source branch: zz the notice failed$/);
         assert.equal((error.cause as Error).message, 'zz the notice failed');
         return true;
       });

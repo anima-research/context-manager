@@ -73,7 +73,7 @@ describe('history mutation plan', () => {
     assert.deepEqual(codes([editMessage('m3', text('x'), { expectedAfterSha256: sha('m0') })]), ['AFTER_SHA_MISMATCH']);
   });
 
-  it('puts the label first in an edited message unless a text block holds it, and refuses a blank one', () => {
+  it('puts the label first in an edited message of text unless a text block holds it, and refuses a blank one', () => {
     const plan = planMutation(state(), { ops: [editMessage('m3', text('it says b'))] });
     assert.equal(plan.valid, true);
     const target = plan.targets[0]!;
@@ -301,6 +301,10 @@ describe('history mutation plan', () => {
     const s = state({ rows: hiddenPair, window: hiddenPair, view: hiddenPair.filter(shown), viewKeeps: shown });
     const revealed = planMutation(s, { ops: [{ kind: 'edit_message', messageId: 'h1', expectedSha256: sha('h1', hiddenPair), content: [call], label: '[edited by Clement]' }] });
     assert.ok(revealed.violations.some((v) => v.code === 'TOOL_PAIR_SPLIT' && v.targetId === 'h1'), JSON.stringify(revealed.violations));
+    const reveal = { ops: [{ kind: 'edit_message' as const, messageId: 'h1', expectedSha256: sha('h1', hiddenPair), content: [call], label: '[edited by Clement]' }] };
+    const toReader = planMutation(state({ rows: hiddenPair, window: hiddenPair, view: hiddenPair.filter((r) => r.id !== 'h1' && r.id !== 'h2') }), reveal, [{ namespace: 'b', state: s }]);
+    assert.ok(toReader.violations.some((v) => v.code === 'TOOL_PAIR_SPLIT' && v.remediation?.readerNamespace === 'b'), `a reader's filter, applied to the edited row: ${JSON.stringify(toReader.violations)}`);
+
     const shownPair = [row('h0', 1, 'User', text('hello')), row('h1', 2, 'Ada', [call]), row('h2', 3, 'User', [result]), row('h3', 4, 'Ada', text('done'))];
     const t = state({ rows: shownPair, window: shownPair, view: shownPair.filter(shown), viewKeeps: shown });
     const hidden = planMutation(t, { ops: [{ kind: 'edit_message', messageId: 'h2', expectedSha256: sha('h2', shownPair), content: [result, ...text('HIDE')], label: '[edited by Clement]' }] });

@@ -304,6 +304,21 @@ describe('recallEnvelope: the delimiter is a convention, not parseable XML', () 
     assert.equal(buildRecallEnvelopeTags(notText).open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4">', 'a stored `by` that isn\'t text names no one');
   });
 
+  it('names, for a carrier, the writer of the summary whose text it renders, though its own record is stale', () => {
+    class CarrierProbe extends AutobiographicalStrategy {
+      hold(summaries: SummaryEntry[]): void { this.summaries = summaries; }
+      answer(s: SummaryEntry): string { return this.summaryAnswerContent(s).map((b) => (b.type === 'text' ? b.text : '')).join(''); }
+    }
+    const under = fakeSummary({ content: 'zz-edited by hand', external: { by: 'operator', at: 1 }, mergedInto: 'L2-8' });
+    const carrier = fakeSummary({ id: 'L2-8', level: 2, sourceLevel: 1, sourceIds: ['L1-7'], carriedFrom: 'L1-7' });
+    const probe = new CarrierProbe({ recallEnvelope: 'xml' });
+    probe.hold([under, carrier]);
+    assert.match(probe.answer(carrier), /^<cm-recall id="L2-8" level="2" span="zz-msg-1\.\.zz-msg-4" writtenBy="operator">[\s\S]*zz-edited by hand/);
+    const { external: _writer, ...unattributed } = under;
+    probe.hold([unattributed, { ...carrier, external: { by: 'a stale writer', at: 0 } }]);
+    assert.doesNotMatch(probe.answer(carrier), /writtenBy/, 'the carrier\'s own stale writer isn\'t named');
+  });
+
   it('does not touch content when the mode is none or unset', () => {
     const summary = fakeSummary();
     const content: ContentBlock[] = [{ type: 'text', text: 'zz-memory-body' }];
