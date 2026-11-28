@@ -490,6 +490,12 @@ function runsOf(ps: number[]): number[][] {
   return runs;
 }
 
+export function crossedSummaryIds(inputs: Pick<RepairInputs, 'summaries' | 'records' | 'messages'>): string[] {
+  const storeOrder = new Map(inputs.messages.map((m, i) => [String(m.id), i] as const));
+  const v = view(inputs.summaries, inputs.records, storeOrder);
+  return crossedOf(v, inputs.summaries).map((c) => c.id);
+}
+
 export function loadedAsWritten(
   written: { summaries: readonly unknown[]; records: readonly unknown[] },
   loaded: { summaries: unknown; records: unknown },

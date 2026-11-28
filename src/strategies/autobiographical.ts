@@ -44,6 +44,8 @@ import type {
   MemoryWorkItem,
   MemoryWorkTarget,
   SummaryTextEdit,
+  SummaryTextEditOptions,
+  HistoryMutationStrategy,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -103,6 +105,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
+import { describeSummaryEditRefusal, planSummaryEdit, summariesFoldingRows, withSummariesAbove } from '../summary-edit.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
@@ -4020,6 +4023,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.diag.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
     }
     this.summaries = settled.summaries;
+    this._answerCostCache.clear();
     if (settlingRepaired(settled)) {
       // Read before the write, which moves the branch's sequence past the
       // summaries as they were. A repair that dropped only empty summaries,
@@ -4796,7 +4800,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let total = 0;
     for (let i = summariesChronological.length - 1; i >= 0; i--) {
       const s = summariesChronological[i]!;
-      const envelopeText = recallEnvelopeAddedText(s, this.config.recallEnvelope);
+      const envelopeText = recallEnvelopeAddedText(this.attributed(s), this.config.recallEnvelope);
       const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50 +
         this.estimateTokens([{ type: 'text', text: envelopeText }]);
       if (total + est > maxTokens) continue;
@@ -8849,7 +8853,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `undone` and `removed` change none of this: an undone row, a row taken
    * out and a removed row have each left. The manager doesn't call this for a removal
    * in legacy mode, so a row removed there stays in what folded it, as it
-   * always has. The work is synchronous, so it is done when the manager's
+   * always has, except in a history mutation, which calls it for the rows
+   * it removes on the branch it builds: the chunk records let them go, and
+   * what folds them unfolds. The work is synchronous, so it is done when the manager's
    * call returns, and written after the window's tombstones.
    */
   async onRetracted(
@@ -8894,7 +8900,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * stored record the load leaves out, with no id or no rows, which no
    * write of this instance's puts back, doesn't read as another writer's.
    */
-  private storeWrittenElsewhere(): boolean {
+  private storeWrittenElsewhere(unreadable = false): boolean {
     const store = this.store;
     if (!store) return false;
     try {
@@ -8909,7 +8915,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (this.chunkPersistenceEnabled &&
           differs(this.chunksStateId, this.chunkRecords, (stored) => loadedChunkRecords<ChunkRecord>(stored)));
     } catch {
-      return false;
+      return unreadable;
     }
   }
 
@@ -9121,13 +9127,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const view = ctx.messageStore;
     // The L1s holding a row that left among their sources, the L1 of each
     // chunk record holding one, and (in unfold) every summary above them.
-    const seeds = new Set<string>();
-    for (const summary of this.summaries) {
-      if (summary.level === 1 && summary.sourceIds.some((id) => leaving.has(id))) seeds.add(summary.id);
-    }
-    for (const record of this.chunkRecords) {
-      if (record.summaryId && record.sourceIds.some((id) => leaving.has(id))) seeds.add(record.summaryId);
-    }
+    const seeds = summariesFoldingRows(this.summaries, this.chunkRecords, leaving);
 
     // A row that left and is in the window again, presented again before
     // this was heard, stays in a record that holds it beside a row of its
@@ -9200,16 +9200,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     seeds: ReadonlySet<string>,
     sourcesOf: (record: ChunkRecord) => MessageId[] | undefined,
   ): { dropped: string[]; orphaned: string[]; refolded: string[]; emptied: string[] } {
-    const dropped = new Set(seeds);
-    for (let grew = dropped.size > 0; grew;) {
-      grew = false;
-      for (const summary of this.summaries) {
-        if (!dropped.has(summary.id) && summary.level > 1 && summary.sourceIds.some((id) => dropped.has(id))) {
-          dropped.add(summary.id);
-          grew = true;
-        }
-      }
-    }
+    const dropped = withSummariesAbove(this.summaries, seeds);
 
     const refolded: string[] = [];
     const emptied: string[] = [];
@@ -16022,40 +16013,126 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Replace the text of one summary. Its lineage stays as it is; its tokens
-   * are stamped from the new text; what described the call that wrote the
-   * old text goes, since it no longer matches: the verbatim response blocks
-   * it carried, its `provenance` and its split-stitch record (`stitched`);
-   * and `external` says who supplied the text. The store's history keeps
-   * the entry as it was. Summaries merged over the old text are reported
-   * and left alone. Without `apply` nothing is written.
+   * are stamped from the new text's length, as for any text no provider
+   * measured; what described the call that wrote the old text goes, since it
+   * no longer matches: the verbatim response blocks it carried (only with
+   * `dropResponseContent`), its `provenance` and its split-stitch record
+   * (`stitched`); and `external` says who supplied the text. Each entry that
+   * carries it up a level reads the new text and is written as its copy
+   * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
+   * reported and left alone. The store's history keeps each entry as it was.
+   * The summary and its carriers are written in one write of the summaries,
+   * so they never part: each holds the old text, or each the new. A write
+   * that throws may still have landed: the error says so, and this strategy
+   * holds the new text where it could read the store back and found it
+   * there. Read the summary before asking for the edit again. Without `apply`
+   * nothing is written. Refused as SummaryTextEditOptions says, and, before
+   * anything is written, where the stored summaries can't be shown to be as
+   * this strategy holds them (another handle wrote them, or reading them
+   * failed).
    */
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
-    const entry = this.summaries.find((s) => s.id === id);
-    if (!entry) throw new Error(`no summary ${id}`);
-    if (body.trim().length === 0) throw new Error('the memory text is empty');
-    const parents: SummaryTextEdit['parents'] = [];
-    for (let parent = this.summaryById(getSummaryParentId(entry) ?? ''); parent; parent = this.summaryById(getSummaryParentId(parent) ?? '')) {
-      parents.push({ id: parent.id, level: parent.level });
-    }
+    const plan = planSummaryEdit(this.summaries, id, body, options);
+    if (!plan) throw new Error(`no summary ${id}`);
+    if (plan.refusals.length > 0) throw new Error(plan.refusals.map((refusal) => describeSummaryEditRefusal(id, refusal)).join('; '));
+    const { entry } = plan;
     const edit: SummaryTextEdit = {
       id,
       level: entry.level,
       applied: options.apply === true,
-      prior: { sha256: createHash('sha256').update(entry.content, 'utf8').digest('hex'), length: entry.content.length, tokens: entry.tokens },
-      tokens: Math.ceil(body.length / 3),
-      droppedResponseBlocks: entry.responseContent?.length ?? 0,
-      parents,
+      prior: plan.prior,
+      tokens: plan.tokens,
+      droppedResponseBlocks: plan.droppedResponseBlocks,
+      carriedBy: plan.carriedBy,
+      parents: plan.parents,
     };
     if (!options.apply) return edit;
-    entry.content = body;
-    entry.tokens = edit.tokens;
-    delete entry.responseContent;
-    delete entry.provenance;
-    delete entry.stitched;
-    entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
-    this.writeStoredSummary(entry, 'editSummaryText', 'new text');
+    if (this.store && this.storeWrittenElsewhere(true)) {
+      throw new Error('the stored summaries can\'t be shown to be as this strategy holds them: another handle changed them since this strategy read them, or reading them failed; nothing was written: open the store again');
+    }
+    const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    const rewritten = new Set([id, ...plan.carriedBy.map((carrier) => carrier.id)]);
+    const summaries = this.summaries.map((summary) => {
+      if (!rewritten.has(summary.id)) return summary;
+      const { responseContent: _responseContent, provenance: _provenance, stitched: _stitched, ...kept } = summary;
+      return { ...kept, content: body, tokens: edit.tokens, external };
+    });
+    const store = this.store;
+    try {
+      if (store) {
+        try {
+          this.writeHeldState(this.summariesStateId, () => store.setStateJson(this.summariesStateId, summaries));
+        } catch (error) {
+          let landed = false;
+          try {
+            landed = canonicalJson(store.getStateJson(this.summariesStateId) ?? null) === storedCanonicalJson(summaries);
+          } catch {
+            landed = false;
+          }
+          if (landed) this.summaries = summaries;
+          throw new Error(
+            `the write of summary ${id}'s edit threw, and it ${landed
+              ? 'landed: the strategy holds the new text'
+              : 'may have landed, while the strategy still holds the old text: initialize the manager again (setStrategy(getStrategy())) to read what the store holds, before asking for the edit again'} (${error instanceof Error ? error.message : String(error)})`,
+            { cause: error },
+          );
+        }
+      }
+      this.summaries = summaries;
+    } finally {
+      this._answerCostCache.clear();
+    }
     return edit;
+  }
+
+  historyMemory(): ReturnType<HistoryMutationStrategy['historyMemory']> {
+    this.requireLoadedBranch('historyMemory');
+    const store = this.store;
+    const read = !store || this.stillHeldAsStored(this.summariesStateId) ? this.summaries : store.getStateJson(this.summariesStateId);
+    const stored: readonly unknown[] = Array.isArray(read) ? read : [];
+    return { summaries: this.summaries, chunkRecords: this.chunkRecords, stored };
+  }
+
+  /**
+   * Drop `seeds` with every summary above them, as a let-go of rows drops
+   * what folds them (unfold): each chunk record of a dropped L1 keeps its
+   * rows and is compressed again, and a summary the drop leaves without its
+   * parent renders and merges again. Then the chunks are rebuilt and, in
+   * hierarchical mode, the merge check runs, as after a let-go. Refused,
+   * before anything is written, where the stored summaries or chunk records
+   * can't be shown to be as this strategy holds them, since the drop writes
+   * both states whole.
+   */
+  dropSummaries(seeds: readonly string[], ctx: StrategyContext): string[] {
+    this.requireBranchMutation('dropSummaries');
+    if (this.store && this.storeWrittenElsewhere(true)) {
+      throw new Error(`the drop of [${seeds.join(', ')}] is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them, since another handle changed them after this strategy read them, or reading them failed: initialize the manager again (setStrategy(getStrategy())), or open the store again`);
+    }
+    let dropped: string[] = [];
+    try {
+      dropped = this.unfold(new Set(seeds), () => undefined).dropped;
+      this._overlapBlocked.clear();
+    } finally {
+      this.rebuildChunks(ctx.messageStore);
+    }
+    if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
+      this.sweepPaidOffMergeQuarantine();
+      this.checkMergeThreshold();
+    }
+    return dropped;
+  }
+
+  /**
+   * A new instance with this one's settings that starts no compression by
+   * itself (ContextStrategy.cloneForScratch). A subclass builds its own: this
+   * one's settings don't say how to build another class.
+   */
+  cloneForScratch(): ContextStrategy {
+    if (Object.getPrototypeOf(this) !== AutobiographicalStrategy.prototype) {
+      throw new Error(`${this.name}: a subclass of AutobiographicalStrategy gives its own cloneForScratch`);
+    }
+    return new AutobiographicalStrategy({ ...this.config, autoTickOnNewMessage: false, logEffectiveConfig: false });
   }
 
   /** Inventory, not solver eligibility: pins, locks, and geometry can prevent using these summaries. */
@@ -19660,7 +19737,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const recallEnvelope = isRecallEnveloped(this.config.recallEnvelope) ? this.config.recallEnvelope : 'none';
     const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
-    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
+    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration, this.carriedMemory(s).external?.by ?? null]);
     const cached = this._answerCostCache.get(key);
     if (cached !== undefined) return cached;
     const estimate = this.estimateTokens(this.liveWindowAnswerContent(s));
@@ -23729,7 +23806,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
       this.summaryAnswerProse(summary),
-      summary,
+      this.attributed(summary),
       this.config.recallEnvelope,
     );
   }
@@ -23759,6 +23836,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * carries it, and the copy an entry was written with stands only where
    * this instance doesn't hold the summary under it.
    */
+  /**
+   * `summary` as its recall envelope names it: with the writer (`external`)
+   * of the summary whose text answers for it (carriedMemory). A carrier that
+   * an edit of an earlier release left behind its summary would otherwise
+   * name its own stale writer beside the summary's text.
+   */
+  private attributed(summary: SummaryEntry): SummaryEntry {
+    const writer = this.carriedMemory(summary).external;
+    if (writer === summary.external) return summary;
+    const { external: _stale, ...rest } = summary;
+    return writer ? { ...rest, external: writer } : rest;
+  }
+
   private carriedMemory(entry: SummaryEntry): SummaryEntry {
     for (let under: SummaryEntry | undefined; carriesItsSource(entry) && (under = this.summaryById(entry.sourceIds[0]!)); ) entry = under;
     return entry;
@@ -23803,7 +23893,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected liveWindowAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
       this.liveWindowAnswerProse(summary),
-      summary,
+      this.attributed(summary),
       this.config.recallEnvelope,
     );
   }
@@ -23973,7 +24063,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // equals it (isCapMarker).
       omissionMarked = capped.some(isCapMarker);
       if (idx > 0) content = separated(content);
-      content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      content.push(...wrapRecallAnswerContent(capped, this.attributed(s), this.config.recallEnvelope));
       refs.push(cappedWhole(prose, capped) ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       admitted++;
       // The cap ended inside this answer, where it cut, dropped or left out a
@@ -24061,7 +24151,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prose = this.liveWindowAnswerProse(summary);
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return {
-      content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
+      content: wrapRecallAnswerContent(capped, this.attributed(summary), this.config.recallEnvelope),
       refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
     };
   }

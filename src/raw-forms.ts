@@ -43,7 +43,9 @@
  * An opaque item (a Responses item membrane has no block for: an encrypted
  * compaction item, a hosted tool's call such as a web search, a custom tool
  * call) rides on a zero-width text block whose raw item is its whole content:
- * no field can render it. So an opaque carrier is never released. In a
+ * no field can render it. So an opaque carrier is never released, except
+ * where content that replaces a message holds a changed copy of one, which
+ * would replay the old item. In a
  * pairing it is an item like any other, so a hosted tool's call is the
  * follower of the reasoning that led to it. A pairing released through one
  * leaves it whole, with its id. So where its reasoning is stripped and it
@@ -54,6 +56,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import { canonicalJson } from './canonical-json.js';
 
 type RawFormCarrier = { rawXml?: unknown; rawItem?: unknown };
 
@@ -155,6 +158,58 @@ export function releaseEditedRawForms(
     return next;
   });
   return changed ? result : after;
+}
+
+export function releaseReplacedRawForms(before: readonly ContentBlock[], after: readonly ContentBlock[]): ContentBlock[] {
+  const unused = new Map<string, number[]>();
+  before.forEach((block, at) => {
+    const key = canonicalJson(block);
+    unused.set(key, [...(unused.get(key) ?? []), at]);
+  });
+  const placeOf = after.map((block) => unused.get(canonicalJson(block))?.shift());
+  const groups: Array<{ keys: string[]; at: number[] }> = [];
+  const byKey = new Map<string, number[]>();
+  before.forEach((block, at) => {
+    for (const key of rawFormKeys(block)) byKey.set(key, [...(byKey.get(key) ?? []), at]);
+  });
+  for (const [key, at] of byKey) groups.push({ keys: [key], at });
+  for (const pairing of pairingsOf(before)) {
+    groups.push({ keys: pairing, at: before.flatMap((block, at) => (pairing.includes(itemKey(block) ?? '') ? [at] : [])) });
+  }
+  const moved = new Set<string>();
+  for (const { keys, at } of groups) {
+    const first = at[0]!;
+    const last = at[at.length - 1]!;
+    const kept = placeOf.flatMap((place, j) => (place !== undefined && at.includes(place) ? [j] : []));
+    if (kept.length === 0) continue;
+    const span = placeOf.slice(kept[0], kept[kept.length - 1]! + 1);
+    if (span.length !== last - first + 1 || span.some((place, k) => place !== first + k)) for (const key of keys) moved.add(key);
+  }
+  const held = new Set(before.flatMap(rawFormValues));
+  const matched = after.map((block, j) => {
+    const place = placeOf[j];
+    return place === undefined ? withoutHeldRawForms(block, held) : withoutRawForms(before[place]!, moved);
+  });
+  const released = releaseEditedRawForms(before, matched);
+  return released === matched ? matched : released.map((block, j) => (placeOf[j] === undefined ? matched[j]! : block));
+}
+
+function rawFormValues(block: ContentBlock): string[] {
+  const xml = xmlKey(block);
+  const raw = (block as RawFormCarrier).rawItem;
+  return [...(xml !== undefined ? [xml] : []), ...(raw && typeof raw === 'object' ? [`item:${canonicalJson(raw)}`] : [])];
+}
+
+function withoutHeldRawForms(block: ContentBlock, held: ReadonlySet<string>): ContentBlock {
+  const xml = xmlKey(block);
+  const raw = (block as RawFormCarrier).rawItem;
+  const dropXml = xml !== undefined && held.has(xml);
+  const dropItem = raw !== null && typeof raw === 'object' && held.has(`item:${canonicalJson(raw)}`);
+  if (!dropXml && !dropItem) return block;
+  const copy = { ...block } as ContentBlock & RawFormCarrier;
+  if (dropXml) delete copy.rawXml;
+  if (dropItem) delete copy.rawItem;
+  return copy as ContentBlock;
 }
 
 /**
@@ -281,7 +336,8 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
  * carries alone moves with it, unless it belongs to a reasoning pairing: moved
  * alone, a reasoning item or the item it led to would keep the id that ties it
  * to a partner it no longer sits with, so it gives that item up too, as an
- * edit does. An opaque carrier keeps its item, as everywhere (see above). The
+ * edit does. An opaque carrier keeps its item, as in an edit's release (see
+ * above); only content that replaces it with a changed copy loses it. The
  * blocks left behind are reconciled with releaseEditedRawForms, which
  * releases the rest of the pairing.
  */

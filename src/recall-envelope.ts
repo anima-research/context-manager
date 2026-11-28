@@ -44,11 +44,17 @@ export function buildRecallEnvelopeTags(summary: SummaryEntry, mode: 'xml' | 'ba
     const first = summary.sourceRange?.first;
     const last = summary.sourceRange?.last;
     if (first && last) attributes.push(`span="${first}..${last}"`);
+    const by = summary.external?.by;
+    if (typeof by === 'string' && by !== '') attributes.push(`writtenBy="${attributeValue(by)}"`);
   }
   const open = attributes.length > 0
     ? `<${RECALL_ENVELOPE_TAG} ${attributes.join(' ')}>`
     : `<${RECALL_ENVELOPE_TAG}>`;
   return { open, close: `</${RECALL_ENVELOPE_TAG}>` };
+}
+
+function attributeValue(text: string): string {
+  return text.replace(/[&<>"\r\n]/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
 /**

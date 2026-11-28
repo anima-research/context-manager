@@ -1,4 +1,5 @@
 import type {
+  ContextStrategy,
   StoredMessage,
   MessageStoreView,
   KnowledgeConfig,
@@ -37,6 +38,14 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
     // Merge knowledge-specific fields onto the base config so all KnowledgeConfig
     // fields are actually present (super() only stores AutobiographicalConfig fields).
     this.knowledgeConfig = { ...this.config, ...config } as KnowledgeConfig;
+  }
+
+  /** A new instance with this one's settings that starts no compression by itself (ContextStrategy.cloneForScratch). */
+  cloneForScratch(): ContextStrategy {
+    if (Object.getPrototypeOf(this) !== KnowledgeStrategy.prototype) {
+      throw new Error(`${this.name}: a subclass of KnowledgeStrategy gives its own cloneForScratch`);
+    }
+    return new KnowledgeStrategy({ ...this.knowledgeConfig, ...this.config, autoTickOnNewMessage: false, logEffectiveConfig: false });
   }
 
   /**

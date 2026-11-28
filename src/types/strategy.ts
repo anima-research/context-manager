@@ -251,6 +251,18 @@ export interface ContextStrategy {
   /** Strategy name for identification */
   readonly name: string;
 
+  /**
+   * A new, unopened instance with this one's settings that starts no
+   * compression by itself, for a manager that builds a history mutation on a
+   * branch of its own (ContextManager.compileMutationPreview,
+   * applyHistoryMutation). Absent where the strategy can't be built again
+   * from what it holds; for the manager that makes the change, those calls
+   * then take a strategy from their caller, and a reader needs one of its
+   * own, unless its historyMemory() holds no summaries and it has no
+   * onRetracted, where a passthrough stands in for it.
+   */
+  cloneForScratch?(): ContextStrategy;
+
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
    *  A value that isn't a positive number, such as 0, undefined, a negative
@@ -488,7 +500,10 @@ export interface ContextStrategy {
    *
    * While the manager is in legacy mode its window is the record, and a
    * removal takes the row out of both at once: nothing calls this, and a
-   * strategy that folded the row keeps what it folded, as it always has. A
+   * strategy that folded the row keeps what it folded, as it always has,
+   * except in a history mutation (compileMutationPreview,
+   * applyHistoryMutation), which calls this, with `removed`, for the rows
+   * it removes in legacy mode too, on the branch it builds. A
    * tombstone write the store refuses takes nothing out and calls nothing;
    * one that throws after the store kept part of it calls this with the
    * rows it took out before the error is thrown or logged. A row
@@ -519,7 +534,9 @@ export interface ContextStrategy {
    * Fire and forget, as onPresented: a rejection, or a throw before it
    * returns, is logged through the manager's diagnostics, naming the rows,
    * and doesn't reach the caller. The rows stay out of the window, and the
-   * strategy isn't offered them again.
+   * strategy isn't offered them again. A history mutation is the
+   * exception: it waits for the call, in either mode, and a rejection or a
+   * throw fails the mutation, which deletes the branch it built.
    */
   onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean; ids: readonly MessageId[] }): Promise<void>;
 
@@ -3172,10 +3189,12 @@ export interface SummaryEntry {
    * one source. Its text, `responseContent`, `tokens`, `created` and
    * `provenance` are that summary's own, copied when it was carried, so
    * `provenance` names the request that authored the text, at the level it
-   * was written for. The copy is not kept in step with the summary: a
-   * compile and a summarizer request read the text from the summary carried
-   * as it stands, so a repair that rewrites a summary in place edits that
-   * summary, not the entries that carry it.
+   * was written for. A compile and a summarizer request read the text from
+   * the summary carried as it stands, so a repair that rewrites a summary in
+   * place edits that summary, not the entries that carry it.
+   * `editSummaryText` keeps them in step: it writes the new text, tokens and
+   * `external` to each entry that carries the summary it edits, and drops
+   * their response blocks and provenance, as it does the summary's.
    *
    * The entry is a carry only while that summary is its one source. A
    * topology repair can give it another (an adoption, a re-homed fragment)
@@ -3187,8 +3206,10 @@ export interface SummaryEntry {
    * Set when the text came from outside the strategy's own compression
    * calls: an operator installed it as the result of the work, or replaced
    * the text of an existing summary (`importExternalMemory`,
-   * `editSummaryText`). Absent on every other entry. Nothing renders it and
-   * no selection reads it. An entry that has it has no `provenance`: that
+   * `editSummaryText`). Absent on every other entry. Under
+   * `recallEnvelope: 'xml'`, the recall envelope of the entry, and of each
+   * entry that carries it, names a `by` that isn't empty as `writtenBy`, and
+   * selection prices that envelope; nothing else of selection reads it. An entry that has it has no `provenance`: that
    * records a model's accepted answer, and here there is none. An installed
    * entry names the request it answers in `external.requestHash`; an edit
    * drops the `provenance` of the call that wrote the text it replaced,
@@ -3250,12 +3271,36 @@ export interface SummaryTextEdit {
   applied: boolean;
   /** The text replaced: its sha256 (hex, of the UTF-8 text), its `String.length` (UTF-16 code units) and its token stamp. */
   prior: { sha256: string; length: number; tokens: number };
-  /** The new text's token stamp: an estimate from its length, as for any summary that comes with no usage. */
+  /** The new text's token stamp: an estimate from its length (`Math.ceil(length / 3)`), as for any summary text no provider measured. */
   tokens: number;
-  /** Verbatim response blocks the entry carried, which go with the text they matched (so do its `provenance` and `stitched`). */
+  /** The most verbatim response blocks that the entry, or one that carries it, held: they go with the text they matched (so do its `provenance` and `stitched`). */
   droppedResponseBlocks: number;
-  /** Summaries merged over the old text, nearest first. They are left as they are. */
+  /**
+   * Entries that carry the summary up a level (`carriedFrom`), nearest first.
+   * A compile reads the new text in their place, and an applied edit writes
+   * each as a copy of the edited summary again: its text, tokens and
+   * `external`, with no response blocks, `provenance` or `stitched`, as the
+   * summary keeps none.
+   */
+  carriedBy: Array<{ id: string; level: SummaryLevel }>;
+  /** Summaries merged over the old text, nearest first, with every summary above them. They are left as they are. */
   parents: Array<{ id: string; level: SummaryLevel }>;
+}
+
+/**
+ * `editSummaryText`'s options. Without `apply` nothing is written. The edit is
+ * refused, dry or not, where the entry carries up a level another summary
+ * that the strategy holds (a compile reads that summary's text), where
+ * `expectedPriorSha256` isn't its text's, where it renders verbatim response
+ * blocks and `dropResponseContent` isn't set, and where the new text is
+ * empty.
+ */
+export interface SummaryTextEditOptions {
+  apply?: boolean;
+  /** sha256 (hex) of the UTF-8 text the caller read. */
+  expectedPriorSha256?: string;
+  /** Drop the verbatim response blocks the entry renders in place of its text. */
+  dropResponseContent?: boolean;
 }
 
 /**
@@ -3273,7 +3318,48 @@ export interface ExternalMemoryStrategy extends ContextStrategy {
     ctx: StrategyContext,
     options?: { apply?: boolean },
   ): Promise<{ item: MemoryWorkItem; applied: boolean; tokens: number; summaryId?: string }>;
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: { apply?: boolean }): SummaryTextEdit;
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: SummaryTextEditOptions): SummaryTextEdit;
+}
+
+/**
+ * Strategy whose summaries a history mutation can see
+ * (ContextManager.planHistoryMutation, applyHistoryMutation). A history
+ * mutation refuses a strategy that isn't one, unless it is
+ * PassthroughStrategy or WindowedPassthroughStrategy itself. One that keeps
+ * no summaries gives empty lists.
+ */
+export interface HistoryMemorySource {
+  /**
+   * Its summaries and chunk records as it holds them now, and its summaries
+   * as the store holds them (`stored`), which differ where another handle
+   * wrote them since this strategy read them. Read only.
+   */
+  historyMemory(): {
+    summaries: readonly SummaryEntry[];
+    chunkRecords: ReadonlyArray<{ id: string; sourceIds: string[]; compressed: boolean; summaryId?: string }>;
+    stored: readonly unknown[];
+  };
+}
+
+/**
+ * Strategy whose summaries a history mutation reads and changes
+ * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
+ * AutobiographicalStrategy and its subclasses.
+ */
+export interface HistoryMutationStrategy extends ContextStrategy, HistoryMemorySource, Pick<ExternalMemoryStrategy, 'editSummaryText'> {
+  /**
+   * Drop the summaries `seeds` names, with every summary above them; each
+   * chunk record of a dropped L1 keeps its rows and is compressed again, and
+   * the summaries a drop leaves without a parent render and merge again.
+   * Returns the ids dropped.
+   */
+  dropSummaries(seeds: readonly string[], ctx: StrategyContext): string[];
+}
+
+export function isHistoryMutationStrategy(s: ContextStrategy): s is HistoryMutationStrategy {
+  return 'editSummaryText' in s && typeof s.editSummaryText === 'function'
+    && 'dropSummaries' in s && typeof s.dropSummaries === 'function'
+    && 'historyMemory' in s && typeof s.historyMemory === 'function';
 }
 
 export function isExternalMemoryStrategy(s: ContextStrategy): s is ExternalMemoryStrategy {

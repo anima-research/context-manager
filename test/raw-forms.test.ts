@@ -32,6 +32,7 @@ import type { ContextEntry, SummaryEntry } from '../src/types/index.js';
 import {
   rawFormKeys,
   releaseEditedRawForms,
+  releaseReplacedRawForms,
   releaseSharedRawFormsOnMove,
   releaseTrailingReasoning,
   releaseVanishedRawForms,
@@ -204,7 +205,78 @@ describe('raw forms: keys and release', () => {
     assert.equal(releaseSharedRawFormsOnMove(rs9, [fc1, rs9]), rs9);
   });
 
-  it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {
+  it('content that replaces a message gives up a raw form its kept blocks share once their order changes, and a changed opaque carrier gives up its item', () => {
+    const big = xmlUse('a', '/big');
+    const small = xmlUse('b', '/small');
+    const swapped = releaseReplacedRawForms([big, small], [{ ...small }, { ...big }]);
+    assert.deepEqual(swapped.map((block) => rawOf(block).rawXml), [undefined, undefined], 'the shared <function_calls> would replay the old order');
+    const inOrder = releaseReplacedRawForms([big, small], [{ ...big }, { ...small }]);
+    assert.deepEqual(inOrder.map((block) => rawOf(block).rawXml), [CALLS_XML, CALLS_XML], 'in its order it is still true');
+    const carrier = opaqueCarrier();
+    const redacted = releaseReplacedRawForms([carrier], [{ ...carrier, text: '[redacted]' } as ContentBlock]);
+    assert.equal(rawOf(redacted[0]!).rawItem, undefined);
+    assert.deepEqual(redacted[0], { type: 'text', text: '[redacted]' });
+  });
+
+  it('content that replaces a message keeps a shared raw form only where its blocks stay together in their order, with nothing between them', () => {
+    const first = itemText('first part');
+    const second = itemText('second part');
+    const inserted = releaseReplacedRawForms([first, second], [{ ...first }, { type: 'text', text: 'a note' }, { ...second }]);
+    assert.deepEqual(inserted.map((block) => rawOf(block).rawItem), [undefined, undefined, undefined], 'the item would replay both parts before the note');
+    const lead = { type: 'text', text: 'lead' } as ContentBlock;
+    const moved = releaseReplacedRawForms([lead, first, second], [{ ...first }, { ...second }, { ...lead }]);
+    assert.deepEqual(moved.map((block) => rawOf(block).rawItem), [MESSAGE_ITEM, MESSAGE_ITEM, undefined], 'the two parts moved together, in order');
+  });
+
+  it('content that replaces a message gives up only the raw forms whose blocks moved apart', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const x = { type: 'tool_result', toolUseId: 'call_1', content: 'x', rawItem: { type: 'function_call_output', id: 'fco_1' } } as ContentBlock;
+    const y = itemText('after', { type: 'message', id: 'msg_2', role: 'assistant', content: [] });
+    const after = releaseReplacedRawForms([rs1, fc1, x, y], [{ ...rs1 }, { ...fc1 }, { ...y }, { ...x }]);
+    assert.deepEqual(after.map((block) => rawOf(block).rawItem), [rawOf(rs1).rawItem, rawOf(fc1).rawItem, rawOf(y).rawItem, rawOf(x).rawItem], 'each item stands alone or with its pairing, as it stood');
+    const crossed = releaseReplacedRawForms([rs1, fc1, x], [{ ...fc1 }, { ...rs1 }, { ...x }]);
+    assert.deepEqual(crossed.map((block) => rawOf(block).rawItem), [undefined, undefined, rawOf(x).rawItem], 'the reasoning moved after the call it led to');
+  });
+
+  it('content that replaces a message matches a repeated block by its place', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const part = itemText('a part');
+    const before = [rs1, part, part];
+    const after = releaseReplacedRawForms(before, before.map((block) => ({ ...block })));
+    assert.deepEqual(after.map((block) => rawOf(block).rawItem), [rawOf(rs1).rawItem, MESSAGE_ITEM, MESSAGE_ITEM]);
+    const one = releaseReplacedRawForms(before, [{ ...rs1 }, { ...part }]);
+    assert.deepEqual(one.map((block) => rawOf(block).rawItem), [undefined, undefined], 'one copy of the part is gone');
+  });
+
+  it('content that replaces a message keeps a raw form that the old content didn\'t hold, and gives up a copy of one it held', () => {
+    const part = itemText('a part');
+    const fresh = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_9', encrypted_content: 'new' } } as ContentBlock;
+    const added = releaseReplacedRawForms([part], [{ ...part }, fresh]);
+    assert.deepEqual(added.map((block) => rawOf(block).rawItem), [MESSAGE_ITEM, rawOf(fresh).rawItem], 'a new opaque item is the caller\'s');
+    assert.equal(rawOf(releaseReplacedRawForms([opaqueCarrier()], [fresh])[0]!).rawItem, rawOf(fresh).rawItem, 'and so is one that replaces another');
+    const restated = itemText('restated', { type: 'message', id: 'msg_9', role: 'assistant', content: [{ type: 'output_text', text: 'restated' }] });
+    assert.equal(rawOf(releaseReplacedRawForms([part], [restated])[0]!).rawItem, rawOf(restated).rawItem, 'and so is a new message item');
+    assert.equal(rawOf(releaseReplacedRawForms([part], [{ ...part, text: 'reworded' } as ContentBlock])[0]!).rawItem, undefined, 'a copy of the old item still goes');
+    const searched = searchCall();
+    const updated = { type: 'text', text: '', rawItem: { type: 'web_search_call', id: 'ws_1', status: 'failed' } } as ContentBlock;
+    assert.equal(rawOf(releaseReplacedRawForms([searched], [updated])[0]!).rawItem, rawOf(updated).rawItem, 'and so is an item that keeps an old id with new contents');
+    const sameId = itemText('new words', { ...rawOf(part).rawItem as object, content: [{ type: 'output_text', text: 'new words' }] });
+    assert.notDeepEqual(rawOf(sameId).rawItem, rawOf(part).rawItem, 'setup: the same id, new contents');
+    assert.deepEqual(rawOf(releaseReplacedRawForms([part], [sameId])[0]!).rawItem, rawOf(sameId).rawItem, 'a message item too, which no opaque carrier holds');
+  });
+
+  it('content that replaces a message keeps the rawXml that is a block\'s content', () => {
+    const use = xmlUse('a', '/big');
+    const changed = '<function_calls>\n<invoke name="fs:write"/>\n</function_calls>';
+    const after = releaseReplacedRawForms([use, attempt()], [{ ...use }, attempt(changed)]);
+    assert.equal(rawOf(after[1]!).rawXml, changed, 'a changed tool_attempt is written as given');
+    const added = releaseReplacedRawForms([use], [{ ...use }, attempt()]);
+    assert.equal(rawOf(added[1]!).rawXml, CALLS_XML, 'and so is a new one');
+    assert.equal(rawOf(releaseReplacedRawForms([use], [{ ...use, input: { path: '/other' } } as ContentBlock])[0]!).rawXml, undefined, 'a changed tool_use gives up its replay');
+  });
+
+  it('a moved opaque carrier keeps its item even in a pairing', () => {
     const think = reasoning();
     const search = searchCall();
     assert.equal(releaseSharedRawFormsOnMove(search, [think, search]), search);
@@ -212,7 +284,7 @@ describe('raw forms: keys and release', () => {
 });
 
 describe('raw forms: opaque carriers, drops and appends', () => {
-  it('an opaque carrier keeps its raw item, and is the follower of the reasoning before it', () => {
+  it('an opaque carrier keeps its raw item where a release asks, and is the follower of the reasoning before it', () => {
     const think = reasoning();
     const search = searchCall();
     const parts = [itemText('first part'), itemText('second part')];

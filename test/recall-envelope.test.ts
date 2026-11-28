@@ -297,6 +297,35 @@ describe('recallEnvelope: the delimiter is a convention, not parseable XML', () 
     assert.ok(!open.includes('span='), 'an unsourceable span must be absent, not empty');
   });
 
+  it('names who supplied a summary\'s text, with what would read as markup written as character references', () => {
+    const { open } = buildRecallEnvelopeTags(fakeSummary({ external: { by: 'A & B <x>\n"y"', at: 1 } }));
+    assert.equal(open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4" writtenBy="A &#38; B &#60;x&#62;&#10;&#34;y&#34;">');
+    const notText = fakeSummary({ external: JSON.parse('{"by": 7, "at": 1}') });
+    assert.equal(buildRecallEnvelopeTags(notText).open, '<cm-recall id="L1-7" level="1" span="zz-msg-1..zz-msg-4">', 'a stored `by` that isn\'t text names no one');
+  });
+
+  it('names, for a carrier, the writer of the summary whose text it renders, though its own record is stale', () => {
+    class CarrierProbe extends AutobiographicalStrategy {
+      hold(summaries: SummaryEntry[]): void { this.summaries = summaries; }
+      answer(s: SummaryEntry): string { return this.summaryAnswerContent(s).map((b) => (b.type === 'text' ? b.text : '')).join(''); }
+      cost(s: SummaryEntry): number { return this.recallAnswerCost(s).estimate; }
+    }
+    const under = fakeSummary({ content: 'zz-edited by hand', external: { by: 'operator', at: 1 }, mergedInto: 'L2-8' });
+    const carrier = fakeSummary({ id: 'L2-8', level: 2, sourceLevel: 1, sourceIds: ['L1-7'], carriedFrom: 'L1-7' });
+    const probe = new CarrierProbe({ recallEnvelope: 'xml' });
+    probe.hold([under, carrier]);
+    assert.match(probe.answer(carrier), /^<cm-recall id="L2-8" level="2" span="zz-msg-1\.\.zz-msg-4" writtenBy="operator">[\s\S]*zz-edited by hand/);
+    const { external: _writer, ...unattributed } = under;
+    const stale = { ...carrier, external: { by: 'a stale writer', at: 0 } };
+    probe.hold([unattributed, stale]);
+    assert.doesNotMatch(probe.answer(stale), /writtenBy/, 'the carrier\'s own stale writer isn\'t named');
+    const priced = new CarrierProbe({ recallEnvelope: 'xml' });
+    priced.hold([under, carrier]);
+    const before = priced.cost(carrier);
+    priced.hold([{ ...under, external: { by: 'an operator whose name is a good deal longer than before', at: 2 } }, carrier]);
+    assert.ok(priced.cost(carrier) > before, 'a carrier is priced again when the writer of its summary changes');
+  });
+
   it('does not touch content when the mode is none or unset', () => {
     const summary = fakeSummary();
     const content: ContentBlock[] = [{ type: 'text', text: 'zz-memory-body' }];
