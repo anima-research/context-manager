@@ -229,9 +229,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       console.log(`summary: ${edit.id} (L${edit.level})`);
       console.log(`old text: ${edit.prior.length} chars, ${edit.prior.tokens} tokens, sha256 ${edit.prior.sha256}`);
       console.log(`new text: ${body.length} chars, ${edit.tokens} tokens, sha256 ${sha256(body)}, by ${by.by}`);
-      console.log(`verbatim response blocks dropped (the most on one entry): ${edit.droppedResponseBlocks}`);
+      console.log(`verbatim response blocks ${edit.applied ? 'dropped' : 'to drop'} (the most on one entry): ${edit.droppedResponseBlocks}`);
       if (edit.carriedBy.length > 0) {
-        console.log(`carried up a level by, which read the new text: ${edit.carriedBy.map((carrier) => `${carrier.id} (L${carrier.level})`).join(', ')}`);
+        console.log(`carried up a level by, which ${edit.applied ? 'read' : 'would read'} the new text: ${edit.carriedBy.map((carrier) => `${carrier.id} (L${carrier.level})`).join(', ')}`);
       }
       console.log(edit.parents.length === 0
         ? 'merged over the old text: nothing'

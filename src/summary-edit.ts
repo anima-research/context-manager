@@ -35,12 +35,6 @@ export function planSummaryEdit(
     const carries = parents.length === 0 && carriesItsSource(parent) && parent.sourceIds[0] === below.id;
     (carries ? carriedBy : parents).push({ id: parent.id, level: parent.level });
   }
-  for (const carrier of summaries) {
-    if (carrier.id !== entry.id && carriesItsSource(carrier) && carrier.sourceIds[0] === entry.id && !seen.has(carrier.id)) {
-      seen.add(carrier.id);
-      carriedBy.push({ id: carrier.id, level: carrier.level });
-    }
-  }
 
   const refusals: SummaryEditRefusal[] = [];
   if (carriesItsSource(entry)) {
@@ -80,7 +74,7 @@ export function describeSummaryEditRefusal(id: string, refusal: SummaryEditRefus
     case 'RESPONSE_CONTENT_SHADOW':
       return `summary ${id}, or an entry that carries it, holds ${refusal.responseBlocks} verbatim response block(s) of the old text; dropResponseContent (or the CLI's --drop-response-content) deletes them from the summary and each carrier`;
     case 'EMPTY_CONTENT':
-      return 'the memory text is empty';
+      return 'the memory text is empty: give a text that isn\'t blank';
     default: {
       const _exhaustive: never = refusal;
       return _exhaustive;

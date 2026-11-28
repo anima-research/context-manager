@@ -16046,7 +16046,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
     const plan = planSummaryEdit(this.summaries, id, body, options);
-    if (!plan) throw new Error(`no summary ${id}`);
+    if (!plan) throw new Error(`the edit of summary ${id} is refused, and nothing was written: there is no summary ${id}`);
     if (plan.refusals.length > 0) {
       throw new Error(`the edit of summary ${id} is refused, and nothing was written: ${plan.refusals.map((refusal) => describeSummaryEditRefusal(id, refusal)).join('; ')}`);
     }
