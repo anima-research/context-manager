@@ -140,7 +140,7 @@ describe('history mutation plan', () => {
     assert.deepEqual(codes([editCall, removeChange], s), ['TOOL_PAIR_SPLIT'], 'the change still stands when the call is edited');
   });
 
-  it('refuses a split that only the window\'s order shows', () => {
+  it('refuses a split that only the window shows, where the record holds a later result for the call', () => {
     const rows = [...ROWS.slice(0, 3), row('m3', 4, 'User', [{ type: 'tool_result', toolUseId: 't1', content: 'file a, again' }])];
     const presented = state({ rows, view: inOrder(['m0', 'm1', 'm2'], rows), windowMode: 'presented' });
     const plan = planMutation(presented, { ops: [{ ...remove('m2'), expectedSha256ById: { m2: sha('m2', rows) } }] });

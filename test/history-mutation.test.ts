@@ -699,7 +699,7 @@ describe('history mutation', () => {
     });
   });
 
-  it('keeps rows that beforeSwitch appends after the source\'s, and every other state of the store', async () => {
+  it('keeps rows that beforeSwitch appends after the source\'s, and another resident\'s state of the store', async () => {
     const path = await residentStore();
     await resident(path, async (manager) => {
       const store = manager.getStore();
@@ -1213,6 +1213,22 @@ describe('history mutation', () => {
     }
   });
 
+  it('says that a plan drifts where another handle changed an edited summary\'s response blocks, though its text is the same', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      const { target, manifest } = l1Edit(manager);
+      assert.ok(target.responseContent?.length, 'setup: the summary holds response blocks');
+      const plan = manager.planHistoryMutation(manifest);
+      const summariesId = `${NS}/autobio:summaries`;
+      const store = manager.getStore();
+      const held = store.getStateJson(summariesId) as SummaryEntry[];
+      store.setStateJson(summariesId, held.map((s) => (s.id === target.id ? { ...s, responseContent: s.responseContent!.map((_, i) => ({ type: 'text', text: `block ${i}, which another handle wrote` })) } : s)));
+      await manager.setStrategy(manager.getStrategy());
+      await assert.rejects(apply(manager, manifest, 'surgery/blocks-changed', plan), refusedWith('PLAN_DRIFT'));
+      assert.equal(manager.currentBranch().name, 'main');
+    });
+  });
+
   it('says that a plan drifts where the history, the manifest or the readers changed', async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
@@ -1612,12 +1628,18 @@ describe('history mutation', () => {
       const store = manager.getStore();
       const native = store.switchBranch.bind(store);
       const branches = branchNames(manager);
-      store.switchBranch = (name: string) => (name === 'surgery/undone' ? withBranchFileBlocked(path, () => native(name)) : native(name));
+      let entered = false;
+      store.switchBranch = (name: string) => {
+        if (name !== 'surgery/undone') return native(name);
+        entered = true;
+        return withBranchFileBlocked(path, () => native(name));
+      };
       try {
         await assert.rejects(manager.applyHistoryMutation(manifest, { targetBranch: 'surgery/undone', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }));
       } finally {
         store.switchBranch = native;
       }
+      assert.ok(entered, 'setup: the apply reached its switch');
       assert.equal(store.currentBranch().name, 'main', 'the store stays on the source');
       assert.deepEqual(branchNames(manager), branches, 'the branch it built is deleted');
       assert.equal(rendered([manager.getMessage(id)!]), 'as it was', 'and the manager works on the source');
@@ -2486,6 +2508,27 @@ describe('history mutation', () => {
     } finally {
       manager.close();
     }
+  });
+
+  it('tells the strategy of the rows that a removal in a legacy window takes out, so that no chunk record keeps only their ids', async () => {
+    const path = await residentStore();
+    await resident(path, async (manager) => {
+      type Records = { chunkRecords: Array<{ id: string; sourceIds: string[]; compressed: boolean }> };
+      const records = () => (manager.getStrategy() as unknown as Records).chunkRecords;
+      assert.equal(manager.windowMode(), 'legacy', 'setup: the window is legacy');
+      const taken = records().filter((r) => r.compressed).slice(0, 3);
+      const ids = taken.flatMap((r) => r.sourceIds);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'remove_messages', messageIds: ids, expectedSha256ById: Object.fromEntries(ids.map((id) => [id, messageSha(manager, id)])), foldedPolicy: 'drop_covering_summaries' }] };
+      await apply(manager, manifest, 'surgery/legacy-removal');
+      const dead = (rows: Records['chunkRecords']) => rows.filter((r) => r.sourceIds.length > 0 && r.sourceIds.every((id) => !manager.getMessage(id))).map((r) => r.id);
+      assert.deepEqual(dead(records()), [], 'no record holds only removed rows');
+      assert.ok(!records().some((r) => taken.some((t) => t.id === r.id && r.sourceIds.length > 0)), 'the records of the removed chunks let their rows go');
+    });
+    await resident(path, async (manager) => {
+      assert.equal(manager.currentBranch().name, 'surgery/legacy-removal');
+      const records = (manager.getStrategy() as unknown as { chunkRecords: Array<{ sourceIds: string[] }> }).chunkRecords;
+      assert.ok(!records.some((r) => r.sourceIds.length > 0 && r.sourceIds.every((id) => !manager.getMessage(id))), 'nor after a reopen');
+    });
   });
 
   it('applies a summary edit through a strategy that has no importExternalMemory()', async () => {
