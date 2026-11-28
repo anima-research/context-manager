@@ -13,6 +13,9 @@
   them with the summaries merged over the old text. To migrate, set
   `dropResponseContent` where deleting the blocks is meant, edit the
   carried summary rather than its carrier, and read `carriedBy` beside
-  `parents` for every entry that an edit reaches. Nothing else changes for
+  `parents` for every entry that an edit reaches. A strategy that
+  implements `ExternalMemoryStrategy` returns `carriedBy` from its
+  `editSummaryText` too: the entries that carry the edited summary, or an
+  empty list. Nothing else changes for
   an edit of any other summary: it keeps the lineage, and stamps tokens
   from the new text's length.
