@@ -3340,7 +3340,7 @@ export interface HistoryMemorySource {
  * (ContextManager.planHistoryMutation, applyHistoryMutation). Implemented by
  * AutobiographicalStrategy and its subclasses.
  */
-export interface HistoryMutationStrategy extends ExternalMemoryStrategy, HistoryMemorySource {
+export interface HistoryMutationStrategy extends ContextStrategy, HistoryMemorySource, Pick<ExternalMemoryStrategy, 'editSummaryText'> {
   /**
    * Drop the summaries `seeds` names, with every summary above them; each
    * chunk record of a dropped L1 keeps its rows and is compressed again, and
@@ -3351,7 +3351,7 @@ export interface HistoryMutationStrategy extends ExternalMemoryStrategy, History
 }
 
 export function isHistoryMutationStrategy(s: ContextStrategy): s is HistoryMutationStrategy {
-  return isExternalMemoryStrategy(s)
+  return 'editSummaryText' in s && typeof s.editSummaryText === 'function'
     && 'dropSummaries' in s && typeof s.dropSummaries === 'function'
     && 'historyMemory' in s && typeof s.historyMemory === 'function';
 }

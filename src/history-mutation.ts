@@ -150,7 +150,7 @@ type PlannedMessageEdit = {
   messageId: MessageId;
   beforeSha256: string;
   afterSha256: string;
-  /** The content as the edit writes it: the label first where the content didn't hold it. */
+  /** The content as the edit writes it: the label added where the content didn't hold it, after the row's leading tool results, or first. */
   content: ContentBlock[];
   label: string;
   foldedPolicy: FoldedEditPolicy;
@@ -486,7 +486,7 @@ export function planMutation(
               refuse(opIndex, refusal.code, `summary ${op.summaryId}'s text has sha256 ${refusal.actualSha256}, not ${refusal.expectedSha256}`, op.summaryId, { actualSha256: refusal.actualSha256 });
               break;
             case 'RESPONSE_CONTENT_SHADOW':
-              refuse(opIndex, refusal.code, `summary ${op.summaryId} renders ${refusal.responseBlocks} verbatim response block(s) in place of its text: set dropResponseContent`, op.summaryId, { responseBlocks: refusal.responseBlocks });
+              refuse(opIndex, refusal.code, `summary ${op.summaryId}, or an entry that carries it, holds ${refusal.responseBlocks} verbatim response block(s) of the old text, which render in place of the text: dropResponseContent deletes them from the summary and each carrier`, op.summaryId, { responseBlocks: refusal.responseBlocks });
               break;
             case 'EMPTY_CONTENT':
               refuse(opIndex, refusal.code, 'the new text is empty', op.summaryId);
@@ -536,10 +536,13 @@ export function planMutation(
         let content: ContentBlock[];
         try {
           const given = contentForWrite(op.content, `Edit of ${op.messageId} refused`);
+          // A row's tool results stay first, as a provider takes them after a call.
+          const results = given.findIndex((block) => block.type !== 'tool_result');
+          const at = results === -1 ? given.length : results;
           const labelled: ContentBlock[] = op.label.trim().length === 0 || given.some((block) => block.type === 'text' && block.text.includes(op.label))
             ? given
-            : [{ type: 'text', text: op.label }, ...given];
-          content = releaseReplacedRawForms(row.content, contentForWrite(labelled, `Edit of ${op.messageId} refused, with its label first`).map(blockAsStored));
+            : [...given.slice(0, at), { type: 'text', text: op.label }, ...given.slice(at)];
+          content = releaseReplacedRawForms(row.content, contentForWrite(labelled, `Edit of ${op.messageId} refused, with its label added`).map(blockAsStored));
         } catch (error) {
           if (!(error instanceof MalformedContentError)) throw error;
           refuse(opIndex, 'MALFORMED_CONTENT', error.message, op.messageId, { places: [...error.places] });
@@ -704,11 +707,11 @@ export function planMutation(
       ...foldsAny(other.summaries, touchedRows, (fields) => (fields.level === 1 ? fields.id : undefined)),
       ...foldsAny(other.records, touchedRows, (fields) => fields.summaryId),
     ].filter((id, i, all) => all.indexOf(id) === i);
-    const held = [...removedRows].filter((id) => other.windowHolds(id));
+    const held = [...touchedRows].filter((id) => other.windowHolds(id));
     if (folding.length === 0 && held.length === 0) continue;
     refuse(-1, 'UNLISTED_READER', `namespace ${other.namespace} isn't among the readers, and ` + [
       ...(folding.length > 0 ? [`its summaries ${folding.join(', ')} fold rows the change reaches`] : []),
-      ...(held.length > 0 ? [`its window holds ${held.join(', ')}, which the change removes`] : []),
+      ...(held.length > 0 ? [`its window holds ${held.join(', ')}, which the change edits or removes`] : []),
     ].join(', and ') + ': pass its manager as a reader, or name it in ignoreNamespaces', undefined, { readerNamespace: other.namespace });
   }
   const droppedSummaries = [...dropped];
@@ -915,23 +918,24 @@ export interface HistoryAnomaly {
 export function historyAnomalies(state: HistoryState): HistoryAnomaly[] {
   const out: HistoryAnomaly[] = [];
   const add = (anomaly: HistoryAnomaly) => out.push(anomaly);
-  state.rows.forEach((row, index) => {
+  state.record.forEach((row, index) => {
     const places = malformedContentPlaces(row.content);
     if (places.length > 0) add({ code: 'MALFORMED_CONTENT', targetId: row.id, message: `message ${row.id}: ${places.join('; ')}` });
     else if (row.content.length === 0) add({ code: 'EMPTY_CONTENT', targetId: row.id, message: `message ${row.id} has no content blocks` });
-    if (row.bodyGroupId && row.shardCount !== undefined && (index === 0 || state.rows[index - 1]!.bodyGroupId !== row.bodyGroupId)) {
-      const body = bodyOf(state.rows, index);
+    if (row.bodyGroupId && row.shardCount !== undefined && (index === 0 || state.record[index - 1]!.bodyGroupId !== row.bodyGroupId)) {
+      const body = bodyOf(state.record, index);
       if (body.length !== row.shardCount) {
         add({ code: 'INCOMPLETE_BODY', targetId: row.id, message: `body ${row.bodyGroupId} holds ${body.length} of its ${row.shardCount} shards` });
       }
     }
   });
-  const splits = new Map<string, { targetId: string; message: string; in: string[] }>();
   for (const [rows, where] of [[state.record, 'the record'], [state.view, 'the view']] as const) {
+    const seen = new Set<string>();
     const split = (targetId: string, message: string) => {
-      const found = splits.get(`${targetId}\u0000${message}`) ?? { targetId, message, in: [] };
-      if (!found.in.includes(where)) found.in.push(where);
-      splits.set(`${targetId}\u0000${message}`, found);
+      const key = `${targetId}\u0000${message}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      add({ code: 'TOOL_PAIR_SPLIT', targetId, message: `${message}, in ${where}` });
     };
     for (const u of findUnpairedToolBlocks(rows)) {
       const id = rows[u.message]!.id;
@@ -947,7 +951,6 @@ export function historyAnomalies(state: HistoryState): HistoryAnomaly[] {
       }
     }
   }
-  for (const { targetId, message, in: places } of splits.values()) add({ code: 'TOOL_PAIR_SPLIT', targetId, message: `${message}, in ${places.join(' and ')}` });
   if (state.memory) {
     const crossed = crossedSummaryIds({
       summaries: state.memory.summaries.map((s) => ({ id: s.id, level: s.level, sourceIds: [...s.sourceIds], sourceRange: s.sourceRange })),

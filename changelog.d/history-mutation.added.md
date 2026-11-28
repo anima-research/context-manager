@@ -19,9 +19,9 @@
     - a summary that renders verbatim response blocks, unless the op sets
       `dropResponseContent`;
     - merged parents, unless `parentPolicy` says to leave or drop them;
-    - a folded message, unless `foldedPolicy` says to drop or leave what
-      folds it, except a removal from a presented window, which drops what
-      folds it by default, as the window's removal does;
+    - a folded message, unless `foldedPolicy` says to drop what folds it,
+      or, for an edit, to leave it; a removal from a presented window drops
+      what folds it by default, as the window's removal does;
     - an empty summary text, malformed content, an edit of a shard, or the
       removal of part of a body;
     - a tool call split from its result, or a system change put between
@@ -42,14 +42,15 @@
       none. A strategy without summaries joins with a `historyMemory()` of
       empty lists.
   - An edited message takes a required `label` that names who changed it.
-    The label goes first in the content, unless a text block holds it
-    already. The message's metadata records the edit (`historyMutation`),
+    The label goes first in the content, or after the message's leading
+    tool results, unless a text block holds it already. The message's metadata records the edit (`historyMutation`),
     beside the metadata that it had. Each block that the edit changes loses
     the raw replay forms (`rawItem`, `rawXml`) that the old content held, so
     that a formatter sends the new text. A raw form that the old content
     didn't hold is the caller's, and stays.
   - `applyHistoryMutation(manifest, { targetBranch, expectedSourceBranch,
-    expectedPlanSha256, by, strategy?, beforeSwitch?, readers? })` makes the
+    expectedPlanSha256, by, strategy?, beforeSwitch?, readers?,
+    ignoreNamespaces? })` makes the
     plan again and refuses a plan that drifted. It forks `targetBranch` from
     the head with every state. A manager on that branch makes the writes,
     with a fresh instance of the strategy
@@ -75,7 +76,9 @@
     the process also deletes the
     branch built. Where that deletion fails, the error (`BRANCH_LEFT`) names
     the branch. It says whether the branch is still there, or deleted with
-    the deletion not saved yet. A process that stops leaves the branch, as a
+    the deletion not saved yet. Where the work on the built branch threw,
+    the error says so, that the branch is deleted, and that the source
+    holds what it held. A process that stops leaves the branch, as a
     preview leaves its scratch branch (`preview-mutation/<uuid>`), and an
     apply can't build on that name until it is deleted. The switch can fail
     after the store has moved to the branch, such as where the store can't
@@ -122,17 +125,20 @@
     source branch and the store's log keep the earlier text. So a
     redaction isn't an erasure.
   - The plan refuses where the store holds a namespace that isn't the
-    manager's or a reader's, and whose summaries or chunk records fold a
-    row that the change edits or removes, or whose presented window holds
-    a removed row (`UNLISTED_READER`, naming it). A caller that means to
-    leave a namespace as it is names it in `ignoreNamespaces`, which
-    `planSha256` covers.
+    manager's or a reader's, and whose autobiographical summaries or chunk
+    records fold a row that the change edits or removes, or whose presented
+    window holds one (`UNLISTED_READER`, naming it). It knows a namespace by
+    those states, so a manager whose strategy keeps its summaries
+    elsewhere is passed as a reader. A caller that means to leave a
+    namespace as it is names it in `ignoreNamespaces`, which `planSha256`
+    covers, and whose states the plan doesn't read.
   - `checkHistoryInvariants()` lists the anomalies of a history as it
     stands. These are malformed or empty content, a body that lacks shards,
     a tool call or result without its partner, a system change between a
     call and its result, and crossed summaries. It reads tool pairs in
     record order and in the order that a compile reads the window, with the
-    view filter applied.
+    view filter applied, and names a split once in each of the two where it
+    stands.
   - Under `recallEnvelope: 'xml'`, the recall envelope of a summary gains
     `writtenBy` when the summary's text came from outside the strategy and
     names who wrote it (`external.by` isn't empty). Its carriers gain it
@@ -151,6 +157,9 @@
     `MutationViolationCode`, `MutationTargetDescription`, and
     `MessageEditStamp`, the shape of `metadata.historyMutation`); `messageContentSha256` and `textSha256`,
     the sha256s that an op names for a message and a summary;
-    `HistoryMutationStrategy` and its guard `isHistoryMutationStrategy`,
-    what a strategy implements for its summaries to be changed; and
+    `HistoryMemorySource`, what a strategy implements for the plan to read
+    its summaries; `HistoryMutationStrategy` (`historyMemory`,
+    `editSummaryText` and `dropSummaries`) and its guard
+    `isHistoryMutationStrategy`, what a strategy implements for its
+    summaries to be changed; and
     `findUnpairedToolBlocks` with its `UnpairedToolBlock`.

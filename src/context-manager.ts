@@ -594,6 +594,12 @@ function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutati
   return { by: by.by, ...(by.note !== undefined ? { note: by.note } : {}) };
 }
 
+/** A failure of the work on a branch that a mutation built, and has deleted since: the library's refusals pass as they are, and any other error says where it happened. */
+function onBuiltBranch(error: unknown, where: string): unknown {
+  if (error instanceof HistoryMutationError) return error;
+  return new Error(`${where} threw, and that branch is deleted, so the source branch holds what it held: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+}
+
 function invalidPlan(plan: HistoryMutationPlan): HistoryMutationError {
   return new HistoryMutationError(
     `the plan has ${plan.violations.length} violation(s), so nothing was written: ${plan.violations.map((v) => `${v.code}${v.opIndex >= 0 ? ` (op ${v.opIndex})` : ''}: ${v.message}`).join('; ')}`,
@@ -2871,7 +2877,7 @@ export class ContextManager {
         try {
           markStoreBranchSwitch(this.store);
         } catch {
-          // Invalidated either way.
+          // The manager is invalidated above whether or not the generation moves.
         }
         throw new Error(
           `Branch selection ${name} failed, and the store ${now ? `moved to ${now.name}` : "can't say which branch it is on"}: the manager is uninitialized; ` +
@@ -4810,7 +4816,7 @@ export class ContextManager {
       const value: unknown = this.store.getStateJson(id);
       return Array.isArray(value) ? value : [];
     };
-    const namespaces = [...found].filter((namespace) => !listed.has(namespace)).sort().map((namespace): UnlistedNamespace => {
+    const namespaces = [...found].filter((namespace) => !listed.has(namespace) && !ignore.includes(namespace)).sort().map((namespace): UnlistedNamespace => {
       const window = ids.has(windowIndexStateId(namespace)) ? new WindowIndex(this.store, namespace, this.diag) : null;
       return {
         namespace,
@@ -4888,13 +4894,14 @@ export class ContextManager {
       staging = await this.managerOnBranch(scratch, strategy, true);
       await staging.applyPlannedOps(plan, editStamp(by, this.now(), plan.sourceBranch));
       await beforeCompile?.({ manager: staging, sourceBranch: plan.sourceBranch });
+      await staging.settleRetractions();
       compiled = await staging.compile(budget, injections, { ...selectOptions, dryRun: true });
       staging.close();
     } catch (error) {
       if (staging) await Promise.allSettled([...staging.retractedCalls]);
       staging?.close();
       this.deleteBuiltBranch(scratch, created.id, plan, error);
-      throw error;
+      throw onBuiltBranch(error, `the preview's work on branch ${scratch}`);
     }
     this.deleteBuiltBranch(scratch, created.id, plan);
     return { plan, compiled };
@@ -5056,7 +5063,7 @@ export class ContextManager {
       staging?.close();
       reader?.close();
       this.deleteBuiltBranch(targetBranch, created.id, plan, error);
-      throw error;
+      throw onBuiltBranch(error, `the apply's work on branch ${targetBranch}, before the store moved to it,`);
     }
     let toSequence = builtHead;
     const receipt = (): HistoryMutationReceipt => ({
@@ -5086,7 +5093,7 @@ export class ContextManager {
         now = `reading which branch the store is on failed (${read instanceof Error ? read.message : String(read)})`;
       }
       const message = `the mutation is applied on ${targetBranch}: the store moved to it, and the switch didn't complete ` +
-        `(this error's cause says why); ${now}: getStore().sync() saves a switch whose ` +
+        `(this error's cause says why); ${now}: sync() saves a switch whose ` +
         'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is';
       throw new HistoryMutationError(message, [{ opIndex: -1, code: 'APPLIED_INIT_FAILED', message }], plan, { cause: error, receipt: receipt() });
     }
@@ -5111,10 +5118,12 @@ export class ContextManager {
       const left = stands === undefined
         ? "the store can't be read to tell whether it is still there"
         : !stands
-          ? 'it is deleted, and its deletion is not saved yet: getStore().sync() saves it'
+          ? 'it is deleted, and its deletion is not saved yet: sync() saves it'
           : current === branch
             ? 'the store is on it: switch the store to another branch, then delete it'
-            : 'it is still there: delete it by hand';
+            : current === undefined
+              ? "it is still there, and the store can't say which branch it is on: switch the store to another branch if it is on this one, then delete it"
+              : 'it is still there: delete it by hand';
       const leftMessage = `deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
       const message = failure !== undefined ? `${why(failure)}; and ${leftMessage}` : leftMessage;
       const listed = failure instanceof HistoryMutationError;
@@ -5209,7 +5218,9 @@ export class ContextManager {
 
   private dropStillHeld(planned: readonly string[]): void {
     if (planned.length === 0) return;
-    const held = new Set(historyMemoryOf(this.strategy)?.summaries.map((s) => s.id) ?? []);
+    const memory = historyMemoryOf(this.strategy);
+    if (!memory) throw new Error(`the ${this.strategy.name} strategy has no historyMemory(), so the summaries that the plan drops (${planned.join(', ')}) can't be found in it`);
+    const held = new Set(memory.summaries.map((s) => s.id));
     const left = planned.filter((id) => held.has(id));
     if (left.length === 0) return;
     const drop = (this.strategy as Partial<Pick<HistoryMutationStrategy, 'dropSummaries'>>).dropSummaries;
