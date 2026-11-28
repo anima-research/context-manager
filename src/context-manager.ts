@@ -2802,12 +2802,13 @@ export class ContextManager {
    * switchBranch() or setStrategy(). Inspection and close remain available.
    * If a newer initialization supersedes this one, the call rejects with
    * InitializationSupersededError naming the branch it selected, or saying
-   * that its native switch threw. Where the
-   * store selects the branch and then the native switch fails, the switch is
-   * in effect and may not be saved: the call rejects, saying so, the
-   * strategy isn't initialized there, and sync() saves the
-   * selection once the store can write. Where the failed switch leaves the
-   * store on another branch, the call rejects and names it.
+   * that its native switch threw. Where the store selects the branch and
+   * then the native switch fails, as chronicle 0.6 and 0.7 can (0.8 undoes
+   * such a selection), the switch is in effect and may not be saved: the
+   * call rejects, saying so, the strategy isn't initialized there, and
+   * sync() saves the selection once the store can write. Where the failed
+   * switch leaves the store on another branch, the call rejects and names
+   * it.
    *
    * The switch moves the store's branch, which every manager on the store
    * follows, and starts a new branch generation. Every other manager's
