@@ -125,6 +125,14 @@ export interface StoredMessage {
 }
 
 /**
+ * A stored message as a read without blob resolution gives it
+ * (`resolveBlobs: false`): media that the store keeps as a blob is a
+ * `blob_ref`, at the top of the content and inside a tool result. A write
+ * refuses a `blob_ref`, so this content can't be written back as it is.
+ */
+export type UnresolvedMessage = Omit<StoredMessage, 'content'> & { content: StoredContentBlock[] };
+
+/**
  * Reference to a blob stored in Chronicle.
  * Used internally to avoid duplicating media content.
  */
@@ -142,12 +150,23 @@ export interface BlobReference {
  * Used for storage efficiency.
  *
  * - Media with base64 data is replaced with blob_ref
+ * - An image with base64 data in a tool_result's content array is replaced
+ *   with blob_ref
  * - URL-based images pass through unchanged
  * - All other content types pass through unchanged
  */
 export type StoredContentBlock =
-  | Exclude<ContentBlock, { type: 'document' | 'audio' | 'video' }>
-  | { type: 'blob_ref'; ref: BlobReference };
+  | Exclude<ContentBlock, { type: 'document' | 'audio' | 'video' | 'tool_result' }>
+  | StoredToolResult
+  | BlobReferenceBlock;
+
+/** What the store writes in place of inline media. */
+export type BlobReferenceBlock = { type: 'blob_ref'; ref: BlobReference };
+
+/** A tool_result as stored: its content array can hold blob references. */
+export type StoredToolResult = Omit<Extract<ContentBlock, { type: 'tool_result' }>, 'content'> & {
+  content: string | Array<ContentBlock | BlobReferenceBlock>;
+};
 
 /**
  * Internal representation of a stored message with blob references.

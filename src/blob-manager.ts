@@ -7,7 +7,7 @@ import type {
   VideoContent,
   Base64Source,
 } from '@animalabs/membrane';
-import type { BlobReference, StoredContentBlock } from './types/index.js';
+import type { BlobReference, BlobReferenceBlock, StoredContentBlock } from './types/index.js';
 import { blockForWrite } from './well-formed-content.js';
 import { blobKindOf, blobMediaType, imageMediaTypeOfBase64, sniffRasterImageMediaType } from './stored-media.js';
 
@@ -48,7 +48,10 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  * returns content as it was given, with what a write mends mended, not this.
  *
  * Inline media is kept as a blob: an image whose source isn't a URL, and
- * every document, audio or video block. It comes back as
+ * every document, audio or video block. An image whose source isn't a URL,
+ * in the content array of a `tool_result` at the top of the content, is kept
+ * as a blob too, and comes back in its place in that array; other media in
+ * that array is kept as given. Media comes back as
  * `{ type, source: { type: 'base64', data, mediaType } }` and nothing else:
  * its data is re-encoded from the decoded bytes, and an image's media type
  * is taken from its bytes' signature where they have one (png, jpeg, gif,
@@ -93,14 +96,29 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  */
 export function blockAsStored(block: ContentBlock): ContentBlock {
   block = blockForWrite(block, 'blockAsStored');
+  if (holdsBlobImage(block)) {
+    return { ...block, content: block.content.map((b) => (blobKindOf(b) === 'image' ? mediaAsStored(b, 'image') : b)) };
+  }
   const kind = blobKindOf(block);
   if (!kind) return block;
+  return mediaAsStored(block, kind);
+}
+
+function mediaAsStored(block: ContentBlock, kind: BlobReference['originalType']): ContentBlock {
   const { data, mediaType } = (block as { source: Base64Source }).source;
-  // The store's own read of the data (storeBase64). What it refuses, the
-  // boundary has refused by name above.
   const bytes = Buffer.from(data, 'base64');
   const type = blobMediaType(kind, mediaType, () => sniffRasterImageMediaType(bytes)) ?? mediaType;
   return blockFromBlob(kind, bytes.toString('base64'), type);
+}
+
+type ToolResultBlock = Extract<ContentBlock, { type: 'tool_result' }>;
+
+function holdsBlobImage(block: ContentBlock): block is ToolResultBlock & { content: ContentBlock[] } {
+  return block.type === 'tool_result' && Array.isArray(block.content) && block.content.some((b) => blobKindOf(b) === 'image');
+}
+
+function isImageReference(block: ContentBlock | BlobReferenceBlock): block is BlobReferenceBlock {
+  return block.type === 'blob_ref' && block.ref.originalType === 'image';
 }
 
 /**
@@ -185,6 +203,14 @@ export class BlobManager {
   private extractBlobFromBlock(block: ContentBlock): StoredContentBlock {
     // Which blocks become blobs, and how they read back, is shared with
     // blockAsStored, so the store and that export can't disagree.
+    if (holdsBlobImage(block)) {
+      return {
+        ...block,
+        content: block.content.map((b): ContentBlock | BlobReferenceBlock => (blobKindOf(b) === 'image'
+          ? { type: 'blob_ref', ref: this.storeBase64((b as { source: Base64Source }).source, 'image') }
+          : b)),
+      };
+    }
     const kind = blobKindOf(block);
     if (!kind) return block as StoredContentBlock;
     return { type: 'blob_ref', ref: this.storeBase64((block as { source: Base64Source }).source, kind) };
@@ -209,11 +235,16 @@ export class BlobManager {
   }
 
   private resolveBlobInBlock(block: StoredContentBlock): ContentBlock {
+    if (block.type === 'tool_result' && Array.isArray(block.content) && block.content.some(isImageReference)) {
+      return { ...block, content: block.content.map((b) => (isImageReference(b) ? this.resolveReference(b.ref) : b as ContentBlock)) };
+    }
     if (block.type !== 'blob_ref') {
       return block as ContentBlock;
     }
+    return this.resolveReference(block.ref);
+  }
 
-    const { ref } = block;
+  private resolveReference(ref: BlobReference): ContentBlock {
     const data = this.cachedBlobBase64(ref.hash);
 
     if (data === null) {
@@ -224,16 +255,22 @@ export class BlobManager {
   }
 
   /**
-   * Check if a content block contains media that would be stored as a blob.
+   * Check if a content block contains media that would be stored as a blob:
+   * the block itself, or an image in its content array where it's a
+   * `tool_result`.
    */
   static hasStorableMedia(block: ContentBlock): boolean {
-    return blobKindOf(block) !== null;
+    return blobKindOf(block) !== null || holdsBlobImage(block);
   }
 
   /**
-   * Estimate the storage size of media content.
+   * Estimate the storage size of media content: the block's own, or the sum
+   * of the images in its content array where it's a `tool_result`.
    */
   static estimateMediaSize(block: ContentBlock): number {
+    if (holdsBlobImage(block)) {
+      return block.content.reduce((sum, b) => sum + (blobKindOf(b) === 'image' ? BlobManager.estimateMediaSize(b) : 0), 0);
+    }
     if (!blobKindOf(block)) return 0;
     const data = (block as { source: { data?: unknown } }).source.data;
     return typeof data === 'string' ? Math.ceil(data.length * 0.75) : 0; // base64 -> bytes

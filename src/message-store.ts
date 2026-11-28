@@ -7,6 +7,7 @@ import type {
   MessageMetadata,
   StoredMessage,
   StoredMessageInternal,
+  UnresolvedMessage,
   MessageStoreView,
   MessageQuery,
   MessageQueryResult,
@@ -347,10 +348,12 @@ export interface MessageWindowOptions {
 }
 
 /**
- * A window of messages plus enough metadata to page through the store.
+ * A window of messages plus enough metadata to page through the store: each
+ * message resolved (StoredMessage), or as a read without blob resolution
+ * gives it (UnresolvedMessage).
  */
-export interface MessageWindow {
-  messages: StoredMessage[];
+export interface MessageWindow<M extends StoredMessage | UnresolvedMessage = StoredMessage> {
+  messages: M[];
   /**
    * Actual first slot index of the returned window. May be lower than the
    * requested offset when alignToBodyGroups extended the window backward.
@@ -1252,7 +1255,10 @@ export class MessageStore {
    * full-materialization fallback for older chronicle copies, mirroring
    * the feature-detect in getInternal().
    */
-  getWindow(offset: number, limit: number, opts: MessageWindowOptions = {}): MessageWindow {
+  getWindow(offset: number, limit: number, opts: MessageWindowOptions & { resolveBlobs: false }): MessageWindow<UnresolvedMessage>;
+  getWindow(offset: number, limit: number, opts?: MessageWindowOptions & { resolveBlobs?: true }): MessageWindow;
+  getWindow(offset: number, limit: number, opts?: MessageWindowOptions): MessageWindow | MessageWindow<UnresolvedMessage>;
+  getWindow(offset: number, limit: number, opts: MessageWindowOptions = {}): MessageWindow | MessageWindow<UnresolvedMessage> {
     const totalCount = this.length();
     let start = Math.max(0, Math.min(offset, totalCount));
     let end = Math.min(start + Math.max(0, limit), totalCount);
@@ -1272,11 +1278,11 @@ export class MessageStore {
     }
 
     const internals = this.getSliceInternal(start, end - start);
-    const resolveBlobs = opts.resolveBlobs !== false;
+    if (opts.resolveBlobs === false) {
+      return { messages: internals.map((internal) => this.internalToUnresolved(internal, internal.id)), startIndex: start, totalCount };
+    }
     return {
-      messages: internals.map((internal, i) =>
-        this.internalToStored(internal, internal.id, start + i, resolveBlobs)
-      ),
+      messages: internals.map((internal, i) => this.internalToStored(internal, internal.id, start + i)),
       startIndex: start,
       totalCount,
     };
@@ -2066,7 +2072,7 @@ export class MessageStore {
         // message carrying inline media — resolveBlobs:true matches how
         // estimateTokens is used everywhere else in this file (getAll()'s
         // default).
-        const stored = this.internalToStored(internal, internal.id, ordinal, true);
+        const stored = this.internalToStored(internal, internal.id, ordinal);
         const rawBlockEstimates = stored.content.map((block) => this.estimateBlockTokensRaw(block));
         cached = { channelId, rawBlockEstimates };
         this.tokenStatsCache.set(ordinal, cached);
@@ -2327,12 +2333,16 @@ export class MessageStore {
     internal: StoredMessageInternal,
     id: MessageId,
     _index: number,
-    resolveBlobs: boolean = true,
   ): StoredMessage {
+    const unresolved = this.internalToUnresolved(internal, id);
+    return { ...unresolved, content: this.blobManager.resolveBlobs(unresolved.content) };
+  }
+
+  private internalToUnresolved(internal: StoredMessageInternal, id: MessageId): UnresolvedMessage {
     // What doesn't match ContentBlock is left out before anything reads it,
     // blob resolution included (well-formed-content.ts).
     const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged, this.log);
-    const stored: StoredMessage = {
+    const stored: UnresolvedMessage = {
       id,
       // chronicle record sequence captured when the message was appended
       // (see `add()` line 131: `sequence: record.sequence`). The previous
@@ -2347,12 +2357,7 @@ export class MessageStore {
       // so /undo of a 800-message conversation forked ~400 messages back.
       sequence: internal.sequence,
       participant: internal.participant,
-      // When resolveBlobs is false, blob_ref placeholder blocks are passed
-      // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
-      // ContentBlock for viewer purposes).
-      content: resolveBlobs
-        ? this.blobManager.resolveBlobs(content)
-        : (content as unknown as ContentBlock[]),
+      content,
       metadata: internal.metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,

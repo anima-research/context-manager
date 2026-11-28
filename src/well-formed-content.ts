@@ -13,7 +13,9 @@
  * which only data that isn't a string can be, since any string reads as
  * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
- * blob, not media inside a `tool_result`, which it keeps as given.
+ * blob, and also an image in the content array of a `tool_result` that is a
+ * block of the content, so a write refuses such an image too. It keeps other
+ * media inside a `tool_result`, and anything deeper, as given.
  * Nothing else is checked: not ids, a tool call's name or signatures, which a provider may
  * still refuse a block without, and nothing else of a media source, such as
  * a URL image's URL, which the formatters and the providers read. A
@@ -40,15 +42,17 @@
  * string `mediaType`: a read gives an image the type its bytes' signature
  * names, where they carry one, and nothing else names a document's, audio's
  * or video's. The rule holds at any depth, as the read's other checks do.
- * Three shapes a read gives still meet a write's refusal, each in a record
- * the store's writes don't make: inline media at the top of the content,
- * where the store keeps a blob, whose source it can't keep as one
- * (unstorableSource: data it can't read, or no media type it can give it); a
- * `blob_ref` the read takes inside a `tool_result`, which resolution leaves
- * as it is, since it resolves the content's own blocks; and an image's
- * `blob_ref` without a string `mediaType` whose bytes carry no signature
- * (refHasMediaType). Leaving out the first two would take a read that knows
- * where a block sits, which these walks don't.
+ * Four shapes a read gives still meet a write's refusal, each in a record
+ * the store's writes don't make: inline media where the store keeps a blob,
+ * whose source it can't keep as one (unstorableSource: data it can't read, or
+ * no media type it can give it); a `blob_ref` the read takes deeper than a
+ * `tool_result`'s own content array, and a document's, audio's or video's
+ * `blob_ref` in that array, both of which resolution leaves as they are,
+ * since it resolves the content's blocks and the images in a top-level
+ * `tool_result`'s array; and an image's `blob_ref` without a string
+ * `mediaType` whose bytes carry no signature (refHasMediaType). Leaving out
+ * the first three would take a read that knows where a block sits, which
+ * these walks don't.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -289,14 +293,28 @@ function refHasMediaType(ref: Record<string, unknown>): boolean {
   return typeof ref.mediaType === 'string' || ref.originalType === 'image';
 }
 
-/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource). */
 function storeRefuses(block: unknown): boolean {
+  return mediaRefused(block) || nestedImages(block).some(([image]) => mediaRefused(image));
+}
+
+function mediaRefused(block: unknown): boolean {
   return (
     isRecord(block) &&
     MEDIA_TYPES.has(block.type as string) &&
     isRecord(block.source) &&
     unstorableSource(block as unknown as ContentBlock) !== null
   );
+}
+
+function nestedImages(block: unknown): Array<[unknown, number]> {
+  if (!isRecord(block) || block.type !== 'tool_result' || !Array.isArray(block.content)) return [];
+  const images: Array<[unknown, number]> = [];
+  const inner: unknown[] = block.content;
+  for (let i = 0; i < inner.length; i++) {
+    const b = inner[i];
+    if (isRecord(b) && b.type === 'image') images.push([b, i]);
+  }
+  return images;
 }
 
 function allWellFormed(content: readonly unknown[], side: Side): boolean {
@@ -389,6 +407,7 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
           places.push(`${at}.content[${i}] is a system_change inside a tool_result; a system change goes in a message of its own`);
         } else {
           placesIn(inner[i], `${at}.content[${i}]`, places, side);
+          if (side === 'write' && isRecord(inner[i]) && inner[i].type === 'image') storePlacesIn(inner[i], `${at}.content[${i}]`, places);
         }
       }
       return;
@@ -420,9 +439,9 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
   }
 }
 
-/** The places of inline media in `block`, a block of the content, that the store can't keep, as phrases from `at`. */
+/** The places of `block`, a media block, that the store can't keep, as phrases from `at`. */
 function storePlacesIn(block: unknown, at: string, places: string[]): void {
-  if (!storeRefuses(block)) return;
+  if (!mediaRefused(block)) return;
   const { type, source } = block as { type: string; source: Record<string, unknown> };
   const unstorable = unstorableSource(block as unknown as ContentBlock)!;
   if (unstorable.data) places.push(`${at}.source.data is ${kindOf(source.data)}, not base64 data`);
