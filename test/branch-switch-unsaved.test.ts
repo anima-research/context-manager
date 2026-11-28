@@ -15,7 +15,8 @@ import { join } from 'node:path';
 
 import { JsStore } from '@animalabs/chronicle';
 
-import { ContextManager, PassthroughStrategy } from '../src/index.js';
+import { ContextManager, InitializationSupersededError, PassthroughStrategy } from '../src/index.js';
+import { observeStoreBranch } from '../src/branch-generation.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'branch-switch-unsaved-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -53,6 +54,14 @@ describe('a branch selection that the store makes and does not save', () => {
       }
       assert.equal(store.currentBranch().name, 'elsewhere', 'the store is on the branch it selected');
       assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/, 'the manager refuses work there');
+      const unsynced = join(dir, `copy-${stores++}`);
+      cpSync(path, unsynced, { recursive: true });
+      const before = JsStore.open({ path: unsynced });
+      try {
+        assert.equal(before.currentBranch().name, 'main', 'setup: before sync(), the saved selection is the old one');
+      } finally {
+        before.close();
+      }
       store.sync();
       const copy = join(dir, `copy-${stores++}`);
       cpSync(path, copy, { recursive: true });
@@ -110,7 +119,7 @@ describe('a branch selection that the store makes and does not save', () => {
         return switchBranch(name);
       };
       try {
-        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked failed, and the store is on elsewhere: the manager is uninitialized; setStrategy\(getStrategy\(\)\) initializes it where the store is: zz the switch went elsewhere/);
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked failed, and the store is on elsewhere: the manager is uninitialized; setStrategy\(getStrategy\(\)\) initializes it where the store is, and getStore\(\)\.sync\(\) saves the store's selection once the store can write: zz the switch went elsewhere/);
       } finally {
         store.switchBranch = switchBranch;
       }
@@ -155,6 +164,77 @@ describe('a branch selection that the store makes and does not save', () => {
         store.currentBranch = currentBranch;
       }
       assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('moves the store\'s branch generation for a switch that took effect and then failed, so a move away and back shows', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      const native = store.switchBranch.bind(store);
+      const before = observeStoreBranch(store).generation;
+      store.switchBranch = (name: string) => {
+        native(name);
+        throw new Error('zz the save failed');
+      };
+      try {
+        await assert.rejects(manager.switchBranch('elsewhere'), /took effect, and then the switch failed/);
+      } finally {
+        store.switchBranch = native;
+      }
+      native('main');
+      assert.ok(observeStoreBranch(store).generation > before, 'back on main, the generation is a new one');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('says where reconciliation found the store, and that a newer selection superseded this one, where a read during the failed switch moves it', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      store.createBranch('third', 'main');
+      const native = store.switchBranch.bind(store);
+      const currentBranch = store.currentBranch.bind(store);
+      let reads = -1;
+      let onRead: (read: number) => void = () => {};
+      store.switchBranch = (name: string) => {
+        const branch = native(name);
+        if (name !== 'elsewhere') return branch;
+        reads = 0;
+        throw new Error('zz the save failed');
+      };
+      store.currentBranch = () => {
+        if (reads >= 0) onRead(++reads);
+        return currentBranch();
+      };
+      try {
+        onRead = (read) => {
+          if (read === 2) native('third');
+        };
+        await assert.rejects(manager.switchBranch('elsewhere'), /took effect and then the switch failed, and reconciliation found third: the selection may not be saved/);
+        reads = -1;
+        await manager.setStrategy(manager.getStrategy());
+        let newer: Promise<void> | undefined;
+        onRead = (read) => {
+          if (read === 1) newer = manager.switchBranch('main');
+        };
+        await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => error instanceof InitializationSupersededError);
+        reads = -1;
+        await newer;
+        assert.equal(manager.currentBranch().name, 'main', 'the newer selection stands');
+      } finally {
+        store.switchBranch = native;
+        store.currentBranch = currentBranch;
+      }
     } finally {
       manager.close();
     }
