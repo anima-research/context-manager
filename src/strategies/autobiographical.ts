@@ -44,6 +44,7 @@ import type {
   MemoryWorkItem,
   MemoryWorkTarget,
   SummaryTextEdit,
+  SummaryTextEditOptions,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
@@ -103,6 +104,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { canonicalJson } from '../canonical-json.js';
+import { describeSummaryEditRefusal, planSummaryEdit } from '../summary-edit.js';
 import { isThinkingBlock, withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { CompressionWithdrawn, isCompressionWithdrawn } from '../compression-withdrawn.js';
@@ -4020,6 +4022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.diag.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
     }
     this.summaries = settled.summaries;
+    this._answerCostCache.clear();
     if (settlingRepaired(settled)) {
       // Read before the write, which moves the branch's sequence past the
       // summaries as they were. A repair that dropped only empty summaries,
@@ -8894,7 +8897,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * stored record the load leaves out, with no id or no rows, which no
    * write of this instance's puts back, doesn't read as another writer's.
    */
-  private storeWrittenElsewhere(): boolean {
+  private storeWrittenElsewhere(unreadable = false): boolean {
     const store = this.store;
     if (!store) return false;
     try {
@@ -8909,7 +8912,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         (this.chunkPersistenceEnabled &&
           differs(this.chunksStateId, this.chunkRecords, (stored) => loadedChunkRecords<ChunkRecord>(stored)));
     } catch {
-      return false;
+      return unreadable;
     }
   }
 
@@ -16022,39 +16025,80 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Replace the text of one summary. Its lineage stays as it is; its tokens
-   * are stamped from the new text; what described the call that wrote the
-   * old text goes, since it no longer matches: the verbatim response blocks
-   * it carried, its `provenance` and its split-stitch record (`stitched`);
-   * and `external` says who supplied the text. The store's history keeps
-   * the entry as it was. Summaries merged over the old text are reported
-   * and left alone. Without `apply` nothing is written.
+   * are stamped from the new text's length, as for any text no provider
+   * measured; what described the call that wrote the old text goes, since it
+   * no longer matches: the verbatim response blocks it carried (only with
+   * `dropResponseContent`), its `provenance` and its split-stitch record
+   * (`stitched`); and `external` says who supplied the text. Each entry that
+   * carries it up a level reads the new text and is written as its copy
+   * again (SummaryTextEdit.carriedBy). Summaries merged over the old text are
+   * reported and left alone. The store's history keeps each entry as it was.
+   * The summary and its carriers are written in one write of the summaries,
+   * so they never part: each holds the old text, or each the new. A write
+   * that throws says whether it landed, as the store reads back: this
+   * strategy then holds what the store holds. Where the read back fails, it
+   * refuses work until it is initialized again. Without `apply` nothing is
+   * written, and the answer is the one that `apply` would give. Refused as
+   * SummaryTextEditOptions says, and, before anything is written, where the
+   * stored summaries or chunk records can't be shown to be as this strategy
+   * holds them (another handle wrote them, or reading them failed).
    */
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: { apply?: boolean } = {}): SummaryTextEdit {
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
-    const entry = this.summaries.find((s) => s.id === id);
-    if (!entry) throw new Error(`no summary ${id}`);
-    if (body.trim().length === 0) throw new Error('the memory text is empty');
-    const parents: SummaryTextEdit['parents'] = [];
-    for (let parent = this.summaryById(getSummaryParentId(entry) ?? ''); parent; parent = this.summaryById(getSummaryParentId(parent) ?? '')) {
-      parents.push({ id: parent.id, level: parent.level });
+    const plan = planSummaryEdit(this.summaries, id, body, options);
+    if (!plan) throw new Error(`the edit of summary ${id} is refused, and nothing was written: there is no summary ${id}`);
+    if (plan.refusals.length > 0) {
+      throw new Error(`the edit of summary ${id} is refused, and nothing was written: ${plan.refusals.map((refusal) => describeSummaryEditRefusal(id, refusal)).join('; ')}`);
     }
+    const { entry } = plan;
     const edit: SummaryTextEdit = {
       id,
       level: entry.level,
       applied: options.apply === true,
-      prior: { sha256: createHash('sha256').update(entry.content, 'utf8').digest('hex'), length: entry.content.length, tokens: entry.tokens },
-      tokens: Math.ceil(body.length / 3),
-      droppedResponseBlocks: entry.responseContent?.length ?? 0,
-      parents,
+      prior: plan.prior,
+      tokens: plan.tokens,
+      droppedResponseBlocks: plan.droppedResponseBlocks,
+      carriedBy: plan.carriedBy,
+      parents: plan.parents,
     };
+    if (this.store && this.storeWrittenElsewhere(true)) {
+      throw new Error(`the edit of summary ${id} is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them, since another handle changed them after this strategy read them, or reading them failed: initialize the manager again (setStrategy(getStrategy())), or open the store again`);
+    }
     if (!options.apply) return edit;
-    entry.content = body;
-    entry.tokens = edit.tokens;
-    delete entry.responseContent;
-    delete entry.provenance;
-    delete entry.stitched;
-    entry.external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
-    this.writeStoredSummary(entry, 'editSummaryText', 'new text');
+    const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
+    const rewritten = new Set([id, ...plan.carriedBy.map((carrier) => carrier.id)]);
+    const summaries = this.summaries.map((summary) => {
+      if (!rewritten.has(summary.id)) return summary;
+      const { responseContent: _responseContent, provenance: _provenance, stitched: _stitched, ...kept } = summary;
+      return { ...kept, content: body, tokens: edit.tokens, external };
+    });
+    const store = this.store;
+    try {
+      if (store) {
+        try {
+          this.writeHeldState(this.summariesStateId, () => store.setStateJson(this.summariesStateId, summaries));
+        } catch (error) {
+          let landed: boolean | undefined;
+          try {
+            landed = canonicalJson(store.getStateJson(this.summariesStateId) ?? null) === storedCanonicalJson(summaries);
+          } catch {
+            landed = undefined;
+          }
+          if (landed === true) this.summaries = summaries;
+          // Memory may be unlike the store: refuse work until it is read again.
+          if (landed === undefined) this.loadedBranchIdentity = null;
+          const outcome = landed === true
+            ? 'landed: the strategy holds the new text'
+            : landed === false
+              ? "didn't land: the store and the strategy hold the old text, and the edit can be asked for again"
+              : 'may have landed, and reading the store back failed: the strategy refuses work until it is initialized again (setStrategy(getStrategy())), or the store is opened again';
+          throw new Error(`the write of summary ${id}'s edit threw, and it ${outcome} (${error instanceof Error ? error.message : String(error)})`, { cause: error });
+        }
+      }
+      this.summaries = summaries;
+    } finally {
+      this._answerCostCache.clear();
+    }
     return edit;
   }
 

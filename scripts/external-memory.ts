@@ -12,7 +12,8 @@
  *   node dist/scripts/external-memory.js import <store-path> --namespace <ns> [--message-slot isolated|shared]
  *       --descriptor <file> --body-file <file> --by <who> [--note <text>] [--apply]
  *   node dist/scripts/external-memory.js edit <store-path> --namespace <ns> [--message-slot isolated|shared]
- *       --id <summary-id> --body-file <file> --by <who> [--note <text>] [--apply]
+ *       --id <summary-id> --body-file <file> --by <who> [--note <text>] [--drop-response-content]
+ *       [--expected-prior-sha256 <sha256>] [--apply]
  *
  * The invocation is checked whole before anything is opened, as
  * inspect-store's is: the subcommand, the store path, then only that
@@ -58,10 +59,15 @@
  *
  * edit replaces the text of one summary by id: lineage untouched, tokens
  * stamped from the new text, `external` ({ by, at, note }) set, and what
- * described the call that wrote the old text dropped (its verbatim response
- * blocks, its `provenance`, its split-stitch record). It prints the old
+ * described the call that wrote the old text dropped (its `provenance`, its
+ * split-stitch record). A summary whose verbatim response blocks render in
+ * place of its text is refused unless --drop-response-content drops them
+ * too, from it and each entry that carries it. It refuses to edit a carrier
+ * whose carried summary it holds. It prints the old
  * text's sha256 and length, and the summaries merged over the old text,
- * which it leaves as they are. The store's history keeps the old text: the
+ * which it leaves as they are. With --expected-prior-sha256, it refuses the
+ * edit where the old text has another sha256: a dry run ends with the apply
+ * command, which carries the sha256 of the old text that it read. The store's history keeps the old text: the
  * line printed after an applied edit names the sequence to read the
  * summaries state at (chronicle's getStateJsonAt).
  *

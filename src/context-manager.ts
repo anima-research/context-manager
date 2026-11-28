@@ -52,7 +52,7 @@ import {
   isDerivationManifestStrategy,
   isExternalMemoryStrategy,
 } from './types/index.js';
-import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit } from './types/index.js';
+import type { DerivationManifestOptions, ExternalMemoryProvenance, ExternalMemoryStrategy, MemoryWorkItem, MemoryWorkTarget, SummaryTextEdit, SummaryTextEditOptions } from './types/index.js';
 import { isStateExistsFor } from './state-registration.js';
 import { NoFoldPlanToPreviewError } from './types/strategy.js';
 import type { RenderStats } from './types/index.js';
@@ -4630,8 +4630,8 @@ export class ContextManager {
     return this.externalMemoryStrategy('importExternalMemory').importExternalMemory(item, body, by, this.createStrategyContext(), options);
   }
 
-  /** Replace the text of one summary, leaving its lineage and the summaries merged over it as they are. */
-  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: { apply?: boolean }): SummaryTextEdit {
+  /** Replace the text of one summary, leaving its lineage and the summaries merged over it as they are (see SummaryTextEditOptions). */
+  editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options?: SummaryTextEditOptions): SummaryTextEdit {
     return this.externalMemoryStrategy('editSummaryText').editSummaryText(id, body, by, options);
   }
 
