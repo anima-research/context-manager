@@ -372,8 +372,9 @@ interface DerivableStore {
  * `created` says whether this call created it. A caller never needs to retry
  * a fork to learn whether it happened. Where the call's own switch threw and
  * a newer initialization began while the call read the store's branch, the
- * selection may not have happened: the message says the switch failed, and
- * `cause` is what it threw. From setStrategy(), `branch` is undefined.
+ * selection may not have happened, or may not be saved: the message says
+ * that the switch threw, and `cause` is what it threw. From setStrategy(),
+ * `branch` is undefined.
  */
 export class InitializationSupersededError extends Error {
   readonly branch: string | undefined;
@@ -386,7 +387,7 @@ export class InitializationSupersededError extends Error {
         ? 'Strategy initialization was superseded by a newer initialization'
         : failed
           ? `ContextManager.${selection.created ? 'fork created' : 'switchBranch to'} branch "${selection.branch}"` +
-            `${selection.created ? ', and then its switch' : ''} failed, and a newer initialization superseded it: ` +
+            `${selection.created ? ', its switch' : ''} threw, and a newer initialization superseded it: ` +
             `${failed.error instanceof Error ? failed.error.message : String(failed.error)}`
           : `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
             `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`,
@@ -2847,13 +2848,14 @@ export class ContextManager {
       if (this.initializationAttempt !== before) throw new InitializationSupersededError({ branch: name, created, failed: { error } });
       if (now !== undefined && now.id === from) throw error;
       if (now === undefined || now.name !== name) {
-        ++this.initializationAttempt;
+        const invalidated = ++this.initializationAttempt;
         this.initializedAttempt = null;
         try {
           markStoreBranchSwitch(this.store);
         } catch {
           // The manager is invalidated above whether or not the generation moves.
         }
+        if (invalidated !== this.initializationAttempt) throw new InitializationSupersededError({ branch: name, created, failed: { error } });
         throw new Error(
           `Branch selection ${name}${made} failed, and the store ${now ? `is on ${now.name}` : "can't say which branch it is on"}: the manager is uninitialized; ` +
             `setStrategy(getStrategy()) initializes it where the store is, and getStore().sync() saves the store's selection once the store can write: ${said(error)}`,
@@ -2876,7 +2878,7 @@ export class ContextManager {
       );
     }
     if (attempt !== this.initializationAttempt) {
-      throw new InitializationSupersededError({ branch: name, created });
+      throw new InitializationSupersededError({ branch: name, created, ...(unsaved !== undefined ? { failed: unsaved } : {}) });
     }
     if (unsaved !== undefined) {
       if (requested.name !== name) {
