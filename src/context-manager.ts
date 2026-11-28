@@ -370,19 +370,27 @@ interface DerivableStore {
  * From switchBranch() or fork(), the call's branch selection, and a fork's
  * branch creation, had already happened: `branch` names the branch, and
  * `created` says whether this call created it. A caller never needs to retry
- * a fork to learn whether it happened. From setStrategy(), `branch` is
- * undefined.
+ * a fork to learn whether it happened. Where the call's own switch threw and
+ * a newer initialization began while the call read the store's branch, the
+ * selection may not have happened: the message says the switch failed, and
+ * `cause` is what it threw. From setStrategy(), `branch` is undefined.
  */
 export class InitializationSupersededError extends Error {
   readonly branch: string | undefined;
   readonly created: boolean;
 
-  constructor(selection?: { branch: string; created: boolean }) {
+  constructor(selection?: { branch: string; created: boolean; failed?: { error: unknown } }) {
+    const failed = selection?.failed;
     super(
-      selection
-        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
-          `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
-        : 'Strategy initialization was superseded by a newer initialization',
+      !selection
+        ? 'Strategy initialization was superseded by a newer initialization'
+        : failed
+          ? `ContextManager.${selection.created ? 'fork created' : 'switchBranch to'} branch "${selection.branch}"` +
+            `${selection.created ? ', and then its switch' : ''} failed, and a newer initialization superseded it: ` +
+            `${failed.error instanceof Error ? failed.error.message : String(failed.error)}`
+          : `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+            `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`,
+      failed ? { cause: failed.error } : undefined,
     );
     this.name = 'InitializationSupersededError';
     this.branch = selection?.branch;
@@ -2836,7 +2844,7 @@ export class ContextManager {
       } catch {
         now = undefined;
       }
-      if (this.initializationAttempt !== before) throw new InitializationSupersededError({ branch: name, created });
+      if (this.initializationAttempt !== before) throw new InitializationSupersededError({ branch: name, created, failed: { error } });
       if (now !== undefined && now.id === from) throw error;
       if (now === undefined || now.name !== name) {
         ++this.initializationAttempt;
