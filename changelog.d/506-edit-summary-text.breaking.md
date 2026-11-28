@@ -9,5 +9,5 @@
   error names it: a compile reads that summary's text in the entry's place,
   so such an edit never showed. To migrate, set `dropResponseContent` where
   deleting the blocks is meant, and edit the carried summary rather than
-  its carrier. Unchanged: an edit of any other summary, the lineage that it
-  keeps, and the token stamp from the new text's length.
+  its carrier. Nothing else changes for an edit of any other summary: it
+  keeps the lineage, and stamps tokens from the new text's length.
