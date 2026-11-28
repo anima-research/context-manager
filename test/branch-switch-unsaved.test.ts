@@ -2,10 +2,14 @@
  * branch-switch-unsaved: a branch selection that the store makes and then
  * fails to save, and one that leaves the store on another branch.
  *
- * Chronicle selects a branch before it checkpoints the selection. A failed
- * checkpoint leaves the selection in effect. The manager takes that as a
- * switch that is made and not saved: the call rejects, saying so, and the
- * manager refuses work until it is initialized on the branch.
+ * Chronicle 0.6 and 0.7 select a branch before they checkpoint the
+ * selection, and a failed checkpoint leaves the selection in effect. The
+ * manager takes that as a switch that is made and not saved: the call
+ * rejects, saying so, and the manager refuses work until it is initialized
+ * on the branch. Chronicle 0.8 undoes such a selection, so there the switch
+ * is a refusal. Each test of a real failed checkpoint runs on the chronicle
+ * that behaves as it says; the other tests make the store's answer with
+ * wrappers.
  */
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -37,8 +41,27 @@ function withBranchFileBlocked<T>(path: string, body: () => T): T {
   }
 }
 
+/** Whether this chronicle keeps a selection whose checkpoint fails, as 0.6 and 0.7 do. */
+const KEEPS_UNSAVED = ((): boolean => {
+  const path = join(dir, 'probe');
+  const store = JsStore.openOrCreate({ path });
+  try {
+    store.createBranch('probe', 'main');
+    try {
+      withBranchFileBlocked(path, () => store.switchBranch('probe'));
+    } catch {
+      // The checkpoint failed, as it is meant to.
+    }
+    return store.currentBranch().name === 'probe';
+  } finally {
+    store.close();
+  }
+})();
+const ON_KEEPING = { skip: KEEPS_UNSAVED ? false : 'this chronicle undoes a selection whose checkpoint fails' };
+const ON_UNDOING = { skip: KEEPS_UNSAVED ? 'this chronicle keeps a selection whose checkpoint fails' : false };
+
 describe('a branch selection that the store makes and does not save', () => {
-  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', async () => {
+  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', ON_KEEPING, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
@@ -79,7 +102,7 @@ describe('a branch selection that the store makes and does not save', () => {
     }
   });
 
-  it('leaves the store on a branch that fork created and selected, when the selection fails its checkpoint', async () => {
+  it('leaves the store on a branch that fork created and selected, when the selection fails its checkpoint', ON_KEEPING, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
@@ -97,6 +120,31 @@ describe('a branch selection that the store makes and does not save', () => {
       store.sync();
       await manager.setStrategy(manager.getStrategy());
       assert.equal(manager.currentBranch().name, 'forked');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('takes a switch whose checkpoint fails for a refusal where the store undoes it, and names the branch that a fork created', ON_UNDOING, async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => withBranchFileBlocked(path, () => native(name));
+      try {
+        await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => error instanceof Error && !/Branch selection/.test(error.message));
+        assert.equal(store.currentBranch().name, 'main', 'the store stays where it was');
+        manager.editMessage(id, [{ type: 'text', text: 'an edit' }]);
+        await assert.rejects(manager.fork('forked'), /^Error: Branch selection forked \(created\) was refused, and the store stays on its branch: branch forked exists, and the loaded branch stays usable: /);
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'main');
+      assert.ok(store.listBranches().some((branch) => branch.name === 'forked'), 'the branch that the fork created is there');
+      manager.editMessage(id, [{ type: 'text', text: 'another edit' }]);
     } finally {
       manager.close();
     }
