@@ -227,7 +227,12 @@ describe('a branch selection that the store makes and does not save', () => {
         onRead = (read) => {
           if (read === 1) newer = manager.switchBranch('main');
         };
-        await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => error instanceof InitializationSupersededError);
+        await assert.rejects(manager.switchBranch('elsewhere'), (error: unknown) => {
+          assert.ok(error instanceof InitializationSupersededError);
+          assert.match(error.message, /^ContextManager\.switchBranch to branch "elsewhere" failed, and a newer initialization superseded it: zz the save failed$/);
+          assert.equal((error.cause as Error).message, 'zz the save failed');
+          return true;
+        });
         reads = -1;
         await newer;
         assert.equal(manager.currentBranch().name, 'main', 'the newer selection stands');
