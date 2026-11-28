@@ -9,6 +9,8 @@ import type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   StoredMessage,
+  StoredMessageInternal,
+  StoredContentBlock,
   ContextEntry,
   TokenBudget,
   PendingWork,
@@ -59,10 +61,11 @@ import type { RenderStats } from './types/index.js';
 import { overRequestLimit, refuseUnreadableRequestLimit, requestOverheadContent } from './request-limit.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { blockAsStored } from './blob-manager.js';
 import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { WindowIndex, WindowWriteOutcomeUnknownError, presentedMessageView, recordPositionOf, requireBatchedIdentityAppend, requireMessageIds, windowIndexStateId, type LeftRow, type WindowMode, type WindowStatus } from './window-index.js';
-import { bodyBoundsIn } from './body-runs.js';
+import { bodyBoundsIn, isWholeGroup } from './body-runs.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
@@ -72,6 +75,8 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import { SWEEPS_APPLIED_STATE_ID, appendApplied, appendTake, askEntry, listedLaterShards, newestTakes, noDrop, runSweepPass, sweepBodyOf, sweepPassRunning, sweepsApplied, sweptRows, textLength } from './sweep.js';
+import type { ListedBody, SummaryDropCost, SweepApplied, SweepBody, SweepChange, SweepEntry, SweepFailure, SweepPassOutcome, SweepPassReport, SweepReceipt, SweepShow, SweepTake, SweptRows } from './sweep.js';
 import {
   IDENTITY_KEYS, UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   recordedThrough,
@@ -565,6 +570,17 @@ export class WriteOutcomeUnknownError extends Error {
 /** Rows of a message as an error names them: `message <id>`, or `<n> rows of the message (<ids>)`. */
 function rowsOfTheMessage(ids: readonly MessageId[]): string {
   return ids.length === 1 ? `message ${ids[0]}` : `${ids.length} rows of the message (${ids.join(', ')})`;
+}
+
+type IngressChunker = {
+  chunkIngressMessage?: (
+    participant: string,
+    content: ContentBlock[]
+  ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
+};
+
+function shardsAtIngress<D extends { shards: readonly unknown[] }>(decision: D | null | undefined): decision is D {
+  return !!decision && decision.shards.length > 1;
 }
 
 /**
@@ -1081,15 +1097,10 @@ export class ContextManager {
   ): MessageId {
     this.requireInitialized('addMessage');
     // Optional strategy-driven ingestion-time chunking
-    const strategyAny = this.strategy as unknown as {
-      chunkIngressMessage?: (
-        participant: string,
-        content: ContentBlock[]
-      ) => { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null;
-    };
+    const strategyAny = this.strategy as unknown as IngressChunker;
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
-      if (decision && decision.shards.length > 1) {
+      if (shardsAtIngress(decision)) {
         // Every shard declares its group's size, so a group an interrupted
         // write left short reads as partial, not whole (compile provenance).
         // That needs indices exactly 0..n-1: refuse anything else before
@@ -1877,7 +1888,8 @@ export class ContextManager {
    * microtask or later) instead. Nor may it remove a message then
    * (removeMessage, removeMessages on this manager are refused, as a
    * removal could split the body or move the rows the sharded
-   * write removes if it fails), nor ask for a branch cut (branchAt,
+   * write removes if it fails), nor ask for a sweep's pass (applySweeps is
+   * refused, as it would read part of the body), nor ask for a branch cut (branchAt,
    * branchSequenceOf, fork and derive on this manager are refused, as the
    * record holds only the shards stored so far), or move the store's
    * branch: the sharded write stops before its next shard and throws
@@ -1986,6 +1998,464 @@ export class ContextManager {
    */
   getChannelTokenStats(opts?: ChannelTokenStatsOptions): ChannelTokenStats {
     return this.messageStore.getChannelTokenStats(opts);
+  }
+
+  /**
+   * What `entry` would change of the slot this manager writes, on the open
+   * branch. Each body is read as the store holds it, not through this
+   * manager's view, and without blobs (MessageStore.bodiesAsStored), and the
+   * entry gives its new content. A body that a pass would not rewrite is a
+   * failure here too: one stored short, one on which the entry threw or gave
+   * no content, and one whose rewrite the store or the strategy refuses, as
+   * the refusal reads. Later shards that a pass listed are no body: the next
+   * pass removes them. A show's changes never give the old text, and a show
+   * writes nothing, also while a taken sweep waits to be applied. It counts
+   * the strategy's summaries that a pass of the changes would leave old
+   * (oldSummaryCost), and gives what the pass would drop itself where it
+   * joins a long note (writeDropCost): each summary over a piece of the
+   * note, its first row included, and each summary above one, also for a
+   * note whose later shards an earlier pass listed and left standing, which
+   * the next pass removes first. A summary is in one of the two, never
+   * both. Refused while a sharded addMessage of this manager stores its
+   * shards, and while a sweep pass runs, as from a listener of its write.
+   */
+  showSweep(entry: SweepEntry): SweepShow {
+    this.requireInitialized('showSweep');
+    this.refuseDuringPass('showSweep');
+    if (this.writingShards) {
+      throw new Error(
+        'ContextManager.showSweep refused: a sharded addMessage is storing its shards, and a show now would read part of its body. ' +
+          'Ask for the show once that call has returned.',
+      );
+    }
+    const slot = this.messageSlot();
+    const items = sweepsApplied(this.store).items.filter((item) => item.slot === slot);
+    const { mended, failed } = this.sweepCandidates(entry, listedLaterShards(items));
+    const removed = new Set(mended.flatMap(({ rows }) => rows.slice(1).map((row) => row.id)));
+    const joined = new Map(mended.filter(({ rows }) => rows.length > 1).map(({ body }) => [body.id, Infinity]));
+    for (const item of items) {
+      if (item.kind !== 'listed') continue;
+      for (const body of item.bodies) {
+        const leftover = this.leftoverShards(body);
+        if (leftover.length === 0) continue;
+        for (const id of leftover) removed.add(id);
+        joined.set(body.id, Math.max(joined.get(body.id) ?? -Infinity, item.sequence));
+      }
+    }
+    const rows: SweptRows = { rewritten: new Map(mended.map(({ body }) => [body.id, Infinity])), removed, joined };
+    const contents = new Map(mended.map(({ body, written }) => [body.id, written]));
+    return {
+      changes: mended.map(({ body, content }) => ({
+        id: body.id,
+        timestamp: body.timestamp,
+        content,
+        oldLength: textLength(body.content),
+        newLength: textLength(content),
+      })),
+      failures: failed,
+      oldSummaries: this.oldSummariesOver(rows).summaries,
+      writeDrops: this.strategy.writeDropCost?.(rows, this.createStrategyContext(), contents) ?? noDrop(),
+    };
+  }
+
+  /**
+   * What the second act of the sweep `name` (dropOldSummaries) would drop
+   * from this manager's strategy, on the open branch: its old summaries at
+   * each level, the chunk records that its compression would fold again,
+   * and the estimated tokens of the rows under them, which render raw until
+   * it has. An old summary is a summary written before a pass listed a row
+   * under it, or a summary above one, but for one that a pass's join of a
+   * long note drops (showSweep's `writeDrops`). It writes nothing. It reads the
+   * strategy as it last read the store, so where another instance of the
+   * namespace wrote since, the act, which takes up the store first, can
+   * drop otherwise. Refused while a sweep pass runs, as from a listener of
+   * its write.
+   */
+  oldSummaryCost(name: string): SummaryDropCost {
+    this.requireInitialized('oldSummaryCost');
+    this.refuseDuringPass('oldSummaryCost');
+    return this.oldSummariesOver(this.sweptRowsOf(name));
+  }
+
+  /**
+   * The second act of the sweep `name`: this manager's strategy drops its
+   * old summaries over the rows that the sweep's passes listed on the open
+   * branch (oldSummaryCost), with every summary above them, and gives what
+   * it dropped. It is done when this returns: no compile of this manager
+   * after it, dry or live, holds one of them. Each chunk record under them keeps its rows,
+   * and the strategy's compression folds it again, at the cost of its
+   * summarizer calls; until then its rows render raw, and a compile whose
+   * budget can't hold them refuses. A second call drops nothing. Other
+   * namespaces keep theirs. Then it appends to the branch's applied list
+   * that this namespace made the act, so another instance of the namespace
+   * takes up the store at its next initialize, live select, tick or L1.
+   * Until then, that instance's dry compile can still hold a dropped
+   * summary. A call that throws lists nothing: call it again, and it lists
+   * the act, whatever its drop had written. Refused while a sweep pass runs,
+   * as from a listener of its write, and while a sharded addMessage of this
+   * manager stores its shards.
+   */
+  dropOldSummaries(name: string): SummaryDropCost {
+    this.requireInitialized('dropOldSummaries');
+    this.refuseDuringPass('dropOldSummaries');
+    if (this.writingShards) {
+      throw new Error(
+        'ContextManager.dropOldSummaries refused: a sharded addMessage is storing its shards, and the act now would read part of its body. ' +
+          'Make the act once that call has returned.',
+      );
+    }
+    if (!this.strategy.dropOldSummaries) return noDrop();
+    const dropped = this.strategy.dropOldSummaries(this.sweptRowsOf(name), this.createStrategyContext());
+    appendApplied(this.store, { v: 1, kind: 'dropped', name, slot: this.messageSlot(), namespace: this.strategyNamespace, at: new Date().toISOString() });
+    return dropped;
+  }
+
+  private refuseDuringPass(call: string): void {
+    if (!sweepPassRunning()) return;
+    throw new Error(
+      `ContextManager.${call} refused: a sweep pass is running, and it reads the slot and the strategy as that pass leaves them partway. ` +
+        'Ask once the pass has returned.',
+    );
+  }
+
+  private sweptRowsOf(name: string): SweptRows {
+    const slot = this.messageSlot();
+    return sweptRows(sweepsApplied(this.store).items.filter((item) => item.slot === slot && item.name === name));
+  }
+
+  private oldSummariesOver(rows: SweptRows): SummaryDropCost {
+    return this.strategy.oldSummaryCost?.(rows, this.createStrategyContext()) ?? noDrop();
+  }
+
+  /**
+   * Take the sweep `name` for the whole store: one typed record, which every
+   * branch sees, durable before this returns. It rewrites nothing: each
+   * manager applies it at its next pass (applySweeps). No call takes a take
+   * back. A take of a sweep that a branch has finished is a new take, which
+   * that branch owes again.
+   */
+  takeSweep(name: string): SweepTake {
+    this.requireOpen('takeSweep');
+    if (typeof name !== 'string' || name === '') throw new Error('ContextManager.takeSweep: a sweep needs a name');
+    return appendTake(this.store, name, new Date().toISOString());
+  }
+
+  /**
+   * A pass for the slot this manager writes, on the open branch, for each
+   * sweep the store took whose newest take this branch hasn't finished for
+   * the slot. First it removes the later shards an earlier pass listed and
+   * left standing after their first shard was rewritten, with no entry
+   * asked, and lists them again before it removes them, so a strategy that
+   * folded them since lets go of that. Then, for each owed sweep, it asks the
+   * entry of that name in `entries` of each body, read as showSweep reads
+   * them; a sweep with no entry there is reported `unknown` and left. Before
+   * it rewrites, it appends to the branch's applied list the bodies it will
+   * rewrite: a body that showSweep names as a failure is reported and not
+   * listed. A body stored as one row is edited; a body stored as shards is
+   * written whole at its first shard, which keeps its id and place, and its
+   * later shards are then removed as removeMessages removes rows. A body that
+   * changed after the pass read it is reported and left as it is. A rewrite
+   * never makes one row of content that the strategy would store as shards
+   * (chunkIngressMessage), unless the body was such a row already. Once
+   * every listed body is rewritten and no body failed, it appends that the
+   * branch finished the take. Its report gives what the strategy dropped
+   * during the pass (`dropped`): a joined note loses each summary over a
+   * piece of it, its first row included, and each summary above one. A
+   * strategy can refuse the pass as it begins (beforeSweepPass), as an
+   * audit-only one does, and then the call throws and writes nothing.
+   *
+   * Synchronous, so no turn that awaits can start between its reads and its
+   * writes, and one pass at a time runs: a listener of its writes that asks
+   * for another, on any store, is refused. A listener of its writes that
+   * compiles sees the slot as that write left it: after a long note's
+   * first shard is rewritten and before its later shards are removed, the
+   * state a stop there leaves. A listener that moves the store to another
+   * branch or closes the manager stops it after that write, and so does a
+   * write to the applied list that throws (`stopped`).
+   */
+  applySweeps(entries: readonly SweepEntry[]): SweepPassReport {
+    this.requireInitialized('applySweeps');
+    if (this.writingShards) {
+      throw new Error(
+        'ContextManager.applySweeps refused: a sharded addMessage is storing its shards, and a pass now would read part of its body. ' +
+          'Ask for the pass once that call has returned.',
+      );
+    }
+    const branch = this.store.currentBranch().id;
+    const { report, ended } = runSweepPass(() => {
+      const ended = this.strategy.beforeSweepPass?.(this.createStrategyContext());
+      return { report: this.sweepPass(entries), ended };
+    });
+    if (this.isClosed() || this.store.currentBranch().id !== branch) return report;
+    if (!ended) return { ...report, dropped: noDrop() };
+    try {
+      return { ...report, dropped: ended(this.createStrategyContext()) };
+    } catch (error) {
+      logThrown('Strategy: what a sweep pass dropped could not be told:', error, this.diag);
+      return report;
+    }
+  }
+
+  private sweepPass(entries: readonly SweepEntry[]): SweepPassReport {
+    const slot = this.messageSlot();
+    const branch = this.store.currentBranch();
+    const report: SweepPassReport = { slot, branch: branch.name, sweeps: [], stopped: null, unreadable: { items: [], takes: [] }, dropped: null };
+    const outcomes = new Map<string, SweepPassOutcome>();
+    const outcomeOf = (name: string, take: string): SweepPassOutcome => {
+      let outcome = outcomes.get(name);
+      if (!outcome) {
+        outcome = { name, take, outcome: 'owed', rewritten: [], removed: [], failed: [] };
+        outcomes.set(name, outcome);
+      }
+      return outcome;
+    };
+    const stillHere = (): boolean => {
+      if (report.stopped === null && this.isClosed()) report.stopped = 'a listener of its write closed the manager';
+      if (report.stopped === null && this.store.currentBranch().id !== branch.id) {
+        report.stopped = `a listener of its write moved the store from branch ${branch.name} to ${this.store.currentBranch().name}`;
+      }
+      return report.stopped === null;
+    };
+    const done = (): SweepPassReport => ({ ...report, sweeps: [...outcomes.values()] });
+    const list = (item: SweepApplied): boolean => {
+      try {
+        appendApplied(this.store, item);
+        return true;
+      } catch (error) {
+        report.stopped = `writing to the branch's applied list threw, and the write may have landed: ${describeThrown(error)}`;
+        return false;
+      }
+    };
+
+    const read = sweepsApplied(this.store);
+    report.unreadable.items = read.unreadable;
+    const applied = read.items.filter((item) => item.slot === slot);
+    const listed = listedLaterShards(applied);
+    for (const item of applied) {
+      if (item.kind !== 'listed') continue;
+      for (const body of item.bodies) {
+        let leftover: MessageId[];
+        try {
+          leftover = this.leftoverShards(body);
+        } catch (error) {
+          outcomeOf(item.name, item.take).failed.push({ id: body.id, error: describeThrown(error) });
+          continue;
+        }
+        if (leftover.length === 0) continue;
+        if (!list({ ...item, at: new Date().toISOString(), bodies: [{ ...body, laterShards: leftover }] })) return done();
+        try {
+          this.removeMessages(leftover[0]!, leftover[leftover.length - 1]!);
+          outcomeOf(item.name, item.take).removed.push(...leftover);
+        } catch (error) {
+          outcomeOf(item.name, item.take).failed.push({
+            id: body.id,
+            error: `${describeThrown(error)}. The removal may have landed before that; the next pass removes any of these shards that stand.`,
+          });
+        }
+        if (!stillHere()) return done();
+      }
+    }
+
+    const finished = new Set(applied.filter((item) => item.kind === 'finished').map((item) => `${item.name}\u0000${item.take}`));
+    const takes = newestTakes(this.store);
+    report.unreadable.takes = takes.unreadable;
+    for (const take of takes.takes) {
+      const outcome = outcomes.get(take.name);
+      if (finished.has(`${take.name}\u0000${take.take}`)) {
+        if (outcome) {
+          outcome.take = take.take;
+          outcome.outcome = outcome.failed.length === 0 ? 'finished' : 'owed';
+        }
+        continue;
+      }
+      const owed = outcomeOf(take.name, take.take);
+      owed.take = take.take;
+      this.applyTake(take, entries, slot, owed, listed, stillHere, list);
+      if (report.stopped !== null) break;
+    }
+    return done();
+  }
+
+  private applyTake(
+    take: SweepTake,
+    entries: readonly SweepEntry[],
+    slot: string,
+    outcome: SweepPassOutcome,
+    listed: Set<MessageId>,
+    stillHere: () => boolean,
+    list: (item: SweepApplied) => boolean,
+  ): void {
+    const entry = entries.find((each) => each.name === take.name);
+    if (!entry) {
+      outcome.outcome = 'unknown';
+      return;
+    }
+    const { mended, failed } = this.sweepCandidates(entry, listed);
+    outcome.failed.push(...failed);
+    if (mended.length > 0) {
+      const listing = list({
+        v: 1,
+        kind: 'listed',
+        name: take.name,
+        take: take.take,
+        slot,
+        at: new Date().toISOString(),
+        sequence: this.store.currentSequence(),
+        bodies: mended.map(({ body, rows }) => ({
+          id: body.id,
+          participant: body.participant,
+          timestamp: body.timestamp.getTime(),
+          laterShards: rows.slice(1).map((row) => row.id),
+        })),
+      });
+      if (!listing) return;
+      for (const { rows } of mended) for (const row of rows.slice(1)) listed.add(row.id);
+    }
+    for (const { body, rows, content } of mended) {
+      if (!this.storedAsRead(rows)) {
+        outcome.failed.push({
+          id: body.id,
+          error: `${body.id} changed during this pass, after the pass read it: it stays as it is now, and the next pass reads it again.`,
+        });
+        continue;
+      }
+      try {
+        this.write(() => this.messageStore.rewriteBody(body.id, content));
+        outcome.rewritten.push(body.id);
+      } catch (error) {
+        outcome.failed.push({ id: body.id, error: `${describeThrown(error)}. The rewrite may have landed before that; the next pass reads the body again.` });
+        if (!stillHere()) return;
+        continue;
+      }
+      if (!stillHere()) return;
+      if (rows.length === 1) continue;
+      try {
+        this.removeMessages(rows[1]!.id, rows[rows.length - 1]!.id);
+        outcome.removed.push(...rows.slice(1).map((row) => row.id));
+      } catch (error) {
+        outcome.failed.push({
+          id: body.id,
+          error: `${describeThrown(error)}. The removal may have landed before that; the list names its later shards, and the next pass removes any that stand.`,
+        });
+      }
+      if (!stillHere()) return;
+    }
+    for (const { body, written } of mended) {
+      if (!outcome.rewritten.includes(body.id) || JSON.stringify(this.messageStore.get(body.id)?.content) === JSON.stringify(written.map(blockAsStored))) continue;
+      outcome.failed.push({
+        id: body.id,
+        error: `${body.id} changed during this pass, after its rewrite: it stays as it is now, and the next pass reads it again.`,
+      });
+    }
+    if (outcome.failed.length === 0 && list({ v: 1, kind: 'finished', name: take.name, take: take.take, slot, at: new Date().toISOString() })) {
+      outcome.outcome = 'finished';
+    }
+  }
+
+  private storedAsRead(rows: readonly StoredMessageInternal[]): boolean {
+    const now = this.messageStore.bodyAsStored(rows[0]!.id);
+    return (
+      now !== null &&
+      now.length === rows.length &&
+      now.every((row, i) => row.id === rows[i]!.id && JSON.stringify(row.content) === JSON.stringify(rows[i]!.content))
+    );
+  }
+
+  private sweepCandidates(
+    entry: SweepEntry,
+    skip: ReadonlySet<MessageId>,
+  ): { mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[]; written: ContentBlock[] }>; failed: SweepFailure[] } {
+    const mended: Array<{ body: SweepBody; rows: StoredMessageInternal[]; content: StoredContentBlock[]; written: ContentBlock[] }> = [];
+    const failed: SweepFailure[] = [];
+    for (const rows of this.messageStore.bodiesAsStored()) {
+      const first = rows[0]!;
+      if (skip.has(first.id)) continue;
+      if (!isWholeGroup(first, rows)) {
+        failed.push({
+          id: first.id,
+          error:
+            `${first.id} is stored short: its body group ${first.bodyGroupId} declares ${first.shardCount} shards, and the store ` +
+            `holds ${rows.length} of them together. An entry is asked of a whole body only, so it stays as it is.`,
+        });
+        continue;
+      }
+      const body = sweepBodyOf(rows);
+      const asked = askEntry(entry, body);
+      if (asked.kind === 'left') continue;
+      if (asked.kind === 'threw') {
+        failed.push({ id: body.id, error: asked.error });
+        continue;
+      }
+      let written: ContentBlock[];
+      try {
+        written = this.refuseRewrite(body, rows, asked.content);
+      } catch (error) {
+        failed.push({ id: body.id, error: describeThrown(error) });
+        continue;
+      }
+      mended.push({ body, rows, content: asked.content, written });
+    }
+    return { mended, failed };
+  }
+
+  private refuseRewrite(body: SweepBody, rows: readonly StoredMessageInternal[], content: StoredContentBlock[]): ContentBlock[] {
+    const written = this.messageStore.checkRewrite(body.id, content);
+    if (!this.wouldShard(body.participant, written)) return written;
+    const old = rows.length === 1 ? this.messageStore.get(body.id)?.content : undefined;
+    if (old !== undefined && this.wouldShard(body.participant, old)) return written;
+    throw new Error(
+      `Rewrite of ${body.id} refused: the strategy would store its new content as shards, and nothing shards a stored row ` +
+        'again, so a rewrite never makes one row of it. The body stays as it is, and each pass refuses it again while the ' +
+        'entry gives this content: the sweep stays owed until the entry gives shorter content or the body is removed.',
+    );
+  }
+
+  private wouldShard(participant: string, content: ContentBlock[]): boolean {
+    const chunker = this.strategy as unknown as IngressChunker;
+    return typeof chunker.chunkIngressMessage === 'function' && shardsAtIngress(chunker.chunkIngressMessage(participant, content));
+  }
+
+  /**
+   * Where the sweep `name` stands for the slot this manager writes, on the
+   * open branch: the store's newest take of it, whether this branch
+   * finished that take, each pass the branch's applied list holds, with the
+   * bodies it listed, each marked where none of the later shards listed
+   * for it is stored now (`laterShardsGone`), and the
+   * strategy's old summaries over the rows those passes listed
+   * (oldSummaryCost). It never gives the old text.
+   */
+  sweepReceipt(name: string): SweepReceipt {
+    this.requireInitialized('sweepReceipt');
+    const slot = this.messageSlot();
+    const take = newestTakes(this.store).takes.find((each) => each.name === name) ?? null;
+    const items = sweepsApplied(this.store).items.filter((item) => item.slot === slot && item.name === name);
+    return {
+      name,
+      take,
+      finished: take !== null && items.some((item) => item.kind === 'finished' && item.take === take.take),
+      passes: items.flatMap((item) =>
+        item.kind === 'listed'
+          ? [{ take: item.take, at: item.at, sequence: item.sequence, bodies: item.bodies.map((body) => ({ ...body, laterShardsGone: this.laterShardsGone(body) })) }]
+          : [],
+      ),
+      oldSummaries: this.oldSummariesOver(sweptRows(items)).summaries,
+    };
+  }
+
+  private messageSlot(): string {
+    return MessageStore.registrationFor(this.slots.messageNamespace).id;
+  }
+
+  private laterShardsGone(body: ListedBody): boolean {
+    return body.laterShards.length > 0 && body.laterShards.every((id) => this.messageStore.sequenceOf(id) === undefined);
+  }
+
+  private leftoverShards(body: ListedBody): MessageId[] {
+    const stored = body.laterShards.filter((id) => this.messageStore.sequenceOf(id) !== undefined);
+    if (stored.length === 0) return [];
+    const run = this.bodyRunOf(stored[0]!);
+    if (!run || run[0]!.id === body.id) return [];
+    return run.map((row) => row.id);
   }
 
   // ==========================================================================
@@ -2900,7 +3370,8 @@ export class ContextManager {
    *
    * What is inherited is the set of states this manager owns: its message
    * slot, its auxiliary slots, its context log, its window index (see
-   * presentRows), its thinking-binding record and its strategy's states.
+   * presentRows), its thinking-binding record, the branch's applied list of
+   * sweeps (sweep.ts) and its strategy's states.
    * Other states in the store are not carried onto the derived branch.
    * The window is the parent's as of the checkpoint: at the head the child
    * starts with the parent's window and its arrived-and-not-presented rows
@@ -2957,6 +3428,7 @@ export class ContextManager {
       // has none written, and the child is in legacy mode too, its window the
       // record as of the checkpoint, as the parent's was then.
       windowIndexStateId(this.strategyNamespace),
+      SWEEPS_APPLIED_STATE_ID,
       // Authoring-request preimages are keyed by hash in one store-wide
       // tree; inherited so the child can still resolve a memory's origin.
       // Ignored by the store when the tree was never created.

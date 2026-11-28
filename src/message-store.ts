@@ -7,6 +7,7 @@ import type {
   MessageMetadata,
   StoredMessage,
   StoredMessageInternal,
+  StoredContentBlock,
   MessageStoreView,
   MessageQuery,
   MessageQueryResult,
@@ -844,6 +845,9 @@ export class MessageStore {
    * answered. The walk stops at a message of any other kind, so a call no
    * result answered, further back, refuses nothing. `index` is where the
    * content goes: the end for an append, the message's place for an edit.
+   * `last` is the last row the content replaces, a body's last shard for a
+   * rewrite at its first (rewriteBody): the walk forward reads what follows
+   * it.
    *
    * It leaves alone what a write can't see, as main does: a message of
    * another kind between a call and its result, which is already off the
@@ -852,7 +856,7 @@ export class MessageStore {
    * several stores; and a removal, or an edit, that takes away a result or a
    * message between. Each parts the pair once the call is folded.
    */
-  refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length()): void {
+  refuseToolPairSplit(content: ContentBlock[], what: string, index: number = this.length(), last: number = index): void {
     const length = this.length();
     const at = (i: number): StoredMessageInternal | null => (i >= 0 && i < length ? this.getInternal(i) : null);
     // A body is one step of either walk, read whole: ingress sharding puts a
@@ -912,7 +916,7 @@ export class MessageStore {
     if (index < length && holdsBlock(content, 'tool_use')) {
       // Forward over changes and results, while a call here is unanswered.
       const open = new Set([...callsInOrder(content)].filter(([, stillOpen]) => stillOpen).map(([id]) => id));
-      for (let i = index + 1; i < length && open.size > 0; ) {
+      for (let i = last + 1; i < length && open.size > 0; ) {
         const { to, shards } = bodyAt(i);
         if (holds(shards, 'tool_use')) break;
         if (holds(shards, 'system_change')) {
@@ -955,19 +959,109 @@ export class MessageStore {
       );
     }
     this.refuseToolPairSplit(newContent, `Edit of ${messageId} refused`, index);
+    this.writeEdit(index, oldMessage, oldMessage, newContent);
+  }
 
+  /**
+   * Write `content` as the whole content of the body whose first row is
+   * `messageId`, at that row, keeping its id and place, with no body group
+   * fields (bodyGroupId, shardIndex, shardCount). A body stored as shards
+   * then reads as this row, followed by its later shards as a body of
+   * their own, which the caller removes (removeRange). A `blob_ref` in
+   * `content` is read from the store. Refuses what checkRewrite refuses.
+   */
+  rewriteBody(messageId: MessageId, content: StoredContentBlock[]): void {
+    const { index, oldMessage, kept, newContent } = this.prepareRewrite(messageId, content);
+    this.writeEdit(index, oldMessage, kept, newContent);
+  }
+
+  /**
+   * Throw what rewriteBody would refuse, writing nothing: a row that isn't
+   * its body's first, and what an edit refuses, reading what follows the
+   * body, not its later shards, for a tool call's result. Gives the content
+   * as rewriteBody would write it, its blobs read from the store.
+   */
+  checkRewrite(messageId: MessageId, content: StoredContentBlock[]): ContentBlock[] {
+    return this.prepareRewrite(messageId, content).newContent;
+  }
+
+  private prepareRewrite(
+    messageId: MessageId,
+    content: StoredContentBlock[],
+  ): { index: number; oldMessage: StoredMessageInternal; kept: Omit<StoredMessageInternal, 'content'>; newContent: ContentBlock[] } {
+    const what = `Rewrite of ${messageId} refused`;
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) {
+      throw new Error(`Message not found: ${messageId}`);
+    }
+    const oldMessage = this.getInternal(index);
+    if (!oldMessage) {
+      throw new Error(`Message not found at index: ${index}`);
+    }
+    const at = (i: number) => this.getInternal(i);
+    const first = bodyStart(at, index);
+    if (first !== index) {
+      throw new Error(
+        `${what}: it is a later shard of body group ${oldMessage.bodyGroupId}, not the first row of its body. Its body's first row is ${at(first)?.id}.`,
+      );
+    }
+    const last = bodyEnd(this.length(), at, index);
+    const newContent = contentForWrite(this.blobManager.resolveBlobs(content), what);
+    this.refuseToolPairSplit(newContent, what, index, last);
+    const { bodyGroupId: _group, shardIndex: _index, shardCount: _count, ...kept } = oldMessage;
+    return { index, oldMessage, kept, newContent };
+  }
+
+  /**
+   * Every body the slot holds, in store order, each as the rows that make
+   * it up (body-runs.ts), read without blobs: media is its `blob_ref`.
+   */
+  bodiesAsStored(): StoredMessageInternal[][] {
+    const all = this.getAllInternal();
+    const at = (i: number) => all[i];
+    const bodies: StoredMessageInternal[][] = [];
+    for (let i = 0; i < all.length; ) {
+      const to = bodyEnd(all.length, at, i);
+      bodies.push(all.slice(i, to + 1).map((row) => this.asStored(row)));
+      i = to + 1;
+    }
+    return bodies;
+  }
+
+  /**
+   * The body whose first row is `messageId`, as bodiesAsStored gives it, or
+   * null when the slot holds no such row.
+   */
+  bodyAsStored(messageId: MessageId): StoredMessageInternal[] | null {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return null;
+    const at = (i: number) => this.getInternal(i);
+    const rows: StoredMessageInternal[] = [];
+    for (let i = index, to = bodyEnd(this.length(), at, index); i <= to; i++) {
+      const row = at(i);
+      if (row) rows.push(this.asStored(row));
+    }
+    return rows;
+  }
+
+  private asStored(row: StoredMessageInternal): StoredMessageInternal {
+    const content = wellFormedContent(row.content, `message ${row.id}`, this.malformedLogged, this.log);
+    return content === row.content ? row : { ...row, content };
+  }
+
+  private writeEdit(
+    index: number,
+    oldMessage: StoredMessageInternal,
+    kept: Omit<StoredMessageInternal, 'content'>,
+    newContent: ContentBlock[],
+  ): void {
+    const messageId = oldMessage.id;
     // The old content as a read gives it, so an edit can replace a message
     // whose stored content doesn't match ContentBlock.
     const oldContent = this.blobManager.resolveBlobs(
       wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged, this.log),
     );
-    const storedContent = this.blobManager.extractBlobs(newContent);
-
-    // Update the stored message
-    const updated: StoredMessageInternal = {
-      ...oldMessage,
-      content: storedContent,
-    };
+    const updated: StoredMessageInternal = { ...kept, content: this.blobManager.extractBlobs(newContent) };
 
     const cacheWasCurrent = this.cacheIsCurrent();
     noteRevisionBeforeCountedWrite(this.store, this.stateId);

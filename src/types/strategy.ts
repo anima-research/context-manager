@@ -11,6 +11,7 @@ import type {
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 import type { WindowMode } from '../window-index.js';
+import type { SummaryDropCost, SweptRows } from '../sweep.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -603,6 +604,43 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * The old summaries over `rows`, and the cost of dropping them
+   * (dropOldSummaries). A summary of any level is old where it was written
+   * before the newest listing of a row of `rows.rewritten` under it, by the
+   * store's sequence; every summary above an old one is old too. What a
+   * pass's join drops (writeDropCost) is no old summary. Writes nothing. A
+   * strategy without it keeps no old summaries.
+   */
+  oldSummaryCost?(rows: SweptRows, ctx: StrategyContext): SummaryDropCost;
+
+  /**
+   * What a pass that rewrites `rows` drops itself, where it joins a long
+   * note: each summary over a later shard of `rows.removed`, each summary
+   * over a first row of `rows.joined` written before that row's join was
+   * listed, and each summary above one. `contents` gives the new content of
+   * a rewritten row, which the raw tokens count. Writes nothing. A strategy
+   * without it drops nothing at a pass.
+   */
+  writeDropCost?(rows: SweptRows, ctx: StrategyContext, contents: ReadonlyMap<MessageId, ContentBlock[]>): SummaryDropCost;
+
+  /**
+   * The second act of a sweep: drop the old summaries over `rows`
+   * (oldSummaryCost), done when it returns, and give what was dropped. The
+   * chunk records under them keep their rows and are folded again.
+   */
+  dropOldSummaries?(rows: SweptRows, ctx: StrategyContext): SummaryDropCost;
+
+  /**
+   * Asked as the manager's pass begins, before the pass writes anything: a
+   * throw refuses the pass, and nothing is written. The function it gives
+   * is asked as the pass ends, where the store is still on the branch and
+   * the manager open: it reads the branch's applied list of sweeps
+   * (sweep.ts) and gives what the strategy dropped during the pass, by any
+   * path.
+   */
+  beforeSweepPass?(ctx: StrategyContext): (ctx: StrategyContext) => SummaryDropCost;
 
   /**
    * Declares that select() reports its rendered layout completely, and which
@@ -3104,6 +3142,15 @@ export interface SummaryEntry {
   mergedInto?: string;
   /** Creation timestamp */
   created: number;
+  /**
+   * The store's sequence on its branch (`JsStore.currentSequence`) just
+   * before the summary was written. A sweep compares it with the sequence
+   * of the pass that listed a row under the summary: in its count of old
+   * summaries, and where the pass joined a long note, whose first row then
+   * loses each L1 written before. Absent on a summary written before it was
+   * added.
+   */
+  writtenAtSequence?: number;
   /** Phase type tag (used by KnowledgeStrategy for asymmetric budget) */
   phaseType?: string;
   /**
