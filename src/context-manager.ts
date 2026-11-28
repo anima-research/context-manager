@@ -2829,12 +2829,14 @@ export class ContextManager {
     try {
       this.store.switchBranch(name);
     } catch (error) {
+      const before = this.initializationAttempt;
       let now: { id: string; name: string } | undefined;
       try {
         now = this.store.currentBranch();
       } catch {
         now = undefined;
       }
+      if (this.initializationAttempt !== before) throw new InitializationSupersededError({ branch: name, created });
       if (now !== undefined && now.id === from) throw error;
       if (now === undefined || now.name !== name) {
         ++this.initializationAttempt;
@@ -2846,7 +2848,7 @@ export class ContextManager {
         }
         throw new Error(
           `Branch selection ${name}${made} failed, and the store ${now ? `is on ${now.name}` : "can't say which branch it is on"}: the manager is uninitialized; ` +
-            `setStrategy(getStrategy()) initializes it where the store is: ${said(error)}`,
+            `setStrategy(getStrategy()) initializes it where the store is, and getStore().sync() saves the store's selection once the store can write: ${said(error)}`,
           { cause: error },
         );
       }
@@ -2869,6 +2871,13 @@ export class ContextManager {
       throw new InitializationSupersededError({ branch: name, created });
     }
     if (unsaved !== undefined) {
+      if (requested.name !== name) {
+        throw new Error(
+          `Branch selection ${name}${made} took effect and then the switch failed, and reconciliation found ${requested.name}: the selection may not be saved; ` +
+          `getStore().sync() saves the store's selection once the store can write, and setStrategy(getStrategy()) initializes this manager where the store is: ${said(unsaved.error)}`,
+          { cause: unsaved.error },
+        );
+      }
       throw new Error(
         `Branch selection ${name}${made} took effect, and then the switch failed, so the selection may not be saved: ` +
         `getStore().sync() saves it once the store can write, and setStrategy(getStrategy()) initializes this manager on it: ${said(unsaved.error)}`,
