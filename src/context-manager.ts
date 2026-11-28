@@ -594,9 +594,9 @@ function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutati
   return { by: by.by, ...(by.note !== undefined ? { note: by.note } : {}) };
 }
 
-/** A failure of the work on a branch that a mutation built, and has deleted since: the library's refusals pass as they are, and any other error says where it happened. */
-function onBuiltBranch(error: unknown, where: string): unknown {
-  if (error instanceof HistoryMutationError) return error;
+/** A failure of the work on a branch that a mutation built, and has deleted since: this mutation's own refusals pass as they are, and any other error, another mutation's included, says where it happened. */
+function onBuiltBranch(error: unknown, where: string, plan: HistoryMutationPlan): unknown {
+  if (error instanceof HistoryMutationError && error.plan === plan) return error;
   return new Error(`${where} threw, and that branch is deleted: the mutation wrote nothing to the source branch: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 }
 
@@ -4904,7 +4904,7 @@ export class ContextManager {
       if (staging) await Promise.allSettled([...staging.retractedCalls]);
       staging?.close();
       this.deleteBuiltBranch(scratch, created.id, plan, error);
-      throw onBuiltBranch(error, `the preview's work on branch ${scratch}`);
+      throw onBuiltBranch(error, `the preview's work on branch ${scratch}`, plan);
     }
     this.deleteBuiltBranch(scratch, created.id, plan);
     return { plan, compiled };
@@ -5066,7 +5066,7 @@ export class ContextManager {
       staging?.close();
       reader?.close();
       this.deleteBuiltBranch(targetBranch, created.id, plan, error);
-      throw onBuiltBranch(error, `the apply's work on branch ${targetBranch}, before the store moved to it,`);
+      throw onBuiltBranch(error, `the apply's work on branch ${targetBranch}, before the store moved to it,`, plan);
     }
     let toSequence = builtHead;
     const receipt = (): HistoryMutationReceipt => ({
@@ -5213,11 +5213,23 @@ export class ContextManager {
       if (target.kind === 'remove_messages') {
         this.retractRemoved(target.messageIds);
         await this.settleRetractions();
+        await this.tellRemovedInLegacyWindow([], target.messageIds);
       }
       const folding = share.covering.find((c) => c.opIndex === target.opIndex);
       if (folding?.foldedPolicy === 'drop_covering_summaries') this.dropStillHeld(folding.coveringSummaries);
     }
     this.store.sync();
+  }
+
+  /**
+   * A legacy window hears no retraction of the rows a mutation removes, so
+   * the strategy is told of them here, as a presented window's removal tells
+   * it: its chunk records let them go, and what folds them unfolds.
+   * Otherwise the records keep ids that no row has.
+   */
+  private async tellRemovedInLegacyWindow(rows: readonly StoredMessage[], ids: readonly MessageId[]): Promise<void> {
+    if (ids.length === 0 || this.windowIndex.mode() !== 'legacy' || !this.strategy.onRetracted) return;
+    await this.strategy.onRetracted(rows, this.createStrategyContext(), { undone: false, removed: true, ids });
   }
 
   private dropStillHeld(planned: readonly string[]): void {
@@ -5254,6 +5266,7 @@ export class ContextManager {
         case 'remove_messages': {
           const listing = this.messageStore.getAll();
           const taking = new Set(target.messageIds);
+          const removed = listing.filter((row) => taking.has(row.id));
           const runs: Array<[MessageId, MessageId]> = [];
           listing.forEach((row, i) => {
             if (!taking.has(row.id)) return;
@@ -5265,6 +5278,7 @@ export class ContextManager {
             else this.removeMessages(from, to);
           }
           await this.settleRetractions();
+          await this.tellRemovedInLegacyWindow(removed, target.messageIds);
           if (target.foldedPolicy === 'drop_covering_summaries') this.dropStillHeld(target.coveringSummaries);
           break;
         }

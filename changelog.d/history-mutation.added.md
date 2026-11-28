@@ -8,9 +8,12 @@
     holds now and, for an edit, the content or text that the edit writes.
     It also returns the summaries that the mutation drops, the first row
     whose rendering may change (an estimate that errs early), whether a
-    changed row lies inside the thinking-binding record, and a `planSha256`
+    changed row lies inside the thinking-binding record (by sequence, so a
+    row that an edit brings into view ahead of the record's last row isn't
+    counted), and a `planSha256`
     of all that it reports, its violations included, with each summary that
-    it drops as the strategy holds it.
+    it drops or edits, and each carrier of an edited summary, as the
+    strategy holds it.
   - The plan refuses each of these, and says what to change:
     - a target that changed since its caller read it, a target named twice,
       or a target that isn't there;
@@ -77,8 +80,9 @@
     branch built. Where that deletion fails, the error (`BRANCH_LEFT`) names
     the branch. It says whether the branch is still there, or deleted with
     the deletion not saved yet. Where the work on the built branch threw,
-    the error says so, that the branch is deleted, and that the source
-    holds what it held. A process that stops leaves the branch, as a
+    the error says so, that the branch is deleted, and that the mutation
+    wrote nothing to the source branch. A process that stops leaves the
+    branch, as a
     preview leaves its scratch branch (`preview-mutation/<uuid>`), and an
     apply can't build on that name until it is deleted. The switch can fail
     after the store has moved to the branch, such as where the store can't
@@ -121,6 +125,10 @@
     `preview-mutation/<id>` branch, which `listBranches()` lists. The
     scratch strategy gets the live strategy's rendering frontier, as
     `derive` does, so that the live strategy's hot settings apply there too.
+  - A removal tells the strategy of the rows that it takes out, in a
+    legacy window as in a presented one, so that its chunk records let them
+    go and what folds them unfolds. A legacy window hears no retraction of
+    its own, so without this the records would keep ids that no row has.
   - A mutation changes what agents read, not what the store holds: the
     source branch and the store's log keep the earlier text. So a
     redaction isn't an erasure. `drop_covering_summaries` drops the
@@ -150,7 +158,8 @@
     references. A summary stored with `external` before this change gains
     it as well. A compile that renders such a summary sends different bytes
     once, and so does a compression or merge request whose prompt holds it,
-    so that request can miss its cached prefix once.
+    so that request can miss its cached prefix once, and a quarantine
+    entry keyed by that request's hash no longer matches it.
   - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`. The
     store's edit event still carries the content alone.
   - `AutobiographicalStrategy`, `KnowledgeStrategy` and
@@ -158,7 +167,8 @@
     the apply use for a fresh instance, and `AutobiographicalStrategy`
     gains `historyMemory()` and `dropSummaries()`. A subclass of any of the
     three gives its own `cloneForScratch()`, since the inherited one throws
-    for a subclass; or the caller passes `strategy`.
+    for a subclass. The caller can pass `strategy` for the manager's own
+    scratch instance, but not for a reader's.
   - New exports: `HistoryMutationError`, and the types that an op, a plan,
     a receipt, an anomaly and a violation use (`HistoryMutationManifest`,
     `HistoryMutationOp`, the policies, `HistoryMutationPlan`,

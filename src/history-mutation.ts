@@ -713,7 +713,7 @@ export function planMutation(
     refuse(-1, 'UNLISTED_READER', `namespace ${other.namespace} isn't among the readers, and ` + [
       ...(folding.length > 0 ? [`its summaries ${folding.join(', ')} fold rows the change reaches`] : []),
       ...(held.length > 0 ? [`its window holds ${held.join(', ')}, which the change edits or removes`] : []),
-    ].join(', and ') + ': pass its manager as a reader, or name it in ignoreNamespaces', undefined, { readerNamespace: other.namespace });
+    ].join(', and ') + ': pass its manager as a reader, or name it in ignoreNamespaces, which leaves its summaries and window as they are', undefined, { readerNamespace: other.namespace });
   }
   const droppedSummaries = [...dropped];
   const effects = windowEffects(state, targets, droppedSummaries);
@@ -732,6 +732,7 @@ export function planMutation(
       targets,
       ignoreNamespaces: [...unlisted.ignore].sort(),
       droppedSummaries: entries(state.memory, droppedSummaries),
+      editedSummaries: entries(state.memory, targets.flatMap((t) => (t.kind === 'edit_summary' ? [t.summaryId, ...t.carriedBy] : []))),
       ...effects,
       readers: readerPlans.map((r, i) => ({ ...r, droppedSummaries: entries(readers[i]!.state.memory, r.droppedSummaries) })),
     }), 'utf8')

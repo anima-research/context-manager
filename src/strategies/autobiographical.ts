@@ -16097,10 +16097,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * what folds them (unfold): each chunk record of a dropped L1 keeps its
    * rows and is compressed again, and a summary the drop leaves without its
    * parent renders and merges again. Then the chunks are rebuilt and, in
-   * hierarchical mode, the merge check runs, as after a let-go.
+   * hierarchical mode, the merge check runs, as after a let-go. Refused,
+   * before anything is written, where the stored summaries or chunk records
+   * can't be shown to be as this strategy holds them, since the drop writes
+   * both states whole.
    */
   dropSummaries(seeds: readonly string[], ctx: StrategyContext): string[] {
     this.requireBranchMutation('dropSummaries');
+    if (this.store && this.storeWrittenElsewhere(true)) {
+      throw new Error(`the drop of [${seeds.join(', ')}] is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them, since another handle changed them after this strategy read them, or reading them failed: initialize the manager again (setStrategy(getStrategy())), or open the store again`);
+    }
     let dropped: string[] = [];
     try {
       dropped = this.unfold(new Set(seeds), () => undefined).dropped;
