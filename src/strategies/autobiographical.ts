@@ -8853,7 +8853,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `undone` and `removed` change none of this: an undone row, a row taken
    * out and a removed row have each left. The manager doesn't call this for a removal
    * in legacy mode, so a row removed there stays in what folded it, as it
-   * always has. The work is synchronous, so it is done when the manager's
+   * always has, except in a history mutation, which calls it for the rows
+   * it removes on the branch it builds: the chunk records let them go, and
+   * what folds them unfolds. The work is synchronous, so it is done when the manager's
    * call returns, and written after the window's tombstones.
    */
   async onRetracted(

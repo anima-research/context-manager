@@ -4775,10 +4775,10 @@ export class ContextManager {
     const out: Array<{ manager: ContextManager; namespace: string; state: HistoryState; strategy: () => ContextStrategy }> = [];
     const namespaces = new Set([this.strategyNamespace]);
     for (const reader of readers ?? []) {
-      if (reader === this) throw new Error(`ContextManager.${operation}: a reader is the manager itself`);
-      if (out.some((r) => r.manager === reader)) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} is named twice`);
-      if (reader.store !== this.store) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} reads another store`);
-      if (namespaces.has(reader.strategyNamespace)) throw new Error(`ContextManager.${operation}: two managers have strategy namespace ${reader.strategyNamespace}`);
+      if (reader === this) throw new Error(`ContextManager.${operation}: a reader is the manager itself, so nothing is written: leave it out of readers`);
+      if (out.some((r) => r.manager === reader)) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} is named twice, so nothing is written: name each reader once`);
+      if (reader.store !== this.store) throw new Error(`ContextManager.${operation}: the reader with strategy namespace ${reader.strategyNamespace} reads another store, so nothing is written: give only managers on this store`);
+      if (namespaces.has(reader.strategyNamespace)) throw new Error(`ContextManager.${operation}: two managers have strategy namespace ${reader.strategyNamespace}, so nothing is written: give one manager for each namespace`);
       reader.requireInitialized(operation);
       if (operation !== 'planHistoryMutation') reader.refuseCutWhileWritingShards(operation);
       namespaces.add(reader.strategyNamespace);
@@ -4991,14 +4991,14 @@ export class ContextManager {
       throw new HistoryMutationError(message, [{ opIndex: -1, code, message }], plan);
     };
     if (plan.sourceBranch !== options.expectedSourceBranch) {
-      refuse('BRANCH_MISMATCH', `the store is on ${plan.sourceBranch}, not ${options.expectedSourceBranch}`);
+      refuse('BRANCH_MISMATCH', `the store is on ${plan.sourceBranch}, not ${options.expectedSourceBranch}, so nothing is written: plan again on the branch meant`);
     }
     if (plan.planSha256 !== options.expectedPlanSha256) {
       refuse('PLAN_DRIFT', `the plan made now has sha256 ${plan.planSha256}, not ${options.expectedPlanSha256}: the history, the manifest, the readers or ignoreNamespaces changed since that plan was made; read the plan this error carries`);
     }
     if (!plan.valid) throw invalidPlan(plan);
     if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
-      refuse('TARGET_BRANCH_EXISTS', `branch ${targetBranch} exists`);
+      refuse('TARGET_BRANCH_EXISTS', `branch ${targetBranch} exists, so nothing is written: give another targetBranch`);
     }
     const source = snapshotOf(state);
     const baseline = historyAnomalies(state);
@@ -5010,7 +5010,7 @@ export class ContextManager {
       created = this.store.createBranch(targetBranch, plan.sourceBranch);
     } catch (error) {
       this.deleteBuiltBranch(targetBranch, undefined, plan, error);
-      throw error;
+      throw new Error(`creating branch ${targetBranch} threw, so the apply deleted what of it was made, and didn't switch: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
     let fromSequence: number;
     let builtHead = 0;
@@ -5049,15 +5049,16 @@ export class ContextManager {
         mismatches.push(...readerReadBackMismatches(plan, share, readerSource, readerWritten, stamp, stillInWindow));
         broken.push(...introducedAnomalies(readerBaseline, historyAnomalies(readerWritten)).map((a) => `reader ${namespace}: ${a.message}`));
       }
-      if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${targetBranch} reads back other than planned: ${mismatches.join('; ')}`);
-      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.join('; ')}`);
+      const unswitched = `: the apply deletes ${targetBranch} and doesn't switch, so ${plan.sourceBranch} holds what it held`;
+      if (mismatches.length > 0) refuse('READBACK_MISMATCH', `${targetBranch} reads back other than planned: ${mismatches.join('; ')}${unswitched}`);
+      if (broken.length > 0) refuse('INVARIANT_BROKEN', `${targetBranch} breaks rules ${plan.sourceBranch} keeps: ${broken.join('; ')}${unswitched}`);
       const built = this.store.listBranches().find((branch) => branch.name === targetBranch);
       if (this.store.currentBranch().id !== sourceId || this.store.currentSequence() !== fromSequence || built?.id !== created.id) {
         refuse('SOURCE_MOVED', `the store moved while the apply built ${targetBranch}: ` + (
           this.store.currentBranch().id !== sourceId ? `it is on ${this.store.currentBranch().name}, not ${plan.sourceBranch}`
             : this.store.currentSequence() !== fromSequence ? `${plan.sourceBranch} took records after sequence ${fromSequence}, which the branch doesn't hold`
               : `${targetBranch} is not the branch the apply built`
-        ) + ': plan again once nothing else writes the history');
+        ) + `: the apply deletes ${targetBranch} and doesn't switch; plan again once nothing else writes the history`);
       }
       builtHead = view.currentSequence();
       this.store.sync();
@@ -5082,7 +5083,11 @@ export class ContextManager {
     try {
       await this.selectBranch(targetBranch, false, () => {
         switched = true;
-        toSequence = this.store.currentSequence();
+        try {
+          toSequence = this.store.currentSequence();
+        } catch {
+          // The receipt keeps the built branch's head.
+        }
       });
     } catch (error) {
       if (!switched) {
@@ -5130,7 +5135,7 @@ export class ContextManager {
               : 'it is still there: delete it by hand';
       const leftMessage = `deleting branch ${branch}, which it built, failed (${why(cleanup)}): ${left}`;
       const message = failure !== undefined ? `${why(failure)}; and ${leftMessage}` : leftMessage;
-      const listed = failure instanceof HistoryMutationError;
+      const listed = failure instanceof HistoryMutationError && failure.plan === plan;
       throw new HistoryMutationError(
         message,
         [...(listed ? failure.violations : []), { opIndex: -1, code: 'BRANCH_LEFT', targetId: branch, message: listed ? leftMessage : message }],
@@ -5156,7 +5161,7 @@ export class ContextManager {
     if (keepsNoSummaries(strategy) || (strategy.onRetracted === undefined && historyMemoryOf(strategy)?.summaries.length === 0)) return () => new PassthroughStrategy();
     throw new Error(
       `ContextManager.${operation}: the reader with strategy namespace ${this.strategyNamespace} runs the ${strategy.name} strategy, which keeps summaries or hears rows leave its window, ` +
-        `and gives no strategy for the branch (${unusable instanceof Error ? unusable.message : 'it has no cloneForScratch'}), so an apply can't reconcile it there`,
+        `and gives no strategy for the branch (${unusable instanceof Error ? unusable.message : 'it has no cloneForScratch'}), so an apply can't reconcile it there, and nothing is written: give that strategy a cloneForScratch() that returns a fresh instance`,
     );
   }
 
@@ -5213,7 +5218,7 @@ export class ContextManager {
       if (target.kind === 'remove_messages') {
         this.retractRemoved(target.messageIds);
         await this.settleRetractions();
-        await this.tellRemovedInLegacyWindow([], target.messageIds);
+        await this.tellRemovedInLegacyWindow([], target.messageIds.filter((id) => share.heldIds.includes(id)));
       }
       const folding = share.covering.find((c) => c.opIndex === target.opIndex);
       if (folding?.foldedPolicy === 'drop_covering_summaries') this.dropStillHeld(folding.coveringSummaries);
@@ -5235,12 +5240,12 @@ export class ContextManager {
   private dropStillHeld(planned: readonly string[]): void {
     if (planned.length === 0) return;
     const memory = historyMemoryOf(this.strategy);
-    if (!memory) throw new Error(`the ${this.strategy.name} strategy has no historyMemory(), so the summaries that the plan drops (${planned.join(', ')}) can't be found in it`);
+    if (!memory) throw new Error(`the ${this.strategy.name} strategy has no historyMemory(), so the summaries that the plan drops (${planned.join(', ')}) can't be found in it: give a strategy that has one`);
     const held = new Set(memory.summaries.map((s) => s.id));
     const left = planned.filter((id) => held.has(id));
     if (left.length === 0) return;
     const drop = (this.strategy as Partial<Pick<HistoryMutationStrategy, 'dropSummaries'>>).dropSummaries;
-    if (typeof drop !== 'function') throw new Error(`the ${this.strategy.name} strategy holds summaries the plan drops (${left.join(', ')}), and has no dropSummaries() to drop them`);
+    if (typeof drop !== 'function') throw new Error(`the ${this.strategy.name} strategy holds summaries the plan drops (${left.join(', ')}), and has no dropSummaries() to drop them: give a strategy that has one, or a policy that drops none`);
     drop.call(this.strategy, left, this.createStrategyContext());
   }
 

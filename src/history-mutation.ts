@@ -420,10 +420,10 @@ export function planMutation(
   const { malformed, copies } = checkedOps(manifest);
   for (const { opIndex, message } of malformed) refuse(opIndex, 'MALFORMED_OP', message);
   const ops = malformed.length > 0 ? [] : copies;
-  if (malformed.length === 0 && ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops');
+  if (malformed.length === 0 && ops.length === 0) refuse(-1, 'EMPTY_MANIFEST', 'the manifest has no ops: give at least one op');
   const stale = (memory: HistoryMemory | null) => memory?.stored !== undefined && memory.stored !== memory.summaries && canonicalJson(memory.stored.map(asStored)) !== canonicalJson(memory.summaries.map(asStored));
   const restart = 're-initialize that manager (setStrategy(getStrategy())) and plan again';
-  const hidden = (name: string) => `the ${name} strategy has no historyMemory(), so the plan can't see what summaries it keeps over the rows the change reaches; a strategy that keeps none joins with a historyMemory() of empty lists`;
+  const hidden = (name: string) => `the ${name} strategy has no historyMemory(), so the plan can't see what summaries it keeps over the rows the change reaches; a strategy that keeps none joins with a historyMemory() of empty lists, and one that keeps summaries joins with a historyMemory() that lists them`;
   if (state.hiddenStrategy !== undefined) refuse(-1, 'STRATEGY_UNSUPPORTED', hidden(state.hiddenStrategy));
   for (const { namespace, state: reader } of readers) {
     if (reader.hiddenStrategy !== undefined) refuse(-1, 'STRATEGY_UNSUPPORTED', `reader ${namespace}: ${hidden(reader.hiddenStrategy)}`, undefined, { readerNamespace: namespace });
@@ -500,7 +500,7 @@ export function planMutation(
         }
         const afterSha256 = textSha256(op.newText);
         if (op.expectedAfterSha256 !== undefined && op.expectedAfterSha256 !== afterSha256) {
-          refuse(opIndex, 'AFTER_SHA_MISMATCH', `the new text has sha256 ${afterSha256}, not ${op.expectedAfterSha256}`, op.summaryId, { afterSha256 });
+          refuse(opIndex, 'AFTER_SHA_MISMATCH', `the new text has sha256 ${afterSha256}, not ${op.expectedAfterSha256}: read the new text in this plan, and give its sha256 if it is the text meant`, op.summaryId, { afterSha256 });
         }
         const mergedParents = plan.parents.map((p) => p.id);
         const parentPolicy = op.parentPolicy ?? 'refuse';
@@ -554,7 +554,7 @@ export function planMutation(
         }
         const afterSha256 = storedSha256(content);
         if (op.expectedAfterSha256 !== undefined && op.expectedAfterSha256 !== afterSha256) {
-          refuse(opIndex, 'AFTER_SHA_MISMATCH', `the content as written has sha256 ${afterSha256}, not ${op.expectedAfterSha256}`, op.messageId, { afterSha256 });
+          refuse(opIndex, 'AFTER_SHA_MISMATCH', `the content as written has sha256 ${afterSha256}, not ${op.expectedAfterSha256}: read the content in this plan, and give its sha256 if it is the content meant`, op.messageId, { afterSha256 });
         }
         const foldedPolicy = op.foldedPolicy ?? 'refuse';
         const coveringSummaries = covering(state.memory, new Set([op.messageId]));
@@ -633,7 +633,7 @@ export function planMutation(
     }
   });
 
-  if (state.rows.length > 0 && state.rows.every((row) => removedRows.has(row.id))) refuse(-1, 'EMPTY_STORE', 'the mutation would remove every message');
+  if (state.rows.length > 0 && state.rows.every((row) => removedRows.has(row.id))) refuse(-1, 'EMPTY_STORE', 'the mutation would remove every message: keep at least one');
   const splitOps = new Set<number>();
   const splitsSeen = new Set<string>();
   const applied = (rows: readonly StoredMessage[]) => rows.flatMap((row) => {
@@ -708,10 +708,13 @@ export function planMutation(
       ...foldsAny(other.summaries, touchedRows, (fields) => (fields.level === 1 ? fields.id : undefined)),
       ...foldsAny(other.records, touchedRows, (fields) => fields.summaryId),
     ].filter((id, i, all) => all.indexOf(id) === i);
+    const recording = foldsAny(other.records.filter((record) => typeof record !== 'object' || record === null || typeof (record as { summaryId?: unknown }).summaryId !== 'string'), removedRows, (fields) => fields.id)
+      .filter((id) => !folding.includes(id));
     const held = [...touchedRows].filter((id) => other.windowHolds(id));
-    if (folding.length === 0 && held.length === 0) continue;
+    if (folding.length === 0 && recording.length === 0 && held.length === 0) continue;
     refuse(-1, 'UNLISTED_READER', `namespace ${other.namespace} isn't among the readers, and ` + [
       ...(folding.length > 0 ? [`its summaries ${folding.join(', ')} fold rows the change reaches`] : []),
+      ...(recording.length > 0 ? [`its chunk records ${recording.join(', ')} hold rows the change removes`] : []),
       ...(held.length > 0 ? [`its window holds ${held.join(', ')}, which the change edits or removes`] : []),
     ].join(', and ') + ': pass its manager as a reader, or name it in ignoreNamespaces, which leaves its summaries and window as they are', undefined, { readerNamespace: other.namespace });
   }
@@ -851,7 +854,7 @@ function introducedToolSplits(before: readonly StoredMessage[], after: readonly 
       messageId: now.messageId,
       ...(partnerId !== undefined ? { partnerId } : {}),
       message: `the ${now.kind} ${now.toolId} in message ${now.messageId} would be left with no ${now.kind === 'tool_use' ? 'result' : 'call'}` +
-        (partnerId === undefined ? ''
+        (partnerId === undefined ? `: give it its ${now.kind === 'tool_use' ? 'result' : 'call'} in the same change, or leave it out`
           : changeable(partnerId) && changeable(now.messageId) ? ` (its partner was in message ${partnerId}): change both together`
             : ` (its partner was in message ${partnerId}; message ${changeable(partnerId) ? now.messageId : partnerId} is in a slot this manager merges, which its mutation can't change): leave the pair as it is`),
       remediation: { toolId: now.toolId, orphanedMessageId: now.messageId, ...(partnerId !== undefined ? { partnerMessageId: partnerId } : {}) },
@@ -875,7 +878,7 @@ function introducedToolSplits(before: readonly StoredMessage[], after: readonly 
     const [callId, toolId] = key.split('\u0000') as [MessageId, string];
     splits.push({
       messageId: callId,
-      message: `a system change (message ${changeId}) would stand between the tool call ${toolId} in message ${callId} and its result`,
+      message: `a system change (message ${changeId}) would stand between the tool call ${toolId} in message ${callId} and its result: change the mutation so that the call and its result stay next to each other`,
       remediation: { toolId, callMessageId: callId, systemChangeMessageId: changeId },
     });
   }

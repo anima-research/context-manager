@@ -258,7 +258,8 @@ export interface ContextStrategy {
    * applyHistoryMutation). Absent where the strategy can't be built again
    * from what it holds; for the manager that makes the change, those calls
    * then take a strategy from their caller, and a reader needs one of its
-   * own.
+   * own, unless its historyMemory() holds no summaries and it has no
+   * onRetracted, where a passthrough stands in for it.
    */
   cloneForScratch?(): ContextStrategy;
 
@@ -499,7 +500,10 @@ export interface ContextStrategy {
    *
    * While the manager is in legacy mode its window is the record, and a
    * removal takes the row out of both at once: nothing calls this, and a
-   * strategy that folded the row keeps what it folded, as it always has. A
+   * strategy that folded the row keeps what it folded, as it always has,
+   * except in a history mutation (compileMutationPreview,
+   * applyHistoryMutation), which calls this, with `removed`, for the rows
+   * it removes in legacy mode too, on the branch it builds. A
    * tombstone write the store refuses takes nothing out and calls nothing;
    * one that throws after the store kept part of it calls this with the
    * rows it took out before the error is thrown or logged. A row
@@ -530,7 +534,9 @@ export interface ContextStrategy {
    * Fire and forget, as onPresented: a rejection, or a throw before it
    * returns, is logged through the manager's diagnostics, naming the rows,
    * and doesn't reach the caller. The rows stay out of the window, and the
-   * strategy isn't offered them again.
+   * strategy isn't offered them again. A history mutation is the
+   * exception: it waits for the call, in either mode, and a rejection or a
+   * throw fails the mutation, which deletes the branch it built.
    */
   onRetracted?(rows: readonly StoredMessage[], ctx: StrategyContext, info: { undone: boolean; removed: boolean; ids: readonly MessageId[] }): Promise<void>;
 
