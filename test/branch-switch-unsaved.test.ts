@@ -47,11 +47,15 @@ const KEEPS_UNSAVED = ((): boolean => {
   const store = JsStore.openOrCreate({ path });
   try {
     store.createBranch('probe', 'main');
-    try {
-      withBranchFileBlocked(path, () => store.switchBranch('probe'));
-    } catch {
-      // The checkpoint failed, as it is meant to.
-    }
+    let failed = false;
+    withBranchFileBlocked(path, () => {
+      try {
+        store.switchBranch('probe');
+      } catch {
+        failed = true;
+      }
+    });
+    if (!failed) throw new Error('setup: a switch whose checkpoint is blocked didn\'t fail, so the probe can\'t tell this chronicle');
     return store.currentBranch().name === 'probe';
   } finally {
     store.close();
