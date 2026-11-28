@@ -597,7 +597,7 @@ function requireEditor(operation: 'compileMutationPreview' | 'applyHistoryMutati
 /** A failure of the work on a branch that a mutation built, and has deleted since: the library's refusals pass as they are, and any other error says where it happened. */
 function onBuiltBranch(error: unknown, where: string): unknown {
   if (error instanceof HistoryMutationError) return error;
-  return new Error(`${where} threw, and that branch is deleted, so the source branch holds what it held: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  return new Error(`${where} threw, and that branch is deleted: the mutation wrote nothing to the source branch: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 }
 
 function invalidPlan(plan: HistoryMutationPlan): HistoryMutationError {
@@ -4847,8 +4847,10 @@ export class ContextManager {
    * Throws HistoryMutationError for a plan with violations,
    * and BRANCH_LEFT, naming the scratch branch, where its deletion fails.
    *
-   * `by` is who the apply will name, which the compile shows (a recall
-   * envelope's `writtenBy`). `strategy` gives the scratch manager its
+   * `by` is who the apply will name. The compile shows it only where it
+   * renders an edited summary under `recallEnvelope: 'xml'` (`writtenBy`);
+   * an edited message records it in its metadata, which a compile doesn't
+   * render. `strategy` gives the scratch manager its
    * strategy where this one's has no cloneForScratch; it must not compress
    * on its own. `readers` are planned as planHistoryMutation plans them, so
    * the plan returned is the one an apply with them agrees to; none is
@@ -4992,7 +4994,7 @@ export class ContextManager {
       refuse('BRANCH_MISMATCH', `the store is on ${plan.sourceBranch}, not ${options.expectedSourceBranch}`);
     }
     if (plan.planSha256 !== options.expectedPlanSha256) {
-      refuse('PLAN_DRIFT', `the plan made now has sha256 ${plan.planSha256}, not ${options.expectedPlanSha256}: the history, the manifest or the readers changed since that plan was made; read the plan this error carries`);
+      refuse('PLAN_DRIFT', `the plan made now has sha256 ${plan.planSha256}, not ${options.expectedPlanSha256}: the history, the manifest, the readers or ignoreNamespaces changed since that plan was made; read the plan this error carries`);
     }
     if (!plan.valid) throw invalidPlan(plan);
     if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
@@ -5095,7 +5097,8 @@ export class ContextManager {
       }
       const message = `the mutation is applied on ${targetBranch}: the store moved to it, and the switch didn't complete ` +
         `(this error's cause says why); ${now}: sync() saves a switch whose ` +
-        'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is';
+        'checkpoint failed, and setStrategy(getStrategy()) initializes the manager where the store is; ' +
+        're-initialize each other manager on the store too, as after switchBranch';
       throw new HistoryMutationError(message, [{ opIndex: -1, code: 'APPLIED_INIT_FAILED', message }], plan, { cause: error, receipt: receipt() });
     }
     return receipt();
@@ -5117,7 +5120,7 @@ export class ContextManager {
       const stands = read(() => this.store.listBranches().some(built));
       const current = stands ? read(() => this.store.currentBranch().name) : undefined;
       const left = stands === undefined
-        ? "the store can't be read to tell whether it is still there"
+        ? "the store can't be read to tell whether it is still there: open the store again, list its branches, and delete the branch if it is there"
         : !stands
           ? 'it is deleted, and its deletion is not saved yet: sync() saves it'
           : current === branch
@@ -5236,7 +5239,7 @@ export class ContextManager {
     for (const target of plan.targets) {
       switch (target.kind) {
         case 'edit_summary':
-          if (!mutable) throw new Error(`the ${strategy.name} strategy keeps no summaries`);
+          if (!mutable) throw new Error(`the ${strategy.name} strategy can't edit a summary: it lacks one of historyMemory(), editSummaryText() and dropSummaries() (isHistoryMutationStrategy)`);
           mutable.editSummaryText(target.summaryId, target.newText, by, {
             apply: true, expectedPriorSha256: target.beforeSha256, dropResponseContent: target.dropResponseContent,
           });

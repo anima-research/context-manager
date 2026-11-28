@@ -123,7 +123,11 @@
     `derive` does, so that the live strategy's hot settings apply there too.
   - A mutation changes what agents read, not what the store holds: the
     source branch and the store's log keep the earlier text. So a
-    redaction isn't an erasure.
+    redaction isn't an erasure. `drop_covering_summaries` drops the
+    summaries whose sources hold the row, with those merged over them. A
+    summary written later from a prompt that showed the row as context,
+    such as a recall or the head of a chunk, can repeat its text, and the
+    plan doesn't find it.
   - The plan refuses where the store holds a namespace that isn't the
     manager's or a reader's, and whose autobiographical summaries or chunk
     records fold a row that the change edits or removes, or whose presented
@@ -149,6 +153,12 @@
     so that request can miss its cached prefix once.
   - `editMessage` and `MessageStore.edit` take `{ mergeMetadata }`. The
     store's edit event still carries the content alone.
+  - `AutobiographicalStrategy`, `KnowledgeStrategy` and
+    `PassthroughStrategy` gain `cloneForScratch()`, which the preview and
+    the apply use for a fresh instance, and `AutobiographicalStrategy`
+    gains `historyMemory()` and `dropSummaries()`. A subclass of any of the
+    three gives its own `cloneForScratch()`, since the inherited one throws
+    for a subclass; or the caller passes `strategy`.
   - New exports: `HistoryMutationError`, and the types that an op, a plan,
     a receipt, an anomaly and a violation use (`HistoryMutationManifest`,
     `HistoryMutationOp`, the policies, `HistoryMutationPlan`,

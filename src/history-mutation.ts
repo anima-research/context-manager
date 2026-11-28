@@ -54,8 +54,9 @@ export type HistoryMutationOp =
       /**
        * Who changed the message, as the resident will read it, such as
        * `[redacted; surgery 2026-11-25 by Clement]`. It goes first in the
-       * content, as a text block of its own, unless a text block of the
-       * content already holds it. Required, and not blank.
+       * content, as a text block of its own, or after the tool results that
+       * the content opens with, unless a text block of the content already
+       * holds it. Required, and not blank.
        */
       label: string;
       /** sha256 of the content as the plan writes it (the plan's `after`). */
@@ -480,16 +481,16 @@ export function planMutation(
         for (const refusal of plan.refusals) {
           switch (refusal.code) {
             case 'CARRIED_SUMMARY_TARGET':
-              refuse(opIndex, refusal.code, `summary ${op.summaryId} carries ${refusal.authoritativeSummaryId} up a level, whose text a compile reads in its place`, op.summaryId, { authoritativeSummaryId: refusal.authoritativeSummaryId });
+              refuse(opIndex, refusal.code, `summary ${op.summaryId} carries ${refusal.authoritativeSummaryId} up a level, whose text a compile reads in its place: edit ${refusal.authoritativeSummaryId} instead`, op.summaryId, { authoritativeSummaryId: refusal.authoritativeSummaryId });
               break;
             case 'CAS_MISMATCH':
-              refuse(opIndex, refusal.code, `summary ${op.summaryId}'s text has sha256 ${refusal.actualSha256}, not ${refusal.expectedSha256}`, op.summaryId, { actualSha256: refusal.actualSha256 });
+              refuse(opIndex, refusal.code, `summary ${op.summaryId}'s text has sha256 ${refusal.actualSha256}, not ${refusal.expectedSha256}: read it again (describeMutationTarget) and plan again`, op.summaryId, { actualSha256: refusal.actualSha256 });
               break;
             case 'RESPONSE_CONTENT_SHADOW':
               refuse(opIndex, refusal.code, `summary ${op.summaryId}, or an entry that carries it, holds ${refusal.responseBlocks} verbatim response block(s) of the old text, which render in place of the text: dropResponseContent deletes them from the summary and each carrier`, op.summaryId, { responseBlocks: refusal.responseBlocks });
               break;
             case 'EMPTY_CONTENT':
-              refuse(opIndex, refusal.code, 'the new text is empty', op.summaryId);
+              refuse(opIndex, refusal.code, "the new text is empty: give a text that isn't blank", op.summaryId);
               break;
             default: {
               const _exhaustive: never = refusal;
@@ -531,7 +532,7 @@ export function planMutation(
         }
         const beforeSha256 = messageContentSha256(row.content);
         if (beforeSha256 !== op.expectedSha256) {
-          refuse(opIndex, 'CAS_MISMATCH', `message ${op.messageId}'s content has sha256 ${beforeSha256}, not ${op.expectedSha256}`, op.messageId, { actualSha256: beforeSha256 });
+          refuse(opIndex, 'CAS_MISMATCH', `message ${op.messageId}'s content has sha256 ${beforeSha256}, not ${op.expectedSha256}: read it again (describeMutationTarget) and plan again`, op.messageId, { actualSha256: beforeSha256 });
         }
         let content: ContentBlock[];
         try {
@@ -592,7 +593,7 @@ export function planMutation(
           const sha256 = messageContentSha256(row.content);
           beforeSha256ById[id] = sha256;
           if (op.expectedSha256ById[id] !== sha256) {
-            refuse(opIndex, 'CAS_MISMATCH', `message ${id}'s content has sha256 ${sha256}, not ${op.expectedSha256ById[id] ?? 'none given'}`, id, { actualSha256: sha256 });
+            refuse(opIndex, 'CAS_MISMATCH', `message ${id}'s content has sha256 ${sha256}, not ${op.expectedSha256ById[id] ?? 'none given'}: read it again (describeMutationTarget) and plan again`, id, { actualSha256: sha256 });
           }
           taking.add(id);
           const body = bodyOf(state.rows, index);

@@ -4800,7 +4800,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let total = 0;
     for (let i = summariesChronological.length - 1; i >= 0; i--) {
       const s = summariesChronological[i]!;
-      const envelopeText = recallEnvelopeAddedText(s, this.config.recallEnvelope);
+      const envelopeText = recallEnvelopeAddedText(this.attributed(s), this.config.recallEnvelope);
       const est = (s.tokens ?? Math.ceil(s.content.length / 4)) + 50 +
         this.estimateTokens([{ type: 'text', text: envelopeText }]);
       if (total + est > maxTokens) continue;
@@ -19729,7 +19729,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const recallEnvelope = isRecallEnveloped(this.config.recallEnvelope) ? this.config.recallEnvelope : 'none';
     const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
-    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration, s.external?.by ?? null]);
+    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration, this.carriedMemory(s).external?.by ?? null]);
     const cached = this._answerCostCache.get(key);
     if (cached !== undefined) return cached;
     const estimate = this.estimateTokens(this.liveWindowAnswerContent(s));
@@ -23798,7 +23798,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
       this.summaryAnswerProse(summary),
-      summary,
+      this.attributed(summary),
       this.config.recallEnvelope,
     );
   }
@@ -23828,6 +23828,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * carries it, and the copy an entry was written with stands only where
    * this instance doesn't hold the summary under it.
    */
+  /**
+   * `summary` as its recall envelope names it: with the writer (`external`)
+   * of the summary whose text answers for it (carriedMemory). A carrier that
+   * an edit of an earlier release left behind its summary would otherwise
+   * name its own stale writer beside the summary's text.
+   */
+  private attributed(summary: SummaryEntry): SummaryEntry {
+    const writer = this.carriedMemory(summary).external;
+    if (writer === summary.external) return summary;
+    const { external: _stale, ...rest } = summary;
+    return writer ? { ...rest, external: writer } : rest;
+  }
+
   private carriedMemory(entry: SummaryEntry): SummaryEntry {
     for (let under: SummaryEntry | undefined; carriesItsSource(entry) && (under = this.summaryById(entry.sourceIds[0]!)); ) entry = under;
     return entry;
@@ -23872,7 +23885,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected liveWindowAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
       this.liveWindowAnswerProse(summary),
-      summary,
+      this.attributed(summary),
       this.config.recallEnvelope,
     );
   }
@@ -24042,7 +24055,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // equals it (isCapMarker).
       omissionMarked = capped.some(isCapMarker);
       if (idx > 0) content = separated(content);
-      content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      content.push(...wrapRecallAnswerContent(capped, this.attributed(s), this.config.recallEnvelope));
       refs.push(cappedWhole(prose, capped) ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       admitted++;
       // The cap ended inside this answer, where it cut, dropped or left out a
@@ -24130,7 +24143,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prose = this.liveWindowAnswerProse(summary);
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return {
-      content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
+      content: wrapRecallAnswerContent(capped, this.attributed(summary), this.config.recallEnvelope),
       refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
     };
   }
