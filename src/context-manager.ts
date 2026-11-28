@@ -2856,9 +2856,10 @@ export class ContextManager {
 
   private async selectBranch(name: string, created: boolean, selected?: () => void): Promise<void> {
     // A rejected native selection leaves the loaded branch usable. Chronicle
-    // selects the branch before it checkpoints the selection, and a failed
-    // checkpoint leaves the selection in effect: that is a switch, unsaved.
-    // Once the switch succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
+    // 0.6 and 0.7 select the branch before they checkpoint the selection, and
+    // a failed checkpoint leaves the selection in effect: that is a switch,
+    // unsaved. Chronicle 0.8 undoes such a selection. Once the switch
+    // succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
     const from = this.store.currentBranch().id;
     let unsaved: { error: unknown } | undefined;
     try {

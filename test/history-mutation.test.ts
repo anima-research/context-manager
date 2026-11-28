@@ -52,6 +52,7 @@ const membrane = {
 } as never;
 
 let stores = 0;
+let keptUnsaved: boolean | undefined;
 async function residentStore(): Promise<string> {
   const path = join(dir, `store-${stores++}`);
   const first = await ContextManager.open({ path, namespace: NS, strategy: new AutobiographicalStrategy({ ...RESIDENT, mergeThreshold: 99 } as never), membrane });
@@ -1340,7 +1341,8 @@ describe('history mutation', () => {
     }
   });
 
-  it('says what a failed checkpoint left of a branch it built', async () => {
+  it('says what a failed checkpoint left of a branch it built, as this chronicle leaves it', async () => {
+    const keeps = keepsUnsaved();
     const path = await residentStore();
     await resident(path, async (manager) => {
       const { manifest } = l1Edit(manager);
@@ -1362,7 +1364,7 @@ describe('history mutation', () => {
       } finally {
         store.createBranch = createBranch;
       }
-      assert.equal(inMemory, true, 'setup: the native create ran, and its branch stood in memory when its checkpoint failed');
+      assert.equal(inMemory, keeps, keeps ? 'setup: the native create ran, and its branch stood in memory when its checkpoint failed' : 'setup: this chronicle undid the create whose checkpoint failed');
       assert.ok(!branchNames(manager).includes('surgery/created'), 'a branch created in memory before its checkpoint failed is deleted');
       store.deleteBranch = (name: string) => (name === 'surgery/unsaved' ? withBranchFileBlocked(path, () => deleteBranch(name)) : deleteBranch(name));
       try {
@@ -1371,13 +1373,17 @@ describe('history mutation', () => {
             targetBranch: 'surgery/unsaved', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' },
             beforeSwitch: async () => { throw new Error('the host could not reconcile its other residents'); },
           }),
-          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && /its deletion is not saved yet: sync\(\) saves it/.test(String(error)),
+          (error: unknown) => refusedWith('BRANCH_LEFT')(error) && (keeps ? /its deletion is not saved yet: sync\(\) saves it/ : /it is still there: delete it by hand/).test(String(error)),
         );
       } finally {
         store.deleteBranch = deleteBranch;
       }
       assert.equal(manager.currentBranch().name, 'main');
-      assert.ok(!branchNames(manager).includes('surgery/unsaved'), 'the deletion holds in memory');
+      if (keeps) assert.ok(!branchNames(manager).includes('surgery/unsaved'), 'the deletion holds in memory');
+      else {
+        assert.ok(branchNames(manager).includes('surgery/unsaved'), 'this chronicle undid the deletion');
+        deleteBranch('surgery/unsaved');
+      }
       store.sync();
     });
     await resident(path, async (manager) => {
@@ -1496,6 +1502,26 @@ describe('history mutation', () => {
     }
   }
 
+  /** Whether this chronicle keeps a branch change whose checkpoint fails, as 0.6 and 0.7 do; 0.8 undoes it. */
+  function keepsUnsaved(): boolean {
+    if (keptUnsaved === undefined) {
+      const path = join(dir, 'chronicle-probe');
+      const store = JsStore.openOrCreate({ path });
+      try {
+        store.createBranch('probe', 'main');
+        try {
+          withBranchFileBlocked(path, () => store.switchBranch('probe'));
+        } catch {
+          // The checkpoint failed, as it is meant to.
+        }
+        keptUnsaved = store.currentBranch().name === 'probe';
+      } finally {
+        store.close();
+      }
+    }
+    return keptUnsaved;
+  }
+
   it('leaves the manager uninitialized where its bookkeeping after a landed switch fails', async () => {
     const path = await residentStore();
     await resident(path, async (manager) => {
@@ -1534,7 +1560,7 @@ describe('history mutation', () => {
     });
   });
 
-  it('says a switch that landed and failed its checkpoint is applied, with its receipt and how to save it', async () => {
+  it('says a switch that landed and failed its checkpoint is applied, with its receipt and how to save it', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
@@ -1572,7 +1598,31 @@ describe('history mutation', () => {
     }
   });
 
-  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', async () => {
+  it('deletes the branch it built where the store undoes a switch whose checkpoint fails', { skip: keepsUnsaved() ? 'this chronicle keeps a switch whose checkpoint fails' : false }, async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'as it was' }]);
+      const manifest: HistoryMutationManifest = { ops: [{ kind: 'edit_message', messageId: id, expectedSha256: messageSha(manager, id), label: '[edited by operator]', content: [{ type: 'text', text: 'as edited' }] }] };
+      const plan = manager.planHistoryMutation(manifest);
+      const store = manager.getStore();
+      const native = store.switchBranch.bind(store);
+      const branches = branchNames(manager);
+      store.switchBranch = (name: string) => (name === 'surgery/undone' ? withBranchFileBlocked(path, () => native(name)) : native(name));
+      try {
+        await assert.rejects(manager.applyHistoryMutation(manifest, { targetBranch: 'surgery/undone', expectedSourceBranch: 'main', expectedPlanSha256: plan.planSha256, by: { by: 'operator' } }));
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'main', 'the store stays on the source');
+      assert.deepEqual(branchNames(manager), branches, 'the branch it built is deleted');
+      assert.equal(rendered([manager.getMessage(id)!]), 'as it was', 'and the manager works on the source');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', { skip: keepsUnsaved() ? false : 'this chronicle undoes a switch whose checkpoint fails' }, async () => {
     const path = join(dir, `store-${stores++}`);
     const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
     try {
