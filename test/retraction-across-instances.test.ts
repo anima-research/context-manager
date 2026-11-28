@@ -145,7 +145,7 @@ async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
   }
 }
 
-const strategyFor = () => new AutobiographicalStrategy({
+const strategyFor = (extra: Record<string, unknown> = {}) => new AutobiographicalStrategy({
   compressionModel: 'm',
   targetChunkTokens: 50,
   headWindowTokens: 0,
@@ -155,6 +155,7 @@ const strategyFor = () => new AutobiographicalStrategy({
   l1HoldbackChunks: 0,
   mergeThreshold: 2,
   maxSpeculativeL1s: 1,
+  ...extra,
 });
 
 /** A KnowledgeStrategy, which keeps no chunk records, set as strategyFor is. */
@@ -1044,6 +1045,80 @@ describe('a retraction through another instance sharing the store', () => {
     }
   });
 
+  // The verifier's plant at 4233830 (post-#350 follow-up): writeHeldState
+  // drops the revision it held the state at before the write, so a write
+  // that throws without landing, which leaves the revision where it was,
+  // doesn't read as one nothing moved. Where the read back throws too,
+  // memory has taken the let-go's side (writeUnfolded) and the store still
+  // holds the L1: only the next retraction's compare finds that, and lets
+  // go of the row the store still folds.
+  it("a retraction after this instance's own write of the summaries threw without landing, its read back throwing too, reads the store and lets go of the row the store still folds", async () => {
+    const { store, strategy: A, cm: a, calls } = await instanceA();
+    const handle = store as unknown as Record<string, unknown>;
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      calls[0]!.release();
+      await deadline(ticking);
+      const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+      const row = l1.sourceIds[0]!;
+      // A row past the last closed chunk, which nothing folds, so its let-go writes no summaries.
+      for (let i = 24; i < 26; i++) a.presentRows([a.addMessage('User', [{ type: 'text', text: `${i} zz` }])]);
+      const folded = new Set([
+        ...internals(A).summaries.flatMap((s) => s.sourceIds),
+        ...internals(A).chunkRecords.flatMap((r) => r.sourceIds),
+      ]);
+      const loose = a.getPresentedMessages().map((m) => m.id).filter((id) => !folded.has(id));
+      assert.ok(loose.length >= 1, `premise: a row nothing folds: ${JSON.stringify(internals(A).chunkRecords)}`);
+
+      const realWrite = store.setStateJson.bind(store);
+      const realRead = store.getStateJson.bind(store);
+      let readFails = false;
+      handle.setStateJson = (id: string, value: unknown) => {
+        if (id !== SUMMARIES) return realWrite(id, value);
+        readFails = true;
+        throw new Error('zz the store refused the write of the summaries');
+      };
+      handle.getStateJson = (id: string) => {
+        if (readFails && id === SUMMARIES) {
+          readFails = false;
+          throw new Error('zz the read back of the summaries threw');
+        }
+        return realRead(id);
+      };
+      let first: string[];
+      try {
+        first = await linesDuring(async () => { a.retractRows([row], { undone: true }); });
+      } finally {
+        delete handle.setStateJson;
+        delete handle.getStateJson;
+      }
+      assert.ok(first.some((line) => line.includes('zz the store refused')), `premise: the let-go's write threw: ${first.join('\n')}`);
+      assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), "premise: the store's summaries still hold the L1");
+      assert.ok(internals(A).summaries.every((s) => s.id !== l1.id), "premise: memory took the let-go's side");
+
+      let reads: string[] = [];
+      const lines = await linesDuring(async () => {
+        reads = readsDuring(store, [SUMMARIES], () => a.retractRows([loose.at(-1)!], { undone: true }));
+      });
+      assert.ok(reads.length > 0, `the next retraction reads the summaries, whose revision the failed write left unmoved: ${lines.join('\n')}`);
+      assert.ok(
+        lines.some((line) => line.includes("aren't as this instance holds them") && line.includes(row)),
+        `it takes up the store, and lets go of the row the store still folds: ${lines.join('\n')}`,
+      );
+      assert.ok(
+        stored(store, SUMMARIES).every((s) => s.id !== l1.id && !s.sourceIds.includes(row)),
+        `the store no longer holds the L1 over the row: ${stored(store, SUMMARIES).map((s) => s.id).join(', ')}`,
+      );
+    } finally {
+      delete handle.setStateJson;
+      delete handle.getStateJson;
+      for (const call of calls) call.release();
+      a.close();
+      store.close();
+    }
+  });
+
   // Wave 6, finding 1: another manager's retraction tells only its own
   // strategy, so this instance went on rendering the L1 over the row, from
   // its own summaries and chunk records, until its own next let-go, work
@@ -1086,6 +1161,87 @@ describe('a retraction through another instance sharing the store', () => {
       }
     });
   }
+
+  // The verifier's plants at 4233830 (post-#350 follow-up): the look before
+  // a live select is made once per change of the window's length
+  // (windowLengthLooked): every tombstone and presentation takes an
+  // ordinal, so while the length stands no row has left the window since.
+  it("a live select looks for rows out of the window this instance still folds only where the window's length moved since it last looked", async () => {
+    const { store, strategy: A, cm: a, calls } = await instanceA();
+    let c: ContextManager | undefined;
+    // Rows past the last closed chunk, which nothing folds, so a look that
+    // finds one out of the window lets go of nothing. Each presentation
+    // looks at the length it leaves (windowGrew).
+    for (let i = 24; i < 26; i++) a.presentRows([a.addMessage('User', [{ type: 'text', text: `${i} zz` }])]);
+    const folded = new Set([
+      ...internals(A).summaries.flatMap((s) => s.sourceIds),
+      ...internals(A).chunkRecords.flatMap((r) => r.sourceIds),
+    ]);
+    const loose = a.getPresentedMessages().map((m) => m.id).filter((id) => !folded.has(id));
+    assert.ok(loose.length >= 1, `premise: a row nothing folds: ${JSON.stringify(internals(A).chunkRecords)}`);
+    // The select's look reads the window through the context initialize was given.
+    const view = (A as unknown as { hostContext: { window: { left: () => ReadonlySet<MessageId> | null } } }).hostContext.window;
+    const left = view.left;
+    let looks = 0;
+    view.left = () => {
+      looks++;
+      return left();
+    };
+    try {
+      await a.compile();
+      await a.compile();
+      assert.equal(looks, 0, 'no look at a length it looked at already');
+      c = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      c.retractRows([loose.at(-1)!], { undone: true });
+      await linesDuring(async () => { await a.compile(); });
+      assert.equal(looks, 1, "one look once another manager's tombstone moved the length");
+      await a.compile();
+      assert.equal(looks, 1, 'and none again while the length stands');
+    } finally {
+      view.left = left;
+      for (const call of calls) call.release();
+      c?.close();
+      a.close();
+      store.close();
+    }
+  });
+
+  // The verifier's plant at 4233830 (post-#350 follow-up): an audit-only
+  // instance's open leaves a row out of the window under what folds it, for
+  // inspection (releaseRowsThatLeft), and its select doesn't undo that.
+  it("an audit-only instance's compile leaves a row another manager took out under the L1 that folds it, and writes no let-go", async () => {
+    const { store, strategy: A, cm: a, calls, membrane } = await instanceA();
+    let c: ContextManager | undefined;
+    let audit: ContextManager | undefined;
+    try {
+      const ticking = a.tick();
+      await waitFor(() => calls.length === 1);
+      calls[0]!.release();
+      await deadline(ticking);
+      const l1 = internals(A).summaries.find((s) => s.level === 1)!;
+      const row = l1.sourceIds[0]!;
+      // A manager whose strategy folds nothing takes the row out, so the
+      // store still holds the L1 over it.
+      c = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      c.retractRows([row], { undone: true });
+      assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), 'premise: the store still holds the L1 over the row');
+
+      const inspecting = strategyFor({ auditOnly: true });
+      const lines = await linesDuring(async () => {
+        audit = await ContextManager.open({ store, strategy: inspecting, membrane });
+        await audit.compile();
+      });
+      assert.ok(internals(inspecting).summaries.some((s) => s.id === l1.id), `the audit-only instance still holds the L1 over the row: ${lines.join('\n')}`);
+      assert.ok(stored(store, SUMMARIES).some((s) => s.id === l1.id), 'and so does the store: no let-go was written');
+      assert.ok(!lines.some((line) => line.includes('still folded by this instance')), lines.join('\n'));
+    } finally {
+      for (const call of calls) call.release();
+      audit?.close();
+      c?.close();
+      a.close();
+      store.close();
+    }
+  });
 
   // Wave 6, finding 8: the check above ran before the call's exact
   // adoption only at entry. After the call, an exact L1 found in the store

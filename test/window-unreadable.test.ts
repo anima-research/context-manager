@@ -319,6 +319,46 @@ describe('a write the store threw on, where the index then can\'t be read', () =
     cm.close();
   });
 
+  // The verifier's plant at 4233830 (post-#350 follow-up; cdecc8b, wave 6,
+  // finding 23): close() lets go of what waits for the strategy, which
+  // nothing reads after it: the window writes waiting to be settled, and
+  // the calls waiting for an initialization. Every call refuses after
+  // close(), so no call can tell; this reads what the manager keeps, as
+  // on-retracted's finding-21 case does.
+  it('close() lets go of the window writes waiting to be settled and of the calls waiting for the strategy', async () => {
+    const cm = await ContextManager.open({ path: freshPath(), namespace: 'zz-agent', strategy: new Hearing() });
+    cm.presentRows([]);
+    const [x, y] = ['x', 'y'].map((t) => cm.addMessage('alice', [text(t)])) as [MessageId, MessageId];
+    class FailsToInitialize extends Hearing {
+      async initialize(_ctx: StrategyContext): Promise<void> {
+        throw new Error('zz-init-failed');
+      }
+    }
+    await assert.rejects(cm.setStrategy(new FailsToInitialize()), /zz-init-failed/);
+    // While no strategy is initialized, a row presented and another taken
+    // out wait to be told.
+    cm.presentRows([x]);
+    cm.retractRows([x]);
+    const restore = failNextWriteUnread(cm, true);
+    try {
+      throwsUnknown(() => cm.presentRows([y]), { operation: 'presentRows', entering: [y], leaving: [], cause: 'zz-index-kept-then-failed' });
+    } finally {
+      restore();
+    }
+    const kept = cm as unknown as {
+      presentedUnheard: ReadonlyMap<MessageId, unknown>;
+      retractedUnheard: readonly unknown[];
+      windowIndex: { unsettled: readonly unknown[] };
+    };
+    assert.ok(kept.presentedUnheard.size > 0, 'setup: rows wait to be heard entering');
+    assert.ok(kept.retractedUnheard.length > 0, 'setup: a call waits to be heard leaving');
+    assert.equal(kept.windowIndex.unsettled.length, 1, 'setup: the write waits to be settled');
+    cm.close();
+    assert.equal(kept.windowIndex.unsettled.length, 0, 'the write waiting to be settled is let go');
+    assert.equal(kept.presentedUnheard.size, 0, 'so are the rows waiting to be heard entering');
+    assert.equal(kept.retractedUnheard.length, 0, 'and the calls waiting to be heard leaving');
+  });
+
   // CM #350 bot review, wave 2, finding 45: what waits for a later write
   // holds the rows the write named, not the call's record.
   it("a write whose outcome is unknown doesn't keep the record its call read while its telling waits", async () => {
