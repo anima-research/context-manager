@@ -373,10 +373,15 @@ describe('external-memory', () => {
     const before = memory(path);
     const dry = await run(args);
     assert.equal(dry.code, 0, dry.stderr);
-    assert.match(dry.stdout, /DRY RUN/);
+    assert.match(dry.stdout, new RegExp(`DRY RUN: nothing written; run again with --apply --expected-prior-sha256 ${sha256(target.content)},`));
     assert.equal(memory(path), before, 'a dry run writes nothing to the memory');
 
-    const applied = await run([...args, '--apply']);
+    const other = await run([...args, '--apply', '--expected-prior-sha256', sha256('another text')]);
+    assert.equal(other.code, 1, 'an apply bound to another text is refused');
+    assert.match(other.stderr, /is refused, and nothing was written/);
+    assert.equal(memory(path), before, 'and writes nothing');
+
+    const applied = await run([...args, '--apply', '--expected-prior-sha256', sha256(target.content)]);
     assert.equal(applied.code, 0, applied.stderr);
     assert.match(applied.stdout, new RegExp(`old text: ${target.content.length} chars, ${target.tokens} tokens, sha256 ${sha256(target.content)}`));
     assert.match(applied.stdout, /verbatim response blocks dropped \(the most on one entry\): 2/);
@@ -519,20 +524,22 @@ describe('external-memory', () => {
     });
   });
 
-  it('refuses a summary edit where the stored summaries aren\'t as the strategy holds them, and writes nothing', async () => {
+  it('refuses a summary edit where the stored summaries aren\'t as the strategy holds them, dry run too, and writes nothing', async () => {
     const { path, under, carrier } = await carriedStore();
     const summariesId = `${NS}/autobio:summaries`;
     await asResident(path, answers, async (manager) => {
       const store = manager.getStore();
       const held = store.getStateJson(summariesId) as SummaryEntry[];
-      const ask = () => manager.editSummaryText(under.id, 'Edited by hand.', { by: 'operator' }, { apply: true, dropResponseContent: true, expectedPriorSha256: sha256(under.content) });
+      const ask = (apply: boolean) => () => manager.editSummaryText(under.id, 'Edited by hand.', { by: 'operator' }, { apply, dropResponseContent: true, expectedPriorSha256: sha256(under.content) });
       for (const [what, stored] of [
         ['the summary is gone', held.filter((s) => s.id !== under.id)],
         ['a carrier is gone', held.filter((s) => s.id !== carrier.id)],
         ['another handle wrote a newer text', held.map((s) => (s.id === under.id ? { ...s, content: 'a newer text' } : s))],
       ] as const) {
         store.setStateJson(summariesId, stored);
-        assert.throws(ask, /is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them/, what);
+        for (const apply of [false, true]) {
+          assert.throws(ask(apply), /is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them/, `${what}, ${apply ? 'applied' : 'a dry run'}`);
+        }
         assert.deepEqual(store.getStateJson(summariesId), stored, `${what}: nothing written`);
         assert.equal(manager.getSummary(under.id)?.content, under.content, `${what}: nothing changed in memory`);
       }
