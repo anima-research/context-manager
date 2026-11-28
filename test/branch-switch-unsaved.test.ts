@@ -1,0 +1,185 @@
+/**
+ * branch-switch-unsaved: a branch selection that the store makes and then
+ * fails to save, and one that leaves the store on another branch.
+ *
+ * Chronicle selects a branch before it checkpoints the selection. A failed
+ * checkpoint leaves the selection in effect. The manager takes that as a
+ * switch that is made and not saved: the call rejects, saying so, and the
+ * manager refuses work until it is initialized on the branch.
+ */
+import { after, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { cpSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { JsStore } from '@animalabs/chronicle';
+
+import { ContextManager, PassthroughStrategy } from '../src/index.js';
+
+const dir = mkdtempSync(join(tmpdir(), 'branch-switch-unsaved-'));
+after(() => rmSync(dir, { recursive: true, force: true }));
+
+const NS = 'agents/Ada';
+let stores = 0;
+
+/** Runs `body` while the store's branch file can't be written: a directory stands at its path. */
+function withBranchFileBlocked<T>(path: string, body: () => T): T {
+  const file = join(path, 'branches.bin');
+  renameSync(file, `${file}.held`);
+  mkdirSync(file);
+  try {
+    return body();
+  } finally {
+    rmdirSync(file);
+    renameSync(`${file}.held`, file);
+  }
+}
+
+describe('a branch selection that the store makes and does not save', () => {
+  it('leaves the store on a branch whose switch failed its checkpoint, with the manager refusing work until it is initialized there', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => withBranchFileBlocked(path, () => native(name));
+      try {
+        await assert.rejects(manager.switchBranch('elsewhere'), /Branch selection elsewhere took effect, and then the switch failed, so the selection may not be saved: getStore\(\)\.sync\(\) saves it once the store can write/);
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'elsewhere', 'the store is on the branch it selected');
+      assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/, 'the manager refuses work there');
+      store.sync();
+      const copy = join(dir, `copy-${stores++}`);
+      cpSync(path, copy, { recursive: true });
+      const saved = JsStore.open({ path: copy });
+      try {
+        assert.equal(saved.currentBranch().name, 'elsewhere', 'sync() saved the selection, before any close');
+      } finally {
+        saved.close();
+      }
+      await manager.setStrategy(manager.getStrategy());
+      assert.equal(manager.currentBranch().name, 'elsewhere');
+      manager.editMessage(id, [{ type: 'text', text: 'an edit' }]);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('leaves the store on a branch that fork created and selected, when the selection fails its checkpoint', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      const native = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => withBranchFileBlocked(path, () => native(name));
+      try {
+        await assert.rejects(manager.fork('forked'), /Branch selection forked \(created\) took effect, and then the switch failed/);
+      } finally {
+        store.switchBranch = native;
+      }
+      assert.equal(store.currentBranch().name, 'forked');
+      assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/);
+      store.sync();
+      await manager.setStrategy(manager.getStrategy());
+      assert.equal(manager.currentBranch().name, 'forked');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('leaves the manager uninitialized where a failed native switch left the store on another branch', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('elsewhere', 'main');
+      store.createBranch('asked', 'main');
+      const switchBranch = store.switchBranch.bind(store);
+      store.switchBranch = (name: string) => {
+        if (name === 'asked') {
+          switchBranch('elsewhere');
+          throw new Error('zz the switch went elsewhere');
+        }
+        return switchBranch(name);
+      };
+      try {
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked failed, and the store is on elsewhere: the manager is uninitialized; setStrategy\(getStrategy\(\)\) initializes it where the store is: zz the switch went elsewhere/);
+      } finally {
+        store.switchBranch = switchBranch;
+      }
+      assert.equal(store.currentBranch().name, 'elsewhere');
+      assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/);
+      store.switchBranch = (name: string) => {
+        switchBranch(name);
+        throw undefined;
+      };
+      try {
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked took effect, and then the switch failed/, 'a native error of any value');
+      } finally {
+        store.switchBranch = switchBranch;
+      }
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('leaves the manager uninitialized where the store can\'t say which branch it is on after a failed switch', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('asked', 'main');
+      const switchBranch = store.switchBranch.bind(store);
+      const currentBranch = store.currentBranch.bind(store);
+      let switched = false;
+      store.switchBranch = () => {
+        switched = true;
+        throw new Error('zz no switch');
+      };
+      store.currentBranch = () => {
+        if (switched) throw new Error('zz no read');
+        return currentBranch();
+      };
+      try {
+        await assert.rejects(manager.switchBranch('asked'), /Branch selection asked failed, and the store can't say which branch it is on: the manager is uninitialized/);
+      } finally {
+        store.switchBranch = switchBranch;
+        store.currentBranch = currentBranch;
+      }
+      assert.throws(() => manager.editMessage(id, [{ type: 'text', text: 'an edit' }]), /requires successful strategy initialization/);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('keeps the loaded branch usable where the native switch fails and the store stays where it was', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const manager = await ContextManager.open({ path, namespace: NS, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('User', [{ type: 'text', text: 'a row' }]);
+      const store = manager.getStore();
+      store.createBranch('asked', 'main');
+      const switchBranch = store.switchBranch.bind(store);
+      store.switchBranch = () => {
+        throw new Error('zz no switch');
+      };
+      try {
+        await assert.rejects(manager.switchBranch('asked'), /^Error: zz no switch$/);
+      } finally {
+        store.switchBranch = switchBranch;
+      }
+      assert.equal(store.currentBranch().name, 'main');
+      manager.editMessage(id, [{ type: 'text', text: 'an edit' }]);
+    } finally {
+      manager.close();
+    }
+  });
+});
