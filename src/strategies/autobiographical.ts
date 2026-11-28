@@ -16038,10 +16038,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * that throws says whether it landed, as the store reads back: this
    * strategy then holds what the store holds. Where the read back fails, it
    * refuses work until it is initialized again. Without `apply` nothing is
-   * written. Refused as SummaryTextEditOptions says, and, before anything is
-   * written, where the stored summaries or chunk records can't be shown to
-   * be as this strategy holds them (another handle wrote them, or reading
-   * them failed).
+   * written, and the answer is the one that `apply` would give. Refused as
+   * SummaryTextEditOptions says, and, before anything is written, where the
+   * stored summaries or chunk records can't be shown to be as this strategy
+   * holds them (another handle wrote them, or reading them failed).
    */
   editSummaryText(id: string, body: string, by: Omit<ExternalMemoryProvenance, 'at'>, options: SummaryTextEditOptions = {}): SummaryTextEdit {
     this.requireLoadedBranch('editSummaryText');
@@ -16061,10 +16061,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       carriedBy: plan.carriedBy,
       parents: plan.parents,
     };
-    if (!options.apply) return edit;
     if (this.store && this.storeWrittenElsewhere(true)) {
       throw new Error(`the edit of summary ${id} is refused, and nothing was written: the stored summaries or chunk records can't be shown to be as this strategy holds them, since another handle changed them after this strategy read them, or reading them failed: initialize the manager again (setStrategy(getStrategy())), or open the store again`);
     }
+    if (!options.apply) return edit;
     const external = { by: by.by, at: Date.now(), ...(by.note !== undefined ? { note: by.note } : {}) };
     const rewritten = new Set([id, ...plan.carriedBy.map((carrier) => carrier.id)]);
     const summaries = this.summaries.map((summary) => {

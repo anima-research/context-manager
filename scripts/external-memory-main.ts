@@ -14,7 +14,8 @@ const USAGE = [
   '  external-memory import <store-path> --namespace <ns> [--message-slot isolated|shared]',
   '      --descriptor <file> --body-file <file> --by <who> [--note <text>] [--apply]',
   '  external-memory edit <store-path> --namespace <ns> [--message-slot isolated|shared]',
-  '      --id <summary-id> --body-file <file> --by <who> [--note <text>] [--drop-response-content] [--apply]',
+  '      --id <summary-id> --body-file <file> --by <who> [--note <text>] [--drop-response-content]',
+  '      [--expected-prior-sha256 <sha256>] [--apply]',
 ].join('\n');
 
 type Slot = 'isolated' | 'shared';
@@ -25,7 +26,7 @@ const WRITE = ['--body-file', '--by', '--note'];
 const VALUE_OPTIONS: Record<Command, readonly string[]> = {
   'export-request': [...COMMON, '--level', '--chunk', '--out', '--model', '--participant', '--recipe', '--tools-log'],
   import: [...COMMON, ...WRITE, '--descriptor'],
-  edit: [...COMMON, ...WRITE, '--id'],
+  edit: [...COMMON, ...WRITE, '--id', '--expected-prior-sha256'],
 };
 const FLAGS: Record<Command, readonly string[]> = {
   'export-request': [],
@@ -225,7 +226,12 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
 
       const sequence = store.currentSequence();
-      const edit = manager.editSummaryText(options.get('--id')!, body, by, { apply, dropResponseContent: flags.has('--drop-response-content') });
+      const expectedPriorSha256 = options.get('--expected-prior-sha256');
+      const edit = manager.editSummaryText(options.get('--id')!, body, by, {
+        apply,
+        dropResponseContent: flags.has('--drop-response-content'),
+        ...(expectedPriorSha256 !== undefined ? { expectedPriorSha256 } : {}),
+      });
       console.log(`summary: ${edit.id} (L${edit.level})`);
       console.log(`old text: ${edit.prior.length} chars, ${edit.prior.tokens} tokens, sha256 ${edit.prior.sha256}`);
       console.log(`new text: ${body.length} chars, ${edit.tokens} tokens, sha256 ${sha256(body)}, by ${by.by}`);
@@ -238,7 +244,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         : `merged over the old text, left as they are: ${edit.parents.map((parent) => `${parent.id} (L${parent.level})`).join(', ')}`);
       console.log(edit.applied
         ? `APPLIED. The old text stays in the store's history: getStateJsonAt('${namespace}/autobio:summaries', ${sequence}) holds ${edit.id} as it was.`
-        : 'DRY RUN: nothing written; run again with --apply.');
+        : `DRY RUN: nothing written; run again with --apply --expected-prior-sha256 ${edit.prior.sha256}, so that the edit applies only to the text shown here.`);
       return 0;
     } finally {
       manager.close();

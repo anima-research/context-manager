@@ -38,7 +38,9 @@
     refuses work until it is initialized again. The edit is refused, before
     anything is written, where the stored summaries or chunk records can't
     be shown to be as the strategy holds them: after another handle's write,
-    or where reading them fails.
+    or where reading them fails. A dry run makes the same checks, and prints
+    the old text's sha256: `--expected-prior-sha256` with it refuses the
+    edit where the summary's text has changed since.
 
   `SummaryEntry.external` (`{ by, at, note?, requestHash? }`, optional)
   records who supplied such a text, and for an installed one the sha256 of
