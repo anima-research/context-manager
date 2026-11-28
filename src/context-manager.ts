@@ -370,19 +370,28 @@ interface DerivableStore {
  * From switchBranch() or fork(), the call's branch selection, and a fork's
  * branch creation, had already happened: `branch` names the branch, and
  * `created` says whether this call created it. A caller never needs to retry
- * a fork to learn whether it happened. From setStrategy(), `branch` is
- * undefined.
+ * a fork to learn whether it happened. Where the call's own switch threw and
+ * a newer initialization began while the call read the store's branch, the
+ * selection may not have happened, or may not be saved: the message says
+ * that the switch threw, and `cause` is what it threw. From setStrategy(),
+ * `branch` is undefined.
  */
 export class InitializationSupersededError extends Error {
   readonly branch: string | undefined;
   readonly created: boolean;
 
-  constructor(selection?: { branch: string; created: boolean }) {
+  constructor(selection?: { branch: string; created: boolean; failed?: { error: unknown } }) {
+    const failed = selection?.failed;
     super(
-      selection
-        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
-          `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
-        : 'Strategy initialization was superseded by a newer initialization',
+      !selection
+        ? 'Strategy initialization was superseded by a newer initialization'
+        : failed
+          ? `ContextManager.${selection.created ? 'fork created' : 'switchBranch to'} branch "${selection.branch}"` +
+            `${selection.created ? ', its switch' : ''} threw, and a newer initialization superseded it: ` +
+            `${failed.error instanceof Error ? failed.error.message : String(failed.error)}`
+          : `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+            `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`,
+      failed ? { cause: failed.error } : undefined,
     );
     this.name = 'InitializationSupersededError';
     this.branch = selection?.branch;
@@ -2792,7 +2801,14 @@ export class ContextManager {
    * mutations and strategy operations stay blocked until a successful
    * switchBranch() or setStrategy(). Inspection and close remain available.
    * If a newer initialization supersedes this one, the call rejects with
-   * InitializationSupersededError naming the branch it selected.
+   * InitializationSupersededError naming the branch it selected, or saying
+   * that its native switch threw. Where the store selects the branch and
+   * then the native switch fails, as chronicle 0.6 and 0.7 can (0.8 undoes
+   * such a selection), the switch is in effect and may not be saved: the
+   * call rejects, saying so, the strategy isn't initialized there, and
+   * sync() saves the selection once the store can write. Where the failed
+   * switch leaves the store on another branch, the call rejects and names
+   * it.
    *
    * The switch moves the store's branch, which every manager on the store
    * follows, and starts a new branch generation. Every other manager's
@@ -2808,11 +2824,53 @@ export class ContextManager {
   }
 
   private async selectBranch(name: string, created: boolean): Promise<void> {
-    // On chronicle 0.8.0, a rejected native selection leaves the loaded
-    // branch usable. An earlier chronicle can keep the switch when only its
-    // checkpoint failed. Once the switch succeeds, invalidate BEFORE
-    // fallible/reentrant bookkeeping.
-    this.store.switchBranch(name);
+    // A rejected native selection leaves the loaded branch usable. Chronicle
+    // 0.6 and 0.7 select the branch before they checkpoint the selection, and
+    // a failed checkpoint leaves the selection in effect: that is a switch,
+    // unsaved. Chronicle 0.8 undoes such a selection. Once the switch
+    // succeeds, invalidate BEFORE fallible/reentrant bookkeeping.
+    const said = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+    const made = created ? ' (created)' : '';
+    let from: string | undefined;
+    try {
+      from = this.store.currentBranch().id;
+    } catch {
+      from = undefined;
+    }
+    let unsaved: { error: unknown } | undefined;
+    try {
+      this.store.switchBranch(name);
+    } catch (error) {
+      const before = this.initializationAttempt;
+      let now: { id: string; name: string } | undefined;
+      try {
+        now = this.store.currentBranch();
+      } catch {
+        now = undefined;
+      }
+      if (this.initializationAttempt !== before) throw new InitializationSupersededError({ branch: name, created, failed: { error } });
+      if (now !== undefined && now.id === from) {
+        if (!created) throw error;
+        throw new Error(`Branch selection ${name} (created) was refused, and the store stays on its branch: branch ${name} exists, and the loaded branch stays usable: ${said(error)}`, { cause: error });
+      }
+      if (now === undefined || now.name !== name) {
+        const invalidated = ++this.initializationAttempt;
+        this.initializedAttempt = null;
+        let found = now?.name;
+        try {
+          found = markStoreBranchSwitch(this.store).name;
+        } catch {
+          // The manager is invalidated above whether or not the generation moves.
+        }
+        if (invalidated !== this.initializationAttempt) throw new InitializationSupersededError({ branch: name, created, failed: { error } });
+        throw new Error(
+          `Branch selection ${name}${made} failed, and the store ${found !== undefined ? `is on ${found}` : "can't say which branch it is on"}: the manager is uninitialized; ` +
+            `setStrategy(getStrategy()) initializes it where the store is, and sync() saves the store's selection once the store can write: ${said(error)}`,
+          { cause: error },
+        );
+      }
+      unsaved = { error };
+    }
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
     let requested: StoreBranchGeneration;
@@ -2820,13 +2878,28 @@ export class ContextManager {
       requested = markStoreBranchSwitch(this.store);
     } catch (cause) {
       throw new Error(
-        `Branch selection ${name}${created ? ' (created)' : ''} uncertain: earlier effects may have completed; ` +
-        `inspect the store and selected branch before retrying; recover with switchBranch() or setStrategy(): ` +
-        `${cause instanceof Error ? cause.message : String(cause)}`, { cause },
+        `Branch selection ${name}${made} uncertain: earlier effects may have completed; ` +
+        `inspect the store and selected branch before retrying; recover with switchBranch() or setStrategy(): ${said(cause)}` +
+        (unsaved === undefined ? '' : `; the native switch had failed with the store on ${name}, so the selection may not be saved, and sync() saves it once the store can write: ${said(unsaved.error)}`),
+        { cause },
       );
     }
     if (attempt !== this.initializationAttempt) {
-      throw new InitializationSupersededError({ branch: name, created });
+      throw new InitializationSupersededError({ branch: name, created, ...(unsaved !== undefined ? { failed: unsaved } : {}) });
+    }
+    if (unsaved !== undefined) {
+      if (requested.name !== name) {
+        throw new Error(
+          `Branch selection ${name}${made} took effect and then the switch failed, and reconciliation found ${requested.name}: the selection may not be saved; ` +
+          `sync() saves the store's selection once the store can write, and setStrategy(getStrategy()) initializes this manager where the store is: ${said(unsaved.error)}`,
+          { cause: unsaved.error },
+        );
+      }
+      throw new Error(
+        `Branch selection ${name}${made} took effect, and then the switch failed, so the selection may not be saved: ` +
+        `sync() saves it once the store can write, and setStrategy(getStrategy()) initializes this manager on it: ${said(unsaved.error)}`,
+        { cause: unsaved.error },
+      );
     }
     if (requested.name !== name) {
       throw new Error(`Branch selection requested ${name}, but reconciliation found ${requested.name}; no strategy initialization ran for this selection; recover with switchBranch() or setStrategy()`);
@@ -2852,7 +2925,9 @@ export class ContextManager {
    * switches it. The same recovery contract as switchBranch() applies. If a
    * newer initialization supersedes this one, the call rejects with
    * InitializationSupersededError naming the branch it created, so a caller
-   * never retries a fork to learn whether it happened.
+   * never retries a fork to learn whether it happened. Where the store
+   * refuses the switch and stays on its branch, the call rejects and names
+   * the branch that it created, and the loaded branch stays usable.
    *
    * A fork made while a sharded addMessage of this manager stores its
    * shards (from an onMessage listener of a shard's add) is refused before
