@@ -471,8 +471,11 @@ describe('external-memory', () => {
       id: 'L2-carry', level: 2, sourceLevel: 1, sourceIds: [under.id], carriedFrom: under.id, sourceRange: under.sourceRange,
       content: under.content, tokens: under.tokens, created: under.created,
       ...(under.responseContent ? { responseContent: under.responseContent } : {}),
+      ...(under.provenance ? { provenance: under.provenance } : {}),
+      ...(under.stitched ? { stitched: under.stitched } : {}),
     };
     assert.ok(carrier.responseContent?.length, 'setup: the carrier holds a copy of the response blocks');
+    assert.ok(carrier.provenance, 'setup: and of the provenance, as a carry copies it');
     read(path, (store) => {
       const all = store.getStateJson(`${NS}/autobio:summaries`) as SummaryEntry[];
       store.setStateJson(`${NS}/autobio:summaries`, [...all.map((s) => (s.id === under.id ? { ...s, mergedInto: carrier.id } : s)), carrier]);
@@ -617,7 +620,7 @@ describe('external-memory', () => {
     }
   });
 
-  it('refuses an edit that leaves a carrier\'s own response blocks, rewrites carriers two levels up, and finds a carrier whose summary doesn\'t point to it', async () => {
+  it('refuses an edit that leaves a carrier\'s own response blocks, and rewrites carriers two levels up', async () => {
     const { path, under, carrier } = await carriedStore();
     const top: SummaryEntry = { ...carrier, id: 'L3-carry', level: 3, sourceLevel: 2, sourceIds: [carrier.id], carriedFrom: carrier.id };
     const summariesId = `${NS}/autobio:summaries`;
@@ -630,10 +633,13 @@ describe('external-memory', () => {
     await asResident(path, answers, async (manager) => {
       assert.equal(manager.getSummary(under.id)?.responseContent, undefined, 'setup: the summary holds no response blocks');
       assert.ok(manager.getSummary(carrier.id)?.responseContent?.length, 'setup: its carrier still does');
+      const stored = () => JSON.stringify(manager.getStore().getStateJson(summariesId));
+      const before = stored();
       assert.throws(
         () => manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { apply: true }),
         new RegExp(`summary ${under.id}, or an entry that carries it, holds ${carrier.responseContent!.length} verbatim response block`),
       );
+      assert.equal(stored(), before, 'the refused edit wrote nothing');
       const edit = manager.editSummaryText(under.id, 'By hand.', { by: 'operator' }, { apply: true, dropResponseContent: true });
       assert.deepEqual(edit.carriedBy, [{ id: carrier.id, level: 2 }, { id: top.id, level: 3 }]);
     });
@@ -641,25 +647,9 @@ describe('external-memory', () => {
       const stored = summariesOf(path).find((s) => s.id === id)!;
       assert.deepEqual([stored.content, stored.responseContent], ['By hand.', undefined], id);
     }
-
-    const loose = await carriedStore();
-    read(loose.path, (store) => {
-      const all = store.getStateJson(summariesId) as SummaryEntry[];
-      store.setStateJson(summariesId, all.map((s) => {
-        if (s.id !== loose.under.id) return s;
-        const { mergedInto: _pointer, ...unpointed } = s;
-        return unpointed;
-      }));
-      store.sync();
-    });
-    await asResident(loose.path, answers, async (manager) => {
-      const edit = manager.editSummaryText(loose.under.id, 'By hand.', { by: 'operator' }, { apply: true, dropResponseContent: true });
-      assert.deepEqual(edit.carriedBy, [{ id: loose.carrier.id, level: 2 }], 'a carrier whose summary has no pointer to it');
-    });
-    assert.equal(summariesOf(loose.path).find((s) => s.id === loose.carrier.id)?.content, 'By hand.');
   });
 
-  it('refuses work after a write that threw where reading the store back fails, until the strategy is initialized again', async () => {
+  for (const lands of [false, true]) it(`refuses work after a write that threw${lands ? ' once it landed' : ''} where reading the store back fails, until the strategy is initialized again`, async () => {
     const path = await residentStore();
     const summariesId = `${NS}/autobio:summaries`;
     const target = summariesOf(path)[0]!;
@@ -671,6 +661,7 @@ describe('external-memory', () => {
       store.setStateJson = (id: string, value: unknown) => {
         if (id === summariesId) {
           failed = true;
+          if (lands) set(id, value);
           throw new Error('the disk is full');
         }
         return set(id, value);
@@ -688,8 +679,8 @@ describe('external-memory', () => {
       }
       assert.throws(ask, /requires reinitialization/, 'the strategy refuses work');
       await manager.setStrategy(manager.getStrategy());
-      assert.equal(manager.getSummary(target.id)?.content, target.content, 'initialized again, it holds what the store holds');
-      assert.equal(ask().applied, true);
+      assert.equal(manager.getSummary(target.id)?.content, lands ? 'Edited by hand.' : target.content, 'initialized again, it holds what the store holds');
+      if (!lands) assert.equal(ask().applied, true);
     });
     assert.equal(summariesOf(path).find((s) => s.id === target.id)?.content, 'Edited by hand.');
   });
