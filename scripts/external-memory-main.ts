@@ -244,7 +244,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         : `merged over the old text, left as they are: ${edit.parents.map((parent) => `${parent.id} (L${parent.level})`).join(', ')}`);
       console.log(edit.applied
         ? `APPLIED. The old text stays in the store's history: getStateJsonAt('${namespace}/autobio:summaries', ${sequence}) holds ${edit.id} as it was.`
-        : `DRY RUN: nothing written; run again with --apply --expected-prior-sha256 ${edit.prior.sha256}, so that the edit applies only to the text shown here.`);
+        : `DRY RUN: nothing written; run again with --apply --expected-prior-sha256 ${edit.prior.sha256}, so that the edit applies only where the summary still holds the old text that this dry run read.`);
       return 0;
     } finally {
       manager.close();
